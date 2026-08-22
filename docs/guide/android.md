@@ -54,8 +54,14 @@ without a kill rebuilds the surface and keeps running (screen was
 confirmed broken -- solid black, un-recoverable -- before the
 `suspended` fix, for the record); `adb shell am kill` followed by
 relaunch loads the saved state and logs "resumed from suspend state: ...".
-Resize/orientation handling (the rest of WP4) is unverified -- the AVD
-was only tested in one fixed orientation.
+Resize/orientation handling (the rest of WP4) already works, unmodified:
+the manifest's `android:configChanges` keeps the Activity alive across a
+rotation, and the same `WindowEvent::Resized` / `resync_surface_size`
+path desktop's resizable window already exercises handles the new native
+window size winit reports -- no Android-specific code needed. Verified on
+the AVD (`adb shell settings put system user_rotation 1`, then `0` to
+rotate back): both directions resize and recentre correctly, live, with
+no black-screen glitch and no crash.
 
 ## Building and running
 
