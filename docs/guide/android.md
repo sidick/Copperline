@@ -200,6 +200,33 @@ keyboard`/`InputDevice` sources) has no second UI layout to switch into
 DeX-capable device or a resizable-emulator configuration neither of which
 exist here.
 
+### The controller-walkable UI works end to end, D-pad-driven
+
+With the `hw.keyboard=yes` fix and the modifier-tracking fix above,
+Copperline's existing controller-walkable menu system
+(`src/video/window/app_nav.rs`) was tested for real, not just read from
+source, and it holds up completely -- this is the actual mechanism WP6's
+proposed "handheld, gamepad-only" mode depends on, and it needed no
+Android-specific code at all:
+
+1. Alt+E opens the pop-up menu (About highlighted by default).
+2. Three `KEYCODE_DPAD_UP` presses move the highlight exactly three
+   items, About → Keyboard Shortcuts → Load Kickstart ROM → Save State --
+   confirmed by screenshot.
+3. Enter drills into the highlighted item's submenu (Save State's Quick
+   Save / Quick Load / Save State... / Load State..., Quick Save
+   highlighted by default) -- confirmed by screenshot.
+4. Escape backs out of the submenu, a second Escape closes the menu
+   entirely, back to the running machine with no glitch and no crash.
+
+Since `KEYCODE_DPAD_*` and Android gamepad button keycodes go through
+the exact same `WindowEvent::KeyboardInput` path as the hardware-keyboard
+keys just confirmed above (see WP6's section), this is as close to
+confirming "a gamepad can drive the whole UI" as this environment gets
+without an actual gamepad -- the remaining gap is specifically the
+analog stick (still blocked on winit), not the digital D-pad/button path
+this test exercised.
+
 ## Building and running
 
 ```sh
