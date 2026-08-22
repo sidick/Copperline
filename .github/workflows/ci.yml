@@ -355,7 +355,7 @@ jobs:
     # check, since android-activity's game-activity flavor compiles native
     # C++ in its build.rs and needs the NDK's clang either way, plus a real
     # `assembleDebug` so a manifest/theme/dependency regression (see
-    # docs/guide/android.md's "two non-obvious pieces") is caught here
+    # docs/guide/android.md's "non-obvious pieces") is caught here
     # rather than only at launch on a device.
     runs-on: ubuntu-latest
     steps:

@@ -525,6 +525,7 @@ dependencies = [
  "copperline",
  "copperline-android-host",
  "log",
+ "ndk",
  "winit",
 ]
 

@@ -37,6 +37,12 @@ android-activity = { version = "0.6", features = ["game-activity"] }
 # `copperline`/`copperline-android-host` never need to know which flavor
 # was picked.
 winit = { version = "0.30", features = ["android-game-activity"] }
+# Only for the AssetManager/Asset types used to extract the bundled AROS
+# ROM out of the APK's assets/ on first run (see src/lib.rs and
+# docs/guide/android.md) -- already pulled in transitively at this exact
+# version by android-activity and winit, so this names it rather than
+# adding a second copy.
+ndk = { version = "0.9", default-features = false }
 log = "0.4"
 anyhow = "1"
 

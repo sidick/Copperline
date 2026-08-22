@@ -12,14 +12,18 @@
 //!   desktop `App::run`;
 //! - the Kickstart path, since [`copperline::romsearch::find_bundled_aros`]
 //!   only searches desktop-shaped locations (exe-relative, `assets/aros`
-//!   relative to the CWD) that don't exist on Android. For now this reads
-//!   from the app's internal data directory, pushed there by hand
-//!   (`adb push ... /data/data/<app>/files/aros/`) -- shipping the ROM as
-//!   an APK asset and extracting it on first run is storage work (WP5),
-//!   not part of this stage.
+//!   relative to the CWD) that don't exist on Android. The same bundled
+//!   AROS ROM instead ships as an APK asset (see the Gradle project's
+//!   `copyArosAssets` task) and is extracted into the app's internal data
+//!   directory on first run, once, by [`extract_bundled_aros`]. General
+//!   host-directory storage (a user's own Kickstart, WHDLoad games) is
+//!   still WP5; this is only the one bundled asset every install needs.
 //!
 //! Everything else -- config defaults, machine build, window/render/input
 //! -- is exactly `copperline`'s own code, unmodified.
+
+use std::io::Read as _;
+use std::path::Path;
 
 use android_activity::AndroidApp;
 use anyhow::{anyhow, Context, Result};
@@ -27,6 +31,37 @@ use copperline::audio::NullSink;
 use copperline::config::{self, Config, ConfigOverrides};
 use copperline::emulator;
 use copperline::video::window::App;
+
+/// Files the Gradle project's `copyArosAssets` task bundles under
+/// `assets/aros/` in the APK, matching `assets/aros/` at the repo root.
+const AROS_ASSETS: &[&str] = &["aros-amiga-m68k-rom.bin", "aros-amiga-m68k-ext.bin"];
+
+/// Copy the bundled AROS ROM out of the APK's assets and into `internal`
+/// (the app's private data directory), skipping any file already there --
+/// this runs on every launch, so it needs to be cheap once installed.
+fn extract_bundled_aros(android_app: &AndroidApp, internal: &Path) -> Result<()> {
+    let dir = internal.join("aros");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mgr = android_app.asset_manager();
+    for name in AROS_ASSETS {
+        let dest = dir.join(name);
+        if dest.is_file() {
+            continue;
+        }
+        let asset_path = format!("aros/{name}");
+        let cpath =
+            std::ffi::CString::new(asset_path.as_str()).expect("asset path has no interior NUL");
+        let mut asset = mgr
+            .open(&cpath)
+            .ok_or_else(|| anyhow!("asset {asset_path} not found in the APK"))?;
+        let mut buf = Vec::new();
+        asset
+            .read_to_end(&mut buf)
+            .with_context(|| format!("reading asset {asset_path}"))?;
+        std::fs::write(&dest, &buf).with_context(|| format!("writing {}", dest.display()))?;
+    }
+    Ok(())
+}
 
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
@@ -44,6 +79,7 @@ fn run(android_app: AndroidApp) -> Result<()> {
     let internal = android_app
         .internal_data_path()
         .ok_or_else(|| anyhow!("no internal data path (Context.getFilesDir())"))?;
+    extract_bundled_aros(&android_app, &internal).context("extracting the bundled AROS ROM")?;
 
     let raw = Config::load_raw(None, &ConfigOverrides::default())?;
     copperline::paths::adopt(raw.paths());
@@ -53,13 +89,6 @@ fn run(android_app: AndroidApp) -> Result<()> {
     // desktop-shaped locations; see the module doc.
     cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
     cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
-    if !cfg.rom_path.is_file() {
-        return Err(anyhow!(
-            "no Kickstart at {} -- push the bundled AROS ROM there first \
-             (adb push assets/aros/aros-amiga-m68k-*.bin <internal-data>/aros/)",
-            cfg.rom_path.display()
-        ));
-    }
 
     let emu = emulator::build_machine(&cfg, Box::new(NullSink), true, false)
         .context("building the machine")?;

@@ -16,21 +16,22 @@ Two standalone crates, in the same non-workspace shape as
   its `Cargo.toml`.
 - `crates/copperline-android` -- the actual app: a `cdylib` with the
   `android_main` GameActivity entry point, depending on the host layer and
-  on `copperline` itself (`frontend`, `cpu-jit`). `android_main` builds
-  the machine the same way `src/main.rs` does for an ordinary run with no
-  CLI flags (`Config::load_raw(None, ...)`, `emulator::build_machine`),
-  then drives `copperline`'s real `App`/window loop via
-  [`App::run_android`], winit's Android-specific counterpart to the
-  desktop `App::run`.
+  on `copperline` itself (`frontend`, `cpu-jit`). `android_main` extracts
+  the bundled AROS ROM (see below), builds the machine the same way
+  `src/main.rs` does for an ordinary run with no CLI flags
+  (`Config::load_raw(None, ...)`, `emulator::build_machine`), then drives
+  `copperline`'s real `App`/window loop via [`App::run_android`], winit's
+  Android-specific counterpart to the desktop `App::run`.
 
 ...plus a minimal Gradle project at `crates/copperline-android/android/`
 that packages the two into a real, installable APK.
 
-**Verified end-to-end on a headless AVD: the emulator boots the bundled
-AROS ROM and renders it live**, with Copperline's usual status bar chrome,
-showing "Waiting for bootable media" (correct -- no `df0` is configured
-yet; the Kickstart path is a temporary stand-in, see below). Confirmed via
-`logcat`: window/surface creation, the Zorro identification board
+**Verified end-to-end on a headless AVD, fully self-contained: `adb
+install` + launch, with no manual setup, boots the bundled AROS ROM and
+renders it live**, with Copperline's usual status bar chrome, showing
+"Waiting for bootable media" (correct -- no `df0` is configured yet).
+Confirmed via `logcat`: the ROM extracted from the APK's assets on first
+launch, window/surface creation, the Zorro identification board
 autoconfiguring, chipset register writes -- the real machine, not a stub.
 
 ## Building and running
@@ -41,18 +42,11 @@ cargo ndk -t arm64-v8a --platform 35 \
   -o crates/copperline-android/android/app/src/main/jniLibs \
   build --release --manifest-path crates/copperline-android/Cargo.toml
 
-# 2. Build and install the APK.
+# 2. Build and install the APK (copyArosAssets, a Gradle task, bundles
+#    the ROM from the repo's assets/aros/ automatically -- see below).
 cd crates/copperline-android/android
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-
-# 3. Stage a Kickstart in the app's internal storage (temporary -- see
-#    below) and launch.
-adb push assets/aros/aros-amiga-m68k-rom.bin /data/local/tmp/aros-rom.bin
-adb push assets/aros/aros-amiga-m68k-ext.bin /data/local/tmp/aros-ext.bin
-adb shell run-as org.copperlinehq.copperline mkdir -p files/aros
-adb shell run-as org.copperlinehq.copperline cp /data/local/tmp/aros-rom.bin files/aros/aros-amiga-m68k-rom.bin
-adb shell run-as org.copperlinehq.copperline cp /data/local/tmp/aros-ext.bin files/aros/aros-amiga-m68k-ext.bin
 adb shell am start -n org.copperlinehq.copperline/com.google.androidgamesdk.GameActivity
 ```
 
@@ -61,17 +55,24 @@ or `$ANDROID_HOME/ndk`) and, for the Gradle step, a JDK 17+. The Gradle
 wrapper (`./gradlew`) downloads its own Gradle 9.5.0 and the Android
 Gradle Plugin on first run; no separate Gradle install is needed.
 
-### Kickstart path: a temporary stand-in
+### Kickstart path: the one bundled asset, for now
 
 `copperline::romsearch::find_bundled_aros` only searches desktop-shaped
 locations (exe-relative, `assets/aros` relative to the CWD), which don't
-exist for an Android app. `android_main` reads instead from the app's
-internal data directory (`Context.getFilesDir()`, staged above by hand),
-bypassing `find_bundled_aros` entirely. Shipping the ROM as an APK asset
-and extracting it on first run -- so a real install needs no `adb push`
-step -- is storage work (WP5), not done yet.
+exist for an Android app. Instead, the Gradle project's `copyArosAssets`
+task copies the same `assets/aros/` files from the repo root into the
+APK's own `assets/` (Android's normal read-only per-APK asset store), and
+`android_main`'s `extract_bundled_aros` copies them out into the app's
+internal data directory (`Context.getFilesDir()`, writable, where a real
+file path exists) on first launch, then points `cfg.rom_path`/
+`extended_rom_path` there directly -- bypassing `find_bundled_aros`
+entirely rather than teaching it Android's layout. A user's own Kickstart
+or WHDLoad games, from arbitrary host-chosen storage, is still WP5; this
+is only the one asset every install already needs, done now because a
+manual `adb push` step for every fresh install was worse than doing it
+properly.
 
-### Two non-obvious Gradle/manifest pieces
+### Non-obvious Gradle/manifest pieces
 
 In case they need touching again:
 
@@ -86,6 +87,11 @@ In case they need touching again:
   entirely -- the unresolved superclass reads as "class not found" rather
   than a clearer error -- or an `IllegalStateException` about the theme
   once appcompat is present but the theme isn't).
+- AGP 9's classic `sourceSets { ... }` DSL rejects a `Provider<Directory>`
+  outright ("You cannot add Provider instances to the Android SourceSet
+  API"), which is what `layout.buildDirectory.dir(...)` returns. Resolve
+  it to a plain `File` first (`.get().asFile`) before passing it to
+  `assets.srcDir(...)` (see `copyArosAssets` in `app/build.gradle.kts`).
 
 ### The android-activity flavor choice
 
