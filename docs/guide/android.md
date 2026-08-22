@@ -124,6 +124,71 @@ confirmed by screenshot, within one 5-second check cycle of the override
 taking effect; `cmd thermalservice reset` before uninstalling put the AVD
 back to normal so the override doesn't leak into other testing.
 
+## WP9 (full mode): analysis-only, empirically unverifiable here
+
+WP9 (hardware keyboard, pointer capture, DeX) has no code changes from
+this pass -- what follows is what reading winit's Android backend
+(`platform_impl/android/keycodes.rs`, `mod.rs`) turned up, and why it
+couldn't be confirmed on the AVD.
+
+**Hardware keyboard mapping already covers what the proposal asks for, on
+paper.** Standard letter/number/function keys map through winit's
+existing `to_physical_key`/`to_logical`, the same generic path desktop
+uses -- nothing Android-specific needed. So does everything WP9 names
+specifically: `Keycode::MetaLeft/MetaRight` (a real keyboard's
+Windows/Command-equivalent key) map to `KeyCode::SuperLeft/SuperRight`,
+which `src/keymap.rs` already binds to the Amiga keys; `Keycode::Numpad*`
+map to `KeyCode::Numpad*`, matching the numeric keypad row-for-row. Help
+has no host-keyboard equivalent by design on *any* platform, Android
+included (see `src/video/window/kbdpanel.rs`'s doc comment) -- it's
+reached through the existing on-screen keyboard panel instead, which
+isn't Android-specific either.
+
+**None of this could be empirically confirmed.** `adb shell input
+keyevent` (the only synthetic input tool available without real
+hardware) doesn't reach the app as a genuine hardware KeyEvent would:
+`dumpsys window` confirms the app has focus, but `logcat` shows every
+synthetic key intercepted by GameActivity's bundled GameTextInput layer
+(`gti.InputConnection.onKey`, `source=0x0`) rather than reaching the
+native input queue -- for a D-pad key, a plain letter, or anything else
+tried. This is a testing-environment limitation (no real Bluetooth/USB
+keyboard or gamepad attached to the AVD), not a confirmed defect; the
+mapping analysis above is sound, but unverified the way the gamepad
+D-pad's *behavior* was never actually verified either (WP6's docs
+say "confirmed by reading winit's source", not confirmed on a device --
+same caveat applies here for the same reason).
+
+**Pointer capture is blocked on the identical root cause as WP6's analog
+gamepad input**, not a separate gap: `ActiveEventLoop::set_cursor_grab`
+is a hard `Err(NotSupported)` on Android in winit (no capture API is
+wired up at all), and even without that, a real mouse's relative motion
+would arrive as a `MotionEvent` and get misrouted through winit's
+touch-only handling exactly like a joystick axis does -- winit's Android
+`MotionEvent` handling doesn't discriminate by `source()` at all. A JNI
+`View.requestPointerCapture()` shim (as the proposal describes) would
+still hit this same wall on the Rust side.
+
+**New finding, not previously known:** `WindowEvent::Touch` has no
+handler anywhere in `src/video/window.rs` -- tapping the screen (tried at
+several plausible status-bar-button coordinates, and confirmed via
+`dumpsys window` that the tap coordinates were computed correctly) does
+nothing at all. This isn't a WP9 gap, though: the proposal's own "Out of
+scope" section excludes "any touch-first UI beyond the on-screen keyboard
+overlay" for the whole port, on the premise that handheld mode is
+gamepad/D-pad-navigated (`src/video/window/app_nav.rs`'s existing
+controller-walkable UI, which reads `KeyCode::ArrowUp/Down/Left/Right` --
+the same keys Android's D-pad already maps to per the keyboard analysis
+above, and *also* unverified for the same GameTextInput-interception
+reason). Worth knowing regardless, since a real user reaching for the
+screen first is a natural instinct this doesn't reward.
+
+**Not attempted:** runtime handheld/full mode switching (`Configuration.
+keyboard`/`InputDevice` sources) has no second UI layout to switch into
+-- this session built one UI, not the proposal's two presentation modes
+-- so there's nothing to detect *for* yet. DeX/multi-window needs a
+DeX-capable device or a resizable-emulator configuration neither of which
+exist here.
+
 ## Building and running
 
 ```sh
@@ -231,7 +296,12 @@ gamepad path (D-pad + fire, no analog stick, no gilrs-style calibration)
 is buildable on top of that existing mechanism without touching winit;
 full WP6 (analog input, SDL-style calibration, verification against real
 device pads) needs either a winit fix upstream or bypassing its event
-loop for input, neither of which is done here.
+loop for input, neither of which is done here. Caveat added once this
+became clear during WP9's testing: this button/D-pad mapping is source-
+verified, not device-verified -- `adb shell input keyevent`'s synthetic
+events don't reach a GameActivity app's native input queue (see WP9's
+section below), so there's currently no way to confirm it here short of
+a real gamepad.
 
 ## Root crate feature support
 
