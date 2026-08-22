@@ -82,6 +82,41 @@ resolution-aware default anywhere (desktop or Android) -- `[display]
 shader` is `None` everywhere unless a user opts in, which is a reasonable,
 safe default rather than a gap blocking anything.
 
+**Performance and power (WP8).** `crates/copperline-android`'s
+`android_main` calls two new `src/priority.rs` functions before starting
+the event loop:
+
+- `pin_to_fastest_core` reads every online CPU's `cpuinfo_max_freq` and
+  `sched_setaffinity`s the calling (pacer) thread to whichever core(s)
+  report the highest value -- on a big.LITTLE/big.MID.little handheld SoC
+  this keeps the hot thread off an efficiency core the scheduler would
+  otherwise be free to migrate it onto under load. Best effort, like the
+  rest of the module: logs and continues unpinned if `cpufreq` isn't
+  readable or the syscall fails. On the AVD's uniform-frequency virtual
+  CPUs this pins to all four (`[0, 1, 2, 3]`) -- a degenerate but correct
+  case; a real big.LITTLE SoC would narrow to just the big cores.
+- `elevate_pacer_thread` (already existed; desktop calls it only under
+  `[emulation] realtime_priority`) is now called unconditionally on
+  Android -- there's no desktop-style "don't be antisocial to other apps"
+  tradeoff when this process owns the foreground.
+
+New also: `priority::android_thermal_throttling`, a direct binding to the
+stable NDK `<android/thermal.h>` API (`AThermal_acquireManager` /
+`AThermal_getCurrentThermalStatus` / `AThermal_releaseManager`, linked via
+`#[link(name = "android")]` -- no JNI, no `ndk`/`ndk-sys` wrapper needed,
+they don't have one). `App::check_android_thermal`, called from
+`about_to_wait` and throttled to once every 5 seconds, surfaces
+`THERMAL_STATUS_SEVERE` and worse as an OSD warning (once per throttling
+episode, not repeated every interval) rather than letting the machine
+silently drop below real time with no explanation on screen. Verified on
+the AVD end-to-end, including the parts that don't have a real sensor to
+trigger them: `adb shell cmd thermalservice override-status 3` forces the
+status the same way real thermal stress would, and the OSD
+("Device is thermal throttling -- performance may drop") appeared,
+confirmed by screenshot, within one 5-second check cycle of the override
+taking effect; `cmd thermalservice reset` before uninstalling put the AVD
+back to normal so the override doesn't leak into other testing.
+
 ## Building and running
 
 ```sh

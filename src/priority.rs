@@ -106,15 +106,114 @@ fn elevate_current_thread(label: &str) {
 fn elevate_current_thread(label: &str) {
     use thread_priority::{set_current_thread_priority, ThreadPriority};
     // On Windows this maps to THREAD_PRIORITY_HIGHEST (no privilege needed).
-    // On Linux/other Unix it raises to the top of the current scheduling
-    // policy, which requires privilege to exceed normal; without it the call
-    // returns an error that we log and shrug off.
+    // On Linux/other Unix (Android included) it raises to the top of the
+    // current scheduling policy, which requires privilege to exceed normal;
+    // without it the call returns an error that we log and shrug off.
     match set_current_thread_priority(ThreadPriority::Max) {
         Ok(()) => log::info!("priority: {label} thread elevated (ThreadPriority::Max)"),
         Err(e) => log::warn!(
             "priority: could not elevate {label} thread ({e:?}); \
              continuing at normal priority"
         ),
+    }
+}
+
+/// Pin the calling thread to the SoC's highest-clocked core(s). On a
+/// big.LITTLE (or big.MID.little) handheld SoC, the scheduler is free to
+/// migrate the pacer thread onto a slow efficiency core under load,
+/// exactly when the emulator needs the fast one most; this asks for the
+/// opposite. Best effort, like the rest of this module: reads each
+/// online CPU's `cpuinfo_max_freq`, pins to whichever core(s) report the
+/// highest value, and logs-and-continues if that information (or the
+/// pin itself) isn't available rather than failing the run.
+#[cfg(target_os = "android")]
+pub fn pin_to_fastest_core() {
+    let Some(cpus) = fastest_cpus() else {
+        log::info!("priority: core pinning skipped (no readable cpufreq info)");
+        return;
+    };
+    // SAFETY: `set` is a plain-old-data libc type, zero-initialised before
+    // use; `sched_setaffinity(0, ...)` operates on the calling thread only
+    // (POSIX: pid 0 means "the calling thread"), so this can't reach outside
+    // the thread that called this function.
+    let ret = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for &cpu in &cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if ret == 0 {
+        log::info!("priority: pacer thread pinned to core(s) {cpus:?}");
+    } else {
+        log::warn!(
+            "priority: sched_setaffinity failed ({}); continuing unpinned",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// The CPU indices reporting the highest `cpuinfo_max_freq` among however
+/// many `/sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq` files this
+/// host has readable (0 if none are -- an unprivileged app on some Android
+/// builds can't read them, which is why this is a `Some`/`None`, not an
+/// assumption that CPU 0 exists). 32 is comfortably past any phone/tablet
+/// SoC's core count.
+#[cfg(target_os = "android")]
+fn fastest_cpus() -> Option<Vec<usize>> {
+    let freqs: Vec<(usize, u64)> = (0..32)
+        .filter_map(|cpu| {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+            std::fs::read_to_string(&path)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+                .map(|f| (cpu, f))
+        })
+        .collect();
+    let max = freqs.iter().map(|&(_, f)| f).max()?;
+    Some(
+        freqs
+            .into_iter()
+            .filter(|&(_, f)| f == max)
+            .map(|(cpu, _)| cpu)
+            .collect(),
+    )
+}
+
+/// Android's thermal status, coarsened to "the OS is materially throttling
+/// (or about to)" versus "running fine" -- `None` if the platform API
+/// isn't available (pre-Android 11, or the call itself failed), so a
+/// caller can tell "don't know" from "not throttling". Best effort: reads
+/// `AThermalManager`'s status through the stable NDK `<android/thermal.h>`
+/// API and never fails the run.
+#[cfg(target_os = "android")]
+pub fn android_thermal_throttling() -> Option<bool> {
+    use std::ffi::c_void;
+
+    #[link(name = "android")]
+    extern "C" {
+        fn AThermal_acquireManager() -> *mut c_void;
+        fn AThermal_releaseManager(manager: *mut c_void);
+        fn AThermal_getCurrentThermalStatus(manager: *mut c_void) -> i32;
+    }
+
+    // SAFETY: a null manager is checked before use; the manager is released
+    // exactly once, right after the one call that needs it, so there is no
+    // dangling handle for anything else to touch.
+    unsafe {
+        let manager = AThermal_acquireManager();
+        if manager.is_null() {
+            return None;
+        }
+        let status = AThermal_getCurrentThermalStatus(manager);
+        AThermal_releaseManager(manager);
+        // THERMAL_STATUS_SEVERE (3) and worse: the OS is materially
+        // throttling, not just running warm. status < 0 means the call
+        // itself failed.
+        (status >= 0).then_some(status >= 3)
     }
 }
 

@@ -1412,6 +1412,16 @@ pub struct App {
     /// emulated machine's own video standard.
     #[cfg(target_os = "android")]
     android_frame_rate: Option<(android_activity::AndroidApp, f32)>,
+    /// Throttle for [`Self::check_android_thermal`]: the last time it
+    /// actually made the `AThermal_*` call, so a check this cheap still
+    /// isn't made every `about_to_wait` tick.
+    #[cfg(target_os = "android")]
+    android_thermal_last_check: Option<Instant>,
+    /// Whether the OSD has already told the user thermal throttling is
+    /// active, so [`Self::check_android_thermal`] doesn't repeat itself
+    /// every throttle interval while it's still true.
+    #[cfg(target_os = "android")]
+    android_thermal_warned: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2136,6 +2146,10 @@ impl App {
             suspend_save_path: None,
             #[cfg(target_os = "android")]
             android_frame_rate: None,
+            #[cfg(target_os = "android")]
+            android_thermal_last_check: None,
+            #[cfg(target_os = "android")]
+            android_thermal_warned: false,
         };
         // Attach the sampler now for a directly-booted machine; the config-screen
         // placeholder passes a disabled request and attaches on Run instead.
@@ -2860,6 +2874,34 @@ impl App {
         {
             Ok(()) => info!("android: requested {hz} Hz display refresh"),
             Err(e) => warn!("android: set_frame_rate({hz}) failed: {e}"),
+        }
+    }
+
+    /// Surface thermal throttling as an OSD warning rather than letting the
+    /// machine silently drop below real time with no explanation on
+    /// screen -- WP8. Throttled to once every few seconds (the underlying
+    /// `AThermal_*` call is cheap, but there is no reason to make it every
+    /// `about_to_wait` tick), and only shown once per throttling episode
+    /// (repeating it every interval while still throttling would just spam
+    /// the OSD over itself).
+    #[cfg(target_os = "android")]
+    fn check_android_thermal(&mut self) {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let now = Instant::now();
+        if self
+            .android_thermal_last_check
+            .is_some_and(|last| now.duration_since(last) < CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.android_thermal_last_check = Some(now);
+        match crate::priority::android_thermal_throttling() {
+            Some(true) if !self.android_thermal_warned => {
+                self.android_thermal_warned = true;
+                self.show_osd("Device is thermal throttling -- performance may drop".to_string());
+            }
+            Some(false) => self.android_thermal_warned = false,
+            Some(true) | None => {}
         }
     }
 
@@ -4565,6 +4607,8 @@ impl ApplicationHandler for App {
         if self.render.is_none() {
             return;
         }
+        #[cfg(target_os = "android")]
+        self.check_android_thermal();
         // Act on a completed drop before the OSD/control-flow computation
         // below, so a drop-raised OSD keeps the loop awake for its fade.
         if !self.pending_dropped_files.is_empty() {

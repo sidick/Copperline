@@ -172,5 +172,13 @@ fn run(android_app: AndroidApp) -> Result<()> {
     // run_android below needs to keep consuming the original.
     app.set_android_frame_rate_hint(android_app.clone(), refresh_hz);
 
+    // WP8: keep the pacer thread on the SoC's fastest core and at the
+    // scheduler's front of the queue, rather than leaving a handheld's
+    // big.LITTLE scheduler free to migrate/deprioritise it under load --
+    // there is no desktop-style "don't be antisocial to other apps"
+    // tradeoff here, this process owns the foreground.
+    copperline::priority::pin_to_fastest_core();
+    copperline::priority::elevate_pacer_thread();
+
     app.run_android(android_app)
 }
