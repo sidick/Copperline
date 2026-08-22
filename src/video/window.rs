@@ -1398,6 +1398,13 @@ pub struct App {
     /// Scratch for narrowing a 35 ns-canvas presentation to the recorder's
     /// fixed FB_WIDTH frame.
     record_scratch_fb: Vec<u32>,
+    /// Where [`Self::suspended`] saves a state when the platform is about
+    /// to take the window/surface away (Android backgrounding; every
+    /// other platform essentially never calls `suspended`), so a process
+    /// killed while backgrounded resumes instead of rebooting. Desktop
+    /// passes `None`; crates/copperline-android passes its app-private
+    /// data directory.
+    suspend_save_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2119,6 +2126,7 @@ impl App {
             recorder: None,
             record_fb: Vec::new(),
             record_scratch_fb: Vec::new(),
+            suspend_save_path: None,
         };
         // Attach the sampler now for a directly-booted machine; the config-screen
         // placeholder passes a disabled request and attaches on Run instead.
@@ -2805,6 +2813,14 @@ impl App {
             });
     }
 
+    /// Where [`ApplicationHandler::suspended`] saves a state so a process
+    /// killed in the background resumes rather than reboots. See
+    /// `suspend_save_path`'s field doc; desktop callers have no reason to
+    /// call this.
+    pub fn set_suspend_save_path(&mut self, path: PathBuf) {
+        self.suspend_save_path = Some(path);
+    }
+
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         self.run_with_event_loop(event_loop)
@@ -3440,6 +3456,26 @@ impl ApplicationHandler for App {
         self.request_redraw();
         self.arm_scheduled_events();
         self.engage_warp_launch();
+    }
+
+    /// The window/surface this session's `render` was built against is
+    /// gone (backgrounded on Android, most platforms never call this at
+    /// all) and any further use of it -- present, or even just holding the
+    /// `Arc<Window>` -- is invalid. Dropping it here, rather than only on
+    /// the next [`Self::resumed`], is what makes that the right fix: with
+    /// `render` `None`, [`Self::about_to_wait`]'s existing render guard
+    /// stops stepping the emulated machine until a real surface exists
+    /// again, for free -- backgrounding already means "pause".
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(path) = &self.suspend_save_path {
+            match self.emu.save_state(path) {
+                Ok(()) => info!("suspend: state saved to {}", path.display()),
+                // Backgrounding still has to succeed even if the save
+                // doesn't -- there is no user to show an error to here.
+                Err(e) => error!("suspend: state save to {} failed: {e}", path.display()),
+            }
+        }
+        self.render = None;
     }
 
     fn window_event(

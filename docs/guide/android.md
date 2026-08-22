@@ -10,10 +10,9 @@ Two standalone crates, in the same non-workspace shape as
 `crates/copperline-web` and `crates/copperline-player`:
 
 - `crates/copperline-android-host` -- the reusable host layer (logcat
-  logging today; activity lifecycle, surface handling, storage, input and
-  display policy land here as their own work packages). A plain library,
-  not a native lib itself, and not buildable standalone on Android -- see
-  its `Cargo.toml`.
+  logging today; storage, input and display policy land here as their own
+  work packages). A plain library, not a native lib itself, and not
+  buildable standalone on Android -- see its `Cargo.toml`.
 - `crates/copperline-android` -- the actual app: a `cdylib` with the
   `android_main` GameActivity entry point, depending on the host layer and
   on `copperline` itself (`frontend`, `cpu-jit`). `android_main` extracts
@@ -39,6 +38,24 @@ Paula's 44.1 kHz mix rate, no underruns observed), falling back to
 silence rather than aborting the run if it fails to open -- untested on a
 physical device, and unverified whether sound is actually audible versus
 merely opened without error (the AVD was run headless).
+
+**Backgrounding is handled** (WP4): `ApplicationHandler::suspended` (a
+winit callback essentially every other platform never fires) drops the
+window/surface, which for free stops `about_to_wait` from stepping the
+machine -- backgrounding already means "pause", with no Android-specific
+code needed for that half. If `App::set_suspend_save_path` was called
+(only `copperline-android` calls it), `suspended` also saves a state
+there first, and `android_main` loads it back on a cold start if the file
+exists -- so a process Android kills outright while backgrounded (the
+common case under memory pressure, not just occlusion) resumes instead of
+rebooting AROS from scratch. Verified on the AVD: backgrounding (HOME)
+saves a state and the surface tears down cleanly; bringing the app back
+without a kill rebuilds the surface and keeps running (screen was
+confirmed broken -- solid black, un-recoverable -- before the
+`suspended` fix, for the record); `adb shell am kill` followed by
+relaunch loads the saved state and logs "resumed from suspend state: ...".
+Resize/orientation handling (the rest of WP4) is unverified -- the AVD
+was only tested in one fixed orientation.
 
 ## Building and running
 

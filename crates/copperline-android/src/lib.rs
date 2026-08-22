@@ -103,9 +103,22 @@ fn run(android_app: AndroidApp) -> Result<()> {
         }
     };
 
-    let emu = emulator::build_machine(&cfg, audio, true, false).context("building the machine")?;
+    // A state saved by App::suspended the last time this process was
+    // backgrounded: if Android killed the process rather than just
+    // suspending it (the common case under memory pressure), this cold
+    // start resumes it instead of rebooting AROS from scratch.
+    let suspend_state_path = internal.join("suspend.clstate");
+    let resuming = suspend_state_path.is_file();
+    let mut emu =
+        emulator::build_machine(&cfg, audio, true, resuming).context("building the machine")?;
+    if resuming {
+        match emu.load_state(&suspend_state_path) {
+            Ok(outcome) => log::info!("resumed from suspend state: {}", outcome.summary),
+            Err(e) => log::warn!("suspend state failed to load ({e:#}); starting fresh"),
+        }
+    }
 
-    let app = App::new(
+    let mut app = App::new(
         emu,
         cfg.emulation.power_on,
         Vec::new(), // screenshot_after
@@ -144,6 +157,7 @@ fn run(android_app: AndroidApp) -> Result<()> {
         audio_output_enabled,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
+    app.set_suspend_save_path(suspend_state_path);
 
     app.run_android(android_app)
 }
