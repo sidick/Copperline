@@ -34,10 +34,12 @@ default = [
 ]
 # MT-32 emulation through CopperlineHQ/mt32-rs, reachable as a MIDI-Out
 # target. Off builds carry none of it.
+# Android: `cargo check --target aarch64-linux-android` passes (pure Rust).
 mt32 = ["dep:mt32-rs"]
 # Coppersynth, the built-in General MIDI synthesizer (soundfont player
 # with an MT-32 translation layer), reachable as the "coppersynth" MIDI-Out
 # device. No ROMs needed; the soundfont is fetched or bundled separately.
+# Android: `cargo check --target aarch64-linux-android` passes (pure Rust).
 coppersynth = ["dep:coppersynth"]
 # The WHDLoad game library: the launcher's Library page, the local game
 # database it reads, and the OpenRetro sync that fills it.
@@ -49,6 +51,12 @@ coppersynth = ["dep:coppersynth"]
 # Library page is absent, and `[whdload]` keys that only the library uses
 # are parsed and ignored so a configuration written by a full build still
 # loads. See src/gamelib/.
+# Android: `cargo check --target aarch64-linux-android` cannot get past
+# ureq's rustls build script without an NDK: it needs `aarch64-linux-android-
+# clang` on PATH (cc-rs shells out to it) for `ring`'s C/asm. Not a code
+# issue -- ring supports Android -- just needs `cargo-ndk` or an
+# `ANDROID_NDK_HOME`-derived CC env var set before this can be checked or
+# built. Unverified past that point (WP0/WP3 follow-up).
 game-library = ["dep:ureq", "dep:serde_json", "dep:zeroize"]
 # The MHI virtual MPEG audio decoder board (src/mhi.rs, `[mhi]`): pulls in
 # Symphonia's pure-Rust MPEG audio decoder. Kept a default-on feature (not an
@@ -56,6 +64,7 @@ game-library = ["dep:ureq", "dep:serde_json", "dep:zeroize"]
 # wasm32 browser build (crates/copperline-web, `default-features = false`)
 # does not wire it up -- carry none of it, the same shape as `mt32`/
 # `wasm-boards` above.
+# Android: `cargo check --target aarch64-linux-android` passes (pure Rust).
 mhi = ["dep:symphonia-bundle-mp3", "dep:symphonia-core"]
 display-plan-trace = []
 # Detailed host-cost counters used by native diagnostics. The browser crate
@@ -73,12 +82,20 @@ internal-diagnostics = []
 # pulls no MIDI code and links no MIDI framework. Native backends per platform:
 # CoreMIDI (macOS), the ALSA sequencer (Linux), WinMM (Windows); other targets
 # get a stub. See src/midi/.
+# Android: `cargo check --target aarch64-linux-android` passes; falls
+# through to src/midi/'s stub backend today. AMidi backend is WP10.
 midi = []
 # The interactive desktop frontend: the winit/pixels window and launcher,
 # host audio output, gamepads, file dialogs, and the debugger console's
 # clipboard paste. Off, the crate is the portable headless core (the surface
 # a wasm32 browser frontend builds against); the `copperline` binary
 # requires it.
+# Android: `cargo check --target aarch64-linux-android` passes. File
+# dialogs and clipboard go through src/host/'s stub backend (no Storage
+# Access Framework hook yet) and gamepads through src/gamepad.rs's
+# `android_backend` stub (no pad is ever connected); see each module's docs.
+# winit/pixels/cpal already support Android as a compile target on their
+# own, so nothing else here needed gating.
 frontend = [
     "dep:winit",
     "dep:pixels",
@@ -91,12 +108,20 @@ frontend = [
 # The wasmtime host for functional Zorro boards (src/wasmboard.rs). Separate
 # from `frontend` because it is a core-machine feature, but Cranelift cannot
 # be compiled FOR wasm32, so browser builds turn it off.
+# Android: same as `game-library` -- `cargo check --target
+# aarch64-linux-android` fails only on the missing NDK clang for a
+# transitive C dependency's build script, not on Copperline or wasmtime's
+# own code. Whether wasmtime 36 (an unofficially-supported Android target)
+# fully builds and runs once an NDK is available is still open; that's
+# WP1's stated "prove it" item, not yet proven either way.
 wasm-boards = ["dep:wasmtime", "dep:socket2"]
 # Native-code compilation of hot CPU traces (the m68k crate's Cranelift trace
 # JIT), used by the `[cpu] jit` fast execution mode. Cranelift cannot be
 # compiled FOR wasm32, so browser builds (--no-default-features) leave it off;
 # `[cpu] jit` still works there through the crate's interpreted trace loop,
 # just without native code generation.
+# Android: `cargo check --target aarch64-linux-android` passes (Cranelift
+# aarch64).
 cpu-jit = ["m68k/jit"]
 # The headless `copperline-bench` benchmark binary (core-only; also builds
 # for wasm32-wasip1). Off by default so native release artifacts are
@@ -106,27 +131,41 @@ bench-bin = []
 # over loopback TCP for driving the emulator from scripts and external tools
 # (`--control` headless, `--control-gui` windowed). Uses std::net + threads,
 # so browser builds (--no-default-features) compile it out.
+# Android: `cargo check --target aarch64-linux-android` passes; TCP over
+# `adb forward` per AGENTS.md.
 control = ["dep:serde_json"]
 # User-mode NAT backend for emulated NICs (`[a2065] net = "nat"`, src/net/nat/):
 # a slirp-style virtual gateway giving the guest outbound IPv4 with no host
 # privileges. Uses std::net + threads, so browser builds compile it out.
+# Android: `cargo check --target aarch64-linux-android` passes (smoltcp,
+# pure Rust).
 net-nat = ["dep:smoltcp"]
 # Direct attachment of an emulated NIC to a host Ethernet adapter
 # (`net = "bridge"`). Linux uses AF_PACKET (with the narrowly privileged
 # copperline-net-helper when an unprivileged open is denied), macOS uses the
 # system libpcap, and Windows loads an installed Npcap at runtime.
+# Android: `cargo check --target aarch64-linux-android` fails -- there is no
+# `platform` module for `target_os = "android"` in src/net/bridge/, and none
+# is planned (AF_PACKET needs root; out of scope per the Android port plan).
 net-bridge = ["dep:pcap", "dep:libloading"]
 # The `copperline-ctl` command-line client for the control protocol.
 ctl-bin = ["dep:serde_json"]
 # The remote GDB stub (`--gdb`, src/gdbstub.rs): a 68k-aware gdbserver over
 # TCP. Default on; player builds (crates/copperline-player) leave it out so
 # a shipped game carries no debugger surface.
+# Android: `cargo check --target aarch64-linux-android` passes (pure Rust,
+# std::net).
 gdb = []
 # Real floppy drives through FluxBridge (src/fluxbridge/): the Greaseweazle
 # driver enabled on the dependency below stands in for a disk image on any bay.
 # FluxBridge is a pure-Rust library, so there is nothing to install and no C++
 # in the build. Off, none of it is built, which is what browser builds
 # (--no-default-features) want.
+# Android: `cargo check --target aarch64-linux-android` passes, but this
+# drives a USB Greaseweazle over host serial; there is no such port on a
+# phone/tablet and no JNI path here yet, so the Android crate should not
+# enable this feature even though it type-checks (matches the Android port
+# plan's "no" for FluxBridge).
 fluxbridge = ["dep:fluxbridge"]
 
 [dependencies]
@@ -179,12 +218,6 @@ cpal = { version = "0.18", optional = true }
 # (src/midi/winmm.rs) also uses it; it is pure Rust and wasm-safe.
 ringbuf = "0.5"
 hound = "3.5"
-rfd = { version = "0.17.2", optional = true }
-gilrs = { version = "0.11", optional = true }
-# Host clipboard for the debugger console's paste (text only; the default
-# image-data feature is left off). wayland-data-control covers Wayland
-# hosts; X11 support is built in on Linux.
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
 # WASM plugin host for functional Zorro boards (src/wasmboard.rs). Lean feature
 # set: the Cranelift JIT + runtime only -- no WASI, component model, GC, threads,
 # or wat parsing in the shipped binary (kept deterministic; see the determinism
@@ -237,6 +270,22 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # than for taste; the trust anchors do not, since both are pointed at the
 # Mozilla root set `webpki-roots` bundles rather than at the host's store.
 #
+# rfd (file dialogs), gilrs (gamepads) and arboard (clipboard) have no
+# Android backend to speak to -- there is no native file-picker, joystick or
+# clipboard API behind them there, so they carry no code Android can drive.
+# `frontend` still enables `dep:rfd`/`dep:gilrs`/`dep:arboard` on every
+# target (Cargo requires the declaration whichever table a dep lives in);
+# they simply aren't present as dependencies to build on Android, which is
+# why src/host/ and src/gamepad.rs's `android_backend` exist -- something
+# has to satisfy those call sites' types when these three are gone.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = { version = "0.17.2", optional = true }
+gilrs = { version = "0.11", optional = true }
+# Host clipboard for the debugger console's paste (text only; the default
+# image-data feature is left off). wayland-data-control covers Wayland
+# hosts; X11 support is built in on Linux.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
+
 # Everywhere but Windows: rustls, so a build needs no system OpenSSL and the
 # Flatpak carries no extra runtime.
 [target.'cfg(not(windows))'.dependencies]

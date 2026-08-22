@@ -265,7 +265,7 @@ impl App {
     /// the restored Bus. On failure the running machine is untouched.
     pub(super) fn load_state_from_dialog(&mut self, event_loop: Option<&ActiveEventLoop>) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Load save state")
             .add_filter("Copperline save states", &["clstate"])
             .pick_file();
@@ -352,14 +352,14 @@ impl App {
     /// On any error the running machine keeps its current ROM.
     pub(super) fn load_rom_from_dialog(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Load Kickstart ROM (512 or 256 KiB)")
             .add_filter("Amiga ROM images", &["rom", "bin"])
             .pick_file();
         if let Some(main_path) = picked {
             // Offer an optional extended ROM (AROS/CDTV/CD32). Cancelling skips it
             // and removes any extended ROM currently fitted.
-            let ext_path = rfd::FileDialog::new()
+            let ext_path = crate::host::file_dialog::file_dialog()
                 .set_title("Load extended ROM (optional; Cancel to skip)")
                 .add_filter("Amiga ROM images", &["rom", "bin"])
                 .pick_file();

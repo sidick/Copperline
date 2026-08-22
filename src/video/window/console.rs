@@ -305,7 +305,7 @@ impl App {
 
     /// Paste the host clipboard into the prompt.
     fn console_paste(&mut self) {
-        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+        match crate::host::clipboard::clipboard().paste() {
             Ok(text) => {
                 // Normalize CRLF so a Windows-clipboard script does not
                 // submit a blank line per line.

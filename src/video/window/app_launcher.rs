@@ -105,7 +105,7 @@ impl App {
         } else {
             "Select file"
         };
-        let mut dialog = rfd::FileDialog::new().set_title(title);
+        let mut dialog = crate::host::file_dialog::file_dialog().set_title(title);
         dialog = match field {
             LauncherField::Rom
             | LauncherField::ExtendedRom
@@ -166,7 +166,7 @@ impl App {
             _ => dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin"]),
         };
         if let Some(dir) = start_dir {
-            dialog = dialog.set_directory(dir);
+            dialog = dialog.set_directory(&dir);
         }
         #[cfg(target_os = "macos")]
         let picked = if hard_drive_slot {
@@ -244,9 +244,9 @@ impl App {
             })
             .or_else(crate::paths::harddrives_dir);
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new().set_title("Select host directory");
+        let mut dialog = crate::host::file_dialog::file_dialog().set_title("Select host directory");
         if let Some(dir) = start_dir {
-            dialog = dialog.set_directory(dir);
+            dialog = dialog.set_directory(&dir);
         }
         let picked = dialog.pick_folder();
         if let Some(path) = picked {
@@ -269,7 +269,7 @@ impl App {
             .and_then(|s| s.setup.path(field))
             .map(|p| p.to_path_buf());
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new().set_title("Choose output file");
+        let mut dialog = crate::host::file_dialog::file_dialog().set_title("Choose output file");
         // Seed with the existing path's directory and name, else the default.
         match current.as_ref().and_then(|p| p.parent()) {
             Some(dir) if !dir.as_os_str().is_empty() => dialog = dialog.set_directory(dir),
@@ -421,7 +421,7 @@ impl App {
     /// right extension.
     #[cfg(feature = "game-library")]
     pub(super) fn meta_choose_art(&mut self) {
-        let Some(picked) = rfd::FileDialog::new()
+        let Some(picked) = crate::host::file_dialog::file_dialog()
             .set_title("Choose cover art")
             .add_filter("PNG image", &["png"])
             .pick_file()
@@ -890,7 +890,7 @@ impl App {
             // .img what a card writer expects, so both are offered.
             ("Amiga hard disk image", vec!["hdf", "img"])
         };
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Create disk image")
             .add_filter(kind, &ext)
             .set_file_name(&suggested)
@@ -991,7 +991,7 @@ impl App {
 
     pub(super) fn launcher_add_zorro(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Add Zorro board metadata")
             .add_filter("Board metadata", &["toml"])
             .pick_file();
@@ -1007,7 +1007,7 @@ impl App {
     /// Pick a file for a plugin board's file-typed config option.
     pub(super) fn launcher_board_browse(&mut self, board: usize, opt: usize) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Choose plugin file")
             .pick_file();
         if let Some(path) = picked {
@@ -1024,7 +1024,7 @@ impl App {
 
     pub(super) fn launcher_load(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Load configuration")
             .add_filter("Copperline config", &["toml"])
             .pick_file();
@@ -1198,14 +1198,14 @@ impl App {
             return;
         };
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = crate::host::file_dialog::file_dialog()
             .set_title("Save configuration")
             .add_filter("Copperline config", &["toml"])
             .set_file_name("machine.toml");
         // Where configurations are kept, which is a better first answer than
         // wherever the last unrelated dialog happened to end up.
         if let Some(dir) = crate::paths::configs_dir() {
-            dialog = dialog.set_directory(dir);
+            dialog = dialog.set_directory(&dir);
         }
         let picked = dialog.save_file();
         if let Some(path) = picked {

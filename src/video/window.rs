@@ -1732,7 +1732,7 @@ fn meta_field_max(field: crate::video::launcher::MetaField) -> usize {
 /// document, and a newline in the middle of one is a paste that went wrong.
 #[cfg(feature = "game-library")]
 fn clipboard_line() -> String {
-    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+    match crate::host::clipboard::clipboard().paste() {
         Ok(text) => text.lines().next().unwrap_or_default().trim().to_string(),
         Err(e) => {
             log::warn!("launcher: clipboard unavailable: {e}");

@@ -67,6 +67,8 @@ pub(crate) mod gzip;
 pub mod harddrive;
 pub mod hash;
 pub mod heatmap;
+#[cfg(feature = "frontend")]
+pub mod host;
 pub mod hostsocket;
 pub mod ide_a4000;
 pub mod ide_zorro;

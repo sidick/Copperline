@@ -31,6 +31,17 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
+// gilrs does not build for Android (see Cargo.toml's `frontend` feature);
+// `android_backend` stands in for the slice of its API this module uses, so
+// a build there compiles with no gamepad ever connected. Real Android
+// gamepad input is WP6 in the Android port plan.
+#[cfg(not(target_os = "android"))]
+use gilrs as backend;
+#[cfg(target_os = "android")]
+mod android_backend;
+#[cfg(target_os = "android")]
+use android_backend as backend;
+
 /// An axis must reach this magnitude (after gilrs normalisation to [-1, 1]) to
 /// count as a pressed direction, both when calibrating and at runtime.
 const AXIS_ACTIVE_THRESHOLD: f32 = 0.5;
@@ -275,8 +286,11 @@ struct MappedPadState {
 }
 
 impl MappedPadState {
-    fn set_button(&mut self, button: gilrs::Button, pressed: bool) {
-        use gilrs::Button as B;
+    fn set_button(&mut self, button: backend::Button, pressed: bool) {
+        use backend::Button as B;
+        // The `_` arm is only unreachable on Android, where `android_backend`'s
+        // stand-in `Button` enum has exactly these variants; real gilrs has more.
+        #[allow(unreachable_patterns)]
         match button {
             B::DPadUp => self.dpad_up = pressed,
             B::DPadDown => self.dpad_down = pressed,
@@ -297,8 +311,10 @@ impl MappedPadState {
         }
     }
 
-    fn set_axis(&mut self, axis: gilrs::Axis, value: f32) {
-        use gilrs::Axis as A;
+    fn set_axis(&mut self, axis: backend::Axis, value: f32) {
+        use backend::Axis as A;
+        // Same reason as `set_button`'s `#[allow]`: only unreachable on Android.
+        #[allow(unreachable_patterns)]
         match axis {
             A::LeftStickX => self.left_x = value,
             A::LeftStickY => self.left_y = value,
@@ -334,7 +350,7 @@ impl MappedPadState {
 /// axis/button codes (what calibration records and resolves against) and the
 /// named standard layout (the default for recognised, uncalibrated pads).
 struct RawGamepads {
-    gilrs: gilrs::Gilrs,
+    gilrs: backend::Gilrs,
     axes: BTreeMap<u32, f32>,
     buttons: BTreeMap<u32, bool>,
     mapped: MappedPadState,
@@ -342,7 +358,7 @@ struct RawGamepads {
 
 impl RawGamepads {
     fn new() -> Result<Self> {
-        let gilrs = gilrs::GilrsBuilder::new()
+        let gilrs = backend::GilrsBuilder::new()
             .add_included_mappings(true)
             .add_env_mappings(true)
             .build()
@@ -363,7 +379,7 @@ impl RawGamepads {
             // identity and mapping source on connect: the ground truth for
             // diagnosing a wrong or broken controller-database entry.
             if crate::envcfg::flag("COPPERLINE_DIAG_GAMEPAD") {
-                if event.event == gilrs::EventType::Connected {
+                if event.event == backend::EventType::Connected {
                     let pad = self.gilrs.gamepad(event.id);
                     log::info!(
                         "gamepad diag: connected \"{}\" uuid {} mapping source {:?}",
@@ -379,7 +395,7 @@ impl RawGamepads {
             // already dropped the pad from its connected list, so the id
             // cannot be compared against the driven pad below, and after a
             // reset the surviving pad's state rebuilds from its next events.
-            if event.event == gilrs::EventType::Disconnected {
+            if event.event == backend::EventType::Disconnected {
                 self.axes.clear();
                 self.buttons.clear();
                 self.mapped = MappedPadState::default();
@@ -393,11 +409,11 @@ impl RawGamepads {
                 continue;
             }
             match event.event {
-                gilrs::EventType::AxisChanged(axis, value, code) => {
+                backend::EventType::AxisChanged(axis, value, code) => {
                     self.axes.insert(code.into_u32(), value);
                     self.mapped.set_axis(axis, value);
                 }
-                gilrs::EventType::ButtonChanged(button, value, code) => {
+                backend::EventType::ButtonChanged(button, value, code) => {
                     if self.collapsed_dpad_half_axis(event.id, button, code) {
                         apply_collapsed_dpad(
                             &mut self.axes,
@@ -416,13 +432,13 @@ impl RawGamepads {
                 // A collapsed half-axis d-pad also emits Pressed/Released at
                 // gilrs's threshold crossings; the ButtonChanged value stream
                 // carries the direction, so the guards drop those here.
-                gilrs::EventType::ButtonPressed(button, code)
+                backend::EventType::ButtonPressed(button, code)
                     if !self.collapsed_dpad_half_axis(event.id, button, code) =>
                 {
                     self.buttons.insert(code.into_u32(), true);
                     self.mapped.set_button(button, true);
                 }
-                gilrs::EventType::ButtonReleased(button, code)
+                backend::EventType::ButtonReleased(button, code)
                     if !self.collapsed_dpad_half_axis(event.id, button, code) =>
                 {
                     self.buttons.insert(code.into_u32(), false);
@@ -448,18 +464,18 @@ impl RawGamepads {
     /// back into a signed axis for both the raw and the named state.
     fn collapsed_dpad_half_axis(
         &self,
-        id: gilrs::GamepadId,
-        button: gilrs::Button,
-        code: gilrs::ev::Code,
+        id: backend::GamepadId,
+        button: backend::Button,
+        code: backend::ev::Code,
     ) -> bool {
-        use gilrs::Button as B;
+        use backend::Button as B;
         let pair = match button {
             B::DPadUp | B::DPadDown => (B::DPadUp, B::DPadDown),
             B::DPadLeft | B::DPadRight => (B::DPadLeft, B::DPadRight),
             _ => return false,
         };
         let pad = self.gilrs.gamepad(id);
-        if pad.mapping_source() != gilrs::MappingSource::SdlMappings {
+        if pad.mapping_source() != backend::MappingSource::SdlMappings {
             return false;
         }
         match (pad.button_code(pair.0), pad.button_code(pair.1)) {
@@ -468,7 +484,7 @@ impl RawGamepads {
         }
     }
 
-    fn first_gamepad(&self) -> Option<gilrs::GamepadId> {
+    fn first_gamepad(&self) -> Option<backend::GamepadId> {
         self.gilrs.gamepads().next().map(|(id, _)| id)
     }
 }
@@ -484,14 +500,14 @@ fn apply_collapsed_dpad(
     axes: &mut BTreeMap<u32, f32>,
     buttons: &mut BTreeMap<u32, bool>,
     mapped: &mut MappedPadState,
-    button: gilrs::Button,
+    button: backend::Button,
     value: f32,
     code: u32,
 ) {
     let v = value * 2.0 - 1.0;
     axes.insert(code, v);
     buttons.remove(&code);
-    use gilrs::Button as B;
+    use backend::Button as B;
     match button {
         B::DPadUp | B::DPadDown => mapped.dpad_y = -v,
         B::DPadLeft | B::DPadRight => mapped.dpad_x = v,
@@ -585,7 +601,7 @@ impl GamepadReader {
             Some(cal) => cal.quit.is_some() || cal.menu.is_some(),
             // The database's standard layout always carries the Menu
             // control on Select/Back and the guide button.
-            None => !matches!(pad.mapping_source(), gilrs::MappingSource::None),
+            None => !matches!(pad.mapping_source(), backend::MappingSource::None),
         }
     }
 
@@ -599,14 +615,14 @@ impl GamepadReader {
         let id = raw.first_gamepad()?;
         let pad = raw.gilrs.gamepad(id);
         let uuid = uuid_hex(pad.uuid());
-        let mapped = !matches!(pad.mapping_source(), gilrs::MappingSource::None);
+        let mapped = !matches!(pad.mapping_source(), backend::MappingSource::None);
         match self.store.get(&uuid) {
             Some(cal) => {
                 if self.logged_pad.as_deref() != Some(uuid.as_str()) {
                     self.logged_pad = Some(uuid.clone());
                     log::info!("using saved calibration for gamepad \"{}\"", pad.name());
                     if cal.format < CALIBRATION_FORMAT
-                        && matches!(pad.mapping_source(), gilrs::MappingSource::SdlMappings)
+                        && matches!(pad.mapping_source(), backend::MappingSource::SdlMappings)
                     {
                         // The bundled mappings can flip named-axis signs
                         // relative to what an old-format calibration
@@ -1084,7 +1100,7 @@ pub fn run_calibration() -> Result<()> {
 }
 
 /// Block until a gamepad is connected and an input is seen, returning its id.
-fn wait_for_gamepad(raw: &mut RawGamepads) -> Result<gilrs::GamepadId> {
+fn wait_for_gamepad(raw: &mut RawGamepads) -> Result<backend::GamepadId> {
     loop {
         raw.pump();
         if let Some(id) = raw.first_gamepad() {
@@ -1295,19 +1311,19 @@ mod tests {
         // fixed standard layout: face buttons onto the CD32 colours, Start
         // onto play/pause, shoulders and triggers onto the transport keys.
         let mut mapped = MappedPadState::default();
-        mapped.set_button(gilrs::Button::South, true);
-        mapped.set_button(gilrs::Button::Start, true);
-        mapped.set_button(gilrs::Button::LeftTrigger, true);
-        mapped.set_button(gilrs::Button::RightTrigger2, true);
-        mapped.set_button(gilrs::Button::DPadUp, true);
+        mapped.set_button(backend::Button::South, true);
+        mapped.set_button(backend::Button::Start, true);
+        mapped.set_button(backend::Button::LeftTrigger, true);
+        mapped.set_button(backend::Button::RightTrigger2, true);
+        mapped.set_button(backend::Button::DPadUp, true);
         let s = mapped.resolve();
         assert!(s.fire && s.play && s.rwd && s.ffw && s.up);
         assert!(!s.button2 && !s.green && !s.yellow && !s.down);
 
         mapped = MappedPadState::default();
-        mapped.set_button(gilrs::Button::East, true);
-        mapped.set_button(gilrs::Button::West, true);
-        mapped.set_button(gilrs::Button::North, true);
+        mapped.set_button(backend::Button::East, true);
+        mapped.set_button(backend::Button::West, true);
+        mapped.set_button(backend::Button::North, true);
         let s = mapped.resolve();
         assert!(s.button2 && s.green && s.yellow);
         assert!(!s.fire && !s.play && !s.rwd && !s.ffw);
@@ -1319,25 +1335,25 @@ mod tests {
         // must pass the activity threshold, and d-pad buttons, hat-style
         // d-pad axes, and the left stick all drive the same four lines.
         let mut mapped = MappedPadState::default();
-        mapped.set_axis(gilrs::Axis::LeftStickY, 0.9);
-        mapped.set_axis(gilrs::Axis::LeftStickX, -0.9);
+        mapped.set_axis(backend::Axis::LeftStickY, 0.9);
+        mapped.set_axis(backend::Axis::LeftStickX, -0.9);
         let s = mapped.resolve();
         assert!(s.up && s.left && !s.down && !s.right);
 
-        mapped.set_axis(gilrs::Axis::LeftStickY, 0.3); // below threshold
-        mapped.set_axis(gilrs::Axis::LeftStickX, 0.0);
+        mapped.set_axis(backend::Axis::LeftStickY, 0.3); // below threshold
+        mapped.set_axis(backend::Axis::LeftStickX, 0.0);
         assert_eq!(mapped.resolve(), JoystickState::default());
 
         mapped = MappedPadState::default();
-        mapped.set_axis(gilrs::Axis::DPadY, -1.0);
-        mapped.set_button(gilrs::Button::DPadRight, true);
+        mapped.set_axis(backend::Axis::DPadY, -1.0);
+        mapped.set_button(backend::Button::DPadRight, true);
         let s = mapped.resolve();
         assert!(s.down && s.right && !s.up && !s.left);
     }
 
     #[test]
     fn collapsed_dpad_reroute_recentres_and_replaces_the_button() {
-        use gilrs::Button as B;
+        use backend::Button as B;
         let mut axes = BTreeMap::new();
         let mut buttons = BTreeMap::new();
         let mut mapped = MappedPadState::default();

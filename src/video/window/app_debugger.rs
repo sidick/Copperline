@@ -1097,9 +1097,9 @@ impl App {
         // above the 24-bit space passes through untouched on 020+.
         let addr = addr & self.emu.machine.ui_addr_mask();
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Save memory region")
-            .set_file_name(format!("mem-{addr:06X}-{len:X}.bin"))
+            .set_file_name(&format!("mem-{addr:06X}-{len:X}.bin"))
             .save_file();
         if let Some(path) = picked {
             let bytes = self.emu.machine.debug_read_memory(addr, len as usize);

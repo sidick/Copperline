@@ -10,8 +10,8 @@ impl App {
     /// and the rest are queued for the swap button / shortcut.
     pub(super) fn load_drive_disks_from_dialog(&mut self, drive_idx: usize) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title(format!("Load DF{drive_idx} disk image(s)"))
+        let picked = crate::host::file_dialog::file_dialog()
+            .set_title(&format!("Load DF{drive_idx} disk image(s)"))
             .add_filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS)
             .pick_files();
 
@@ -101,7 +101,7 @@ impl App {
     /// ejecting any current disc first.
     pub(super) fn load_cd_from_dialog(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
+        let picked = crate::host::file_dialog::file_dialog()
             .set_title("Load CD image")
             .add_filter("CD images", &["cue", "iso", "chd"])
             .pick_file();
