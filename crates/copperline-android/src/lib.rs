@@ -19,15 +19,16 @@
 //!   host-directory storage (a user's own Kickstart, WHDLoad games) is
 //!   still WP5; this is only the one bundled asset every install needs.
 //!
-//! Everything else -- config defaults, machine build, window/render/input
-//! -- is exactly `copperline`'s own code, unmodified.
+//! Everything else -- config defaults, machine build, window/render/input,
+//! and audio (`CpalSink`, falling back to silence if it fails to open) --
+//! is exactly `copperline`'s own code, unmodified.
 
 use std::io::Read as _;
 use std::path::Path;
 
 use android_activity::AndroidApp;
 use anyhow::{anyhow, Context, Result};
-use copperline::audio::NullSink;
+use copperline::audio::{AudioSink, CpalSink, NullSink};
 use copperline::config::{self, Config, ConfigOverrides};
 use copperline::emulator;
 use copperline::video::window::App;
@@ -90,8 +91,19 @@ fn run(android_app: AndroidApp) -> Result<()> {
     cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
     cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
 
-    let emu = emulator::build_machine(&cfg, Box::new(NullSink), true, false)
-        .context("building the machine")?;
+    // Fall back to silence rather than aborting the whole run: a device
+    // with no usable audio output shouldn't stop the machine from booting
+    // and displaying, any more than desktop's --noaudio does.
+    let (audio, audio_output_enabled): (Box<dyn AudioSink>, bool) = match CpalSink::new(false, None)
+    {
+        Ok(sink) => (Box::new(sink), true),
+        Err(e) => {
+            log::warn!("audio: cpal init failed ({e:#}); continuing without sound");
+            (Box::new(NullSink), false)
+        }
+    };
+
+    let emu = emulator::build_machine(&cfg, audio, true, false).context("building the machine")?;
 
     let app = App::new(
         emu,
@@ -129,7 +141,7 @@ fn run(android_app: AndroidApp) -> Result<()> {
         cfg.mouse_capture,
         config::about_machine_lines(&cfg),
         raw,
-        false, // audio_output_enabled -- NullSink above; cpal on Android is WP8
+        audio_output_enabled,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
 

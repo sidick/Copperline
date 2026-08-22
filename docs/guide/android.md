@@ -33,6 +33,12 @@ renders it live**, with Copperline's usual status bar chrome, showing
 Confirmed via `logcat`: the ROM extracted from the APK's assets on first
 launch, window/surface creation, the Zorro identification board
 autoconfiguring, chipset register writes -- the real machine, not a stub.
+Audio is real too: `CpalSink` (the same sink desktop uses) opens
+successfully on the AVD's default output device (48 kHz, resampled from
+Paula's 44.1 kHz mix rate, no underruns observed), falling back to
+silence rather than aborting the run if it fails to open -- untested on a
+physical device, and unverified whether sound is actually audible versus
+merely opened without error (the AVD was run headless).
 
 ## Building and running
 
