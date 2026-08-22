@@ -103,6 +103,15 @@ fn run(android_app: AndroidApp) -> Result<()> {
         }
     };
 
+    // The panel refresh rate to request (WP7): the config's video standard
+    // at boot, not necessarily what a state loaded below ends up running --
+    // close enough for a display-mode hint, and simpler than threading a
+    // live accessor through Emulator/Bus for it.
+    let refresh_hz = match cfg.video_standard {
+        copperline::chipset::agnus::VideoStandard::Pal => 50.0,
+        copperline::chipset::agnus::VideoStandard::Ntsc => 60.0,
+    };
+
     // A state saved by App::suspended the last time this process was
     // backgrounded: if Android killed the process rather than just
     // suspending it (the common case under memory pressure), this cold
@@ -158,6 +167,10 @@ fn run(android_app: AndroidApp) -> Result<()> {
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
     app.set_suspend_save_path(suspend_state_path);
+    // A cheap clone (Arc-backed): App needs its own handle to request a
+    // matching refresh rate each time it builds a window/surface, and
+    // run_android below needs to keep consuming the original.
+    app.set_android_frame_rate_hint(android_app.clone(), refresh_hz);
 
     app.run_android(android_app)
 }

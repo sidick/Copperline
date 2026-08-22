@@ -319,6 +319,18 @@ pcap = { version = "2.4", optional = true }
 # crate stays flavor-agnostic, the same as the frontend's other Android
 # gating. See docs/guide/android.md.
 android-activity = "0.6"
+# ANativeWindow_setFrameRate (App::resumed's Android arm, WP7): asks the
+# compositor to pick a display refresh rate compatible with the emulated
+# machine's actual video standard (PAL ~50 Hz, NTSC ~60 Hz) rather than
+# whatever the panel defaults to, on panels that support switching (a
+# growing number of handhelds do, for exactly this reason -- 24/25/50 fps
+# video). Already pulled in transitively by android-activity/winit at this
+# exact version; this just names the type and turns on the feature gating
+# api-level-30's ANativeWindow_setFrameRate.
+ndk = { version = "0.9", default-features = false, features = [
+    "nativewindow",
+    "api-level-30",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Npcap is deliberately not linked at build time: the bridge backend loads it

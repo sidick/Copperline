@@ -63,6 +63,25 @@ the AVD (`adb shell settings put system user_rotation 1`, then `0` to
 rotate back): both directions resize and recentre correctly, live, with
 no black-screen glitch and no crash.
 
+**Display policy (WP7), partial.** Named scaling modes already existed
+generically (`[display] scaling`, `App::resumed`'s `plan_present_scaling`):
+`Smooth` (aspect-fit, the default) and `Integer` (pixel-perfect, falling
+back to smooth when the surface is too small for even 1x) -- both were
+already exercised, correctly, by the WP4 rotation test above, so nothing
+Android-specific was needed there. `App::apply_android_frame_rate_hint`
+is new: `resumed` asks the compositor (`ANativeWindow_setFrameRate`,
+`FrameRateCompatibility::FixedSource`) to match the emulated machine's own
+PAL/NTSC rate (50/60 Hz) rather than whatever the panel defaults to, on
+panels that support switching. Verified on the AVD: the call succeeds and
+`dumpsys display` shows the vote registered
+(`frameRateOverride {uid=..., frameRateHz=...}`), but the AVD's virtual
+display only advertises one 60 Hz mode, so there's nothing to actually
+switch to here -- unverified whether a real variable-refresh-rate panel
+follows the request. Not done: the phosphor/CRT shader has no
+resolution-aware default anywhere (desktop or Android) -- `[display]
+shader` is `None` everywhere unless a user opts in, which is a reasonable,
+safe default rather than a gap blocking anything.
+
 ## Building and running
 
 ```sh

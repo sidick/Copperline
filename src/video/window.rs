@@ -1405,6 +1405,13 @@ pub struct App {
     /// passes `None`; crates/copperline-android passes its app-private
     /// data directory.
     suspend_save_path: Option<PathBuf>,
+    /// Requested via [`Self::set_android_frame_rate_hint`]; applied to
+    /// every window/surface [`Self::resumed`] builds (including after a
+    /// suspend/resume cycle, since a new native window needs the request
+    /// re-asserted). `crates/copperline-android` computes the Hz from the
+    /// emulated machine's own video standard.
+    #[cfg(target_os = "android")]
+    android_frame_rate: Option<(android_activity::AndroidApp, f32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2127,6 +2134,8 @@ impl App {
             record_fb: Vec::new(),
             record_scratch_fb: Vec::new(),
             suspend_save_path: None,
+            #[cfg(target_os = "android")]
+            android_frame_rate: None,
         };
         // Attach the sampler now for a directly-booted machine; the config-screen
         // placeholder passes a disabled request and attaches on Run instead.
@@ -2821,6 +2830,39 @@ impl App {
         self.suspend_save_path = Some(path);
     }
 
+    /// Ask panels that support it to switch display refresh rate to match
+    /// `hz` (the emulated machine's own PAL/NTSC rate), applied in
+    /// [`Self::resumed`]. Desktop callers have no reason to call this.
+    #[cfg(target_os = "android")]
+    pub fn set_android_frame_rate_hint(
+        &mut self,
+        android_app: android_activity::AndroidApp,
+        hz: f32,
+    ) {
+        self.android_frame_rate = Some((android_app, hz));
+    }
+
+    /// The actual `ANativeWindow_setFrameRate` call, split out of
+    /// [`Self::resumed`] only so its long `ndk`/`android_activity` names
+    /// don't compete for room with the platform-generic window/surface
+    /// build above it.
+    #[cfg(target_os = "android")]
+    fn apply_android_frame_rate_hint(&self) {
+        let Some((android_app, hz)) = &self.android_frame_rate else {
+            return;
+        };
+        let Some(native_window) = android_app.native_window() else {
+            warn!("android: no native window to request {hz} Hz on");
+            return;
+        };
+        match native_window
+            .set_frame_rate(*hz, ndk::native_window::FrameRateCompatibility::FixedSource)
+        {
+            Ok(()) => info!("android: requested {hz} Hz display refresh"),
+            Err(e) => warn!("android: set_frame_rate({hz}) failed: {e}"),
+        }
+    }
+
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         self.run_with_event_loop(event_loop)
@@ -3456,6 +3498,8 @@ impl ApplicationHandler for App {
         self.request_redraw();
         self.arm_scheduled_events();
         self.engage_warp_launch();
+        #[cfg(target_os = "android")]
+        self.apply_android_frame_rate_hint();
     }
 
     /// The window/surface this session's `render` was built against is
