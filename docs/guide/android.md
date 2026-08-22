@@ -138,6 +138,40 @@ feature. A consequence: `copperline-android-host` cannot be built or
 type-checked standalone on `target_os = "android"` -- only as
 `copperline-android`'s path dependency.
 
+## Gamepads (WP6): blocked on winit, not just unimplemented
+
+`src/gamepad.rs`'s `android_backend` stub (see below) still reports no
+pads connected. That's not just "not written yet" -- winit 0.30's Android
+backend cannot deliver analog gamepad input at all, confirmed by reading
+its source (`platform_impl/android/mod.rs`):
+
+- `InputEvent::MotionEvent` handling only recognises touch phases
+  (`Down`/`Up`/`Move`/`Cancel`) and doesn't check the event's `source()`.
+  A joystick's `SOURCE_JOYSTICK` axis motion arrives as the same
+  `MotionAction::Move` a touchscreen sends, so it's read through the same
+  path as a touch point (`pointer.x()`/`.y()`, meant for screen
+  coordinates) -- not exposed as axis data anywhere.
+- There's no `DeviceEvent` axis passthrough either; `listen_device_events`
+  is a stub that does nothing.
+- `AndroidApp`'s native input queue is a single consumable stream, and
+  `App::run_android`'s `EventLoop::builder().with_android_app(...)` hands
+  it to winit exclusively -- there's no way for `crates/copperline-android`
+  to also poll it independently the way `gilrs` polls raw OS APIs
+  untouched by winit on desktop.
+
+Buttons are a different story: Android `KeyEvent`s (`BUTTON_A/B/X/Y`,
+`DPAD_*`, `L1`/`R1`, ...) go through winit's ordinary `KeyboardInput`
+window event, `device_id` intact -- `to_physical_key` maps recognised
+gamepad buttons to `PhysicalKey::Unidentified(NativeKeyCode::Android(code))`
+and, notably, DPAD already maps to `KeyCode::ArrowUp/Down/Left/Right`, the
+same physical keys `src/video/window.rs`'s existing keyboard-joystick
+fallback (the desktop numpad stand-in) already reads. A button-only
+gamepad path (D-pad + fire, no analog stick, no gilrs-style calibration)
+is buildable on top of that existing mechanism without touching winit;
+full WP6 (analog input, SDL-style calibration, verification against real
+device pads) needs either a winit fix upstream or bypassing its event
+loop for input, neither of which is done here.
+
 ## Root crate feature support
 
 Every root `Cargo.toml` feature's Android support is recorded as a comment
@@ -146,5 +180,5 @@ aarch64-linux-android`. `rfd` (file dialogs), `arboard` (clipboard) and
 `gilrs` (gamepads) have no Android backend and are target-gated out; the
 `frontend` feature's call sites go through `src/host/` (file dialogs,
 clipboard) or `src/gamepad.rs`'s `android_backend` module (gamepads)
-instead, each backed by a stub until its own work package (storage for
-files, WP6 for gamepads) lands the real thing.
+instead, each backed by a stub -- see "Gamepads (WP6)" above for why that
+stub isn't just an unimplemented placeholder.
