@@ -1,9 +1,8 @@
 # Android (in progress)
 
-Copperline's Android port is under active development and does not yet
-produce an installable emulator. This chapter tracks what exists today;
-see the Android port plan tracked alongside this work for the full
-work-package sequence.
+Copperline's Android port is under active development. This chapter
+tracks what exists today; see the Android port plan tracked alongside
+this work for the full work-package sequence.
 
 ## What exists today
 
@@ -18,29 +17,48 @@ Two standalone crates, in the same non-workspace shape as
   `android_main` GameActivity entry point, depending on the host layer and
   on `copperline` itself (`frontend`, `cpu-jit`).
 
-Both build and link for real with [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
+...plus a minimal Gradle project at `crates/copperline-android/android/`
+that packages the two into a real, installable APK. Verified end-to-end
+on a headless AVD: builds, installs, launches, native code runs (confirmed
+via `logcat`), and stays up rather than crashing. `android_main`
+currently only sets up logging and confirms it ran -- it does not yet
+drive `copperline`'s `App`/window loop, so the app currently shows a
+blank black screen once launched. That's WP4 (lifecycle/surface) next.
+
+## Building and running
 
 ```sh
-cargo ndk -t arm64-v8a --platform 35 -o out build --release
+# 1. Build the Rust side straight into the Gradle project's jniLibs dir.
+cargo ndk -t arm64-v8a --platform 35 \
+  -o crates/copperline-android/android/app/src/main/jniLibs \
+  build --release --manifest-path crates/copperline-android/Cargo.toml
+
+# 2. Build and install the APK.
+cd crates/copperline-android/android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n org.copperlinehq.copperline/com.google.androidgamesdk.GameActivity
 ```
 
-against Android NDK r28c or newer (`ANDROID_NDK_HOME` set, or `cargo-ndk`
-finds one via `$ANDROID_HOME/ndk`). `android_main` currently only sets up
-logging and confirms it ran -- it does not yet drive `copperline`'s
-`App`/window loop.
+Needs an NDK (r28c or newer; `cargo-ndk` finds one via `ANDROID_NDK_HOME`
+or `$ANDROID_HOME/ndk`) and, for the Gradle step, a JDK 17+. The Gradle
+wrapper (`./gradlew`) downloads its own Gradle 9.5.0 and the Android
+Gradle Plugin on first run; no separate Gradle install is needed.
 
-## What doesn't exist yet
+Two non-obvious pieces the manifest and `build.gradle.kts` get right, in
+case they need touching again:
 
-There is no Gradle project in this repo, so there is no way to package
-either crate's `.so` into a real, installable APK yet: GameActivity needs
-the `androidx.games:games-activity` Java/Kotlin glue on the classpath,
-which only a Gradle build (or hand-assembling a matching AAR/dex, which is
-not maintainable) can provide. The load-and-run pipeline itself --
-`cargo-ndk` build, package, `adb install`, launch, confirm via `logcat` --
-has been verified end-to-end using a throwaway `NativeActivity` stand-in
-(the framework's built-in activity class, which needs no Java glue), not
-committed to the repo. Setting up the real Gradle/GameActivity packaging
-is tracked as part of the Android port's WP3.
+- `GameActivity`'s real class name is `com.google.androidgamesdk.
+  GameActivity` -- the `androidx.games:games-activity` artifact ships it
+  under the legacy AGDK package, not `androidx.games.activity`.
+- `GameActivity` extends `AppCompatActivity`, which `games-activity`'s POM
+  does not declare as a dependency, and which refuses to start under
+  anything but a `Theme.AppCompat` descendant. Both `androidx.appcompat:
+  appcompat` and an AppCompat-derived theme are required or the app
+  crashes on launch (a `ClassNotFoundException` if appcompat is missing
+  entirely -- the unresolved superclass reads as "class not found" rather
+  than a clearer error -- or an `IllegalStateException` about the theme
+  once appcompat is present but the theme isn't).
 
 ## Root crate feature support
 

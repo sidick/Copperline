@@ -38,6 +38,14 @@
 # Standalone Android host-layer and app crate build output.
 /crates/copperline-android-host/target
 /crates/copperline-android/target
+# Gradle/AGP build output and local machine state for the Android app's
+# Gradle project; the Rust .so it packages is itself an ignored build
+# artifact (cargo-ndk output, see docs/guide/android.md).
+/crates/copperline-android/android/.gradle/
+/crates/copperline-android/android/app/build/
+/crates/copperline-android/android/app/src/main/jniLibs/
+/crates/copperline-android/android/build/
+/crates/copperline-android/android/local.properties
 # CD images (cue/bin) are local assets, never committed.
 *.[Cc][Uu][Ee]
 *.[Bb][Ii][Nn]

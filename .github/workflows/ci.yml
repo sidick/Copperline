@@ -347,14 +347,16 @@ jobs:
           if-no-files-found: ignore
 
   android:
-    name: Android host layer and app crate
-    # Guards the Android port's WP1/WP2 target-gating and the WP3 crate
-    # skeletons (crates/copperline-android-host, crates/copperline-android):
-    # a real cargo-ndk build for aarch64-linux-android, not just a check, since
-    # android-activity's game-activity flavor compiles native C++ in its
-    # build.rs and needs the NDK's clang either way. Check-only for the root
-    # crate's own feature surface (cheaper, no APK packaging -- that needs a
-    # Gradle project this repo doesn't have yet).
+    name: Android host layer, app crate, and APK
+    # Guards the Android port's WP1/WP2 target-gating, the WP3 crate
+    # skeletons (crates/copperline-android-host, crates/copperline-android),
+    # and the Gradle project that packages them (crates/copperline-android/
+    # android/): a real cargo-ndk build for aarch64-linux-android, not just a
+    # check, since android-activity's game-activity flavor compiles native
+    # C++ in its build.rs and needs the NDK's clang either way, plus a real
+    # `assembleDebug` so a manifest/theme/dependency regression (see
+    # docs/guide/android.md's "two non-obvious pieces") is caught here
+    # rather than only at launch on a device.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -379,14 +381,21 @@ jobs:
         # reaches it.
         working-directory: crates/copperline-android-host
         run: cargo fmt --check
-      - name: App crate
+      - name: App crate (built straight into the Gradle project's jniLibs)
         working-directory: crates/copperline-android
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a --platform 35 build --locked
+        run: cargo ndk -t arm64-v8a --platform 35 -o android/app/src/main/jniLibs build --locked
       - name: App crate formatting
         working-directory: crates/copperline-android
         run: cargo fmt --check
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Assemble debug APK
+        working-directory: crates/copperline-android/android
+        run: ./gradlew assembleDebug --no-daemon
 
   wasm:
     name: Headless core and browser build
