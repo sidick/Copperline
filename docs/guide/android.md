@@ -63,7 +63,7 @@ the AVD (`adb shell settings put system user_rotation 1`, then `0` to
 rotate back): both directions resize and recentre correctly, live, with
 no black-screen glitch and no crash.
 
-**Display policy (WP7), partial.** Named scaling modes already existed
+**Display policy (WP7).** Named scaling modes already existed
 generically (`[display] scaling`, `App::resumed`'s `plan_present_scaling`):
 `Smooth` (aspect-fit, the default) and `Integer` (pixel-perfect, falling
 back to smooth when the surface is too small for even 1x) -- both were
@@ -77,10 +77,17 @@ panels that support switching. Verified on the AVD: the call succeeds and
 (`frameRateOverride {uid=..., frameRateHz=...}`), but the AVD's virtual
 display only advertises one 60 Hz mode, so there's nothing to actually
 switch to here -- unverified whether a real variable-refresh-rate panel
-follows the request. Not done: the phosphor/CRT shader has no
-resolution-aware default anywhere (desktop or Android) -- `[display]
-shader` is `None` everywhere unless a user opts in, which is a reasonable,
-safe default rather than a gap blocking anything.
+follows the request. `android_main` also defaults `[display] shader` to
+`Crt` above a 1920x1080-pixel panel (there's no settings screen yet to
+have chosen something else, so this is the one place the choice is
+actually made for a given run today) -- computed from `AndroidApp::
+config()`'s `screen_width_dp`/`screen_height_dp`/`density` before the
+window exists, since the shader mode has to be decided before `App::new`.
+Below that threshold the desktop default (`None`) stands: a phone-class
+panel can't spare the pixels to scanline structure without just looking
+dim. Verified on the AVD (a 1080x2400 panel, above the threshold): the
+log confirms the computed pixel count and the CRT look (tube curvature,
+vignette, phosphor/dot-mask texture) is visibly active in a screenshot.
 
 **Performance and power (WP8).** `crates/copperline-android`'s
 `android_main` calls two new `src/priority.rs` functions before starting

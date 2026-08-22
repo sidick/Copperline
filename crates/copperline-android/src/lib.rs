@@ -91,6 +91,29 @@ fn run(android_app: AndroidApp) -> Result<()> {
     cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
     cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
 
+    // WP7: on a panel with pixels to spare, default to the CRT look --
+    // there's no settings screen yet to have overridden `[display]
+    // shader` away from its (always, today) default of None, so this is
+    // the one place that default is actually decided for this run.
+    // Below the threshold a phone-class panel can't spare the pixels to
+    // scanline structure without just looking dim, so it keeps None.
+    if cfg.shader == config::ShaderMode::None {
+        let screen_px = android_app.config().screen_width_dp().zip(
+            android_app
+                .config()
+                .screen_height_dp()
+                .zip(android_app.config().density()),
+        );
+        if let Some((width_dp, (height_dp, density))) = screen_px {
+            let scale = f64::from(density) / 160.0;
+            let px = (f64::from(width_dp) * scale) * (f64::from(height_dp) * scale);
+            if px > 1920.0 * 1080.0 {
+                log::info!("display: {px:.0} panel pixels, defaulting to the CRT shader");
+                cfg.shader = config::ShaderMode::Crt;
+            }
+        }
+    }
+
     // Fall back to silence rather than aborting the whole run: a device
     // with no usable audio output shouldn't stop the machine from booting
     // and displaying, any more than desktop's --noaudio does.
