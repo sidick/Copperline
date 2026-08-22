@@ -227,6 +227,48 @@ without an actual gamepad -- the remaining gap is specifically the
 analog stick (still blocked on winit), not the digital D-pad/button path
 this test exercised.
 
+## Storage (WP5): the app's own external-files directory, auto-mounted
+
+Without a config file, `cfg.filesys` starts empty on every launch -- there
+is no desktop-shaped `./copperline.toml` on Android for a `[[filesys]]`
+entry to live in, so without this the guest would have no host storage at
+all: no way to hand it a real Kickstart, a WHDLoad game, or get a save
+file back out.
+
+`android_main` (`crates/copperline-android/src/lib.rs`) auto-mounts
+`AndroidApp::external_data_path()` -- `Context.getExternalFilesDir(null)`,
+a real POSIX path under `/sdcard/Android/data/<pkg>/files` -- as `HOSTFS0:
+-> ANDROID:` whenever `cfg.filesys` is empty, `boot_pri = -128` (mounted,
+but never a boot candidate, matching the config default: an empty
+directory with no `C:`/`S:`/`Devs:` is not something AROS can usefully
+boot from). No runtime permission dialog and no SAF picker is needed for
+this directory specifically -- it's the one location Android grants an
+app without asking, visible from a connected computer or a file manager
+with "show Android/data" enabled, which is enough to drop a Kickstart ROM
+or a WHDLoad `.lha` in before a session and pull a save back out after.
+
+This is deliberately the narrow half of WP5, not the whole thing. The
+wider case -- browsing to any directory the user wants, e.g. an existing
+WHDLoad library or Kickstart collection kept elsewhere -- needs the
+Storage Access Framework: a Kotlin `GameActivity` subclass to launch
+`ACTION_OPEN_DOCUMENT_TREE` and receive its `onActivityResult`, since
+there's no pure-NDK path to a picker result, plus a URI/fd-based
+`filesys.rs` backend, since SAF hands back a `content://` document tree
+rather than a path the existing directory mount can open with `std::fs`.
+Neither is attempted here.
+
+Verified end-to-end on the AVD: `logcat` confirms both the host-side
+mount (`storage: mounting /storage/emulated/0/.../files as HOSTFS0:`) and
+the guest-side one (`filesys: HOSTFS0: handler started (ANDROID: ->
+...)`, logged by the filesys board itself when the guest's handler
+process actually starts) -- and, with `boot_pri` temporarily raised for
+the test, AROS booted directly off it into a shell with no other media
+inserted, proof DOS actually mounted and recognised the volume as a valid
+bootable AmigaDOS device, not just that the host-side config plumbing ran.
+`boot_pri` reverted to `-128` afterwards, the real, permanent value: an
+auto-mounted, otherwise-empty support directory should never be handed to
+the boot-device race.
+
 ## Building and running
 
 ```sh

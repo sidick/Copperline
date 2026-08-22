@@ -91,6 +91,38 @@ fn run(android_app: AndroidApp) -> Result<()> {
     cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
     cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
 
+    // WP5 (storage): no config file exists to have written a `[[filesys]]`
+    // entry (there is no desktop-shaped `./copperline.toml` on Android), so
+    // without this the guest would have no host storage at all. Auto-mount
+    // the app's external-files directory -- `Context.getExternalFilesDir`,
+    // real POSIX paths under `/sdcard/Android/data/<pkg>/files`, readable
+    // from a connected computer or a file manager with "show Android/data"
+    // enabled -- needing no runtime permission or SAF picker, unlike an
+    // arbitrary user-chosen folder. That wider case (browsing to any
+    // directory the user wants, e.g. an existing WHDLoad library) needs a
+    // Kotlin `GameActivity` subclass to receive the picker's result plus a
+    // URI/fd-based `filesys.rs` backend for the resulting `content://`
+    // handle, since SAF hands back a document tree, not a path this
+    // directory mount can use -- not attempted here.
+    if cfg.filesys.is_empty() {
+        if let Some(dir) = android_app.external_data_path() {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    log::info!("storage: mounting {} as HOSTFS0:", dir.display());
+                    cfg.filesys.push(copperline::filesys::MountSpec {
+                        path: dir,
+                        volume: "ANDROID".to_string(),
+                        boot_pri: -128,
+                        readonly: false,
+                    });
+                }
+                Err(e) => log::warn!("storage: could not prepare {} ({e:#})", dir.display()),
+            }
+        } else {
+            log::warn!("storage: no external-files directory available; guest has no HOSTFS");
+        }
+    }
+
     // WP7: on a panel with pixels to spare, default to the CRT look --
     // there's no settings screen yet to have overridden `[display]
     // shader` away from its (always, today) default of None, so this is
