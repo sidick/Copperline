@@ -1422,6 +1422,11 @@ pub struct App {
     /// every throttle interval while it's still true.
     #[cfg(target_os = "android")]
     android_thermal_warned: bool,
+    /// Shift/Ctrl/Alt/Super held state, tracked by hand from `KeyboardInput`
+    /// since winit's Android backend never emits `ModifiersChanged`. See
+    /// [`Self::track_android_modifier_key`].
+    #[cfg(target_os = "android")]
+    android_modifiers_held: ModifiersState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2150,6 +2155,8 @@ impl App {
             android_thermal_last_check: None,
             #[cfg(target_os = "android")]
             android_thermal_warned: false,
+            #[cfg(target_os = "android")]
+            android_modifiers_held: ModifiersState::empty(),
         };
         // Attach the sampler now for a directly-booted machine; the config-screen
         // placeholder passes a disabled request and attaches on Run instead.
@@ -2905,6 +2912,28 @@ impl App {
         }
     }
 
+    /// Update `android_modifiers_held` from an ordinary key press/release
+    /// and, if it actually changed, feed it through the same
+    /// [`Self::update_host_modifiers`] every other platform's
+    /// `ModifiersChanged` event already drives -- see the call site's doc
+    /// comment for why this exists only on Android.
+    #[cfg(target_os = "android")]
+    fn track_android_modifier_key(&mut self, code: KeyCode, state: ElementState) {
+        let flag = match code {
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => ModifiersState::SHIFT,
+            KeyCode::ControlLeft | KeyCode::ControlRight => ModifiersState::CONTROL,
+            KeyCode::AltLeft | KeyCode::AltRight => ModifiersState::ALT,
+            KeyCode::SuperLeft | KeyCode::SuperRight => ModifiersState::SUPER,
+            _ => return,
+        };
+        let mut held = self.android_modifiers_held;
+        held.set(flag, state == ElementState::Pressed);
+        if held != self.android_modifiers_held {
+            self.android_modifiers_held = held;
+            self.update_host_modifiers(held);
+        }
+    }
+
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         self.run_with_event_loop(event_loop)
@@ -3599,6 +3628,16 @@ impl ApplicationHandler for App {
                 if self.should_drop_repeated_main_key(code, state, repeat) {
                     return;
                 }
+                // winit's Android backend never emits ModifiersChanged (confirmed
+                // by reading platform_impl/android/mod.rs -- there is no such
+                // event anywhere in it), so self.modifiers would otherwise never
+                // update there at all, silently disabling every host shortcut
+                // that gates on it (Alt+E for the menu, etc.) even though the
+                // individual key presses that make it up arrive correctly. Track
+                // the four modifier keys' state from the ordinary KeyboardInput
+                // stream instead, only on the platform that needs it.
+                #[cfg(target_os = "android")]
+                self.track_android_modifier_key(code, state);
                 // An open menu takes the keyboard first: while it is up the
                 // cursor keys walk it rather than reaching the Amiga.
                 if self.ui.menu_open
