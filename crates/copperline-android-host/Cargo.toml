@@ -1,0 +1,39 @@
+# The reusable Android host layer: activity/lifecycle, surface, storage,
+# input and display policy, shared by the full emulator
+# (crates/copperline-android) and, later, the publisher-kit player
+# (crates/copperline-player-android). Nothing either of those needs may
+# depend on the launcher or the library -- see the Android port plan.
+#
+# A plain library, not a cdylib: the loadable native library and its
+# `android_main` entry point belong to whichever crate is the actual app
+# (crates/copperline-android today), not to the shared code underneath it.
+[package]
+name = "copperline-android-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+description = "Android host layer (activity, lifecycle, input, display) for Copperline"
+publish = false
+
+# Standalone: deliberately not a member of any workspace, the same shape as
+# crates/copperline-web and crates/copperline-player.
+[workspace]
+
+[dependencies]
+# default-features = false plus frontend and cpu-jit only: this is all the
+# publisher-kit player (crates/copperline-player-android, not yet built)
+# will pull in, so the host layer is built against exactly that surface
+# from day one rather than growing hidden dependencies on launcher-only code.
+copperline = { path = "../..", default-features = false, features = [
+    "frontend",
+    "cpu-jit",
+] }
+android_logger = "0.15"
+log = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

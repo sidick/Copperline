@@ -35,6 +35,9 @@
 /crates/zz9k-plugin/target
 # Standalone bezel preview harness build output (tools/bezel-preview).
 /tools/bezel-preview/target
+# Standalone Android host-layer and app crate build output.
+/crates/copperline-android-host/target
+/crates/copperline-android/target
 # CD images (cue/bin) are local assets, never committed.
 *.[Cc][Uu][Ee]
 *.[Bb][Ii][Nn]

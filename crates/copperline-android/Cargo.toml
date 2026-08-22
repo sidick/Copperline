@@ -1,0 +1,38 @@
+# The full Copperline emulator on Android: launcher, library, tools, on top
+# of crates/copperline-android-host. Sideload/GitHub-releases only -- it
+# needs user-supplied Kickstarts and the library's OpenRetro sync, neither
+# of which belongs in front of Play review. See the Android port plan.
+[package]
+name = "copperline-android"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+description = "Copperline Amiga emulator for Android"
+publish = false
+
+# Standalone: deliberately not a member of any workspace, the same shape as
+# crates/copperline-web and crates/copperline-player.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+copperline-android-host = { path = "../copperline-android-host" }
+# frontend + cpu-jit from copperline-android-host's own dependency already
+# covers the MVP shell; the rest of WP1's "yes" list (game-library, mhi,
+# mt32, coppersynth, net-nat, control, gdb) is added once each is wired up
+# by its own work package, not enabled speculatively ahead of that.
+copperline = { path = "../..", default-features = false, features = [
+    "frontend",
+    "cpu-jit",
+] }
+android-activity = { version = "0.6", features = ["game-activity"] }
+log = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -44,6 +44,7 @@ project:
         - file: guide/headless.md
         - file: guide/browser.md
         - file: guide/publishing.md
+        - file: guide/android.md
     - title: Extending
       children:
         - file: zorro.md
@@ -85,6 +86,7 @@ project:
         - guide/headless.md
         - guide/browser.md
         - guide/publishing.md
+        - guide/android.md
         - zorro.md
         - debugger/window.md
         - debugger/console.md
