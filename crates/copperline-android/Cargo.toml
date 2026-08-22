@@ -29,6 +29,14 @@ copperline = { path = "../..", default-features = false, features = [
     "cpu-jit",
 ] }
 android-activity = { version = "0.6", features = ["game-activity"] }
+# winit (pulled in transitively via copperline's `frontend` feature) has
+# its own android-activity dependency; without this, its default feature
+# selection conflicts with the game-activity choice above ("multiple
+# implementations of android-activity" at link time). Cargo unifies
+# features across the whole build, so declaring it here is enough --
+# `copperline`/`copperline-android-host` never need to know which flavor
+# was picked.
+winit = { version = "0.30", features = ["android-game-activity"] }
 log = "0.4"
 anyhow = "1"
 

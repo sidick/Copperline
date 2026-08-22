@@ -371,14 +371,12 @@ jobs:
           ndk-version: r28c
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: Host layer crate
-        working-directory: crates/copperline-android-host
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a --platform 35 build --locked
       - name: Host layer crate formatting
-        # A standalone workspace, so the root Formatting step never
-        # reaches it.
+        # A standalone workspace, so the root Formatting step never reaches
+        # it. Not built standalone: it deliberately can't select an
+        # android-activity flavor on its own (see its Cargo.toml) and is
+        # only ever built as crates/copperline-android's path dependency,
+        # covered by the next step.
         working-directory: crates/copperline-android-host
         run: cargo fmt --check
       - name: App crate (built straight into the Gradle project's jniLibs)

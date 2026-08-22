@@ -90,7 +90,6 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum",
- "simd_cesu8",
  "thiserror 2.0.20",
 ]
 
@@ -484,6 +483,7 @@ dependencies = [
 name = "copperline"
 version = "0.17.0"
 dependencies = [
+ "android-activity",
  "anyhow",
  "arboard",
  "bincode",
@@ -519,7 +519,6 @@ dependencies = [
 name = "copperline-android-host"
 version = "0.1.0"
 dependencies = [
- "android-activity",
  "android_logger",
  "anyhow",
  "copperline",

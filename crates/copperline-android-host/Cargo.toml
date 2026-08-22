@@ -25,6 +25,15 @@ publish = false
 # publisher-kit player (crates/copperline-player-android, not yet built)
 # will pull in, so the host layer is built against exactly that surface
 # from day one rather than growing hidden dependencies on launcher-only code.
+#
+# Because of this, the crate cannot build standalone on `target_os =
+# "android"`: `frontend` pulls in winit, and winit's own android-activity
+# dependency needs a "game-activity"/"native-activity" feature selected
+# somewhere in the build graph, which nothing here provides on purpose --
+# picking one is deliberately left to whichever app crate actually ships
+# (copperline-android today; copperline-player-android later), so this
+# layer stays usable by either without forcing their choice. Build/check
+# it as part of one of those, not on its own; see docs/guide/android.md.
 copperline = { path = "../..", default-features = false, features = [
     "frontend",
     "cpu-jit",

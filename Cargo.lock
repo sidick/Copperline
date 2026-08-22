@@ -554,6 +554,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "copperline"
 version = "0.17.0"
 dependencies = [
+ "android-activity",
  "anyhow",
  "arboard",
  "bincode",

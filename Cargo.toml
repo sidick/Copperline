@@ -311,6 +311,15 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppl
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
 pcap = { version = "2.4", optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+# Only for the `AndroidApp` type `video::window::App::run_android` takes:
+# the app crate (crates/copperline-android) is what actually receives one
+# from `android_main` and picks the GameActivity/NativeActivity flavor
+# (via its own direct dependency and winit's matching feature) -- this
+# crate stays flavor-agnostic, the same as the frontend's other Android
+# gating. See docs/guide/android.md.
+android-activity = "0.6"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Npcap is deliberately not linked at build time: the bridge backend loads it
 # from a trusted system directory only when selected, so NAT-only installs do

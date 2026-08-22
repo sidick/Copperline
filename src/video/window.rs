@@ -2807,6 +2807,25 @@ impl App {
 
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
+        self.run_with_event_loop(event_loop)
+    }
+
+    /// Android's counterpart to [`Self::run`]: the event loop has to be
+    /// built around the `AndroidApp` GameActivity/NativeActivity handle
+    /// `android_main` receives, rather than the plain `EventLoop::new()`
+    /// every other platform uses. See crates/copperline-android.
+    #[cfg(target_os = "android")]
+    pub fn run_android(self, android_app: android_activity::AndroidApp) -> Result<()> {
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+        let mut builder = EventLoop::builder();
+        builder.with_android_app(android_app);
+        let event_loop = builder
+            .build()
+            .map_err(|e| anyhow!("EventLoop::build: {e}"))?;
+        self.run_with_event_loop(event_loop)
+    }
+
+    fn run_with_event_loop(self, event_loop: EventLoop<()>) -> Result<()> {
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = self;
         // Start the control server's socket threads with a wake that
