@@ -417,6 +417,93 @@ below for how (the AVD needed `hw.keyboard=yes`, which it didn't have
 at first) -- a real analog gamepad is still needed to test anything
 beyond digital buttons, since that's the actual blocked part.
 
+### Full WP6 implementation plan
+
+**Enumeration and hotplug can be built now, independently of the winit
+blocker above.** `InputManager.getInputDeviceIds()`/`InputDeviceListener`
+is a system-service query, not a read off `AndroidApp`'s native input
+queue -- it doesn't compete with winit for that single consumable stream
+the way motion/button *event delivery* does, so wiring device
+appearance/removal into port assignment doesn't need the analog blocker
+resolved first.
+
+**Event delivery for analog axes does need a winit bypass, and there is
+currently no Activity to hook it from.** `crates/copperline-android`
+uses stock `com.google.androidgamesdk.GameActivity`
+(`android/app/src/main/AndroidManifest.xml`) directly -- no Kotlin/Java
+source exists in the tree to override `dispatchGenericMotionEvent`/
+`dispatchKeyEvent` on, unlike a hand-rolled Activity would give you for
+free. WP5's Storage Access Framework work (above) already anticipates
+needing "a Kotlin `GameActivity` subclass to launch the picker" for its
+own reasons; introducing the first Activity subclass is a decision
+shared by both work packages, not WP6-specific, and whoever picks either
+one up should check whether the other has already forced the subclass
+into existence. The alternative -- reaching `InputManager` and raw
+`MotionEvent`s via JNI from native code with no Activity subclass at all
+-- avoids that coupling but still needs the same underlying question
+answered: how motion events reach native code at all when
+`AndroidApp`'s queue is already exclusively winit's.
+
+**Once axis data is reachable, the translation and mapping layer itself
+is straightforward** and matches `src/gamepad.rs`'s existing model
+closely: `JoystickState`/`PadState` (`src/gamepad.rs:147,165`) is
+already exactly d-pad + two buttons for plain joystick mode, or the same
+directional lines plus `green`/`yellow`/`play`/`rwd`/`ffw` for CD32 --
+smaller than a modern gamepad's full button set, not something needing
+SDL_GameControllerDB-level generality. The same pipeline buttons already
+use -- `apply_joystick_state` (`src/video/window.rs:2546`) ->
+`Bus::input.set_joystick`/`set_cd32_buttons` (`src/bus.rs:2331,2357`) --
+is the target for analog input too; no new port-routing logic is needed,
+only a new source feeding the same calls `android_backend`'s stub
+(`src/gamepad/android_backend.rs`) currently leaves empty.
+
+Recommended shape once the event-delivery question is settled:
+
+- **Source filtering**: `(device.getSources() & InputDevice.SOURCE_CLASS_JOYSTICK)
+  != 0` -- a bitmask test, not `==` (the same trap
+  [SDL hit](https://github.com/libsdl-org/SDL/issues/2718)).
+- **A small logical-action enum** (`DirUp/Down/Left/Right`, `Fire1/Fire2`,
+  `Cd32Red/Blue/Yellow/Green`, `Cd32ShoulderL/R`, `MouseLeft/Right`,
+  `MenuToggle`) sits between raw `MotionEvent.AXIS_*`/
+  `KeyEvent.KEYCODE_BUTTON_*` codes and `JoystickState`/`PadState`,
+  driven by a per-device-class default table rather than hardcoded
+  keycodes -- Android gamepads don't agree on button codes across
+  vendors, and a table means a new controller's quirks are a data edit
+  later, not a code change. One default table covering the standard
+  Android gamepad profile is enough to start.
+- **Per-port-mode physical mapping**: Joystick mode ORs the D-pad and
+  left-stick-thresholded-at-~50%-deflection into one 8-way digital
+  signal (matching a real joystick's feel, no analog nuance to lose);
+  CD32 mode reuses that same directional OR and maps face buttons to
+  red/blue/yellow/green, shoulders to CD32's extra buttons; Mouse mode
+  drives the cursor from the right stick instead (proportional, not
+  digital) with face buttons for left/right click -- and shares its
+  winit-bypass requirement with WP9's blocked pointer-capture gap above,
+  since both need real `MotionEvent` motion data winit currently
+  misroutes through its touch-only path.
+- **`MenuToggle`** defaults to `KEYCODE_BUTTON_MODE` (the nearest thing
+  to a platform convention for a guide/home-style button), with `Start`
+  long-press as a fallback -- some OEM skins intercept `BUTTON_MODE` for
+  a system overlay before it reaches the app, so this needs verifying
+  against real hardware early rather than assumed.
+
+**Explicitly out of scope for a first pass**: SDL2-style remappable
+controller config or a community mapping database; force feedback/rumble
+(`InputDevice.getVibrator()`/`VibratorManager` device coverage is
+patchy, API 31+ only); Amiberry's Wheel Mouse, Analog joystick, and CDTV
+remote port modes (low value relative to effort -- revisit only if a
+specific target title needs one); "Default" isn't a mode to replicate,
+it's Amiberry's autodetect UX.
+
+**Open questions**: which port mode(s) matter first for a real target
+title (affects how much of the button/axis set needs mapping); whether
+WP5's SAF work forces the first Activity subclass into existence before
+WP6 needs one, or vice versa; known controllers to validate against
+(Bluetooth Xbox/PlayStation pads, USB-OTG generic pads -- device/vendor
+fragmentation here is a real testing cost, not just a coding one); and
+whether `KEYCODE_BUTTON_MODE` actually reaches the app on target devices
+before relying on it as the default binding.
+
 ## Root crate feature support
 
 Every root `Cargo.toml` feature's Android support is recorded as a comment
