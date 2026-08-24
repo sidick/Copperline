@@ -269,6 +269,41 @@ bootable AmigaDOS device, not just that the host-side config plumbing ran.
 auto-mounted, otherwise-empty support directory should never be handed to
 the boot-device race.
 
+### A user's own Kickstart
+
+`android_main` also looks in `external/kickstart/` (a fixed, discoverable
+subfolder of the same `ANDROID:` directory above, not its root -- so it
+reads as "put your ROM here" rather than mixing with WHDLoad games or
+anything else parked in general storage) for a real Kickstart to boot
+instead of the bundled AROS ROM. Identification is by content
+(`copperline::romdb::describe_file`), the same convention the desktop's
+own asset-gated tests use (see `tests/README.md`) -- never by file name,
+so it does not matter what a dumper or a collection manager happened to
+call the file. The folder is created (empty) on every launch if it does
+not exist yet, so there is somewhere to find by browsing over USB or a
+file manager even before a ROM is ever added.
+
+`find_user_kickstart` sorts the folder's entries for a deterministic
+pick, identifies each with `describe_file`, and takes the first
+recognised file as `cfg.rom_path`; a second recognised file (if any)
+becomes `cfg.extended_rom_path` (the CDTV/CD32 second flash bank); a
+third and beyond are logged and ignored. An Amiga Forever encrypted image
+is named in the log but never selected -- decoding it needs a `rom.key`
+this path does not look for. An empty or all-unrecognised folder falls
+back to the bundled AROS ROM already set above it, logged either way, so
+a run's `logcat` always says which ROM actually booted and why.
+
+Verified on the AVD: `adb push`ing a real Kickstart 3.1 image into
+`external/kickstart/` and relaunching logs `kickstart: .../KICK31.ROM
+identified as Kickstart 3.1 (40.63) A500/A600/A2000` followed by
+`kickstart: booting the user-supplied ROM at ...`, and a screenshot
+confirms the real Kickstart boot banner ("AMIGA ROM Operating System and
+Libraries... Copyright (C) 1985-1993 Commodore-Amiga, Inc.") in place of
+AROS's own -- a real, non-AROS machine, not just the log line claiming
+one. Removing the file and relaunching falls back to AROS again, logged
+as `kickstart: no recognised ROM in external/kickstart/; booting the
+bundled AROS ROM`.
+
 ## Building and running
 
 ```sh

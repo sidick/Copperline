@@ -15,9 +15,12 @@
 //!   relative to the CWD) that don't exist on Android. The same bundled
 //!   AROS ROM instead ships as an APK asset (see the Gradle project's
 //!   `copyArosAssets` task) and is extracted into the app's internal data
-//!   directory on first run, once, by [`extract_bundled_aros`]. General
-//!   host-directory storage (a user's own Kickstart, WHDLoad games) is
-//!   still WP5; this is only the one bundled asset every install needs.
+//!   directory on first run, once, by [`extract_bundled_aros`] -- the
+//!   default a fresh install boots. A real Kickstart the user drops into
+//!   `external/kickstart/` (see [`find_user_kickstart`]) overrides it, IDed
+//!   by content the same way the desktop asset-gated tests are, never by
+//!   file name. WHDLoad games remain unaddressed (still needs the wider
+//!   SAF storage case WP5's own detail section describes).
 //!
 //! Everything else -- config defaults, machine build, window/render/input,
 //! and audio (`CpalSink`, falling back to silence if it fails to open) --
@@ -36,6 +39,96 @@ use copperline::video::window::App;
 /// Files the Gradle project's `copyArosAssets` task bundles under
 /// `assets/aros/` in the APK, matching `assets/aros/` at the repo root.
 const AROS_ASSETS: &[&str] = &["aros-amiga-m68k-rom.bin", "aros-amiga-m68k-ext.bin"];
+
+/// Where a user's own Kickstart goes, under the app's external-files
+/// directory (the same one WP5 mounts as `ANDROID:`) -- a fixed,
+/// discoverable subfolder rather than the mount's root, so it reads as
+/// "put your ROM here" to someone browsing over USB or a file manager,
+/// distinct from WHDLoad games or anything else they park in `ANDROID:`.
+const KICKSTART_DIR: &str = "kickstart";
+
+/// A user-supplied Kickstart found in [`KICKSTART_DIR`]: the primary image,
+/// and a second one (if exactly one other file in the folder also
+/// identifies) to use as the extended ROM -- the CDTV/CD32 second flash
+/// bank `cfg.extended_rom_path` exists for. Identification is by content
+/// ([`copperline::romdb::describe_file`]), never by file name, so it does
+/// not matter what a dumper or a collection manager happened to call the
+/// file -- the same convention the desktop asset-gated tests use.
+struct UserKickstart {
+    rom_path: std::path::PathBuf,
+    extended_rom_path: Option<std::path::PathBuf>,
+}
+
+/// Look for a user's own Kickstart in `external/kickstart/`. Creates the
+/// folder if it does not exist yet (so it is there to find, empty, the
+/// first time someone goes looking for where to put a ROM) and returns
+/// `None` -- keeping the bundled AROS default -- when it holds nothing
+/// [`copperline::romdb::describe_file`] recognises. An Amiga-Forever
+/// encrypted image is named in the log but not selected: decoding it needs
+/// a `rom.key` this path does not look for.
+fn find_user_kickstart(external: &Path) -> Option<UserKickstart> {
+    let dir = external.join(KICKSTART_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("kickstart: could not prepare {} ({e:#})", dir.display());
+        return None;
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("kickstart: could not read {} ({e:#})", dir.display());
+            return None;
+        }
+    };
+    let mut candidates: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    // Sorted so which file becomes primary vs. extended is deterministic
+    // (and stable across runs) when a folder holds more than one.
+    candidates.sort();
+
+    let mut recognized = Vec::new();
+    for path in candidates {
+        match copperline::romdb::describe_file(&path) {
+            Some(copperline::romdb::Identified::Known(entry)) => {
+                log::info!(
+                    "kickstart: {} identified as {}",
+                    path.display(),
+                    entry.label
+                );
+                recognized.push(path);
+            }
+            Some(copperline::romdb::Identified::Encrypted) => {
+                log::info!(
+                    "kickstart: {} is an Amiga Forever encrypted image; \
+                     decoding needs a rom.key this path does not supply, skipping",
+                    path.display()
+                );
+            }
+            None => {
+                log::info!(
+                    "kickstart: {} is not a recognised Kickstart image, skipping",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let mut recognized = recognized.into_iter();
+    let rom_path = recognized.next()?;
+    let extended_rom_path = recognized.next();
+    if let Some(extra) = recognized.next() {
+        log::warn!(
+            "kickstart: {} also identified, but only two ROMs are used; ignoring it and any others",
+            extra.display()
+        );
+    }
+    Some(UserKickstart {
+        rom_path,
+        extended_rom_path,
+    })
+}
 
 /// Copy the bundled AROS ROM out of the APK's assets and into `internal`
 /// (the app's private data directory), skipping any file already there --
@@ -87,9 +180,33 @@ fn run(android_app: AndroidApp) -> Result<()> {
     let mut cfg = Config::try_from(raw.clone())?;
 
     // Stand-in for config::resolve_bundled_rom, which only looks in
-    // desktop-shaped locations; see the module doc.
+    // desktop-shaped locations; see the module doc. A user's own Kickstart
+    // in external/kickstart/, if one identifies, overrides this -- checked
+    // after the external directory is known (just below).
     cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
     cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
+
+    // WP5 (storage): a real Kickstart the user dropped in external/
+    // kickstart/ boots a real machine instead of the bundled AROS ROM --
+    // real Workbench, real WHDLoad-compatible ROM behaviour, whatever the
+    // user's own dump supports that AROS does not. Falls back to AROS
+    // (already set above) when the folder holds nothing recognised, so
+    // the app always has something to boot.
+    if let Some(external) = android_app.external_data_path() {
+        match find_user_kickstart(&external) {
+            Some(kickstart) => {
+                log::info!(
+                    "kickstart: booting the user-supplied ROM at {}",
+                    kickstart.rom_path.display()
+                );
+                cfg.rom_path = kickstart.rom_path;
+                cfg.extended_rom_path = kickstart.extended_rom_path;
+            }
+            None => log::info!(
+                "kickstart: no recognised ROM in external/{KICKSTART_DIR}/; booting the bundled AROS ROM"
+            ),
+        }
+    }
 
     // WP5 (storage): no config file exists to have written a `[[filesys]]`
     // entry (there is no desktop-shaped `./copperline.toml` on Android), so
