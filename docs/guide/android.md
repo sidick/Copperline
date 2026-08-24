@@ -420,105 +420,107 @@ beyond digital buttons, since that's the actual blocked part.
 ### Full WP6 implementation plan
 
 **Enumeration and hotplug can be built now, independently of the winit
-blocker above.** `InputManager.getInputDeviceIds()`/`InputDeviceListener`
+blocker below.** `InputManager.getInputDeviceIds()`/`InputDeviceListener`
 is a system-service query, not a read off `AndroidApp`'s native input
 queue -- it doesn't compete with winit for that single consumable stream
 the way motion/button *event delivery* does, so wiring device
-appearance/removal into port assignment doesn't need the analog blocker
+appearance/removal into port assignment doesn't need anything below
 resolved first.
 
-**Event delivery for analog axes needs a winit bypass, but not an
-Activity subclass -- axis data already reaches native code.** The
-`android-activity` crate (already a dependency, `game-activity` feature)
-exposes `MotionEvent::axis_value(Axis)`/`.source()` straight off
-`AndroidApp`'s own native input queue, fed by GameActivity's C++ glue
-with no Java-level `dispatchGenericMotionEvent` override involved at
-all. The actual blocker is narrower than it first looked: `App::run_android`
-hands that single consumable queue *exclusively* to winit's
-`EventLoop::builder().with_android_app(...)`, and winit's Android
-backend only reads touch phases off it (`platform_impl/android/mod.rs`),
-discarding axis data before anything downstream ever sees it. The fix is
-a Rust-only change in `App::run_android`/`src/video/window.rs`: read
-`android_app.input_events_iter()` directly for `SOURCE_CLASS_JOYSTICK`
-motion events rather than relying on winit to forward them, alongside
-(not replacing) winit's own event loop for everything else. No new
-Kotlin/Java is needed for this half of WP6 at all.
+**Analog axis delivery is genuinely blocked, not just missing an
+Activity subclass -- and deferred rather than solved here.**
+`android-activity`'s input queue enforces single-consumer access at
+runtime: a second, independent call to `input_events_iter()` while
+winit's own is outstanding returns `Err(InputUnavailable)`
+(`android-activity` 0.6.1's `game_activity/mod.rs`, the `Weak`/`Arc`
+strong-count check backing `input_receiver`). Worse, there's no "leave
+it for someone else" gap to exploit even if that weren't true: winit's
+Android backend (`platform_impl/android/mod.rs`, `winit` 0.30.13) fully
+drains the queue every pump and marks *every* event `Handled` before
+moving on, including joystick axis motion it doesn't recognise --
+`input_status` starts `Handled` and is never downgraded for the motion
+branch, so the axis payload is read, acknowledged, and thrown away in
+the same step, not left pending. A second reader alongside winit
+doesn't get "what winit left behind"; there is no window where anything
+is left behind.
 
-WP5's Storage Access Framework work (above) is the one that genuinely
-needs the first Activity subclass -- `onActivityResult` is a real
-Android API requirement (the SAF picker's result only ever arrives via
-that Activity lifecycle callback; no NDK/JNI-only path exists around
-it), unlike anything in WP6. The two work packages aren't coupled the
-way an earlier draft of this section said: WP6's enumeration half is
-plain JNI off the existing `AndroidApp` context handle
-(`activity_as_ptr()`/`vm_as_ptr()`, `src/lib.rs` in `android-activity`),
-and its analog-axis half is the winit bypass above -- neither needs
-WP5's subclass to exist first. Once WP5 forces a subclass into existence
-for its own reasons, routing WP6 input through it becomes an option
-worth reconsidering, just not a requirement.
+The only architecturally sound fix is to stop winit from being the
+queue's sole consumer at all -- either fork/patch winit's Android
+backend to forward joystick-class events instead of discarding them, or
+replace its Android input handling entirely and reimplement
+touch/key/modifier handling on our own side (the same handling WP9
+already device-confirmed working: Alt+E menu, D-pad-as-arrow-keys,
+modifier tracking). Either path is real work against code that
+currently works correctly, for a payoff nothing currently needs.
+**Decision: defer.** Ship the digital D-pad/button-only path (already
+device-confirmed, see above) as WP6's v1; revisit true analog only if a
+specific target title needs it. WP9's pointer-capture gap is blocked on
+the identical root cause and is deferred for the same reason.
 
-**Once axis data is reachable, the translation and mapping layer itself
-is straightforward** and matches `src/gamepad.rs`'s existing model
-closely: `JoystickState`/`PadState` (`src/gamepad.rs:147,165`) is
-already exactly d-pad + two buttons for plain joystick mode, or the same
-directional lines plus `green`/`yellow`/`play`/`rwd`/`ffw` for CD32 --
-smaller than a modern gamepad's full button set, not something needing
-SDL_GameControllerDB-level generality. The same pipeline buttons already
-use -- `apply_joystick_state` (`src/video/window.rs:2546`) ->
-`Bus::input.set_joystick`/`set_cd32_buttons` (`src/bus.rs:2331,2357`) --
-is the target for analog input too; no new port-routing logic is needed,
-only a new source feeding the same calls `android_backend`'s stub
-(`src/gamepad/android_backend.rs`) currently leaves empty.
+**Consequence: gamepad-driven mouse mode is blocked too, not just
+analog joystick mode.** The natural design for Mouse mode -- right
+stick drives the cursor proportionally -- needs exactly the axis data
+that's unreachable, so it's deferred alongside analog joystick rather
+than shippable in a v1 that only has digital D-pad/button input. There
+is no digital substitute that isn't materially worse than a real analog
+stick for pointer control (D-pad-to-cursor is coarse and slow compared
+to touchscreen or physical mouse). Practically, that leaves the
+Amiga-side pointer driven by the touchscreen or a real Bluetooth/USB
+mouse for now, not the gamepad -- worth keeping in mind for any UI that
+assumes a gamepad can always drive every port mode.
 
-Recommended shape once the event-delivery question is settled:
+**What's still buildable for a v1 given the deferral**: Joystick mode
+(D-pad + two buttons, matching `JoystickState`, `src/gamepad.rs:147`)
+and CD32 pad mode (same directional input plus
+`green`/`yellow`/`play`/`rwd`/`ffw`, `PadState`, `src/gamepad.rs:165`)
+are both reachable today through the existing button path -- Android
+`KeyEvent`s for D-pad and face/shoulder buttons already arrive via
+winit's ordinary `KeyboardInput` (device-confirmed, see above and
+WP9's section) -- feeding the same pipeline buttons already use:
+`apply_joystick_state` (`src/video/window.rs:2546`) ->
+`Bus::input.set_joystick`/`set_cd32_buttons` (`src/bus.rs:2331,2357`),
+replacing `android_backend`'s stub (`src/gamepad/android_backend.rs`).
+Enumeration/hotplug via `InputManager` (above) is unaffected by any of
+this and can be built alongside it.
+
+Recommended shape for the digital-only v1:
 
 - **Source filtering**: `(device.getSources() & InputDevice.SOURCE_CLASS_JOYSTICK)
   != 0` -- a bitmask test, not `==` (the same trap
-  [SDL hit](https://github.com/libsdl-org/SDL/issues/2718)).
+  [SDL hit](https://github.com/libsdl-org/SDL/issues/2718)) -- still
+  matters for identifying gamepad-class devices even with buttons only.
 - **A small logical-action enum** (`DirUp/Down/Left/Right`, `Fire1/Fire2`,
-  `Cd32Red/Blue/Yellow/Green`, `Cd32ShoulderL/R`, `MouseLeft/Right`,
-  `MenuToggle`) sits between raw `MotionEvent.AXIS_*`/
-  `KeyEvent.KEYCODE_BUTTON_*` codes and `JoystickState`/`PadState`,
-  driven by a per-device-class default table rather than hardcoded
-  keycodes -- Android gamepads don't agree on button codes across
-  vendors, and a table means a new controller's quirks are a data edit
-  later, not a code change. One default table covering the standard
-  Android gamepad profile is enough to start.
-- **Per-port-mode physical mapping**: Joystick mode ORs the D-pad and
-  left-stick-thresholded-at-~50%-deflection into one 8-way digital
-  signal (matching a real joystick's feel, no analog nuance to lose);
-  CD32 mode reuses that same directional OR and maps face buttons to
-  red/blue/yellow/green, shoulders to CD32's extra buttons; Mouse mode
-  drives the cursor from the right stick instead (proportional, not
-  digital) with face buttons for left/right click -- and shares its
-  winit-bypass requirement with WP9's blocked pointer-capture gap above,
-  since both need real `MotionEvent` motion data winit currently
-  misroutes through its touch-only path.
+  `Cd32Red/Blue/Yellow/Green`, `Cd32ShoulderL/R`, `MenuToggle`) sits
+  between raw `KeyEvent.KEYCODE_BUTTON_*`/`KEYCODE_DPAD_*` codes and
+  `JoystickState`/`PadState`, driven by a per-device-class default
+  table rather than hardcoded keycodes -- Android gamepads don't agree
+  on button codes across vendors, and a table means a new controller's
+  quirks are a data edit later, not a code change. `MouseLeft/Right`
+  drop out of this enum for now along with Mouse mode itself. One
+  default table covering the standard Android gamepad profile is
+  enough to start.
 - **`MenuToggle`** defaults to `KEYCODE_BUTTON_MODE` (the nearest thing
   to a platform convention for a guide/home-style button), with `Start`
   long-press as a fallback -- some OEM skins intercept `BUTTON_MODE` for
   a system overlay before it reaches the app, so this needs verifying
   against real hardware early rather than assumed.
 
-**Explicitly out of scope for a first pass**: SDL2-style remappable
-controller config or a community mapping database; force feedback/rumble
+**Explicitly out of scope for a first pass**: analog joystick input and
+gamepad-driven Mouse mode (deferred above, not forgotten -- revisit if
+a target title needs either); SDL2-style remappable controller config
+or a community mapping database; force feedback/rumble
 (`InputDevice.getVibrator()`/`VibratorManager` device coverage is
 patchy, API 31+ only); Amiberry's Wheel Mouse, Analog joystick, and CDTV
-remote port modes (low value relative to effort -- revisit only if a
-specific target title needs one); "Default" isn't a mode to replicate,
-it's Amiberry's autodetect UX.
+remote port modes (low value relative to effort); "Default" isn't a
+mode to replicate, it's Amiberry's autodetect UX.
 
-**Open questions**: which port mode(s) matter first for a real target
-title (affects how much of the button/axis set needs mapping); whether
-`android_app.input_events_iter()` can safely be read for joystick axes
-alongside winit's own consumption of the same queue, or whether events
-need routing/filtering between the two consumers to avoid winit missing
-something it still needs (the touch/key events it already handles
-correctly); known controllers to validate against (Bluetooth Xbox/
-PlayStation pads, USB-OTG generic pads -- device/vendor fragmentation
-here is a real testing cost, not just a coding one); and whether
-`KEYCODE_BUTTON_MODE` actually reaches the app on target devices before
-relying on it as the default binding.
+**Open questions**: which of Joystick/CD32 pad mode matters first for a
+real target title (affects how much of the button set needs mapping);
+known controllers to validate the digital path against (Bluetooth
+Xbox/PlayStation pads, USB-OTG generic pads -- device/vendor
+fragmentation here is a real testing cost, not just a coding one); and
+whether `KEYCODE_BUTTON_MODE` actually reaches the app on target
+devices before relying on it as the default binding.
 
 ## Root crate feature support
 
