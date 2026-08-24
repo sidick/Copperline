@@ -427,22 +427,35 @@ the way motion/button *event delivery* does, so wiring device
 appearance/removal into port assignment doesn't need the analog blocker
 resolved first.
 
-**Event delivery for analog axes does need a winit bypass, and there is
-currently no Activity to hook it from.** `crates/copperline-android`
-uses stock `com.google.androidgamesdk.GameActivity`
-(`android/app/src/main/AndroidManifest.xml`) directly -- no Kotlin/Java
-source exists in the tree to override `dispatchGenericMotionEvent`/
-`dispatchKeyEvent` on, unlike a hand-rolled Activity would give you for
-free. WP5's Storage Access Framework work (above) already anticipates
-needing "a Kotlin `GameActivity` subclass to launch the picker" for its
-own reasons; introducing the first Activity subclass is a decision
-shared by both work packages, not WP6-specific, and whoever picks either
-one up should check whether the other has already forced the subclass
-into existence. The alternative -- reaching `InputManager` and raw
-`MotionEvent`s via JNI from native code with no Activity subclass at all
--- avoids that coupling but still needs the same underlying question
-answered: how motion events reach native code at all when
-`AndroidApp`'s queue is already exclusively winit's.
+**Event delivery for analog axes needs a winit bypass, but not an
+Activity subclass -- axis data already reaches native code.** The
+`android-activity` crate (already a dependency, `game-activity` feature)
+exposes `MotionEvent::axis_value(Axis)`/`.source()` straight off
+`AndroidApp`'s own native input queue, fed by GameActivity's C++ glue
+with no Java-level `dispatchGenericMotionEvent` override involved at
+all. The actual blocker is narrower than it first looked: `App::run_android`
+hands that single consumable queue *exclusively* to winit's
+`EventLoop::builder().with_android_app(...)`, and winit's Android
+backend only reads touch phases off it (`platform_impl/android/mod.rs`),
+discarding axis data before anything downstream ever sees it. The fix is
+a Rust-only change in `App::run_android`/`src/video/window.rs`: read
+`android_app.input_events_iter()` directly for `SOURCE_CLASS_JOYSTICK`
+motion events rather than relying on winit to forward them, alongside
+(not replacing) winit's own event loop for everything else. No new
+Kotlin/Java is needed for this half of WP6 at all.
+
+WP5's Storage Access Framework work (above) is the one that genuinely
+needs the first Activity subclass -- `onActivityResult` is a real
+Android API requirement (the SAF picker's result only ever arrives via
+that Activity lifecycle callback; no NDK/JNI-only path exists around
+it), unlike anything in WP6. The two work packages aren't coupled the
+way an earlier draft of this section said: WP6's enumeration half is
+plain JNI off the existing `AndroidApp` context handle
+(`activity_as_ptr()`/`vm_as_ptr()`, `src/lib.rs` in `android-activity`),
+and its analog-axis half is the winit bypass above -- neither needs
+WP5's subclass to exist first. Once WP5 forces a subclass into existence
+for its own reasons, routing WP6 input through it becomes an option
+worth reconsidering, just not a requirement.
 
 **Once axis data is reachable, the translation and mapping layer itself
 is straightforward** and matches `src/gamepad.rs`'s existing model
@@ -497,12 +510,15 @@ it's Amiberry's autodetect UX.
 
 **Open questions**: which port mode(s) matter first for a real target
 title (affects how much of the button/axis set needs mapping); whether
-WP5's SAF work forces the first Activity subclass into existence before
-WP6 needs one, or vice versa; known controllers to validate against
-(Bluetooth Xbox/PlayStation pads, USB-OTG generic pads -- device/vendor
-fragmentation here is a real testing cost, not just a coding one); and
-whether `KEYCODE_BUTTON_MODE` actually reaches the app on target devices
-before relying on it as the default binding.
+`android_app.input_events_iter()` can safely be read for joystick axes
+alongside winit's own consumption of the same queue, or whether events
+need routing/filtering between the two consumers to avoid winit missing
+something it still needs (the touch/key events it already handles
+correctly); known controllers to validate against (Bluetooth Xbox/
+PlayStation pads, USB-OTG generic pads -- device/vendor fragmentation
+here is a real testing cost, not just a coding one); and whether
+`KEYCODE_BUTTON_MODE` actually reaches the app on target devices before
+relying on it as the default binding.
 
 ## Root crate feature support
 
