@@ -304,6 +304,64 @@ one. Removing the file and relaunching falls back to AROS again, logged
 as `kickstart: no recognised ROM in external/kickstart/; booting the
 bundled AROS ROM`.
 
+### A user's own `copperline.toml`: floppies, hard drives, WHDLoad
+
+Everything above only ever set two things on Android's behalf --
+`cfg.rom_path` and the `HOSTFS0:` mount -- because nothing loaded a
+config file at all: `run()` called `Config::load_raw(None, ...)`
+unconditionally, so `[floppy]`, `[ide]`/`[scsi]`/`[lide]`, and
+`[whdload]` could never be populated no matter where a user placed a
+file. `emulator::build_machine` itself needed no Android-specific
+change to honour them -- it already reads every config section
+generically -- so this was the one missing piece, not a partial gap
+across formats.
+
+`run()` now looks for `copperline.toml` at the root of the same
+`external_data_path()` directory `HOSTFS0:` mounts (not inside
+`kickstart/`, so config and mounted storage read as two separate,
+top-level things browsing over USB), and loads it exactly as `--config`
+would on desktop when present -- a malformed file fails the run with a
+clear error (surfaced via `android_main`'s `log::error!`) rather than
+silently falling back to defaults, matching desktop's own `--config`
+behaviour rather than leaving someone wondering why their disk never
+showed up. A user's own `[machine]`/`rom` in that file, if present,
+wins over both the bundled AROS default and a `external/kickstart/`
+find -- checked via `raw.rom.is_none()` before either applies. Relative
+paths inside the file resolve against the process's own working
+directory, which is not a meaningful concept on Android, so
+`[floppy.dfN] path` and friends need absolute paths -- typically under
+the same external-files directory printed in `logcat` at launch (the
+`storage: mounting ... as HOSTFS0:` line).
+
+Device-confirmed on the AVD: pushing a synthetic 901120-byte `.adf` and
+a `copperline.toml` with
+
+```toml
+[floppy.df0]
+path = "/storage/emulated/0/Android/data/org.copperlinehq.copperline/files/test.adf"
+```
+
+into the external-files directory (plain `adb push`, no root or
+`run-as` needed -- the same directory the Kickstart test above already
+established is host-writable) and relaunching logs `config: loading
+.../copperline.toml`, no crash, and the status bar's DF0 eject icon
+lights up green (dim/disabled with nothing inserted) -- confirmed by a
+before/after screenshot crop -- proof the drive really has a disk in it,
+not just that the config parsed. The synthetic image has no real boot
+block, so AROS correctly still reports "Waiting for bootable media"; a
+real ADF would boot from it the same way a real Kickstart does above.
+
+Not yet exercised end-to-end, but structurally identical (same
+`build_machine` path, same config sections it already reads): HDF
+hardfiles via `[ide]`/`[scsi]`/`[lide]`, and WHDLoad via `[whdload]
+game = "..."`. WHDLoad has one further requirement beyond the config
+file: `WHDLoad_usr.lha` isn't bundled into the APK the way the AROS ROM
+is (`copyArosAssets` only stages `assets/aros/*`), so a user pointing
+`[whdload]` at a game also needs to supply that archive themselves
+under the mounted directory, or the app's own `assets/whdboot/` copy
+needs bundling the same way AROS is, for a config-only solve -- not
+attempted here.
+
 ## Building and running
 
 ```sh

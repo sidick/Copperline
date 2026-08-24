@@ -19,12 +19,19 @@
 //!   default a fresh install boots. A real Kickstart the user drops into
 //!   `external/kickstart/` (see [`find_user_kickstart`]) overrides it, IDed
 //!   by content the same way the desktop asset-gated tests are, never by
-//!   file name. WHDLoad games remain unaddressed (still needs the wider
-//!   SAF storage case WP5's own detail section describes).
+//!   file name;
+//! - the config source, since there is no desktop-shaped `./copperline.toml`
+//!   relative to a CWD on Android either: a `copperline.toml` at the root
+//!   of the external-files directory (the same one `HOSTFS0:` mounts,
+//!   below) is loaded when present, exactly as `--config` would load one
+//!   on desktop -- giving `[floppy]`, `[ide]`/`[scsi]`/`[lide]`, and
+//!   `[whdload]` a way onto the machine. WHDLoad additionally needs
+//!   `WHDLoad_usr.lha` supplied the same way, since it isn't bundled into
+//!   the APK the way the AROS ROM is.
 //!
-//! Everything else -- config defaults, machine build, window/render/input,
-//! and audio (`CpalSink`, falling back to silence if it fails to open) --
-//! is exactly `copperline`'s own code, unmodified.
+//! Everything else -- machine build, window/render/input, and audio
+//! (`CpalSink`, falling back to silence if it fails to open) -- is exactly
+//! `copperline`'s own code, unmodified.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -175,36 +182,63 @@ fn run(android_app: AndroidApp) -> Result<()> {
         .ok_or_else(|| anyhow!("no internal data path (Context.getFilesDir())"))?;
     extract_bundled_aros(&android_app, &internal).context("extracting the bundled AROS ROM")?;
 
-    let raw = Config::load_raw(None, &ConfigOverrides::default())?;
+    // WP5 (storage): a `copperline.toml` the user dropped in the app's
+    // external-files directory (the same one HOSTFS0: mounts, below) is
+    // loaded exactly as `--config` would load one on desktop, giving
+    // [floppy], [ide]/[scsi]/[lide], and [whdload] a way onto the machine
+    // for the first time -- `emulator::build_machine` already reads all of
+    // these generically, so this is the only piece that was actually
+    // missing. A malformed file fails the run the same way a bad --config
+    // does on desktop (surfaced via android_main's log::error!, not a
+    // silent fallback to defaults that would leave someone wondering why
+    // their disk never showed up). Relative paths inside it resolve
+    // against the process's own working directory, which is not
+    // meaningful on Android -- point [floppy.dfN] path etc. at absolute
+    // paths under the external-files directory printed below.
+    let config_path = android_app
+        .external_data_path()
+        .map(|dir| dir.join("copperline.toml"));
+    let raw = match config_path.as_deref().filter(|p| p.is_file()) {
+        Some(path) => {
+            log::info!("config: loading {}", path.display());
+            Config::load_raw(Some(path), &ConfigOverrides::default())?
+        }
+        None => Config::load_raw(None, &ConfigOverrides::default())?,
+    };
     copperline::paths::adopt(raw.paths());
     let mut cfg = Config::try_from(raw.clone())?;
 
     // Stand-in for config::resolve_bundled_rom, which only looks in
-    // desktop-shaped locations; see the module doc. A user's own Kickstart
-    // in external/kickstart/, if one identifies, overrides this -- checked
-    // after the external directory is known (just below).
-    cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
-    cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
+    // desktop-shaped locations; see the module doc. Only when the loaded
+    // config didn't already name a `rom` of its own -- a user's [machine]/
+    // `rom` in copperline.toml above always wins. A user's own Kickstart
+    // in external/kickstart/, if one identifies, overrides the bundled
+    // AROS default the same way -- checked after the external directory
+    // is known (just below).
+    if raw.rom.is_none() {
+        cfg.rom_path = internal.join("aros/aros-amiga-m68k-rom.bin");
+        cfg.extended_rom_path = Some(internal.join("aros/aros-amiga-m68k-ext.bin"));
 
-    // WP5 (storage): a real Kickstart the user dropped in external/
-    // kickstart/ boots a real machine instead of the bundled AROS ROM --
-    // real Workbench, real WHDLoad-compatible ROM behaviour, whatever the
-    // user's own dump supports that AROS does not. Falls back to AROS
-    // (already set above) when the folder holds nothing recognised, so
-    // the app always has something to boot.
-    if let Some(external) = android_app.external_data_path() {
-        match find_user_kickstart(&external) {
-            Some(kickstart) => {
-                log::info!(
-                    "kickstart: booting the user-supplied ROM at {}",
-                    kickstart.rom_path.display()
-                );
-                cfg.rom_path = kickstart.rom_path;
-                cfg.extended_rom_path = kickstart.extended_rom_path;
+        // WP5 (storage): a real Kickstart the user dropped in external/
+        // kickstart/ boots a real machine instead of the bundled AROS ROM --
+        // real Workbench, real WHDLoad-compatible ROM behaviour, whatever the
+        // user's own dump supports that AROS does not. Falls back to AROS
+        // (already set above) when the folder holds nothing recognised, so
+        // the app always has something to boot.
+        if let Some(external) = android_app.external_data_path() {
+            match find_user_kickstart(&external) {
+                Some(kickstart) => {
+                    log::info!(
+                        "kickstart: booting the user-supplied ROM at {}",
+                        kickstart.rom_path.display()
+                    );
+                    cfg.rom_path = kickstart.rom_path;
+                    cfg.extended_rom_path = kickstart.extended_rom_path;
+                }
+                None => log::info!(
+                    "kickstart: no recognised ROM in external/{KICKSTART_DIR}/; booting the bundled AROS ROM"
+                ),
             }
-            None => log::info!(
-                "kickstart: no recognised ROM in external/{KICKSTART_DIR}/; booting the bundled AROS ROM"
-            ),
         }
     }
 
