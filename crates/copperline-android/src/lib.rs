@@ -335,6 +335,7 @@ fn run(android_app: AndroidApp) -> Result<()> {
         cfg.mouse_capture,
         config::about_machine_lines(&cfg),
         raw,
+        cfg.runahead_machine_block_reason(),
         audio_output_enabled,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
