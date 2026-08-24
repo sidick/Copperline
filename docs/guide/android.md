@@ -522,6 +522,46 @@ fragmentation here is a real testing cost, not just a coding one); and
 whether `KEYCODE_BUTTON_MODE` actually reaches the app on target
 devices before relying on it as the default binding.
 
+### Digital v1 implemented, source-verified only -- device confirmation
+### blocked by an unrelated pre-existing crash
+
+The digital-only plan above is implemented: `src/gamepad/android_backend.rs`
+now holds a real (if minimal) synthetic single-pad queue instead of the
+permanent no-op stub, fed by two new `src/video/window.rs` methods --
+`track_android_gamepad_dpad` (D-pad, hooked into the existing
+`PhysicalKey::Code` `KeyboardInput` arm alongside
+`track_android_modifier_key`) and `handle_android_gamepad_button`
+(face/shoulder buttons, a new `PhysicalKey::Unidentified` arm, since
+winit has no typed `KeyCode` for them). Both call
+`android_backend::push_button`, which queues a `Connected` event on
+first use and then `ButtonPressed`/`ButtonReleased`, exactly the shape
+`gamepad.rs`'s existing `RawGamepads::pump`/`GamepadReader::poll`
+already expects from real gilrs -- no changes needed there.
+`Gamepad::mapping_source()` reports `SdlMappings` once connected so
+`poll()` takes its calibration-free "standard layout" path
+(`MappedPadState::resolve_pad`, already written, already used by every
+real desktop pad): South=fire/red, East=blue, West=green, North=yellow,
+Start=play/pause, shoulders/triggers=rewind/forward, Select/Mode=host
+Menu -- which also means `KEYCODE_BUTTON_MODE` opening Copperline's
+menu (one of the open questions above) comes for free rather than
+needing its own binding.
+
+Verified: compiles clean on both `cargo check`/`clippy -D warnings`
+(desktop) and `cargo ndk ... clippy -- -D warnings` (`aarch64-linux-android`,
+via `cargo-ndk` against NDK r28.2.13676358); the existing desktop
+`gamepad`/`video::window` unit test suite (23 tests) passes unchanged,
+confirming nothing in the shared pipeline regressed. **Not yet
+device-confirmed**: launching the APK on the `copperline-test` AVD hits
+a reproducible `SIGSEGV` in the `android_main` thread immediately after
+"display: N panel pixels, defaulting to the CRT shader" and before any
+input ever reaches the app -- confirmed to be pre-existing and unrelated
+to this work by reproducing the identical crash (same fault address) on
+the unmodified stub via `git stash`. This blocks *all* Android testing
+on this AVD right now, not just gamepad input, and is worth its own
+investigation (a shader/Vulkan init issue on this particular AVD image
+is the leading suspect, given where it happens) before anything Android
+-side can be device-confirmed again.
+
 ## Root crate feature support
 
 Every root `Cargo.toml` feature's Android support is recorded as a comment

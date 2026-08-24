@@ -2962,6 +2962,61 @@ impl App {
         }
     }
 
+    /// Feed the D-pad half of Android gamepad input into the synthetic pad
+    /// `crate::gamepad::android_backend` queues for `GamepadReader::poll`
+    /// (WP6's v1, digital only -- see docs/guide/android.md). D-pad already
+    /// arrives as winit's ordinary `KeyCode::ArrowUp/Down/Left/Right`
+    /// (device-confirmed, see the doc's WP9 section), unlike face/shoulder
+    /// buttons, which arrive as `PhysicalKey::Unidentified` and are handled
+    /// separately in `handle_android_gamepad_button`. This runs alongside,
+    /// not instead of, the ordinary arrow-key handling further down (the
+    /// same physical keys a Bluetooth keyboard's arrow keys would send) --
+    /// on Android a spurious extra Amiga cursor-key press from a D-pad
+    /// press is a harmless duplicate, not a conflict, since it drives a
+    /// different part of the guest (the keyboard matrix, not the joystick
+    /// port lines).
+    #[cfg(target_os = "android")]
+    fn track_android_gamepad_dpad(&mut self, code: KeyCode, state: ElementState) {
+        use crate::gamepad::android_backend::{push_button, Button};
+        let button = match code {
+            KeyCode::ArrowUp => Button::DPadUp,
+            KeyCode::ArrowDown => Button::DPadDown,
+            KeyCode::ArrowLeft => Button::DPadLeft,
+            KeyCode::ArrowRight => Button::DPadRight,
+            _ => return,
+        };
+        push_button(button, state == ElementState::Pressed);
+    }
+
+    /// Feed the face/shoulder-button half of Android gamepad input into
+    /// the same synthetic pad, from the `KEYCODE_BUTTON_*` raw codes
+    /// Android's `KeyEvent`s carry (`PhysicalKey::Unidentified`, since
+    /// winit has no typed `KeyCode` variant for them -- see the call
+    /// site). Codes are the stable, longstanding Android API constants
+    /// (`android.view.KeyEvent`); `C`/`Z`/`THUMBL`/`THUMBR` have no
+    /// matching `Button` variant in the standard layout `gamepad.rs`
+    /// resolves against and are left unhandled rather than guessed onto
+    /// something.
+    #[cfg(target_os = "android")]
+    fn handle_android_gamepad_button(&mut self, code: u32, pressed: bool) {
+        use crate::gamepad::android_backend::{push_button, Button};
+        let button = match code {
+            96 => Button::South,          // KEYCODE_BUTTON_A
+            97 => Button::East,           // KEYCODE_BUTTON_B
+            99 => Button::West,           // KEYCODE_BUTTON_X
+            100 => Button::North,         // KEYCODE_BUTTON_Y
+            102 => Button::LeftTrigger,   // KEYCODE_BUTTON_L1
+            103 => Button::RightTrigger,  // KEYCODE_BUTTON_R1
+            104 => Button::LeftTrigger2,  // KEYCODE_BUTTON_L2
+            105 => Button::RightTrigger2, // KEYCODE_BUTTON_R2
+            108 => Button::Start,         // KEYCODE_BUTTON_START
+            109 => Button::Select,        // KEYCODE_BUTTON_SELECT
+            110 => Button::Mode,          // KEYCODE_BUTTON_MODE
+            _ => return,
+        };
+        push_button(button, pressed);
+    }
+
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         self.run_with_event_loop(event_loop)
@@ -3666,6 +3721,8 @@ impl ApplicationHandler for App {
                 // stream instead, only on the platform that needs it.
                 #[cfg(target_os = "android")]
                 self.track_android_modifier_key(code, state);
+                #[cfg(target_os = "android")]
+                self.track_android_gamepad_dpad(code, state);
                 // An open menu takes the keyboard first: while it is up the
                 // cursor keys walk it rather than reaching the Amiga.
                 if self.ui.menu_open
@@ -3908,6 +3965,25 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+            }
+            // Android gamepad face/shoulder buttons: winit has no typed
+            // `KeyCode` for these (unlike D-pad, which arrives as a real
+            // `KeyCode::ArrowUp/Down/Left/Right` and is handled in the
+            // ordinary `PhysicalKey::Code` arm above via
+            // `track_android_gamepad_dpad`), so they arrive here instead.
+            // See `handle_android_gamepad_button`'s doc comment.
+            #[cfg(target_os = "android")]
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state,
+                        physical_key:
+                            PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)),
+                        ..
+                    },
+                ..
+            } => {
+                self.handle_android_gamepad_button(code, state == ElementState::Pressed);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.update_host_modifiers(modifiers.state());

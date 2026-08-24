@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "android"))]
 use gilrs as backend;
 #[cfg(target_os = "android")]
-mod android_backend;
+pub(crate) mod android_backend;
 #[cfg(target_os = "android")]
 use android_backend as backend;
 
