@@ -522,8 +522,7 @@ fragmentation here is a real testing cost, not just a coding one); and
 whether `KEYCODE_BUTTON_MODE` actually reaches the app on target
 devices before relying on it as the default binding.
 
-### Digital v1 implemented, source-verified only -- device confirmation
-### blocked by an unrelated pre-existing crash
+### Digital v1 implemented and device-confirmed
 
 The digital-only plan above is implemented: `src/gamepad/android_backend.rs`
 now holds a real (if minimal) synthetic single-pad queue instead of the
@@ -546,21 +545,72 @@ Menu -- which also means `KEYCODE_BUTTON_MODE` opening Copperline's
 menu (one of the open questions above) comes for free rather than
 needing its own binding.
 
-Verified: compiles clean on both `cargo check`/`clippy -D warnings`
-(desktop) and `cargo ndk ... clippy -- -D warnings` (`aarch64-linux-android`,
-via `cargo-ndk` against NDK r28.2.13676358); the existing desktop
-`gamepad`/`video::window` unit test suite (23 tests) passes unchanged,
-confirming nothing in the shared pipeline regressed. **Not yet
-device-confirmed**: launching the APK on the `copperline-test` AVD hits
-a reproducible `SIGSEGV` in the `android_main` thread immediately after
-"display: N panel pixels, defaulting to the CRT shader" and before any
-input ever reaches the app -- confirmed to be pre-existing and unrelated
-to this work by reproducing the identical crash (same fault address) on
-the unmodified stub via `git stash`. This blocks *all* Android testing
-on this AVD right now, not just gamepad input, and is worth its own
-investigation (a shader/Vulkan init issue on this particular AVD image
-is the leading suspect, given where it happens) before anything Android
--side can be device-confirmed again.
+**Device-confirmed on the `copperline-test` AVD**, not just
+source-verified. All thirteen mapped codes were injected with `adb shell
+input keyevent` and observed arriving as the right `Button` variant via
+a temporary log in `push_button` (since removed): `DPAD_UP/DOWN/LEFT/
+RIGHT` (19-22) through the `PhysicalKey::Code` path, and `BUTTON_A/B/X/Y`
+(96/97/99/100), `L1`/`R1`/`L2`/`R2` (102-105) and `START` (108) through
+the `PhysicalKey::Unidentified` one -- both arms confirmed live, not
+just the one. End-to-end, `adb shell input keyevent --longpress 110`
+(`KEYCODE_BUTTON_MODE`) **opens Copperline's pop-up menu** (confirmed by
+screenshot: Machine Configuration, Frame Analyzer, Debugger, Console,
+the Settings submenus, Quit), which exercises the whole chain rather
+than just the decode step: `push_button` -> the synthetic queue ->
+`Gilrs::next_event` -> `RawGamepads::pump` -> `MappedPadState` ->
+`resolve_pad` -> `PadState.menu` -> the window's menu bridge. That it
+opens at all also confirms the pad is seen as connected *and* as
+database-known, i.e. `poll()` really does take the standard-layout path
+rather than the "uncalibrated, refuse to drive anything" one.
+
+A plain (non-long) `input keyevent` press does *not* open the menu, and
+that is expected rather than a bug: `adb` sends the down and up events
+back to back, so both are queued and drained inside a single
+`RawGamepads::pump`, and the poll that follows sees the button already
+released. Real gilrs coalesces an instantaneous press/release the same
+way; a real pad held for even a few tens of milliseconds spans many
+polls.
+
+Also verified: compiles clean on both `cargo check`/`clippy -D warnings`
+(desktop) and `cargo ndk ... clippy -- -D warnings`
+(`aarch64-linux-android`, via `cargo-ndk` against NDK r28.2.13676358);
+the existing desktop `gamepad`/`video::window` unit test suite (23
+tests) passes unchanged, confirming nothing in the shared pipeline
+regressed.
+
+### Debug Android builds overflow the `android_main` stack
+
+Worth knowing before reaching for a debug build to investigate
+something: **`cargo ndk ... build` without `--release` produces an APK
+that reliably dies on launch**, in `emulator::build_machine`, with
+
+```text
+Fatal signal 11 (SIGSEGV), code 2 (SEGV_ACCERR) ... in tid N (android_main)
+Cause: stack pointer is not in a rw map; likely due to stack overflow.
+```
+
+This is a stack overflow, not a GPU/driver fault (an earlier draft of
+this section guessed shader init, wrongly, from where the last log line
+landed). The tombstone's own memory map is unambiguous: `android_main`'s
+usable `rw` stack is one `0xfb000` mapping -- about 1 MiB, since the
+thread is created by GameActivity's C glue rather than being the process
+main thread desktop gets 8 MiB for -- and the faulting `sp` sits inside
+the 4 KiB guard page immediately below it. Only 27 frames deep, so it's
+frame size, not runaway recursion: a debug build keeps every intermediate
+of the machine's construction live on the stack where an optimised build
+elides them. A release build clears `build_machine`, `App::new` and
+`run_android` without incident, which is why nothing above hit this --
+the documented recipe already says `--release`, and the Rust side of an
+Android build should stay that way even when the Gradle side is
+`assembleDebug` (the two are independent: the APK above was
+`assembleDebug` around a `--release` `.so`).
+
+Nothing is currently done about it, deliberately -- the fix would mean
+finding and boxing whichever locals in `build_machine` dominate that
+frame, which is real work for a configuration nobody needs to ship, and
+`--release` is both the documented path and the only sane one for an
+emulator anyway. It is written down here so the next person to try a
+debug build recognises the crash in a second rather than re-deriving it.
 
 ## Root crate feature support
 
