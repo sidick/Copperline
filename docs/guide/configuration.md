@@ -1595,14 +1595,26 @@ master = "AmigaSYS.hdf"      # raw flat HDF, read/write
 
 Images are opened read/write. Both kinds of HDF work directly:
 
-- a full disk image with its own Rigid Disk Block (RDSK/PART chain), and
+- a full disk image with its own Rigid Disk Block (RDSK/PART chain),
 - a bare partition hardfile (boot block starts with `DOS\x..`), which is
   wrapped in a synthesized RDB on the fly: one extra cylinder of
   16-surface x 32-sector geometry holding an RDSK and a bootable `DH0`
   PART block, with the image's own dostype. The image must be a multiple
   of 256 KiB so the partition is an exact cylinder count. Writes to the
   partition go back to the image file; writes to the synthesized RDB area
-  (re-partitioning) live only for the session.
+  (re-partitioning) live only for the session; and
+- a disk with an **MBR-embedded RDB**: a PC master boot record whose
+  partition table carries a `0x76` entry pointing at a real Amiga RDB
+  embedded further into the image -- the convention both Amithlon and
+  PiStorm use so a PC BIOS or Linux boot loader sees one opaque
+  partition while AmigaOS finds its own RDB underneath. Copperline
+  confirms an `RDSK` block actually lives within that partition's first
+  16 sectors before trusting it (the same window a real Amiga's own RDB
+  scan looks in), then mounts starting at the partition's LBA directly --
+  the MBR sector and
+  anything before the RDB are hidden from the guest, and writes to the
+  RDB/partitions go straight back to the image file like any other RDB
+  image.
 
 A **gzip-compressed hardfile** attaches too -- the `.hdz` convention, or a
 plainly gzipped `.hdf`. Like the floppy formats it is recognised by content

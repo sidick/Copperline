@@ -68,6 +68,18 @@ pub struct HardDriveImage {
     /// session. None for images that contain their own RDB.
     rdb_overlay: Option<Vec<u8>>,
     overlay_write_warned: bool,
+    /// Sectors hidden at the front of the backing store: the PC MBR (and
+    /// anything before the embedded RDB) on a disk whose `0x76` partition
+    /// entry points at a real on-disk RDB -- the convention Amithlon and
+    /// PiStorm both use so a PC BIOS or Linux boot loader sees one opaque
+    /// partition while AmigaOS finds its own RDB underneath. Guest LBA
+    /// 0 maps to file LBA `mbr_skip`; the hidden sectors are permanently
+    /// unreachable from the guest, matching how the format itself works --
+    /// the embedded RDB only ever describes the space after them. Zero for
+    /// every other image. Mutually exclusive with `rdb_overlay` (one skips
+    /// real sectors in front, the other fabricates missing ones), so at
+    /// most one of the two is ever nonzero.
+    mbr_skip: u64,
     /// Lowercase bus tag ("ide"/"scsi") for log messages.
     bus_name: &'static str,
 }
@@ -87,6 +99,8 @@ struct HardDriveImageState<P = PathBuf, B = Vec<u8>, S = SessionImage> {
     total_sectors: u64,
     rdb_overlay: Option<B>,
     overlay_write_warned: bool,
+    #[serde(default)]
+    mbr_skip: u64,
     scsi_bus: bool,
     /// The real disk this drive is, if it is one: the identifier a
     /// configuration names it by, and whether the guest may write to it.
@@ -122,6 +136,7 @@ impl serde::Serialize for HardDriveImage {
             total_sectors: self.total_sectors,
             rdb_overlay: self.rdb_overlay.as_deref(),
             overlay_write_warned: self.overlay_write_warned,
+            mbr_skip: self.mbr_skip,
             scsi_bus: self.bus_name == "scsi",
             host_device: match &self.backing {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -156,6 +171,7 @@ impl<'de> serde::Deserialize<'de> for HardDriveImage {
                     total_sectors: state.total_sectors,
                     rdb_overlay: state.rdb_overlay,
                     overlay_write_warned: state.overlay_write_warned,
+                    mbr_skip: state.mbr_skip,
                     bus_name,
                 });
             }
@@ -190,6 +206,7 @@ impl<'de> serde::Deserialize<'de> for HardDriveImage {
             total_sectors: state.total_sectors,
             rdb_overlay: state.rdb_overlay,
             overlay_write_warned: state.overlay_write_warned,
+            mbr_skip: state.mbr_skip,
             bus_name,
         })
     }
@@ -418,6 +435,99 @@ fn read_gzip_hardfile(path: &Path, bus_name: &str, limit: u64) -> anyhow::Result
     Ok(Some(image))
 }
 
+/// Read `count` sectors starting at `start_lba` from `backing`, for the
+/// open-time format sniff. Used both for the initial LBA-0 sniff and, when
+/// an MBR-embedded RDB is found, the re-sniff at its offset.
+fn sniff_sectors(
+    backing: &mut Backing,
+    path: &Path,
+    bus_name: &str,
+    start_lba: u64,
+    count: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buf = vec![0u8; count * SECTOR_SIZE];
+    match backing {
+        Backing::File(file) => {
+            file.seek(SeekFrom::Start(start_lba * SECTOR_SIZE as u64))
+                .map_err(|e| anyhow::anyhow!("seeking {bus_name} image {}: {e}", path.display()))?;
+            file.read_exact(&mut buf)
+                .map_err(|e| anyhow::anyhow!("reading {bus_name} image {}: {e}", path.display()))?;
+        }
+        Backing::Memory(image) => {
+            let off = start_lba as usize * SECTOR_SIZE;
+            let len = buf.len();
+            buf.copy_from_slice(&image[off..off + len]);
+        }
+        Backing::Session(_) => unreachable!("session backing is installed after validation"),
+        #[cfg(not(target_arch = "wasm32"))]
+        Backing::Device(device) => {
+            for (i, sector) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
+                device
+                    .read_sector(start_lba + i as u64, sector)
+                    .map_err(|e| {
+                        anyhow::anyhow!("reading {bus_name} device {}: {e}", path.display())
+                    })?;
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Backing::PendingDevice(_) => {
+            unreachable!("only save-state decoding creates pending disks")
+        }
+    }
+    Ok(buf)
+}
+
+const MBR_SIGNATURE_OFFSET: usize = 510;
+const MBR_PARTITION_TABLE_OFFSET: usize = 446;
+const MBR_PARTITION_ENTRY_SIZE: usize = 16;
+const MBR_PARTITION_COUNT: usize = 4;
+const MBR_TYPE_OFFSET: usize = 4;
+const MBR_LBA_START_OFFSET: usize = 8;
+
+/// The MBR partition type Amithlon and PiStorm's emulated SCSI/IDE targets
+/// both use to carry a whole Amiga RDB inside one PC partition-table entry:
+/// a PC BIOS sees one opaque partition, while the Amiga side still finds its
+/// own RDB and partitions underneath, starting at that entry's LBA.
+const MBR_AMIGA_RDB_PARTITION_TYPE: u8 = 0x76;
+
+/// If `sector0` is a PC MBR (ends `0x55AA`) carrying a `0x76` partition
+/// entry with a nonzero start, return that entry's starting LBA. Does not
+/// confirm an RDB actually lives there -- callers re-sniff at the returned
+/// offset for that. A zero-LBA entry is skipped rather than returned: it
+/// cannot be the real embedded RDB (LBA 0 is the MBR itself), and treating
+/// it as a match would mask a genuine `0x76` entry elsewhere in the table.
+fn find_mbr_rdb_partition(sector0: &[u8]) -> Option<u64> {
+    if sector0.len() < SECTOR_SIZE
+        || sector0[MBR_SIGNATURE_OFFSET..MBR_SIGNATURE_OFFSET + 2] != [0x55, 0xAA]
+    {
+        return None;
+    }
+    for i in 0..MBR_PARTITION_COUNT {
+        let entry_off = MBR_PARTITION_TABLE_OFFSET + i * MBR_PARTITION_ENTRY_SIZE;
+        let entry = &sector0[entry_off..entry_off + MBR_PARTITION_ENTRY_SIZE];
+        if entry[MBR_TYPE_OFFSET] == MBR_AMIGA_RDB_PARTITION_TYPE {
+            let start_lba = u32::from_le_bytes(
+                entry[MBR_LBA_START_OFFSET..MBR_LBA_START_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if start_lba > 0 {
+                return Some(u64::from(start_lba));
+            }
+        }
+    }
+    None
+}
+
+/// Whether any sector in `sectors` (each `SECTOR_SIZE` bytes) begins with
+/// the RDSK signature -- the shared rule behind both the initial LBA-0
+/// sniff and the MBR-offset confirmation sniff.
+fn contains_rdsk(sectors: &[u8]) -> bool {
+    sectors
+        .chunks(SECTOR_SIZE)
+        .any(|sector| sector.get(..4) == Some(b"RDSK"))
+}
+
 impl HardDriveImage {
     /// Whether the image carries its own Rigid Disk Block, rather than
     /// being a bare single-partition hardfile this had to synthesize one
@@ -481,6 +591,7 @@ impl HardDriveImage {
             total_sectors,
             rdb_overlay: None,
             overlay_write_warned: false,
+            mbr_skip: 0,
             bus_name,
         })
     }
@@ -664,31 +775,35 @@ impl HardDriveImage {
         // block at sector 0, no RDSK block in the first 16 sectors) gets a
         // synthesized RDB cylinder in front so the driver can mount it
         // without any pre-conversion step.
+        let total_file_sectors = len / SECTOR_SIZE as u64;
         let sniff_len = (len as usize).min(RDB_LOCATION_LIMIT * SECTOR_SIZE);
-        let mut head = vec![0u8; sniff_len];
-        match &mut backing {
-            Backing::File(file) => file
-                .read_exact(&mut head)
-                .map_err(|e| anyhow::anyhow!("reading {bus_name} image {}: {e}", path.display()))?,
-            Backing::Memory(image) => head.copy_from_slice(&image[..sniff_len]),
-            Backing::Session(_) => unreachable!("session backing is installed after validation"),
-            #[cfg(not(target_arch = "wasm32"))]
-            Backing::Device(device) => {
-                for (lba, sector) in head.chunks_mut(SECTOR_SIZE).enumerate() {
-                    device.read_sector(lba as u64, sector).map_err(|e| {
-                        anyhow::anyhow!("reading {bus_name} device {}: {e}", path.display())
-                    })?;
+        let head = sniff_sectors(&mut backing, path, bus_name, 0, sniff_len / SECTOR_SIZE)?;
+        let has_rdsk = contains_rdsk(&head);
+        let bare_partition = !has_rdsk && head.get(..3) == Some(b"DOS");
+
+        // Neither a bare partition hardfile nor an image with its own RDB
+        // at LBA 0: check for a PC MBR wrapping a real RDB further into the
+        // file (the convention Amithlon and PiStorm both use), and if the
+        // RDB is confirmed there, skip the MBR sector rather than exposing
+        // it to the guest.
+        let mut mbr_skip: u64 = 0;
+        if !has_rdsk && !bare_partition {
+            if let Some(start_lba) = find_mbr_rdb_partition(&head) {
+                if start_lba < total_file_sectors {
+                    let count = RDB_LOCATION_LIMIT.min((total_file_sectors - start_lba) as usize);
+                    let probe = sniff_sectors(&mut backing, path, bus_name, start_lba, count)?;
+                    if contains_rdsk(&probe) {
+                        log::info!(
+                            "{bus_name}: {} is a PC MBR with an embedded Amiga RDB (0x76 \
+                             partition at LBA {start_lba}); mounting the RDB directly, MBR \
+                             sector hidden from the guest",
+                            path.display()
+                        );
+                        mbr_skip = start_lba;
+                    }
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            Backing::PendingDevice(_) => {
-                unreachable!("only save-state decoding creates pending disks")
-            }
         }
-        let has_rdsk = head
-            .chunks(SECTOR_SIZE)
-            .any(|sector| sector.get(..4) == Some(b"RDSK"));
-        let bare_partition = !has_rdsk && head.get(..3) == Some(b"DOS");
 
         let rdb_overlay = if bare_partition {
             if len % CYL_BYTES != 0 {
@@ -735,7 +850,7 @@ impl HardDriveImage {
         };
 
         let overlay_sectors = rdb_overlay.as_ref().map_or(0, |_| u64::from(CYL_SECTORS));
-        let total_sectors = len / SECTOR_SIZE as u64 + overlay_sectors;
+        let total_sectors = total_file_sectors + overlay_sectors - mbr_skip;
         if session {
             let bytes = match backing {
                 Backing::Memory(bytes) => bytes,
@@ -759,6 +874,7 @@ impl HardDriveImage {
             total_sectors,
             rdb_overlay,
             overlay_write_warned: false,
+            mbr_skip,
             bus_name,
         })
     }
@@ -809,7 +925,7 @@ impl HardDriveImage {
                 return Ok(());
             }
         }
-        let file_lba = lba - self.overlay_sectors();
+        let file_lba = lba - self.overlay_sectors() + self.mbr_skip;
         match &mut self.backing {
             Backing::File(file) => {
                 file.seek(SeekFrom::Start(file_lba * SECTOR_SIZE as u64))?;
@@ -853,7 +969,7 @@ impl HardDriveImage {
                 return Ok(());
             }
         }
-        let file_lba = lba - self.overlay_sectors();
+        let file_lba = lba - self.overlay_sectors() + self.mbr_skip;
         match &mut self.backing {
             Backing::File(file) => {
                 file.seek(SeekFrom::Start(file_lba * SECTOR_SIZE as u64))?;
@@ -1020,6 +1136,7 @@ mod tests {
             total_sectors: original.total_sectors,
             rdb_overlay: original.rdb_overlay.clone(),
             overlay_write_warned: original.overlay_write_warned,
+            mbr_skip: original.mbr_skip,
             scsi_bus: false,
             host_device: None,
             session: match &original.backing {
@@ -1234,6 +1351,7 @@ mod tests {
             total_sectors: 1234,
             rdb_overlay: None,
             overlay_write_warned: false,
+            mbr_skip: 0,
             scsi_bus: false,
             host_device: Some(HostDiskState {
                 id: "disk99".to_string(),
@@ -1440,5 +1558,159 @@ mod tests {
             assert_eq!(sum, 0, "RDB checksum rule broken for bootpri {pri}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// An MBR-embedded RDB disk (the Amithlon/PiStorm convention): a
+    /// one-sector PC MBR whose sole partition entry is type `0x76`,
+    /// starting at `rdb_lba`, with a real
+    /// (synthesized) RDB living there. Sector `rdb_lba + 2` carries a
+    /// marker, which is how a test tells the embedded partition data apart
+    /// from the MBR sector in front of it. `rdb_lba` must be past
+    /// `RDB_LOCATION_LIMIT` to exercise the MBR-skip path rather than the
+    /// existing "RDSK found directly by the plain LBA-0 scan" path (which
+    /// already works today whenever the embedded RDB happens to fall within
+    /// the first 16 sectors, exactly as a real Amiga's own RDB scan would
+    /// find it with no MBR-awareness at all).
+    fn mbr_rdb_bytes(rdb_lba: u32, rdb_cyls: u32) -> Vec<u8> {
+        let total_sectors = rdb_lba as usize + rdb_cyls as usize * CYL_SECTORS as usize;
+        let mut bytes = vec![0u8; total_sectors * SECTOR_SIZE];
+        let entry_off = MBR_PARTITION_TABLE_OFFSET;
+        bytes[entry_off + MBR_TYPE_OFFSET] = MBR_AMIGA_RDB_PARTITION_TYPE;
+        bytes[entry_off + MBR_LBA_START_OFFSET..entry_off + MBR_LBA_START_OFFSET + 4]
+            .copy_from_slice(&rdb_lba.to_le_bytes());
+        bytes[MBR_SIGNATURE_OFFSET] = 0x55;
+        bytes[MBR_SIGNATURE_OFFSET + 1] = 0xAA;
+        let rdb_off = rdb_lba as usize * SECTOR_SIZE;
+        bytes[rdb_off..rdb_off + SECTOR_SIZE].copy_from_slice(&build_rdsk_block(rdb_cyls));
+        let marker_off = rdb_off + 2 * SECTOR_SIZE;
+        bytes[marker_off..marker_off + 4].copy_from_slice(b"MARK");
+        bytes
+    }
+
+    /// A PiStorm/Amithlon-style image typically aligns its RDB to a
+    /// PC-style cylinder boundary (sector 63), well past
+    /// `RDB_LOCATION_LIMIT`.
+    const MBR_RDB_TEST_LBA: u32 = 63;
+
+    #[test]
+    fn mbr_rdb_hides_the_mbr_region_and_exposes_the_embedded_rdb() {
+        let bytes = mbr_rdb_bytes(MBR_RDB_TEST_LBA, 1);
+        let path = temp_image("mbr-rdb.hdf", &bytes);
+        let mut disk = HardDriveImage::open(
+            &path,
+            "DH0",
+            "ide",
+            None,
+            crate::config::HARDFILE_DEFAULT_BOOT_PRI,
+            crate::diskimage::FileSystem::FFS,
+        )
+        .unwrap();
+        assert!(
+            disk.has_own_rdb(),
+            "a real embedded RDB is its own, not synthesized"
+        );
+
+        let mut sector = vec![0u8; SECTOR_SIZE];
+        disk.read_sector(0, &mut sector).unwrap();
+        assert_eq!(
+            &sector[..4],
+            b"RDSK",
+            "guest LBA 0 must land on the embedded RDB"
+        );
+
+        disk.read_sector(2, &mut sector).unwrap();
+        assert_eq!(
+            &sector[..4],
+            b"MARK",
+            "partition data shifts down with the MBR region"
+        );
+
+        assert_eq!(
+            disk.total_sectors(),
+            bytes.len() as u64 / SECTOR_SIZE as u64 - u64::from(MBR_RDB_TEST_LBA),
+            "the hidden MBR region must not count toward the guest-visible capacity"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mbr_rdb_writes_go_straight_to_the_host_file() {
+        let path = temp_image("mbr-rdb-write.hdf", &mbr_rdb_bytes(MBR_RDB_TEST_LBA, 1));
+        {
+            let mut disk = HardDriveImage::open(
+                &path,
+                "DH0",
+                "ide",
+                None,
+                crate::config::HARDFILE_DEFAULT_BOOT_PRI,
+                crate::diskimage::FileSystem::FFS,
+            )
+            .unwrap();
+            disk.write_sector(2, &[0x5A; SECTOR_SIZE]).unwrap();
+            disk.flush().unwrap();
+        }
+        let on_disk = std::fs::read(&path).unwrap();
+        let host_lba = MBR_RDB_TEST_LBA as usize + 2;
+        assert_eq!(
+            &on_disk[host_lba * SECTOR_SIZE..(host_lba + 1) * SECTOR_SIZE],
+            &[0x5A; SECTOR_SIZE][..],
+            "guest LBA 2 must persist at its real, MBR-shifted host LBA"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mbr_without_a_confirmed_rdb_is_left_alone() {
+        // A 0x76 entry pointing at a sector that is not actually an RDB must
+        // not be trusted: the disk mounts as an ordinary raw image instead.
+        let mut bytes = mbr_rdb_bytes(MBR_RDB_TEST_LBA, 1);
+        let rdb_off = MBR_RDB_TEST_LBA as usize * SECTOR_SIZE;
+        bytes[rdb_off..rdb_off + 4].copy_from_slice(b"NOPE");
+        let path = temp_image("mbr-rdb-unconfirmed.hdf", &bytes);
+        let disk = HardDriveImage::open(
+            &path,
+            "DH0",
+            "ide",
+            None,
+            crate::config::HARDFILE_DEFAULT_BOOT_PRI,
+            crate::diskimage::FileSystem::FFS,
+        )
+        .unwrap();
+        assert_eq!(
+            disk.total_sectors(),
+            bytes.len() as u64 / SECTOR_SIZE as u64
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_mbr_rdb_partition_requires_the_boot_signature() {
+        let mut sector0 = vec![0u8; SECTOR_SIZE];
+        let entry_off = MBR_PARTITION_TABLE_OFFSET;
+        sector0[entry_off + MBR_TYPE_OFFSET] = MBR_AMIGA_RDB_PARTITION_TYPE;
+        sector0[entry_off + MBR_LBA_START_OFFSET..entry_off + MBR_LBA_START_OFFSET + 4]
+            .copy_from_slice(&63u32.to_le_bytes());
+        assert_eq!(find_mbr_rdb_partition(&sector0), None);
+        sector0[MBR_SIGNATURE_OFFSET] = 0x55;
+        sector0[MBR_SIGNATURE_OFFSET + 1] = 0xAA;
+        assert_eq!(find_mbr_rdb_partition(&sector0), Some(63));
+    }
+
+    #[test]
+    fn find_mbr_rdb_partition_skips_a_zero_lba_entry_to_find_a_later_one() {
+        // A 0x76 entry with LBA 0 cannot be the real embedded RDB (LBA 0 is
+        // the MBR itself) and must not mask a genuine entry elsewhere in
+        // the table.
+        let mut sector0 = vec![0u8; SECTOR_SIZE];
+        sector0[MBR_SIGNATURE_OFFSET] = 0x55;
+        sector0[MBR_SIGNATURE_OFFSET + 1] = 0xAA;
+        sector0[MBR_PARTITION_TABLE_OFFSET + MBR_TYPE_OFFSET] = MBR_AMIGA_RDB_PARTITION_TYPE;
+        let second_entry_off = MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE;
+        sector0[second_entry_off + MBR_TYPE_OFFSET] = MBR_AMIGA_RDB_PARTITION_TYPE;
+        sector0
+            [second_entry_off + MBR_LBA_START_OFFSET..second_entry_off + MBR_LBA_START_OFFSET + 4]
+            .copy_from_slice(&63u32.to_le_bytes());
+        assert_eq!(find_mbr_rdb_partition(&sector0), Some(63));
     }
 }
