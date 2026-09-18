@@ -1,6 +1,6 @@
 # The C3D 3D accelerator board: device specification
 
-**Draft 0.8.** This chapter specifies the register file, command stream,
+**Draft 0.10.** This chapter specifies the register file, command stream,
 and semantics of C3D, a virtual fixed-function 3D accelerator board
 implemented in Copperline (`src/c3d/`, `[c3d]`) and targeted by a guest
 `minigl.library`. It is written to be implementable by another emulator
@@ -35,18 +35,80 @@ stream; the guest library then supplies window-space vertices itself.
 (c3d-zorro-identity)=
 ## Zorro identity
 
-- Manufacturer **5192** / `0x1448` (the Copperline manufacturer ID; see
-  [](../zorro)'s [manufacturer ID table](../zorro.md#the-copperline-manufacturer-id)),
-  product **9**.
-- No autoboot ROM, not in the Exec free-memory list (`ERTF_MEMLIST`
-  clear): the guest library finds the board with `FindConfigDev(5192, 9)`
-  and owns its window.
+**The autoconfig identity below belongs to the board, not to any one
+implementation of it, and every conforming implementation presents the
+same one.** This is not a convention but a requirement, and the reason is
+guest binary compatibility: an Amiga program and its `minigl.library`
+find the board with `FindConfigDev()` on a manufacturer and product pair
+compiled into them. If a second emulator, or an FPGA card, presented its
+own identity instead, the *same guest binaries* would fail on it, and the
+portability this specification exists for would be lost. The precedent is
+ordinary: every emulator that models Village Tronic's Picasso II presents
+Village Tronic's identity, because that is what the guest driver looks
+for.
+
+- Manufacturer **5192** / `0x1448`, registered to dec0de Consulting, who
+  publish this specification and **grant its use, for these product
+  numbers only, to any implementation that conforms to it** -- emulator
+  or hardware, whoever writes it. An implementation that deviates from
+  this specification in a guest-visible way must *not* present this
+  identity; presenting it asserts conformance, and a guest that finds it
+  is entitled to assume everything in this chapter.
+- An implementer who would rather use **their own registered
+  manufacturer ID** -- which is the more orthodox reading of what an
+  autoconfig manufacturer ID means -- may do so, and adds a row to the
+  [identity registry](#c3d-identity-registry) below. That keeps guest
+  software working, at the cost of needing a guest-library update before
+  the new board is found; using the identity above needs none. Both are
+  supported on purpose, because the trade-off is the implementer's to
+  make, not this specification's.
+- Product **9** for the Zorro III profile, **10** for the Zorro II
+  profile. Distinct products let a guest probe for the wider bus first
+  and fall back, without having to inspect `er_Type` -- the same shape
+  Copperline's emulated ZZ9000 and Graffity boards use for their own two
+  profiles.
+- The autoconfig **serial number is implementation-defined** and is the
+  one field that identifies *who* implemented the board. An
+  implementation may encode its own name and version there. Guest
+  software must never key on it, or on any behaviour derived from it,
+  beyond display and diagnostics; everything a guest needs to decide
+  functionally is in `VERSION`, `CAPS0` and the limits registers.
+- No autoboot ROM, and not in the Exec free-memory list (`ERTF_MEMLIST`
+  clear): the board's window belongs to whichever library claims it.
+- A guest **should confirm the board before writing to it** by reading
+  `ID` (offset `0x000`) and checking the `"C3D "` magic, then `VERSION`
+  for a major it knows. `FindConfigDev()` finds a board by identity;
+  the magic proves the window is this register file before anything
+  writes a doorbell into it.
+(c3d-identity-registry)=
+### Identity registry
+
+Guest software finds the board by walking this table, not by hard-coding
+one pair. A guest library carries the table, tries `FindConfigDev()` for
+each row in order, and confirms the first match by reading `ID` and
+`VERSION` (below) before it writes anything. **This table is the
+coordination point**: an implementation that uses its own identity adds a
+row here by proposing a change to this specification, and guest libraries
+pick it up at their next release.
+
+| Manufacturer | Product | Bus | Implementation |
+|---|---|---|---|
+| `0x1448` (5192) | 9 | Zorro III | The specification's own identity -- any conforming implementation, including Copperline |
+| `0x1448` (5192) | 10 | Zorro II | The same, on the 16-bit bus |
+
+A guest must treat every row as equally valid and must not prefer one
+implementation's behaviour over another's: everything it needs to decide
+functionally is in `VERSION`, `CAPS0` and the limits registers, never in
+the identity it was found by. A guest that finds several boards may use
+any of them, and should prefer the first that reports the capabilities it
+wants.
+
 - Two bus profiles share one register file and one command set:
 
-  | Profile | Bus | Window | Notes |
-  |---|---|---|---|
-  | **Z3** | Zorro III | one window, default 32 MiB, any power of two from 4 MiB to 256 MiB | Copperline ships this profile. Needs a 32-bit CPU (68020 or later, not 68EC020). |
-  | **Z2** | Zorro II | one window, 4 MiB or 8 MiB | For hardware implementations on the 16-bit bus. The data aperture is correspondingly small; texture data streams through the ring rather than living in the aperture. |
+  | Profile | Product | Bus | Window | Notes |
+  |---|---|---|---|---|
+  | **Z3** | 9 | Zorro III | one window, default 32 MiB, any power of two from 4 MiB to 256 MiB | Copperline ships this profile. Needs a 32-bit CPU (68020 or later, not 68EC020). |
+  | **Z2** | 10 | Zorro II | one window, 4 MiB or 8 MiB | For hardware implementations on the 16-bit bus. The data aperture is correspondingly small; texture data streams through the ring rather than living in the aperture. |
 
   A guest library must read `APERTURE_OFFSET`/`APERTURE_SIZE` rather than
   assume either layout.
@@ -116,7 +178,7 @@ guest library uses exclusively for registers.
 | Offset | Name | Access | Reset | Purpose |
 |---|---|---|---|---|
 | `0x000` | `ID` | RO | `0x4333_4420` | Magic `"C3D "`; identifies a C3D device |
-| `0x004` | `VERSION` | RO | `0x0000_0008` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
+| `0x004` | `VERSION` | RO | `0x0000_000A` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
 | `0x008` | `CAPS0` | RO | board-fixed | [Capability bits](#c3d-tiers) |
 | `0x00C` | `CAPS1` | RO | `0` | Reserved for future capability bits |
 | `0x010` | `STATUS` | RO | `0x0000_0001` | Bit 0 `READY`; bit 1 `RESETTING`; bit 2 `FATAL` (an implementation-internal failure; every context is halted; only `CONTROL.RESET` recovers) |
@@ -842,7 +904,7 @@ porting client glue.
 (c3d-versioning)=
 ## Versioning
 
-`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.8` and the
+`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.10` and the
 first released protocol will be `1.0`. A **major** bump is incompatible:
 a guest library refuses a major it does not know. A **minor** bump is
 additive: new opcodes, new capability bits, new limits registers at
@@ -854,6 +916,19 @@ major.
 
 ### Draft history
 
+- **0.10** -- an identity registry added, so an implementer may use
+  their own registered manufacturer ID rather than the shared one. Guest
+  software walks the registry instead of hard-coding a single pair, which
+  is how a driver in this ecosystem normally supports a family of boards.
+  The trade-off between the two routes -- found with no guest change,
+  versus an orthodox manufacturer ID -- is left to the implementer.
+- **0.9** -- the autoconfig identity stated as belonging to the board
+  rather than to Copperline, with an explicit grant of its use to any
+  conforming implementation: guest binaries find the board by
+  manufacturer and product, so a second implementation presenting its own
+  identity would not run them. The serial number becomes the
+  implementation identifier, and the Zorro II profile takes its own
+  product number.
 - **0.8** -- the trace container finalised against its first
   implementation and its runner, replacing the sketch: exact section
   layouts, the big-endian `u32` rule, prefix-then-payload shape,
@@ -970,9 +1045,15 @@ references Copperline's internal types or its savestate format. An
 emulator or hardware design wanting to run the same guest library needs
 to:
 
-1. Autoconfig a board at manufacturer `0x1448`, product `9`, in the Z2
-   or Z3 profile, with no autoboot ROM, and report its layout through
-   `APERTURE_OFFSET`/`APERTURE_SIZE`/`MAX_CONTEXTS`.
+1. Autoconfig a board at manufacturer `0x1448`, product `9` (Zorro III)
+   or `10` (Zorro II), with no autoboot ROM, and report its layout
+   through `APERTURE_OFFSET`/`APERTURE_SIZE`/`MAX_CONTEXTS`. Use that
+   identity if you want existing guest software to find your board with
+   no changes -- the grant in [Zorro identity](#c3d-zorro-identity)
+   exists so that you can, and your own name goes in the serial number.
+   If you would rather use your own registered manufacturer ID, add a row
+   to the [identity registry](#c3d-identity-registry) instead, and expect
+   to wait for a guest-library release before your board is found.
 2. Implement the global and context register files, honouring the
    [access rules](#c3d-access-size) for its bus width.
 3. Implement the ring decoder and the baseline command set over its own
