@@ -1,6 +1,6 @@
 # The C3D 3D accelerator board: device specification
 
-**Draft 0.4.** This chapter specifies the register file, command stream,
+**Draft 0.7.** This chapter specifies the register file, command stream,
 and semantics of C3D, a virtual fixed-function 3D accelerator board
 implemented in Copperline (`src/c3d/`, `[c3d]`) and targeted by a guest
 `minigl.library`. It is written to be implementable by another emulator
@@ -116,7 +116,7 @@ guest library uses exclusively for registers.
 | Offset | Name | Access | Reset | Purpose |
 |---|---|---|---|---|
 | `0x000` | `ID` | RO | `0x4333_4420` | Magic `"C3D "`; identifies a C3D device |
-| `0x004` | `VERSION` | RO | `0x0000_0004` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
+| `0x004` | `VERSION` | RO | `0x0000_0007` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
 | `0x008` | `CAPS0` | RO | board-fixed | [Capability bits](#c3d-tiers) |
 | `0x00C` | `CAPS1` | RO | `0` | Reserved for future capability bits |
 | `0x010` | `STATUS` | RO | `0x0000_0001` | Bit 0 `READY`; bit 1 `RESETTING`; bit 2 `FATAL` (an implementation-internal failure; every context is halted; only `CONTROL.RESET` recovers) |
@@ -196,7 +196,7 @@ Context `n` (`0 <= n < MAX_CONTEXTS`) has a 256-byte register page at
 
 | Offset | Name | Access | Reset | Purpose |
 |---|---|---|---|---|
-| `0x00` | `CTX_CONTROL` | RW | `0` | Bit 0 `ALLOC` (set: page in use; clear: context freed, all its objects destroyed, ring stopped); bit 1 `ENABLE` (decode the ring); bit 2 `RESET` (write 1: return this context's GL state and objects to their initial values without touching the ring pointers; self-clearing) |
+| `0x00` | `CTX_CONTROL` | RW | `0` | Bit 0 `ALLOC` (set: page in use; clear: context freed, all its objects destroyed, ring stopped); bit 1 `ENABLE` (decode the ring); bit 2 `RESET` (write 1: return this context's GL state and objects to their initial values, and clear `GL_ERROR`, `ERROR_CODE`/`ERROR_OFFSET` and `CTX_STATUS.HALTED`, without touching the ring pointers; self-clearing). Unlike `CTX_RESET_STATE`, this **does** clear both error latches -- it is the guest asking for a clean slate, and a context that stayed halted across it, or that inherited a halt when freed and reallocated, would be stuck |
 | `0x04` | `CTX_STATUS` | RO | `0` | Bit 0 `BUSY` (commands submitted and not yet complete); bit 1 `HALTED` (a framing error halted decoding; see [Errors](#c3d-errors)); bit 2 `IDLE_RING` (`RING_HEAD == RING_TAIL`) |
 | `0x08` | `RING_BASE` | RW | `0` | Ring start: an aperture offset, or a guest address if bit 31 of `RING_SIZE` is set (`CAP_GUESTMEM`). Must be longword aligned. |
 | `0x0C` | `RING_SIZE` | RW | `0` | Bits 30:0: ring bytes, a power of two, 4 KiB..`MAX_RING_SIZE`; bit 31: `RING_BASE` is a guest address. Written only while `ENABLE` is clear; writing it also resets `RING_HEAD` and `RING_TAIL` to `0`. |
@@ -310,7 +310,7 @@ and are skipped (their `length` is trusted so decoding can continue).
 | `0x0001` | `FENCE` | `id` | When every preceding command in this ring has taken effect (including readbacks and query results landing in memory), `FENCE_COMPLETED` becomes `id` and, if enabled, the context's fence interrupt is raised. `id` must be greater (unsigned) than the previous fence's; `0` is never a valid fence ID. |
 | `0x0002` | `FLUSH` | -- | Hint that the guest will wait; the device should not defer work. No guest-visible effect. |
 | `0x0003` | `FINISH` | -- | Equivalent to `FLUSH`; provided so a trace reads like the GL calls that produced it. The guest waits by fencing. |
-| `0x0004` | `CTX_RESET_STATE` | -- | Return this context's GL state (not its objects, not its ring) to initial values. |
+| `0x0004` | `CTX_RESET_STATE` | -- | Return this context's GL state (not its objects, not its ring) to initial values. **`GL_ERROR` and the protocol-error latch are left untouched**: this is a command in the stream, and silently discarding an error the guest has not yet read would lose it. |
 
 (c3d-fences)=
 **Fences** are the only synchronisation primitive. `glFinish` is
@@ -331,7 +331,7 @@ IDs are guest-allocated, `1..MAX_SURFACES`; `0` means "none".
 
 | Opcode | Name | Payload | Effect |
 |---|---|---|---|
-| `0x0100` | `SURFACE_DEFINE` | `id, width, height, stride_bytes, format, flags, address` | Create or **redefine** surface `id`. `flags` bit 0: `address` is a guest address (`CAP_SURFACE_GUESTADDR`), else an aperture offset. Redefining an existing surface keeps its depth buffer if the size is unchanged and otherwise recreates it. `stride_bytes` &ge; the row's byte length. The colour contents of a freshly defined surface are **undefined** until a `CLEAR` or `SURFACE_UPLOAD`. |
+| `0x0100` | `SURFACE_DEFINE` | `id, width, height, stride_bytes, format, flags, address` | Create or **redefine** surface `id`. `flags` bit 0: `address` is a guest address (`CAP_SURFACE_GUESTADDR`), else an aperture offset. Redefining an existing surface keeps its depth buffer if the size is unchanged and otherwise recreates it. `stride_bytes` must be at least the row's byte length (`width` &times; the format's bytes per pixel) or `E_BAD_ARG`. An **aperture-backed** surface must lie wholly inside the aperture -- its last row begins at `address + (height - 1) &times; stride_bytes` and runs for the row's byte length -- or `E_BAD_REF`; a guest-address surface is not range-checked, exactly as a space-`1` reference is not. The colour contents of a freshly defined surface are **undefined** until a `CLEAR` or `SURFACE_UPLOAD`. |
 | `0x0101` | `SURFACE_DESTROY` | `id` | Release it. If it is the draw surface, the draw surface becomes `0` and draws are `E_NO_SURFACE`. |
 | `0x0102` | `SET_DRAW_SURFACE` | `id` | Subsequent draws, clears and readbacks target `id`. |
 | `0x0103` | `SURFACE_UPLOAD` | `x, y, w, h` | Read the rectangle from the surface's backing memory into the render target (the guest has drawn 2D into the bitmap and wants 3D composited over it). |
@@ -474,7 +474,10 @@ Initial state is GL's: everything disabled except `DITHER`; blend
 `ALWAYS, 0`; cull `BACK`, front `CCW`; shade `SMOOTH`; colour mask all
 `1`; scissor and viewport the full draw surface at
 `SET_DRAW_SURFACE` time; clear colour `0,0,0,0`, clear depth `1`; fog
-`EXP`, density `1`, start `0`, end `1`, colour `0,0,0,0`.
+`EXP`, density `1`, start `0`, end `1`, colour `0,0,0,0`; blend
+equation `FUNC_ADD`, and `BLEND_FUNC_SEPARATE`'s two pairs equal to the
+blend func's; polygon mode `FILL` for both faces; line width and point
+size `1`.
 
 (c3d-cmd-matrix)=
 ### Matrix (`0x03xx`) -- `CAP_TRANSFORM`
@@ -528,7 +531,7 @@ only in version 1.
 
 | Opcode | Name | Payload | Notes |
 |---|---|---|---|
-| `0x0500` | `TEX_CREATE` | `id` | Creates an empty object with default parameters. Creating an existing ID resets it. |
+| `0x0500` | `TEX_CREATE` | `id` | Creates an empty object with default parameters. Creating an existing ID resets its parameters and discards its images, but **leaves any unit bindings to it intact** -- the object's identity persists, and only `TEX_DESTROY` unbinds. |
 | `0x0501` | `TEX_DESTROY` | `id` | Unbinds it from every unit. |
 | `0x0502` | `TEX_BIND` | `unit, id` | |
 | `0x0503` | `TEX_IMAGE` | `id, level, format, width, height, row_bytes, ref` | Defines mip `level` (`0..`) of `id` from the pixels at `ref`, `height` rows of `row_bytes` bytes (so rows may carry GL's unpack padding without repacking). `width`/`height` powers of two, &le; `MAX_TEXTURE_SIZE`. Level `n` must be half of level `n-1` in each dimension (min 1). The image is copied at consume time per the [lifetime rule](#c3d-ref-lifetime). |
@@ -596,7 +599,7 @@ vertex has, in this fixed order:
 |---|---|---|---|
 | -- | `POS` | 4, 3 or 2 | always present: `x, y, z, w` (`f32`); `w` is `rhw` in window space (see below). The word count is set by `POS_COUNT`; omitted components are implied `z = 0`, `w`/`rhw = 1.0`. |
 | 0 | `COLOR` | 4 | `r, g, b, a` (`f32`, `0..1`) |
-| 1 | `NORMAL` | 3 | `nx, ny, nz` (`f32`) -- transform tier |
+| 1 | `NORMAL` | 3 | `nx, ny, nz` (`f32`) -- transform tier. **Illegal in a window-space draw** (`E_BAD_ARG`) on any device: such a vertex has already been transformed *and* lit, so a normal cannot mean anything there. |
 | 2 | `TEXCOORD0` | 2 | `s, t` (`f32`) |
 | 3 | `TEXCOORD1` | 2 | unit 1 (`CAP_MULTITEXTURE`) |
 | 4 | `TEXCOORD2` | 2 | unit 2 |
@@ -750,8 +753,8 @@ nowhere and lost; the guest is expected to ACK promptly.
 | `4` | `E_BAD_ARG` | skip | A payload word outside its documented range, a `length` inconsistent with `count`/`format`, or a non-zero reserved field |
 | `5` | `E_BAD_REF` | skip | A ref outside the aperture, outside reachable guest memory, misaligned, or in space `1` without `CAP_GUESTMEM` |
 | `6` | `E_BAD_ID` | skip | A texture or surface ID of `0` or above its limit |
-| `7` | `E_NO_SURFACE` | skip | A draw, clear, readback or upload with no draw surface |
-| `8` | `E_BAD_RECT` | skip | A rectangle outside its surface |
+| `7` | `E_NO_SURFACE` | skip | A draw, clear, readback, upload, `READ_PIXELS`, or copy-to-texture (`TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`) with no draw surface |
+| `8` | `E_BAD_RECT` | skip | A rectangle outside its surface. Applies to `SURFACE_UPLOAD`, `SURFACE_READBACK`, `READ_PIXELS` and the copy-to-texture commands' source rectangle; **not** to `SCISSOR` or `VIEWPORT`, which GL clamps rather than rejecting |
 | `9` | `E_UNSUPPORTED_FORMAT` | skip | A surface or texture format the device does not report |
 | `10` | `E_LIMIT` | skip | Beyond a reported limit (texture size, unit, light, plane) |
 
@@ -793,6 +796,24 @@ or takes the interrupt. On real hardware, time is real time.
 Pixel output is **not** bit-identical across implementations. The
 [conformance suite](#c3d-conformance) compares with a stated tolerance.
 
+**Floating-point results are guaranteed reproducible per
+implementation and per platform, not across platforms.** The device
+computes in IEEE-754 single or double precision, and a transcendental
+an implementation needs -- `ROTATE`'s sine and cosine, a fog table --
+comes from whatever maths library that build uses. Those differ in the
+last unit in the last place between platform maths libraries, so a
+value a guest can read back with `QUERY` (a matrix a chain of `ROTATE`s
+built) may differ in its lowest bits between two hosts running the
+same implementation. Within one build on one platform the result is
+reproducible run to run, which is what a save state, a scripted
+capture and a regression comparison rely on; a conformance golden is
+compared with the suite's tolerance, which covers it. An
+implementation that wants cross-platform bit-exactness must supply its
+own transcendentals rather than call the platform's, and this
+specification does not require it. (Copperline states the same
+guarantee for its MPEG audio decoder, and for the same reason; see
+[](mhi.md)'s Copperline implementation notes.)
+
 (c3d-api-device-split)=
 ## The API/device split
 
@@ -821,7 +842,7 @@ porting client glue.
 (c3d-versioning)=
 ## Versioning
 
-`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.4` and the
+`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.7` and the
 first released protocol will be `1.0`. A **major** bump is incompatible:
 a guest library refuses a major it does not know. A **minor** bump is
 additive: new opcodes, new capability bits, new limits registers at
@@ -833,6 +854,21 @@ major.
 
 ### Draft history
 
+- **0.7** -- gaps the dispatch layer exposed: `E_NO_SURFACE` and
+  `E_BAD_RECT` extended to `READ_PIXELS` and the copy-to-texture
+  commands, which read the draw surface but were never listed (they were
+  added in 0.3 without updating the error table); the effect of both
+  resets on `GL_ERROR` and the protocol-error latch stated.
+- **0.6** -- validation rules the first implementation showed were stated
+  loosely or not at all: `NORMAL` is `E_BAD_ARG` in a window-space draw;
+  `stride_bytes` below the row's byte length is `E_BAD_ARG`; an
+  aperture-backed surface whose extent leaves the aperture is `E_BAD_REF`.
+- **0.5** -- after the first implementation of the ring decoder and state
+  machine: floating-point reproducibility stated as per-platform, not
+  cross-platform; `BLEND_EQUATION`, `BLEND_FUNC_SEPARATE`, polygon mode,
+  line width and point size given initial values (the initial-state
+  paragraph predated them); `TEX_CREATE`'s effect on existing unit
+  bindings stated.
 - **0.4** -- after the first client's lock-mode, swap, multitexture and
   pixel-read semantics were checked: readback contract tightened (logically
   complete at the fence; later guest writes take precedence; deferral must
