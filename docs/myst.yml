@@ -85,6 +85,7 @@ project:
         - file: internals/toccata.md
         - file: internals/mhi.md
         - file: internals/copperhf.md
+        - file: internals/c3d.md
         - file: internals/zz9k.md
         - file: internals/picasso2.md
         - file: internals/graffity.md
@@ -138,6 +139,7 @@ project:
         - internals/toccata.md
         - internals/mhi.md
         - internals/copperhf.md
+        - internals/c3d.md
         - internals/zz9k.md
         - internals/picasso2.md
         - internals/graffity.md
