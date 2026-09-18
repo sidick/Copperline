@@ -18,9 +18,20 @@
 //! - [`dispatch`] -- connects `ring` to `state`: one context's registers,
 //!   the doorbell, and the renderer-op stream it produces
 //! - [`trace`] -- the conformance/capture trace container
+//!
+//! One module is not pure logic and is gated accordingly: [`render`]
+//! (cargo feature `c3d`, off by default) is the wgpu backend that turns
+//! [`dispatch`]'s renderer operations into pixels, and it is what the
+//! `copperline-c3d-trace` conformance runner drives.
 
 pub mod dispatch;
 pub mod proto;
 pub mod ring;
 pub mod state;
 pub mod trace;
+
+/// The wgpu renderer. Gated because it is the one part of the board that
+/// creates a GPU device; everything above it is pure logic and builds
+/// everywhere the core does.
+#[cfg(feature = "c3d")]
+pub mod render;

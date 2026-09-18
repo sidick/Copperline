@@ -43,7 +43,7 @@
 //! | `C3DT` | `container_version, protocol_version, capability_mask` | none (fixed 12 bytes) | Trace header. Must be the **first** section in the file and must appear **exactly once**. `protocol_version` is the C3D `VERSION` register value the trace was captured against; `capability_mask` is the `CAPS0` bits the trace exercises -- a runner refuses to replay against a device that lacks any of them. |
 //! | `APER` | `offset` | aperture image bytes | An initial image of part of the data aperture, to be written at `offset` before replay begins. May appear zero or more times. |
 //! | `RING` | `context, ring_tail` | ring bytes | One submission: the bytes the guest appended to `context`'s ring, and the `RING_TAIL` value it then wrote (the doorbell). A runner writes the bytes at the ring's current tail and then sets `RING_TAIL` to `ring_tail`, in that order, exactly reproducing the two-step guest sequence. May appear any number of times; replayed in file order. |
-//! | `BLOB` | `address` | referenced bytes | The bytes a ref (`docs/internals/c3d.md`, "References") named at capture time, to be materialised at guest (or aperture) `address` before the `RING` section that references them is replayed. May appear any number of times. |
+//! | `BLOB` | `space, address` | referenced bytes | The bytes a ref (`docs/internals/c3d.md`, "References") named at capture time, to be materialised at guest (or aperture) `address` before the `RING` section that references them is replayed. May appear any number of times. |
 //! | `GOLD` | `context, fence_id, surface_id` | PNG bytes | A golden image: the expected contents of `surface_id` once `context`'s `FENCE_COMPLETED` reaches `fence_id`. The PNG bytes are opaque to this module -- carried, never decoded. May appear any number of times. |
 //!
 //! Any other tag is read as [`Section::Unknown`], carrying its raw
@@ -280,6 +280,14 @@ pub struct RingSection<'a> {
 /// Guest memory a ref named at capture time (`BLOB`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobSection<'a> {
+    /// Which address space `address` names: `0` the data aperture, `1`
+    /// guest memory. A reference in the command stream carries the same
+    /// distinction, and a trace captured from a `CAP_GUESTMEM` device has
+    /// blobs in both, so the container has to carry it too -- without it
+    /// a runner must guess, and a guess that differs from the capturing
+    /// implementation's silently replays the trace against the wrong
+    /// memory.
+    pub space: u32,
     pub address: u32,
     pub data: &'a [u8],
 }
@@ -483,7 +491,7 @@ impl<'a> Iterator for TraceReader<'a> {
                 })
             }
             TAG_BLOB => {
-                let (prefix, data) = match Self::split_prefix(tag, at, payload, 1) {
+                let (prefix, data) = match Self::split_prefix(tag, at, payload, 2) {
                     Ok(v) => v,
                     Err(e) => {
                         self.failed = true;
@@ -491,7 +499,8 @@ impl<'a> Iterator for TraceReader<'a> {
                     }
                 };
                 Section::Blob(BlobSection {
-                    address: read_u32(prefix),
+                    space: read_u32(prefix),
+                    address: read_u32(&prefix[4..]),
                     data,
                 })
             }
@@ -606,9 +615,13 @@ impl<W: Write> TraceWriter<W> {
     }
 
     /// Append a `BLOB` section: the bytes a ref named at capture time.
-    pub fn blob(&mut self, address: u32, data: &[u8]) -> io::Result<()> {
+    pub fn blob(&mut self, space: u32, address: u32, data: &[u8]) -> io::Result<()> {
         self.require_header()?;
-        self.write_section(TAG_BLOB, &[&address.to_be_bytes()], data)
+        self.write_section(
+            TAG_BLOB,
+            &[&space.to_be_bytes(), &address.to_be_bytes()],
+            data,
+        )
     }
 
     /// Append a `GOLD` section: a golden PNG for `surface_id` once
@@ -649,7 +662,7 @@ mod tests {
         w.header(0x0001_0004, 0b0101_1111).unwrap();
         w.aperture(0x1000, &[1, 2, 3, 4]).unwrap();
         w.ring(0, 0x40, &[0, 0, 0, 1, 0, 0, 0, 0]).unwrap();
-        w.blob(0x2000, b"texel data").unwrap();
+        w.blob(0, 0x2000, b"texel data").unwrap();
         w.gold(0, 7, 1, b"\x89PNG\r\n\x1a\nfakepngbytes").unwrap();
         buf
     }

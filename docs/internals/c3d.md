@@ -1,6 +1,6 @@
 # The C3D 3D accelerator board: device specification
 
-**Draft 0.7.** This chapter specifies the register file, command stream,
+**Draft 0.8.** This chapter specifies the register file, command stream,
 and semantics of C3D, a virtual fixed-function 3D accelerator board
 implemented in Copperline (`src/c3d/`, `[c3d]`) and targeted by a guest
 `minigl.library`. It is written to be implementable by another emulator
@@ -116,7 +116,7 @@ guest library uses exclusively for registers.
 | Offset | Name | Access | Reset | Purpose |
 |---|---|---|---|---|
 | `0x000` | `ID` | RO | `0x4333_4420` | Magic `"C3D "`; identifies a C3D device |
-| `0x004` | `VERSION` | RO | `0x0000_0007` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
+| `0x004` | `VERSION` | RO | `0x0000_0008` | `major << 16 \| minor`; see [Versioning](#c3d-versioning) |
 | `0x008` | `CAPS0` | RO | board-fixed | [Capability bits](#c3d-tiers) |
 | `0x00C` | `CAPS1` | RO | `0` | Reserved for future capability bits |
 | `0x010` | `STATUS` | RO | `0x0000_0001` | Bit 0 `READY`; bit 1 `RESETTING`; bit 2 `FATAL` (an implementation-internal failure; every context is halted; only `CONTROL.RESET` recovers) |
@@ -842,7 +842,7 @@ porting client glue.
 (c3d-versioning)=
 ## Versioning
 
-`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.7` and the
+`VERSION` (`0x004`) is `major << 16 | minor`; this draft is `0.8` and the
 first released protocol will be `1.0`. A **major** bump is incompatible:
 a guest library refuses a major it does not know. A **minor** bump is
 additive: new opcodes, new capability bits, new limits registers at
@@ -854,6 +854,12 @@ major.
 
 ### Draft history
 
+- **0.8** -- the trace container finalised against its first
+  implementation and its runner, replacing the sketch: exact section
+  layouts, the big-endian `u32` rule, prefix-then-payload shape,
+  skip-unknown-tags, and an address *space* on `BLOB`, which the sketch
+  omitted entirely and without which a runner must guess which memory a
+  captured blob belongs in.
 - **0.7** -- gaps the dispatch layer exposed: `E_NO_SURFACE` and
   `E_BAD_RECT` extended to `READ_PIXELS` and the copy-to-texture
   commands, which read the draw surface but were never listed (they were
@@ -904,17 +910,47 @@ per-image tolerance. A native runner (trace in, images out, compare)
 lets an implementer test a backend with no Amiga, no guest library and
 no ROM.
 
-**Trace container** (version 1): a file of tagged sections, each
-`tag[4] length[4] payload` with big-endian lengths. Sections:
-`C3DT` header (container version, protocol version, capability mask the
-trace requires); `APER` an initial aperture image (offset, bytes);
-`RING` one submission (context, the bytes appended to the ring, the
-`RING_TAIL` written); `BLOB` guest memory a ref names (address, bytes),
-recorded at capture time; `GOLD` a golden image for the draw surface at
-a fence (context, fence ID, surface ID, PNG). A runner replays the
-`RING` sections in order, materialising `BLOB`s before each, and
-compares each `GOLD`. The format is finalised with the runner in
-protocol 1.0.
+**Trace container** (version 1). A file is a sequence of sections back to
+back, with no padding, no alignment and no trailer; a reader stops
+cleanly when the bytes run out. Each section is:
+
+```text
+tag[4] length[4] payload[length]
+```
+
+`length` is the payload's byte count as a big-endian `u32`, capping one
+section at 4 GiB. Every fixed field below is likewise a big-endian
+`u32`, matching the wire format's own convention rather than introducing
+a second. Each section is a fixed-size prefix followed by one run of
+variable-length bytes, so a reader can locate every field at a fixed
+offset and slice the remainder without scanning.
+
+| Tag | Fixed prefix | Trailing bytes | Repeats |
+|---|---|---|---|
+| `C3DT` | `container_version, protocol_version, capability_mask` | none | **first section, exactly once** |
+| `APER` | `offset` | aperture image | any |
+| `RING` | `context, ring_tail` | ring bytes | any |
+| `BLOB` | `space, address` | referenced bytes | any |
+| `GOLD` | `context, fence_id, surface_id` | PNG | any |
+
+- `C3DT`'s `capability_mask` is the `CAPS0` bits the trace exercises; a
+  runner refuses to replay it against a device lacking any of them.
+- `RING` is one submission: a runner writes the bytes at the ring's
+  current tail and then sets `RING_TAIL`, in that order, reproducing the
+  guest's two-step sequence. Replayed in file order.
+- `BLOB` is the bytes a reference named at capture time, materialised
+  before the `RING` section that uses them. `space` is `0` for the data
+  aperture and `1` for guest memory, matching a
+  [reference](#c3d-refs)'s own space field -- a trace captured from a
+  `CAP_GUESTMEM` device carries both, and replaying one into the wrong
+  space corrupts the replay silently.
+- `GOLD` is the expected contents of `surface_id` once `context`'s
+  `FENCE_COMPLETED` reaches `fence_id`. Compared with the suite's
+  tolerance, never exactly.
+- **An unrecognised tag is skipped, not rejected**, so a later revision
+  may add a section kind without breaking an older runner -- the same
+  forward-compatibility rule unknown opcodes follow. Ordering beyond
+  "`C3DT` first" is a runner's concern, not the container's.
 
 Coverage targets for 1.0: each primitive type, flat and smooth, each
 texenv mode, the common blend factor pairs, alpha funcs, depth funcs,

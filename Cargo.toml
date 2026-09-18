@@ -80,6 +80,22 @@ cd32-fmv = [
     "dep:symphonia-core",
     "symphonia-bundle-mp3/mp2",
 ]
+# The C3D virtual 3D accelerator board's renderer and its conformance-trace
+# runner (src/c3d/render.rs, the `copperline-c3d-trace` binary). **Off by
+# default**, unlike the other board features: this is the only part of the
+# tree that creates a GPU device of its own, so a build that does not want
+# 3D pays nothing for it -- no adapter enumeration at startup, and no wgpu
+# in a `--no-default-features` core. The board's pure logic (the ring
+# decoder, the GL state machine, the dispatch layer and the trace
+# container, src/c3d/) is deliberately NOT behind this feature: it depends
+# on nothing and builds everywhere the core does, including wasm32, so the
+# conformance logic is never silently excluded from CI.
+#
+# wgpu and pollster are already in the default build's dependency graph
+# through `pixels`, so enabling this adds no new crate copies; the version
+# is pinned to the one `pixels` resolves to for that reason, and moves with
+# it (see the pixels/egui lockstep note below).
+c3d = ["dep:wgpu", "dep:pollster"]
 display-plan-trace = []
 # Detailed host-cost counters used by native diagnostics. The browser crate
 # builds the core with `default-features = false`, so its release hot paths do
@@ -181,6 +197,12 @@ mt32-rs = { git = "https://github.com/CopperlineHQ/mt32-rs", rev = "ac00f818629a
 # The General MIDI synthesiser (Coppersynth), pinned by revision.
 coppersynth = { git = "https://github.com/CopperlineHQ/Coppersynth", rev = "38873e283aa9f2e6d2574d6c71e9a2cf9d0b42a2", optional = true }
 pixels = { version = "0.17", optional = true }
+# The C3D board's renderer (feature `c3d`). Held at the version `pixels`
+# already resolves, so the two share one wgpu in the graph rather than
+# linking a second copy; `pollster` blocks on adapter and device requests
+# from the trace runner, which has no async runtime and wants none.
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
 winit = { version = "0.30", optional = true }
 # egui 0.35 shares pixels 0.17's wgpu 29 device and command encoder.
 # Upgrade pixels and all egui adapters together: egui 0.36 uses wgpu 30.
@@ -420,6 +442,11 @@ required-features = ["bench-bin"]
 name = "copperline-ctl"
 path = "src/bin/copperline-ctl.rs"
 required-features = ["ctl-bin"]
+
+[[bin]]
+name = "copperline-c3d-trace"
+path = "src/bin/c3d-trace.rs"
+required-features = ["c3d"]
 
 [[bin]]
 name = "copperline-import-uae"
