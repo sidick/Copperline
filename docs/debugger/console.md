@@ -1,18 +1,23 @@
 # Debugger console
 
-The debugger console provides an interactive command line interface in a
-dedicated tool window (`Cmd+K` on macOS, `Alt+K` on Linux/Windows, or via
-the status bar menu).
+The debugger console provides an interactive command line in the
+[Debug workspace](window.md#shared-inspector-window). Open it with
+`Cmd+K` on macOS, `Alt+K` on Linux/Windows, or select **Console** in the workspace.
 
-```{figure} ../images/ui-preview-console.png
-:alt: The debugger console
-:width: 90%
+Opening the first inspector pauses emulation (`RUN` resumes execution).
+Switching inspectors preserves command text, output, history, and the current
+run/pause state. Closing one leaves the remaining inspectors open; closing the
+last restores the previous execution state. Explicit Run/Pause choices apply
+to the shared session. The title bar's **Play** switch hides the inspectors
+without closing them or changing the current run/pause state. Their command
+text and history remain available when you return.
 
-Debugger console interface with active breakpoint output.
+```{figure} ../images/ui-preview-console-egui.png
+:alt: Console with selectable output and an editable command field
+:width: 100%
+
+Inspector-only preview of the Console.
 ```
-
-Opening the console pauses emulation (`RUN` resumes execution). Closing the
-console restores the previous execution state.
 
 Guest debug output sent via the
 [uaelib trap](../guide/run.md#uaelib-trap) `KPrintF` helper appears in the
@@ -20,11 +25,15 @@ console as `DBG:` lines while the pane is open (and is always mirrored to the
 host terminal). Lines emitted while the console is closed are not buffered.
 
 Input navigation:
-- `Enter`: Execute command.
-- `Up` / `Down`: Navigate command history.
-- `PageUp` / `PageDown` or mouse wheel: Scroll console output buffer.
-- `Cmd+V` (macOS) or `Ctrl+V` (Linux/Windows): Paste clipboard contents. Multi-line
-  pastes execute each complete line sequentially.
+
+- `Enter` or **Execute**: run the entered commands in order. A `CLOSE` command
+  ends the submitted batch.
+- `Shift+Enter`: add a line to the command field.
+- `Up` / `Down`: browse command history while the command field has focus.
+- `PageUp` / `PageDown`, scrollbars, or mouse wheel: scroll the output buffer.
+- `Cmd+V` (macOS) or `Ctrl+V` (Linux/Windows): paste clipboard contents.
+  Pasted commands remain editable until submitted.
+- `Esc`: leave the command field; outside a text field, return to Play while retaining the inspectors.
 
 Commands are case-insensitive. Addresses and data values use hexadecimal notation
 (optional `$` or `0x` prefix). Raster beam coordinates (VPOS, HPOS) use decimal notation.
@@ -48,6 +57,12 @@ Commands are case-insensitive. Addresses and data values use hexadecimal notatio
 | `RSTEP [N]` (or `RS`) | Reverse step `N` CPU instructions |
 | `RFRAME` | Step one video frame backward |
 | `RRUN` (or `RC`) | Run backward to previous breakpoint or watchpoint |
+
+`STEP`, `OVER`, `OUT` and `RUNTO` carry a CPU parked in `STOP` to the
+interrupt that wakes it -- a stopped 68000 retires nothing until one
+arrives -- so a single `STEP` there retires the handler's first
+instruction. A CPU no interrupt can reach (SR mask 7, or nothing enabled
+in `INTENA`) stays stopped after two video frames of waiting.
 
 ### Breakpoints and watchpoints
 
@@ -80,13 +95,20 @@ Commands are case-insensitive. Addresses and data values use hexadecimal notatio
 | `OUTROM` | Run until PC leaves the default Kickstart ROM window (`$F80000-$FFFFFF`) |
 | `HISTORY [N]` (or `H`) | Display recent instruction history |
 | `STACK` (or `BT`) | Heuristic stack trace of recent return addresses |
-| `POKE ADDR VAL` | Write word value to memory |
+| `POKE ADDR VAL` | Write a word to memory (`ADDR` rounded down to even) |
+| `POKE ADDR VAL VAL ...` | Write a byte sequence from `ADDR`: hex byte pairs, as `FIND` takes them (`POKE 60000 12 34 56`) |
+| `POKE.B \| POKE.W \| POKE.L ADDR VAL [VAL ...]` | Write one or more bytes, words, or longs consecutively from `ADDR` (`.W`/`.L` round it down to even). A value wider than the size is refused, not truncated |
 | `SETREG REG VAL` | Set CPU register value (e.g. `SETREG D0 1234`) |
 | `TRACE START [PATH]` | Begin continuous instruction disassembly logging |
 | `TRACE STOP` | Stop instruction trace logging |
 | `WAVE START [ARGS]` | Arm VCD logic analyzer capture (see [](waveform.md)) |
 | `WAVE STOP` | Stop VCD capture |
 | `HELP` (or `?`) | Display command summary |
+
+Every `POKE` form is a plain CPU-visible RAM write with the semantics of the
+control protocol's `mem.write` and the Memory tab's editor: ROM, overlay
+ROM, and device windows are refused and reported, and memory watchpoints
+are rebaselined so the poke itself does not stop the machine.
 
 `WRITER` compares the word after each CPU step. It misses writes that leave
 the value unchanged, and its reported PC is the CPU instruction around the

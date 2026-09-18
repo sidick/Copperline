@@ -473,6 +473,40 @@ impl App {
                 };
                 self.control_send(line);
             }
+            HostOp::PcmciaInsert {
+                kind,
+                path,
+                size,
+                read_only,
+            } => {
+                let line = match crate::control::exec::pcmcia_insert(
+                    &mut self.emu,
+                    kind,
+                    path.as_deref(),
+                    size,
+                    read_only,
+                ) {
+                    Ok(description) => {
+                        self.show_osd(format!("PCMCIA: {description}"));
+                        self.request_redraw();
+                        proto::ok_line(&id, json!({"card": description}))
+                    }
+                    Err(e) => proto::err_line(&id, &e),
+                };
+                self.control_send(line);
+            }
+            HostOp::PcmciaEject => {
+                let line = if !self.emu.bus().pcmcia_slot_present() {
+                    proto::err_line(
+                        &id,
+                        &CtlError::unsupported("no PCMCIA slot on this machine"),
+                    )
+                } else {
+                    let ejected = self.eject_pcmcia_card();
+                    proto::ok_line(&id, json!({"ejected": ejected}))
+                };
+                self.control_send(line);
+            }
             HostOp::CopperhfAttach {
                 unit,
                 path,
@@ -682,7 +716,10 @@ impl App {
                 ResumeKind::Step { n } => {
                     label = "instruction step";
                     for _ in 0..n {
-                        self.emu.debug_step_realtime()?;
+                        // Past a STOP, like the headless server and the
+                        // workspace's own Step: a parked CPU retires
+                        // nothing until an interrupt reaches it.
+                        self.emu.debug_step_realtime_past_stop()?;
                         if self.emu.machine.ui_debug_stop_pending() {
                             break;
                         }
@@ -1037,6 +1074,10 @@ impl App {
                 self.emu.bus_mut().input.set_analogue(port as usize, x, y);
                 self.emu
                     .tt_note_input(crate::inputsched::ReplayAction::Pot { port, x, y });
+            }
+            InputAction::Pen { position } => {
+                let (x, y) = position.unwrap_or((-1, -1));
+                self.apply_scripted_pen_position(x, y, None);
             }
         }
     }

@@ -31,6 +31,7 @@ pub mod cd32_fmv;
 pub mod cdrom;
 pub mod cdtv;
 pub mod chipset;
+pub mod clipboard;
 pub mod config;
 #[cfg(feature = "control")]
 pub mod control;
@@ -50,6 +51,7 @@ pub mod dms;
 pub mod drive_sounds;
 pub mod emulator;
 pub mod envcfg;
+pub mod expect;
 pub mod filesys;
 pub mod floppy;
 // Physical floppy drives over a Greaseweazle, through the pure-Rust
@@ -67,6 +69,8 @@ pub mod gamelib;
 pub mod gamepad;
 pub mod gary;
 pub mod gayle;
+pub mod gifclip;
+pub mod pcmcia;
 // The remote GDB stub (`--gdb`). Gated so player builds -- shipped games
 // with no debugging surface -- can compile it out; everything else keeps it
 // through the default features.
@@ -87,6 +91,7 @@ pub mod ipf;
 // codes and produces the same `JoystickState` the gamepad reader does), so it
 // rides the same feature gate as `gamepad`. The autofire policy that pairs
 // with it lives in `config`, which every build has.
+pub mod coverage;
 #[cfg(feature = "coppersynth")]
 pub mod csynth;
 #[cfg(feature = "frontend")]
@@ -123,15 +128,19 @@ pub mod sampler;
 pub mod savestate;
 pub mod screenshot;
 pub mod scsi;
+pub mod sdcard;
 pub mod sdmac;
 pub mod serial;
+pub mod sf2000sd;
 pub mod smc;
 pub mod timebase;
 pub mod timestamp;
 pub mod timetravel;
 pub mod toccata;
+pub mod typing;
 pub mod uaelib;
 pub mod uss;
+pub mod verdict;
 pub mod video;
 pub mod warpboot;
 pub mod wasm_manifest;
@@ -139,6 +148,7 @@ pub mod wasm_manifest;
 pub mod wasmboard;
 pub mod waveform;
 pub mod whdload;
+pub mod winconsole;
 pub mod z3660;
 pub mod zorro;
 pub mod zorro_device;

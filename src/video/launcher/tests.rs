@@ -394,7 +394,7 @@ fn a_place_exists_only_while_the_disk_is_ticked() {
 
     let mut setup = MachineSetup::default();
     setup.select_model(Some(MachineModel::A1200));
-    setup.set_host_disks_for_test(disks(3));
+    setup.set_host_disks_for_test(disks(4));
 
     // Blank until ticked, and stepping a blank cell is not a request.
     assert_eq!(setup.host_disks()[0].attach, None);
@@ -420,11 +420,16 @@ fn a_place_exists_only_while_the_disk_is_ticked() {
         "the freed place is picked up by the next tick"
     );
 
-    // Nothing left on a machine with no SCSI: the third tick is refused,
-    // stays unticked, and the next tick clears the warning.
+    // An A1200 has one more place after the IDE cable: its PCMCIA slot,
+    // where the third disk goes in as a CF card.
     setup.select_host_disk(2);
-    assert!(!setup.host_disk_is_selected("disk2"));
-    assert_eq!(setup.host_disks()[2].attach, None);
+    assert_eq!(setup.host_disks()[2].attach, Some(A::Pcmcia));
+
+    // Nothing left on a machine with no SCSI: the fourth tick is refused,
+    // stays unticked, and the next tick clears the warning.
+    setup.select_host_disk(3);
+    assert!(!setup.host_disk_is_selected("disk3"));
+    assert_eq!(setup.host_disks()[3].attach, None);
     assert_eq!(
         setup.host_disk_warning(),
         Some("Every attachment point is already in use")
@@ -1248,24 +1253,36 @@ fn the_rom_tab_carries_an_identification_line_under_each_path_row() {
 fn fmv_rom_path_round_trips_through_the_launcher() {
     let mut setup = MachineSetup::default();
     setup.select_model(Some(MachineModel::Cd32));
-    assert_eq!(setup.value_label(F::FmvRom), "(bundled open FMV ROM)");
+    // The slot starts empty: a stock CD32 has no cartridge.
+    assert!(!setup.fmv_fitted());
+    assert_eq!(setup.value_label(F::FmvRom), "(no FMV module)");
+    assert_eq!(setup.to_raw().fmv, None);
     assert_eq!(setup.to_raw().fmv_rom, None);
     let path = PathBuf::from("/roms/cd32fmv.rom");
     setup.set_path(F::FmvRom, path.clone());
+    assert!(setup.fmv_fitted(), "a named ROM fits the module");
     assert_eq!(setup.path(F::FmvRom), Some(path.as_path()));
     assert_eq!(setup.to_raw().fmv_rom.as_deref(), Some("/roms/cd32fmv.rom"));
+    assert_eq!(setup.to_raw().fmv, None);
 
+    // Clearing the ROM keeps the module, now on the bundled image.
     setup.clear_path(F::FmvRom);
+    assert!(setup.fmv_fitted());
     assert_eq!(setup.path(F::FmvRom), None);
+    assert_eq!(setup.value_label(F::FmvRom), "(bundled open FMV ROM)");
+    assert_eq!(setup.to_raw().fmv, Some(true));
     assert_eq!(setup.to_raw().fmv_rom, None);
 
     setup.set_path(F::FmvRom, path);
     setup.select_model(Some(MachineModel::A1200));
     assert_eq!(setup.path(F::FmvRom), None, "non-CD32 profile drops module");
+    assert!(!setup.fmv_fitted());
 }
 
 #[test]
-fn fmv_rom_explicit_opt_out_survives_a_launcher_round_trip() {
+fn fmv_switch_and_legacy_opt_out_round_trip_through_the_launcher() {
+    // The older explicit opt-out spelling reads as the (now default) empty
+    // slot and is written back as nothing.
     let raw = RawConfig::parse(
         r#"
         fmv_rom = ""
@@ -1275,33 +1292,55 @@ fn fmv_rom_explicit_opt_out_survives_a_launcher_round_trip() {
     )
     .unwrap();
     let mut setup = MachineSetup::from_raw(&raw).unwrap();
+    assert!(!setup.fmv_fitted());
     assert_eq!(setup.path(F::FmvRom), None);
     assert_eq!(setup.value_label(F::FmvRom), "(no FMV module)");
-    assert_eq!(setup.to_raw().fmv_rom.as_deref(), Some(""));
+    assert_eq!(setup.to_raw().fmv, None);
+    assert_eq!(setup.to_raw().fmv_rom, None);
 
     setup.set_path(F::FmvRom, PathBuf::from("replacement.rom"));
     assert_eq!(setup.to_raw().fmv_rom.as_deref(), Some("replacement.rom"));
+
+    // `fmv = true` fits the bundled ROM and survives a round trip.
+    let raw = RawConfig::parse(
+        r#"
+        fmv = true
+        [machine]
+        profile = "CD32"
+        "#,
+    )
+    .unwrap();
+    let setup = MachineSetup::from_raw(&raw).unwrap();
+    assert!(setup.fmv_fitted());
+    assert_eq!(setup.path(F::FmvRom), None);
+    assert_eq!(setup.value_label(F::FmvRom), "(bundled open FMV ROM)");
+    assert_eq!(setup.to_raw().fmv, Some(true));
+    assert_eq!(setup.to_raw().fmv_rom, None);
 }
 
 #[test]
-fn fmv_module_action_switches_between_an_empty_slot_and_the_bundled_default() {
+fn fmv_module_action_switches_between_an_empty_slot_and_the_bundled_module() {
     let mut setup = MachineSetup::default();
     setup.select_model(Some(MachineModel::Cd32));
 
     setup.toggle_fmv_module();
-    assert!(setup.fmv_rom_disabled());
-    assert_eq!(setup.value_label(F::FmvRom), "(no FMV module)");
-    assert_eq!(setup.to_raw().fmv_rom.as_deref(), Some(""));
+    assert!(setup.fmv_fitted());
+    assert_eq!(setup.value_label(F::FmvRom), "(bundled open FMV ROM)");
+    assert_eq!(setup.to_raw().fmv, Some(true));
+    assert_eq!(setup.to_raw().fmv_rom, None);
 
     setup.toggle_fmv_module();
-    assert!(!setup.fmv_rom_disabled());
-    assert_eq!(setup.value_label(F::FmvRom), "(bundled open FMV ROM)");
+    assert!(!setup.fmv_fitted());
+    assert_eq!(setup.value_label(F::FmvRom), "(no FMV module)");
+    assert_eq!(setup.to_raw().fmv, None);
     assert_eq!(setup.to_raw().fmv_rom, None);
 
     setup.set_path(F::FmvRom, PathBuf::from("replacement.rom"));
     setup.toggle_fmv_module();
+    assert!(!setup.fmv_fitted());
     assert_eq!(setup.path(F::FmvRom), None);
-    assert_eq!(setup.to_raw().fmv_rom.as_deref(), Some(""));
+    assert_eq!(setup.to_raw().fmv, None);
+    assert_eq!(setup.to_raw().fmv_rom, None);
 }
 
 #[test]
@@ -2376,6 +2415,23 @@ fn display_scaling_round_trips_through_raw() {
     // Two modes, so cycling on returns to the default.
     s.cycle(LauncherField::Scaling, true);
     assert_eq!(s.scaling, DisplayScaling::Smooth);
+}
+
+#[test]
+fn vsync_launcher_toggle_survives_save_and_reload() {
+    let mut setup = MachineSetup::default();
+    assert!(setup.toggle_value(LauncherField::Vsync));
+    assert!(setup.to_raw().display.vsync.is_none());
+
+    setup.cycle(LauncherField::Vsync, true);
+    assert!(!setup.build_config().unwrap().vsync);
+    let raw = setup.to_raw();
+    assert_eq!(raw.display.vsync, Some(false));
+    let mut reloaded = MachineSetup::from_raw(&raw).unwrap();
+    assert!(!reloaded.toggle_value(LauncherField::Vsync));
+    reloaded.cycle(LauncherField::Vsync, true);
+    assert!(reloaded.build_config().unwrap().vsync);
+    assert!(reloaded.to_raw().display.vsync.is_none());
 }
 
 #[test]
@@ -3562,6 +3618,7 @@ fn sub_pages_of_hdd_cd() {
             LauncherTab::HostDisk,
             LauncherTab::Lide,
             LauncherTab::Copperhf,
+            LauncherTab::Sf2000Sd,
             LauncherTab::BootPriority,
             LauncherTab::CreateFloppy,
         ]
@@ -4150,6 +4207,72 @@ fn copperhf_units_round_trip_with_boot_priority() {
     );
     assert_eq!(back.path(F::CopperhfUnit1), Some(Path::new("data.hdf")));
     assert_eq!(back.value_label(F::CopperhfUnit0Boot), "5");
+}
+
+/// The `[sf2000sd]` Storage sub-page carries just the ROM and card rows, no
+/// personality picker (there is only one identity) -- and, like copperhf,
+/// neither row is ever greyed: there is no board/controller to lack.
+#[test]
+fn sf2000sd_rows_are_always_visible_and_never_greyed() {
+    use LauncherField as F;
+    let s = MachineSetup::default();
+    for f in [F::Sf2000SdRom, F::Sf2000SdCard] {
+        assert!(!s.row_hidden(f), "{f:?} hidden with nothing configured");
+        assert_eq!(
+            s.disabled_reason(f),
+            None,
+            "{f:?} greyed with no board to lack"
+        );
+    }
+    let page_rows = rows(
+        LauncherTab::Sf2000Sd,
+        Default::default(),
+        Default::default(),
+        false,
+        false,
+    );
+    assert_eq!(page_rows.len(), 2);
+    assert_eq!(page_rows[0].kind, RowKind::Path);
+    assert_eq!(page_rows[1].kind, RowKind::Drive);
+}
+
+/// `[sf2000sd]`'s card and boot ROM round-trip through the config screen:
+/// the card like any other drive slot (path, volume name, boot priority),
+/// and the ROM with no bundled default or `""` sentinel to track, unlike
+/// `[lide]`'s.
+#[test]
+fn sf2000sd_card_and_rom_round_trip_with_boot_priority() {
+    use LauncherField as F;
+    let mut s = MachineSetup::default();
+    s.set_path(F::Sf2000SdCard, PathBuf::from("workbench.hdf"));
+    s.set_drive_name(F::Sf2000SdCard, "Boot".to_string());
+    s.set_drive_bootpri(F::Sf2000SdCardBoot, Some(5));
+    s.set_path(F::Sf2000SdRom, PathBuf::from("sf2000sd.rom"));
+
+    assert!(s.has_boot_priority_rows());
+    assert_eq!(s.value_label(F::Sf2000SdCardBoot), "5");
+    assert_eq!(s.disabled_reason(F::Sf2000SdCardBoot), None);
+
+    let raw = s.to_raw();
+    let card = raw.sf2000sd.card.as_ref().unwrap();
+    assert_eq!(card.path, "workbench.hdf");
+    assert_eq!(card.name.as_deref(), Some("Boot"));
+    assert_eq!(card.bootpri, Some(5));
+    assert_eq!(raw.sf2000sd.rom.as_deref(), Some("sf2000sd.rom"));
+
+    let back = MachineSetup::from_raw(&raw).unwrap();
+    assert_eq!(back.path(F::Sf2000SdCard), Some(Path::new("workbench.hdf")));
+    assert_eq!(back.drive_name(F::Sf2000SdCard), Some("Boot"));
+    assert_eq!(back.value_label(F::Sf2000SdCardBoot), "5");
+    assert_eq!(back.path(F::Sf2000SdRom), Some(Path::new("sf2000sd.rom")));
+
+    // Clearing the card drops its boot priority and name -- the same
+    // "meaningless once the image is gone" rule every drive family follows.
+    s.clear_path(F::Sf2000SdCard);
+    assert!(s.row_hidden(F::Sf2000SdCardBoot));
+    assert_eq!(s.to_raw().sf2000sd.card, None);
+    // The ROM is untouched: it is not part of the card slot.
+    assert_eq!(s.path(F::Sf2000SdRom), Some(Path::new("sf2000sd.rom")));
 }
 
 /// The Boot Priority page ranks drives with no real-hardware counterpart
@@ -4754,13 +4877,15 @@ fn midi_rows_appear_only_in_midi_mode() {
 }
 
 #[test]
-fn parallel_device_cycles_none_printer_sampler() {
+fn parallel_device_cycles_none_printer_sampler_adapter() {
     let mut s = MachineSetup::default();
     assert_eq!(s.parallel_device, ParallelDevice::None);
     s.cycle(LauncherField::ParallelDevice, true);
     assert_eq!(s.parallel_device, ParallelDevice::Printer);
     s.cycle(LauncherField::ParallelDevice, true);
     assert_eq!(s.parallel_device, ParallelDevice::Sampler);
+    s.cycle(LauncherField::ParallelDevice, true);
+    assert_eq!(s.parallel_device, ParallelDevice::JoystickAdapter);
     s.cycle(LauncherField::ParallelDevice, true);
     assert_eq!(s.parallel_device, ParallelDevice::None);
 }
@@ -5591,7 +5716,9 @@ fn a_long_boot_order_pages_and_a_short_one_does_not() {
     ] {
         s.set_path(f, PathBuf::from("copperhf.hdf"));
     }
-    assert_eq!(s.boot_priority_row_count(), 20);
+    // ...and the SF2000 SD card, one more row on the third page.
+    s.set_path(F::Sf2000SdCard, PathBuf::from("sf2000sd.img"));
+    assert_eq!(s.boot_priority_row_count(), 21);
     assert_eq!(s.boot_priority_page_count(), 3);
 
     // With every slot filled, each page draws exactly its share -- the same
@@ -5611,7 +5738,7 @@ fn a_long_boot_order_pages_and_a_short_one_does_not() {
                 .count()
         })
         .collect();
-    assert_eq!(per_page, vec![BOOTPRI_PAGE_ROWS, BOOTPRI_PAGE_ROWS, 2]);
+    assert_eq!(per_page, vec![BOOTPRI_PAGE_ROWS, BOOTPRI_PAGE_ROWS, 3]);
     for row in BOOTPRI_ROWS.iter() {
         let on = pages
             .iter()
@@ -5686,9 +5813,10 @@ fn netplay_setup_edits_all_controls_without_persisting_connection_details() -> R
         assert!(state.row_applies(field));
     }
     for (field, count) in [
-        (F::NetplayPlayer, 2),
+        (F::NetplayPlayer, 3),
         (F::NetplayDelay, 7),
         (F::NetplayRollback, 12),
+        (F::NetplaySpectators, 9),
     ] {
         let initial = state.row_value(field);
         let mut values = std::collections::BTreeSet::new();
@@ -5738,6 +5866,110 @@ fn netplay_setup_rejects_invalid_details_and_generates_fresh_codes() {
 }
 
 #[test]
+fn netplay_spectator_role_watches_the_host_and_only_hosts_admit_spectators() -> Result<()> {
+    use crate::netplay::{ConnectionOptions, Role};
+    let mut state = LauncherState::new(MachineSetup::default());
+    state.toggle_netplay();
+    assert!(state.row_applies(F::NetplaySpectators));
+    assert_eq!(state.row_value(F::NetplaySpectators), "Off");
+    state.netplay.cycle(F::NetplaySpectators, true);
+    assert_eq!(state.row_value(F::NetplaySpectators), "Up to 1");
+    state.netplay.cycle(F::NetplaySpectators, false);
+    state.netplay.cycle(F::NetplaySpectators, false);
+    assert_eq!(state.row_value(F::NetplaySpectators), "Up to 8");
+    state.netplay.peer = "127.0.0.1:19733".into();
+    state.netplay.new_code();
+    let options = state.netplay.connection_options()?.unwrap();
+    assert_eq!((options.role(), options.spectators()), (Role::Host, 8));
+    // Player 2 admits nobody, and the row says so.
+    state.netplay.cycle(F::NetplayPlayer, true);
+    assert_eq!(state.netplay.role(), Role::Guest);
+    assert!(!state.row_applies(F::NetplaySpectators));
+    assert_eq!(state.netplay.connection_options()?.unwrap().spectators(), 0);
+    // A spectator addresses the host with the session code and negotiates
+    // no timing of its own.
+    state.netplay.cycle(F::NetplayPlayer, true);
+    assert_eq!(state.row_value(F::NetplayPlayer), "Spectator");
+    assert!(!state.row_applies(F::NetplayDelay));
+    assert!(!state.row_applies(F::NetplayRollback));
+    assert!(!state.row_applies(F::NetplayNewCode));
+    assert!(!state.row_applies(F::NetplaySpectators));
+    assert!(state.row_applies(F::NetplayPeer) && state.row_applies(F::NetplayCode));
+    assert!(state.netplay.options()?.is_none());
+    let options = state.netplay.connection_options()?.unwrap();
+    assert_eq!(options.role(), Role::Spectator);
+    let ConnectionOptions::Watch(watch) = options else {
+        panic!("expected direct watch options");
+    };
+    assert_eq!(watch.host.port(), 19733);
+    let remembered = NetplaySetup::from(&ConnectionOptions::Watch(watch));
+    assert!(remembered.enabled && remembered.spectator);
+    assert_eq!(remembered.peer, "127.0.0.1:19733");
+    assert_eq!(remembered.role(), Role::Spectator);
+    state.netplay.cycle(F::NetplayPlayer, true);
+    assert_eq!(state.netplay.role(), Role::Host);
+    state.netplay.cycle(F::NetplayPlayer, false);
+    assert_eq!(state.netplay.role(), Role::Spectator);
+    Ok(())
+}
+
+#[cfg(feature = "netplay-internet")]
+#[test]
+fn internet_host_shares_a_separate_spectator_code() -> Result<()> {
+    use crate::netplay::Role;
+    let mut host = LauncherState::new(MachineSetup::default());
+    host.toggle_netplay();
+    host.tab = LauncherTab::Netplay;
+    host.netplay.cycle(F::NetplayMode, true);
+    assert!(!host.row_applies(F::NetplayCopySpectatorCode));
+    host.netplay.generate_code()?;
+    assert!(host.netplay.spectator_code.is_empty());
+    host.netplay.cycle(F::NetplaySpectators, true);
+    assert!(
+        host.netplay.connection_options().is_err(),
+        "the invitation predates the spectator setting"
+    );
+    host.netplay.generate_code()?;
+    assert!(host.row_applies(F::NetplayCopySpectatorCode));
+    assert!(crate::netplay::is_spectator_code(
+        &host.netplay.spectator_code
+    ));
+    assert!(!crate::netplay::is_spectator_code(&host.netplay.code));
+    assert_eq!(host.netplay.connection_options()?.unwrap().spectators(), 1);
+    assert!(host
+        .rows()
+        .iter()
+        .any(|row| row.field == F::NetplayCopySpectatorCode));
+    let mut watcher = LauncherState::new(MachineSetup::default());
+    watcher.toggle_netplay();
+    watcher.netplay.cycle(F::NetplayMode, true);
+    watcher.netplay.cycle(F::NetplayPlayer, false);
+    assert_eq!(watcher.row_value(F::NetplayPlayer), "Watch");
+    assert!(!watcher.row_applies(F::NetplayNewCode));
+    watcher.begin_edit_netplay(F::NetplayCode);
+    for c in host.netplay.spectator_code.chars() {
+        watcher.edit_push(c);
+    }
+    watcher.edit_commit();
+    let options = watcher.netplay.connection_options()?.unwrap();
+    assert_eq!(options.role(), Role::Spectator);
+    assert!(options.settings().is_none());
+    let remembered = NetplaySetup::from(&options);
+    assert!(remembered.internet && remembered.spectator);
+    assert_eq!(remembered.code, host.netplay.spectator_code);
+    // Neither code opens the other role.
+    watcher.netplay.code = host.netplay.code.clone();
+    assert!(watcher.netplay.connection_options().is_err());
+    let mut guest = LauncherState::new(MachineSetup::default());
+    guest.toggle_netplay();
+    guest.netplay.cycle(F::NetplayMode, true);
+    guest.netplay.cycle(F::NetplayPlayer, true);
+    guest.netplay.code = host.netplay.spectator_code.clone();
+    assert!(guest.netplay.connection_options().is_err());
+    Ok(())
+}
+
+#[test]
 fn netplay_preserves_each_supported_port_device() {
     let mut state = LauncherState::new(MachineSetup::default());
     state.netplay.enabled = true;
@@ -5784,9 +6016,9 @@ fn internet_netplay_launcher_shares_invitation_and_adopts_host_timing() -> Resul
     assert_eq!(guest.netplay.delay, 6);
     assert_eq!(guest.netplay.rollback, 12);
     let options = guest.netplay.connection_options()?.unwrap();
-    assert_eq!(options.settings().player, 1);
-    assert_eq!(options.settings().input_delay, 6);
-    assert_eq!(options.settings().rollback_frames, 12);
+    assert_eq!(options.settings().unwrap().player, 1);
+    assert_eq!(options.settings().unwrap().input_delay, 6);
+    assert_eq!(options.settings().unwrap().rollback_frames, 12);
     assert!(!guest.row_applies(F::NetplayDelay));
     assert!(!guest.row_applies(F::NetplayRelay));
     assert!(!guest.row_applies(F::NetplayNewCode));
@@ -5810,4 +6042,96 @@ fn internet_netplay_launcher_shares_invitation_and_adopts_host_timing() -> Resul
     host.netplay.generate_code()?;
     assert!(host.netplay.connection_options().is_ok());
     Ok(())
+}
+
+#[cfg(feature = "midi")]
+#[test]
+fn device_mode_rows_are_the_port_picker_only() {
+    let has = |mode, field| {
+        rows(
+            LauncherTab::IoPorts,
+            ParallelDevice::None,
+            mode,
+            false,
+            false,
+        )
+        .iter()
+        .any(|r| r.field == field)
+    };
+    // A real port has a path to pick and nothing to dial or bind.
+    assert!(has(SerialMode::Device, LauncherField::SerialDevice));
+    assert!(!has(SerialMode::Device, LauncherField::SerialConnect));
+    assert!(!has(SerialMode::Device, LauncherField::SerialListen));
+    assert!(!has(SerialMode::Device, LauncherField::SerialTelnet));
+    // And the picker shows for no other mode.
+    for mode in SERIAL_MODES {
+        if mode != SerialMode::Device {
+            assert!(!has(mode, LauncherField::SerialDevice), "{mode:?}");
+        }
+    }
+    // It is a picker, not a typed box, so the address widget stays out.
+    let r = rows(
+        LauncherTab::IoPorts,
+        ParallelDevice::None,
+        SerialMode::Device,
+        false,
+        false,
+    );
+    let found = r
+        .iter()
+        .find(|r| r.field == LauncherField::SerialDevice)
+        .unwrap();
+    assert_eq!(found.kind, RowKind::Cycle);
+    assert!(!LauncherState::is_serial_addr(LauncherField::SerialDevice));
+}
+
+#[cfg(feature = "midi")]
+#[test]
+fn serial_device_round_trips_through_raw() {
+    // The port path is carried whole, whether or not the host lists it.
+    let mut raw = RawConfig::default();
+    raw.serial.mode = Some("device".into());
+    raw.serial.device = Some("/dev/tty.usbserial-1420".into());
+    let setup = MachineSetup::from_raw(&raw).unwrap();
+    assert_eq!(setup.serial_mode, SerialMode::Device);
+    assert_eq!(
+        setup.serial_device.as_deref(),
+        Some("/dev/tty.usbserial-1420")
+    );
+    let back = setup.to_raw();
+    assert_eq!(back.serial.mode.as_deref(), Some("device"));
+    assert_eq!(
+        back.serial.device.as_deref(),
+        Some("/dev/tty.usbserial-1420")
+    );
+}
+
+#[cfg(feature = "midi")]
+#[test]
+fn serial_device_picker_walks_the_host_ports_and_keeps_an_unlisted_path() {
+    let mut setup = MachineSetup {
+        serial_mode: SerialMode::Device,
+        serial_device: Some("/dev/ttyUSB9".into()),
+        ..Default::default()
+    };
+    // A path the host does not list is shown as such, not dropped.
+    assert_eq!(
+        setup.value_label(LauncherField::SerialDevice),
+        "/dev/ttyUSB9 (not found)"
+    );
+    setup.serial_device = None;
+    setup.serial_devices = vec!["/dev/ttyUSB0".into(), "/dev/ttyUSB1".into()];
+    assert_eq!(
+        setup.value_label(LauncherField::SerialDevice),
+        "(pick a port)"
+    );
+    // Cycling walks the listed ports (re-read from the host on each step,
+    // which on a test host may find none: then the step lands back on
+    // unset and the label says so).
+    setup.cycle(LauncherField::SerialDevice, true);
+    let label = setup.value_label(LauncherField::SerialDevice);
+    match setup.serial_device.as_deref() {
+        Some(path) => assert!(setup.serial_devices.iter().any(|p| p == path), "{label}"),
+        None => assert!(label.starts_with("(no serial ports found)") || label == "(pick a port)"),
+    }
 }

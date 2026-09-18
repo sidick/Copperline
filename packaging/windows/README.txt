@@ -21,9 +21,10 @@ is freely redistributable; see aros\LICENSE. To use a real Kickstart instead,
 point a config file at it, or load it at runtime from the menu
 (Load Kickstart ROM...).
 
-The CD32 profile also fits Copperline's bundled open Full Motion Video ROM
-from the fmv\ folder. Set fmv_rom = "" in a config to leave that cartridge
-unfitted.
+Copperline's bundled open Full Motion Video ROM ships in the fmv\ folder.
+The CD32 profile leaves that cartridge slot empty, as a stock CD32 does;
+set fmv = true in a config (or press Fit on the launcher's FMV row) to fit
+the module with it.
 
 Configuration
 -------------
@@ -33,6 +34,24 @@ own Kickstart ROM and disk/hard-disk images, and launch with:
     copperline.exe --config your-config.toml
 
 Run "copperline.exe --help" for the full command-line surface.
+
+Command-line tools
+------------------
+Two companion programs sit next to copperline.exe:
+
+  copperline-ctl.exe         Client for the control protocol (scripting and
+                             AI agents), the MCP server mode (--mcp) and the
+                             Debug Adapter Protocol adapter (--dap) used by
+                             the VS Code extension. It launches the
+                             copperline.exe beside it, so keep them together
+                             or point the copperline.emulatorExecutable
+                             setting at the emulator. Add this folder to
+                             PATH, or set copperline.ctlExecutable to the
+                             full path of copperline-ctl.exe.
+  copperline-import-uae.exe  Converts a WinUAE, Amiberry or FS-UAE config
+                             file into a Copperline TOML config:
+                             copperline-import-uae.exe --from winuae
+                                 --in game.uae --out game.toml
 
 Portable data
 -------------

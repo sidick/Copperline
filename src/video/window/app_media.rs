@@ -27,10 +27,12 @@ impl App {
             return;
         }
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title(format!("Load DF{drive_idx} disk image(s)"))
-            .add_filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS)
-            .pick_files();
+        let picked = super::native_dialog::pick(move || {
+            rfd::FileDialog::new()
+                .set_title(format!("Load DF{drive_idx} disk image(s)"))
+                .add_filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS)
+                .pick_files()
+        });
 
         // The modal file dialog blocks this (the main/emulation) thread, so
         // wall-clock time advanced while emulated time stood still. Re-baseline
@@ -131,10 +133,12 @@ impl App {
     /// ejecting any current disc first.
     pub(super) fn load_cd_from_dialog(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Load CD image")
-            .add_filter("CD images", &["cue", "iso", "nrg", "chd"])
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Load CD image")
+                .add_filter("CD images", &["cue", "iso", "nrg", "chd"])
+                .pick_file()
+        });
 
         // Re-baseline pacing after the modal dialog, as for floppies.
         if let Some(path) = picked {
@@ -159,6 +163,50 @@ impl App {
                 self.show_osd("CD: load failed (see log)");
             }
         }
+    }
+
+    /// Pick a hard-disk image and push it into the PCMCIA slot as a CF
+    /// card, ejecting whatever was there. The menu offers this only on a
+    /// machine with the slot.
+    pub(super) fn insert_pcmcia_card_from_dialog(&mut self) {
+        if !self.emu.bus().pcmcia_slot_present() {
+            self.show_osd("PCMCIA: no slot on this machine");
+            return;
+        }
+        self.suspend_live_audio_for_host_io();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Insert PCMCIA CF card image")
+                .add_filter("Hard-disk images", &["hdf", "hdz", "img", "chd"])
+                .pick_file()
+        });
+        if let Some(path) = picked {
+            match crate::pcmcia::CfCard::open(&path) {
+                Ok(card) => {
+                    let card = crate::pcmcia::PcmciaCard::cf(card);
+                    info!("pcmcia: {}", card.describe());
+                    self.emu.bus_mut().pcmcia_insert(card);
+                    self.show_osd(format!("PCMCIA: {}", display_file_name(&path)));
+                    self.request_redraw();
+                }
+                Err(e) => {
+                    warn!("pcmcia: card image open failed ({}): {e:#}", path.display());
+                    self.show_osd("PCMCIA: card image open failed (see log)");
+                }
+            }
+        }
+        self.finish_host_io_pause();
+    }
+
+    /// Pull the card out of the PCMCIA slot; says whether there was one.
+    pub(super) fn eject_pcmcia_card(&mut self) -> bool {
+        if self.emu.bus_mut().pcmcia_eject().is_none() {
+            self.show_osd("PCMCIA: no card");
+            return false;
+        }
+        self.show_osd("PCMCIA: card ejected");
+        self.request_redraw();
+        true
     }
 
     pub(super) fn eject_cd(&mut self) {

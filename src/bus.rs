@@ -720,11 +720,22 @@ pub(crate) struct RollbackState {
 // fields (open files, audio/serial sinks, wall-clock anchors, memo caches)
 // are #[serde(skip)] and reattached by the savestate loader; everything else
 // is emulated state and must round-trip. New fields are picked up by the
-// derive automatically -- bump savestate::STATE_VERSION when the layout
-// changes incompatibly.
+// derive automatically. In a state file each field lands in the chunk of
+// its subsystem (src/savestate/chunk.rs: `paula` in PAUL, `agnus` in AGNS,
+// anything unclaimed in BUS), and the payloads name their fields, so a new
+// field needs only `#[serde(default)]` (or to be an Option) for older
+// states to keep loading; bump the owning chunk's version, with a
+// migration, only when a change has no correct default.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     pub mem: Memory,
+    /// Whether a state load must leave the RAM banks at the host addresses
+    /// the live machine used. Only a frontend that has handed those raw
+    /// addresses to something else needs it (the libretro core's memory
+    /// map), and it costs a copy of every bank per load, so it is off
+    /// unless that frontend asks. Host policy, never part of a state.
+    #[serde(skip)]
+    keep_ram_addresses: bool,
     /// Cold-power-on RAM policy. This is machine state rather than a host-side
     /// presentation preference: a save-state restored and then power-cycled
     /// must use the same deterministic pattern as the machine that saved it.
@@ -755,6 +766,12 @@ pub struct Bus {
     /// Gayle gate array (A600/A1200 machine profiles); None on machines
     /// without one, which leaves $DA0000/$DE1000 floating as before.
     pub gayle: Option<Gayle>,
+    /// The card in Gayle's PCMCIA slot, if one is inserted. Gayle owns the
+    /// slot's registers and pins; the card owns the address windows. Its
+    /// own save-state chunk (`PCMC`) so states written before the slot
+    /// existed load with an empty socket.
+    #[serde(default)]
+    pub pcmcia: Option<crate::pcmcia::PcmciaCard>,
     /// Ramsey memory controller (A3000/A4000 machine profiles). Answers on
     /// the same $DE0000 page Gayle uses, so the two are never both fitted.
     #[serde(default)]
@@ -973,6 +990,13 @@ pub struct Bus {
     current_frame_display_snapshot_taken: bool,
     #[serde(skip)]
     ocs_same_line_diw_start_blocked_vpos: Option<u32>,
+    /// The earliest colour clock at which the Copper's sleeping WAIT could
+    /// release, so the bus quantum can skip the comparator until then
+    /// (`copper_sleeping_before_wake_bound`). A cache of state the bus
+    /// already holds: rebuilt on demand, cleared by whatever can move the
+    /// wake (`invalidate_copper_wake_bound`), and not saved.
+    #[serde(skip)]
+    copper_wake_bound: CopperWakeBound,
     /// Agnus vertical display window flop: SET when the beam line matches
     /// DIWSTRT.V, RESET when it matches DIWSTOP.V (reset wins on a tie).
     /// The comparators are equality matches against the live registers, so
@@ -2162,6 +2186,12 @@ pub struct FrameBusTrace {
     pub frame: u64,
     pub seconds: f64,
     pub rows: usize,
+    /// The frame height this capture belongs to, as Agnus reckons it: the
+    /// long field of an interlaced signal, or a programmable VARBEAMEN total
+    /// used as it stands. `rows` is the field actually captured, one line
+    /// less on an interlaced short field, so presentation that must not move
+    /// between fields lays out against this instead.
+    pub nominal_rows: usize,
     pub cols: usize,
     pub line_cck: u32,
     pub visible_start_vpos: u32,
@@ -2208,6 +2238,7 @@ impl Default for FrameBusTrace {
             frame: 0,
             seconds: 0.0,
             rows: 0,
+            nominal_rows: 0,
             cols: 0,
             line_cck: COLORCLOCKS_PER_LINE,
             visible_start_vpos: RENDER_VISIBLE_START_VPOS,
@@ -2239,6 +2270,7 @@ impl FrameBusTrace {
         frame: u64,
         seconds: f64,
         frame_lines: u32,
+        nominal_frame_lines: u32,
         line_cck: u32,
         visible_start_vpos: u32,
         visible_lines: usize,
@@ -2249,6 +2281,8 @@ impl FrameBusTrace {
         self.frame = frame;
         self.seconds = seconds;
         self.rows = (frame_lines as usize).clamp(1, FRAME_ANALYZER_MAX_VPOS);
+        self.nominal_rows =
+            (nominal_frame_lines as usize).clamp(self.rows, FRAME_ANALYZER_MAX_VPOS);
         self.cols = (line_cck as usize).clamp(1, FRAME_ANALYZER_MAX_HPOS);
         self.line_cck = line_cck;
         self.visible_start_vpos = visible_start_vpos;
@@ -2287,6 +2321,7 @@ impl FrameBusTrace {
         self.reset_for_frame_with_level(
             frame,
             seconds,
+            frame_lines,
             frame_lines,
             line_cck,
             visible_start_vpos,
@@ -2810,10 +2845,19 @@ pub enum PortDevice {
     /// click, and no joystick port hears from that pad while it does.
     /// Offered on port 1 alone, which is the port a mouse belongs in.
     ///
-    /// Last on purpose: a save state encodes a variant by its position,
-    /// so a state written before this existed must still read an empty
-    /// port as empty. The pickers order themselves.
+    /// A save state encodes a variant by its position, so a state written
+    /// before this existed must still read an empty port as empty: new
+    /// variants go after it. The pickers order themselves.
     GamepadMouse,
+    /// A light pen or light gun. Its photodetector pulls the port's pin 6
+    /// (/FIRx) low as the beam sweeps past it; on the board that pin is
+    /// also Agnus's LP input (port 1's on the A1000, port 2's on every
+    /// later Amiga), and Agnus latches the beam counters on the pulse
+    /// while BPLCON0.LPEN is set. The pen's tip switch / the gun's
+    /// trigger is the port's third-button line (POTxX, read through
+    /// POTGOR), which is why it can be read with the pen off the glass.
+    /// The JOYxDAT counters hold; the pen has no directions.
+    LightPen,
 }
 
 impl PortDevice {
@@ -2825,6 +2869,7 @@ impl PortDevice {
             PortDevice::Cd32Pad => "cd32",
             PortDevice::Analogue => "analogue",
             PortDevice::GamepadMouse => "gamepad-mouse",
+            PortDevice::LightPen => "lightpen",
             PortDevice::None => "none",
         }
     }
@@ -2847,6 +2892,7 @@ impl PortDevice {
             PortDevice::Cd32Pad => "CD32 Pad",
             PortDevice::Analogue => "Analogue",
             PortDevice::GamepadMouse => "Gamepad Mouse",
+            PortDevice::LightPen => "Light Pen",
             PortDevice::None => "None",
         }
     }
@@ -2859,9 +2905,17 @@ impl PortDevice {
             "cd32" | "cd32pad" | "pad" => Some(PortDevice::Cd32Pad),
             "analogue" | "analog" | "paddle" => Some(PortDevice::Analogue),
             "gamepad-mouse" | "gamepad_mouse" | "padmouse" => Some(PortDevice::GamepadMouse),
+            "lightpen" | "light-pen" | "light_pen" | "pen" | "lightgun" | "light-gun"
+            | "light_gun" | "gun" => Some(PortDevice::LightPen),
             "none" | "off" => Some(PortDevice::None),
             _ => None,
         }
+    }
+
+    /// Whether a device can sit in a parallel-port adapter socket (ports
+    /// 3 and 4): the passive adapter carries switch joysticks only.
+    pub fn fits_parallel_port(self) -> bool {
+        matches!(self, PortDevice::Joystick | PortDevice::None)
     }
 }
 
@@ -2940,9 +2994,10 @@ impl ControllerPort {
     /// The JOYxDAT word this port's device presents.
     pub fn joydat(&self) -> u16 {
         match self.device {
-            PortDevice::Mouse | PortDevice::GamepadMouse | PortDevice::None => {
-                mouse_joydat(self.counter_x, self.counter_y)
-            }
+            PortDevice::Mouse
+            | PortDevice::GamepadMouse
+            | PortDevice::LightPen
+            | PortDevice::None => mouse_joydat(self.counter_x, self.counter_y),
             PortDevice::Joystick | PortDevice::Cd32Pad => {
                 digital_joydat(self.up, self.down, self.left, self.right)
             }
@@ -2978,10 +3033,88 @@ impl ControllerPort {
     }
 }
 
+/// One switch joystick on the passive parallel-port four-player adapter
+/// (ports 3 and 4). The adapter is wiring only, with no active parts: each
+/// direction switch shorts one CIA-A port-B data pin to ground -- D0-D3
+/// are port 3's up/down/left/right, D4-D7 port 4's -- port 3's fire shorts
+/// the Centronics SEL line (CIA-B PA2), port 4's fire shorts BUSY (CIA-B
+/// PA0), and a second button on either joystick shorts POUT (CIA-B PA1).
+/// The assignment is the one WinUAE's `handle_parport_joystick` models
+/// (joystick index 2 = SEL, index 3 = BUSY), which is the adapter the
+/// four-player titles were written against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParallelJoystick {
+    /// A joystick is plugged into this adapter socket.
+    pub fitted: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub fire: bool,
+    pub button2: bool,
+}
+
+impl ParallelJoystick {
+    /// This socket's lines as a game-port shaped view, for code that
+    /// diffs or reports every port through one `ControllerPort` reader
+    /// (the input recorder). The quadrature counters are meaningless
+    /// here and read zero.
+    pub fn as_controller_port(self) -> ControllerPort {
+        ControllerPort {
+            device: if self.fitted {
+                PortDevice::Joystick
+            } else {
+                PortDevice::None
+            },
+            up: self.up,
+            down: self.down,
+            left: self.left,
+            right: self.right,
+            fire: self.fire,
+            button2: self.button2,
+            ..ControllerPort::default()
+        }
+    }
+}
+
+/// Where the light pen's photodetector is held against the glass, in the
+/// rendered field's coordinates: `x` in hi-res-pitch columns (times the
+/// canvas scale of a 35 ns scan), `y` in beam lines from the frame's first
+/// visible line. This is the coordinate space `--mouse-to-after`,
+/// `input.mouse_to` and `sprite_framebuffer_origin` share, so a pen can
+/// be aimed at whatever a screenshot or the pointer sprite reports.
+/// `None` is a pen off the glass (or capped): it sees no light and never
+/// pulses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LightPenState {
+    pub position: Option<(i32, i32)>,
+}
+
+/// First port index the parallel-port adapter's sockets occupy in the
+/// port-numbered input API: ports 3 and 4 are indices 2 and 3.
+pub const PARALLEL_PORT_FIRST: usize = 2;
+/// Number of joystick sockets the machine can present: two game ports
+/// plus the two adapter sockets.
+pub const PORT_COUNT: usize = 4;
+
 #[derive(Default, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct InputState {
     /// Index 0 = port 1 (JOY0DAT/POT0/FIR0), 1 = port 2 (JOY1DAT/POT1/FIR1).
     pub ports: [ControllerPort; 2],
+    /// The passive four-player adapter is plugged into the Centronics
+    /// connector. Without it the adapter sockets are absent and the
+    /// parallel pins are left to whatever `[parallel]` peripheral is
+    /// fitted.
+    #[serde(default)]
+    pub parallel_adapter: bool,
+    /// The adapter's two sockets: index 0 = port 3 (D0-D3, SEL), 1 =
+    /// port 4 (D4-D7, BUSY).
+    #[serde(default)]
+    pub parallel_joysticks: [ParallelJoystick; 2],
+    /// The light pen's position on the glass, when a [`PortDevice::LightPen`]
+    /// is fitted to a port.
+    #[serde(default)]
+    pub light_pen: LightPenState,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -3062,22 +3195,56 @@ impl DeviceClock {
 }
 
 impl InputState {
-    /// Port argument convention across the input API: 0 selects port 1,
-    /// every other value port 2.
+    /// Game-port argument convention across the input API: 0 selects port
+    /// 1, 1 selects port 2. Ports 3 and 4 (indices 2 and 3) are the
+    /// parallel adapter's sockets and are routed by [`Self::parallel_index`];
+    /// the game-port-only entry points fold them onto port 2 as the old
+    /// two-port convention always did with any other value.
     fn port_index(port: usize) -> usize {
         usize::from(port != 0)
     }
 
-    /// The device currently plugged into a port.
+    /// The adapter socket a port number names, if it is one of the two
+    /// parallel-port sockets (port 3 = index 0, port 4 = index 1).
+    fn parallel_index(port: usize) -> Option<usize> {
+        match port {
+            2 => Some(0),
+            3 => Some(1),
+            _ => None,
+        }
+    }
+
+    /// The device currently plugged into a port. An adapter socket reads
+    /// as a joystick only while the adapter is fitted with one in it.
     pub fn device(&self, port: usize) -> PortDevice {
+        if let Some(i) = Self::parallel_index(port) {
+            return if self.parallel_adapter && self.parallel_joysticks[i].fitted {
+                PortDevice::Joystick
+            } else {
+                PortDevice::None
+            };
+        }
         self.ports[Self::port_index(port)].device
     }
 
     /// Change the device plugged into a port. Unplugging releases every line
     /// the old device drove; the JOYxDAT counters are chip-side and hold
     /// their values. A freshly plugged analogue controller presents its pots
-    /// centred: a real paddle always shows some resistance.
+    /// centred: a real paddle always shows some resistance. On an adapter
+    /// socket only a joystick fits (anything else unplugs the socket), and
+    /// plugging one in fits the adapter itself if it was absent.
     pub fn set_port_device(&mut self, port: usize, device: PortDevice) {
+        if let Some(i) = Self::parallel_index(port) {
+            let fitted = device == PortDevice::Joystick;
+            self.parallel_joysticks[i] = ParallelJoystick {
+                fitted,
+                ..ParallelJoystick::default()
+            };
+            if fitted {
+                self.parallel_adapter = true;
+            }
+            return;
+        }
         let p = &mut self.ports[Self::port_index(port)];
         if p.device == device {
             return;
@@ -3095,18 +3262,106 @@ impl InputState {
         }
     }
 
+    /// Plug the passive four-player adapter into (or pull it out of) the
+    /// Centronics connector, with a joystick in each socket `fitted` says
+    /// so for. Pulling the adapter releases every switch it carried.
+    pub fn set_parallel_adapter(&mut self, present: bool, fitted: [bool; 2]) {
+        self.parallel_adapter = present;
+        for (socket, fitted) in self.parallel_joysticks.iter_mut().zip(fitted) {
+            *socket = ParallelJoystick {
+                fitted: present && fitted,
+                ..ParallelJoystick::default()
+            };
+        }
+    }
+
+    /// CIA-A port-B data pins the adapter's direction switches are holding
+    /// at ground right now (bit set = pin pulled low): D0-D3 port 3's
+    /// up/down/left/right, D4-D7 port 4's. Nothing while the adapter is
+    /// absent.
+    pub fn parallel_data_pull_downs(&self) -> u8 {
+        if !self.parallel_adapter {
+            return 0;
+        }
+        let mut v = 0u8;
+        for (i, joy) in self.parallel_joysticks.iter().enumerate() {
+            if !joy.fitted {
+                continue;
+            }
+            let shift = 4 * i as u8;
+            if joy.up {
+                v |= 0x01 << shift;
+            }
+            if joy.down {
+                v |= 0x02 << shift;
+            }
+            if joy.left {
+                v |= 0x04 << shift;
+            }
+            if joy.right {
+                v |= 0x08 << shift;
+            }
+        }
+        v
+    }
+
+    /// CIA-B port-A Centronics status pins the adapter's buttons are
+    /// holding at ground (bit set = pin pulled low): port 3's fire on SEL
+    /// (PA2), port 4's fire on BUSY (PA0), either socket's second button
+    /// on the spare POUT line (PA1).
+    pub fn parallel_status_pull_downs(&self) -> u8 {
+        if !self.parallel_adapter {
+            return 0;
+        }
+        let [joy3, joy4] = self.parallel_joysticks;
+        let mut v = 0u8;
+        if joy3.fitted && joy3.fire {
+            v |= crate::parallel::CTL_SEL;
+        }
+        if joy4.fitted && joy4.fire {
+            v |= crate::parallel::CTL_BUSY;
+        }
+        if (joy3.fitted && joy3.button2) || (joy4.fitted && joy4.button2) {
+            v |= crate::parallel::CTL_POUT;
+        }
+        v
+    }
+
+    /// The game port a light pen is plugged into, if any.
+    pub fn light_pen_port(&self) -> Option<usize> {
+        self.ports
+            .iter()
+            .position(|p| p.device == PortDevice::LightPen)
+    }
+
+    /// Hold the light pen's photodetector at `position` on the glass (see
+    /// [`LightPenState`]), or lift it off with `None`.
+    pub fn set_light_pen_position(&mut self, position: Option<(i32, i32)>) {
+        self.light_pen.position = position;
+    }
+
     /// Accumulate mouse quadrature movement into a port's JOYxDAT counters.
     pub fn add_mouse_delta(&mut self, port: usize, dx: i32, dy: i32) {
+        if Self::parallel_index(port).is_some() {
+            return;
+        }
         let p = &mut self.ports[Self::port_index(port)];
         p.counter_x = p.counter_x.wrapping_add(dx as u8);
         p.counter_y = p.counter_y.wrapping_add(dy as u8);
     }
 
     /// Mouse buttons by index: 0 = left (/FIRx), 1 = right (POTxY),
-    /// 2 = middle (POTxX).
+    /// 2 = middle (POTxX). On a light pen the left button is the tip
+    /// switch / trigger, which the pen puts on POTxX: /FIRx is the LP
+    /// pulse line and cannot also carry a held switch, so index 0 and
+    /// index 2 both close the switch.
     pub fn set_mouse_button(&mut self, port: usize, index: u8, pressed: bool) {
+        if Self::parallel_index(port).is_some() {
+            return;
+        }
         let p = &mut self.ports[Self::port_index(port)];
         match index {
+            0 if p.device == PortDevice::LightPen => p.button3 = pressed,
             0 => p.fire = pressed,
             1 => p.button2 = pressed,
             _ => p.button3 = pressed,
@@ -3117,7 +3372,10 @@ impl InputState {
     /// Mouse or empty port so JOYxDAT reports directions; a CD32 pad or
     /// analogue controller keeps its device and just has its lines driven --
     /// fire is /FIRx, button 2 grounds POTxY, and the direction switch lines
-    /// double as the paddle buttons on an analogue device.
+    /// double as the paddle buttons on an analogue device. A light pen has
+    /// no directions and its `fire` is the tip switch / trigger (POTxX).
+    /// On an adapter socket (port 3 or 4) the lines are the adapter's
+    /// switches, and a socket driven this way is fitted with a joystick.
     pub fn set_joystick(
         &mut self,
         port: usize,
@@ -3128,7 +3386,24 @@ impl InputState {
         fire: bool,
         button2: bool,
     ) {
+        if let Some(i) = Self::parallel_index(port) {
+            self.parallel_adapter = true;
+            self.parallel_joysticks[i] = ParallelJoystick {
+                fitted: true,
+                up,
+                down,
+                left,
+                right,
+                fire,
+                button2,
+            };
+            return;
+        }
         let idx = Self::port_index(port);
+        if self.ports[idx].device == PortDevice::LightPen {
+            self.ports[idx].button3 = fire;
+            return;
+        }
         if self.ports[idx].device.is_mouse() || self.ports[idx].device == PortDevice::None {
             self.set_port_device(port, PortDevice::Joystick);
         }
@@ -3143,7 +3418,8 @@ impl InputState {
 
     /// Set a CD32 joypad's extra buttons. Red and Blue arrive through
     /// `set_joystick` as fire/button2; these five only exist in the pad's
-    /// serial report.
+    /// serial report. The adapter sockets carry plain switch joysticks
+    /// and have none of them.
     pub fn set_cd32_buttons(
         &mut self,
         port: usize,
@@ -3153,6 +3429,9 @@ impl InputState {
         green: bool,
         yellow: bool,
     ) {
+        if Self::parallel_index(port).is_some() {
+            return;
+        }
         let p = &mut self.ports[Self::port_index(port)];
         p.cd32_play = play;
         p.cd32_rwd = rwd;
@@ -3165,6 +3444,9 @@ impl InputState {
     /// the count the port's POTxDAT byte latches after a POTGO scan. Engages
     /// the Analogue device.
     pub fn set_analogue(&mut self, port: usize, x: u8, y: u8) {
+        if Self::parallel_index(port).is_some() {
+            return;
+        }
         let idx = Self::port_index(port);
         if self.ports[idx].device != PortDevice::Analogue {
             self.set_port_device(port, PortDevice::Analogue);
@@ -3178,6 +3460,9 @@ impl InputState {
     /// resistance. Each value is measured from +5 V to the corresponding POT
     /// pin; `None` disconnects that axis. Does not change the port's device.
     pub fn set_paddle_resistance(&mut self, port: usize, x_ohms: Option<u32>, y_ohms: Option<u32>) {
+        if Self::parallel_index(port).is_some() {
+            return;
+        }
         let p = &mut self.ports[Self::port_index(port)];
         p.pot_x_ohms = x_ohms;
         p.pot_y_ohms = y_ohms;
@@ -3202,7 +3487,8 @@ impl InputState {
     /// state), while the chip-side quadrature counters clear, the pad
     /// shifters reload, and the driven lines release -- the host input
     /// path re-asserts anything still physically held on the next
-    /// quantum.
+    /// quantum. The adapter and its joysticks stay plugged in with their
+    /// switches released; the pen stays where the hand holds it.
     pub fn reset_for_machine_reset(&mut self) {
         for p in &mut self.ports {
             *p = ControllerPort {
@@ -3210,6 +3496,12 @@ impl InputState {
                 pot_x_ohms: p.pot_x_ohms,
                 pot_y_ohms: p.pot_y_ohms,
                 ..ControllerPort::default()
+            };
+        }
+        for joy in &mut self.parallel_joysticks {
+            *joy = ParallelJoystick {
+                fitted: joy.fitted,
+                ..ParallelJoystick::default()
             };
         }
     }
@@ -3366,6 +3658,7 @@ impl Bus {
 
         let mut bus = Self {
             mem,
+            keep_ram_addresses: false,
             ram_init: RamInit::Zero,
             cia_a: Cia::new(Which::A),
             cia_b: Cia::new(Which::B),
@@ -3381,6 +3674,7 @@ impl Bus {
             rtc: Rtc::default(),
             rtc_present: true,
             gayle: None,
+            pcmcia: None,
             ramsey: None,
             gary: None,
             sdmac: None,
@@ -3459,6 +3753,7 @@ impl Bus {
             last_frame_sprite_dma_observed: false,
             current_frame_display_snapshot_taken: false,
             ocs_same_line_diw_start_blocked_vpos: None,
+            copper_wake_bound: CopperWakeBound::Unknown,
             diw_vertical_open: None,
             current_frame_render_blocked: false,
             current_frame_visible_start_vpos: RENDER_VISIBLE_START_VPOS,
@@ -4366,6 +4661,152 @@ impl Bus {
 
     pub fn attach_gayle(&mut self, gayle: Gayle) {
         self.gayle = Some(gayle);
+        self.pcmcia_sync_pins();
+    }
+
+    // ----- PCMCIA slot -------------------------------------------------------
+
+    /// Whether the machine has a PCMCIA slot at all (a Gayle machine).
+    pub fn pcmcia_slot_present(&self) -> bool {
+        self.gayle.is_some()
+    }
+
+    /// The card in the slot, if any.
+    pub fn pcmcia_card(&self) -> Option<&crate::pcmcia::PcmciaCard> {
+        self.pcmcia.as_ref()
+    }
+
+    pub fn pcmcia_card_mut(&mut self) -> Option<&mut crate::pcmcia::PcmciaCard> {
+        self.pcmcia.as_mut()
+    }
+
+    /// Insert a card. Any card already in the socket is ejected first, so
+    /// Gayle latches the detect change for both, as a physical swap does.
+    /// Returns false (card dropped) on a machine with no slot.
+    pub fn pcmcia_insert(&mut self, card: crate::pcmcia::PcmciaCard) -> bool {
+        if self.gayle.is_none() {
+            return false;
+        }
+        if self.pcmcia.is_some() {
+            self.pcmcia_eject();
+        }
+        self.pcmcia = Some(card);
+        self.pcmcia_sync_pins();
+        true
+    }
+
+    /// Pull the card. Its backing file is flushed on the way out.
+    pub fn pcmcia_eject(&mut self) -> Option<crate::pcmcia::PcmciaCard> {
+        let mut card = self.pcmcia.take()?;
+        card.flush();
+        self.pcmcia_sync_pins();
+        Some(card)
+    }
+
+    /// Re-sample the slot pins into Gayle after anything that can move
+    /// them: an insert, an eject, or a card access (a CF card's IREQ#).
+    fn pcmcia_sync_pins(&mut self) {
+        let pins = self.pcmcia.as_ref().map_or(0, |card| card.pins());
+        if let Some(gayle) = self.gayle.as_mut() {
+            gayle.set_card_pins(pins);
+        }
+    }
+
+    /// A CPU read in one of the slot windows. `None` when nothing answers
+    /// (no slot, slot disabled or shadowed, empty socket, or a cycle the
+    /// card does not drive), so the CPU treats the address as unmapped.
+    pub fn pcmcia_read(&mut self, addr: u32, size: usize) -> Option<u32> {
+        use crate::pcmcia::SlotAccess;
+        if !self.gayle.as_ref().is_some_and(Gayle::slot_enabled) {
+            return None;
+        }
+        let access = crate::pcmcia::classify(addr)?;
+        if size == 4 {
+            let hi = self.pcmcia_read(addr, 2)?;
+            let lo = self.pcmcia_read(addr.wrapping_add(2), 2)?;
+            return Some((hi << 16) | lo);
+        }
+        if size == 2 && addr & 1 != 0 {
+            let hi = self.pcmcia_read(addr, 1)?;
+            let lo = self.pcmcia_read(addr.wrapping_add(1), 1)?;
+            return Some((hi << 8) | lo);
+        }
+        let value = if let SlotAccess::Reset = access {
+            // Reading the reset register releases the card's RESET line;
+            // the data bus is not driven.
+            return Some(0);
+        } else {
+            let card = self.pcmcia.as_mut()?;
+            match access {
+                SlotAccess::Common(off) => card.read_common(off, size),
+                SlotAccess::Attribute(off) => {
+                    let hi = u32::from(card.read_attribute(off));
+                    if size == 2 {
+                        (hi << 8) | u32::from(card.read_attribute(off | 1))
+                    } else {
+                        hi
+                    }
+                }
+                SlotAccess::Io(off) => card.read_io(off, size)?,
+                SlotAccess::Reset => unreachable!(),
+            }
+        };
+        self.pcmcia_sync_pins();
+        if crate::envcfg::flag("COPPERLINE_DIAG_GAYLE") {
+            log::info!("pcmcia rd {addr:#08X}/{size} -> {value:#06X}");
+        }
+        Some(value)
+    }
+
+    /// A CPU write in one of the slot windows; false when nothing takes it.
+    pub fn pcmcia_write(&mut self, addr: u32, size: usize, value: u32) -> bool {
+        use crate::pcmcia::SlotAccess;
+        if !self.gayle.as_ref().is_some_and(Gayle::slot_enabled) {
+            return false;
+        }
+        let Some(access) = crate::pcmcia::classify(addr) else {
+            return false;
+        };
+        if size == 4 {
+            let a = self.pcmcia_write(addr, 2, value >> 16);
+            let b = self.pcmcia_write(addr.wrapping_add(2), 2, value & 0xFFFF);
+            return a || b;
+        }
+        if size == 2 && addr & 1 != 0 {
+            let a = self.pcmcia_write(addr, 1, (value >> 8) & 0xFF);
+            let b = self.pcmcia_write(addr.wrapping_add(1), 1, value & 0xFF);
+            return a || b;
+        }
+        if crate::envcfg::flag("COPPERLINE_DIAG_GAYLE") {
+            log::info!("pcmcia wr {addr:#08X}/{size} <- {value:#06X}");
+        }
+        let Some(card) = self.pcmcia.as_mut() else {
+            // An empty socket still takes the reset-register cycle.
+            return matches!(access, SlotAccess::Reset);
+        };
+        match access {
+            SlotAccess::Common(off) => card.write_common(off, size, value),
+            SlotAccess::Attribute(off) => {
+                if size == 2 {
+                    card.write_attribute(off, (value >> 8) as u8);
+                    card.write_attribute(off | 1, value as u8);
+                } else {
+                    card.write_attribute(off, value as u8);
+                }
+            }
+            SlotAccess::Io(off) => card.write_io(off, size, value),
+            // Writing the reset register asserts the card's RESET line.
+            SlotAccess::Reset => card.reset(),
+        }
+        self.pcmcia_sync_pins();
+        true
+    }
+
+    /// Drain the card's activity latch, for the HDD LED.
+    pub fn take_pcmcia_activity(&mut self) -> bool {
+        self.pcmcia
+            .as_mut()
+            .is_some_and(crate::pcmcia::PcmciaCard::take_activity)
     }
 
     pub fn attach_uaelib(&mut self, uaelib: crate::uaelib::UaeLib) {
@@ -4441,6 +4882,22 @@ impl Bus {
     /// boards were added to the chain.
     pub fn attach_devices(&mut self, devices: Vec<crate::zorro_device::BoardDevice>) {
         self.devices = devices;
+    }
+
+    /// The Copperline services board, if fitted (host filesystem mounts and
+    /// the clipboard unit).
+    pub fn filesys_board(&self) -> Option<&crate::filesys::FilesysBoard> {
+        self.devices.iter().find_map(|d| match d {
+            crate::zorro_device::BoardDevice::Filesys(b) => Some(b),
+            _ => None,
+        })
+    }
+
+    pub fn filesys_board_mut(&mut self) -> Option<&mut crate::filesys::FilesysBoard> {
+        self.devices.iter_mut().find_map(|d| match d {
+            crate::zorro_device::BoardDevice::Filesys(b) => Some(b),
+            _ => None,
+        })
     }
 
     pub fn attach_cdtv(&mut self, cdtv: crate::cdtv::CdtvController) {
@@ -4574,12 +5031,50 @@ impl Bus {
                 && self.agnus.beamcon0() & BEAMCON0_HARDDIS != 0)
     }
 
-    /// External light-pen pulse at the current beam position. No input
-    /// device is wired to this yet; tests (and future controller-port
-    /// plumbing) call it directly.
+    /// External light-pen pulse at the current beam position: the LP pin
+    /// pulled low by hand. The fitted [`PortDevice::LightPen`] does not go
+    /// through here -- it hands Agnus the beam position its detector sees
+    /// (`arm_light_pen_for_frame`) and the pulse fires as the counters
+    /// sweep past it -- so this is for tests that want a pulse at an
+    /// arbitrary moment.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn light_pen_pulse(&mut self) {
         self.agnus.trigger_light_pen();
+    }
+
+    /// The game port whose pin 6 (/FIRx) is wired to Agnus's LP input:
+    /// port 1 on the A1000 (the machine with the WCS at $FC0000), port 2
+    /// on the A500 and everything after it (the A2000 moved the trace,
+    /// and every later board followed). A pen in the other port has a
+    /// working tip switch but its pulses reach nothing.
+    pub fn light_pen_wired_port(&self) -> usize {
+        if self.mem.wcs.is_empty() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Beam position (`vpos`, `hpos`) the fitted light pen's detector sees
+    /// this frame: the pen's glass position mapped through the renderer's
+    /// own comparator geometry, or `None` with no pen on the LP-wired port
+    /// or the pen off the glass.
+    pub fn light_pen_beam_target(&self) -> Option<(u32, u32)> {
+        let port = self.input.light_pen_port()?;
+        if port != self.light_pen_wired_port() {
+            return None;
+        }
+        let (x, y) = self.input.light_pen.position?;
+        crate::video::bitplane::framebuffer_beam_position(self, x, y)
+    }
+
+    /// Hand Agnus the pen's beam position for the frame about to be
+    /// scanned. Called at every frame start, after the frame geometry has
+    /// been promoted, so the mapping is the one the frame just rendered
+    /// used -- which is what a screenshot's coordinates refer to.
+    pub(crate) fn arm_light_pen_for_frame(&mut self) {
+        let target = self.light_pen_beam_target();
+        self.agnus.set_light_pen_target(target);
     }
 
     /// Queue an Amiga raw key press (a 7-bit raw scan code).
@@ -4655,6 +5150,7 @@ impl Bus {
         self.paula.reset_registers();
         self.agnus = Agnus::with_video_standard_and_revision(video_standard, agnus_revision);
         self.copper = Copper::new();
+        self.copper_wake_bound = CopperWakeBound::Unknown;
         self.denise = Denise::new();
         self.blitter = Blitter::new();
         self.configure_chip_dma_masks();
@@ -4662,6 +5158,12 @@ impl Bus {
         if let Some(gayle) = self.gayle.as_mut() {
             gayle.reset();
         }
+        // The system reset line reaches the card's RESET pin through
+        // Gayle, and the pins are sampled afresh afterwards.
+        if let Some(card) = self.pcmcia.as_mut() {
+            card.reset();
+        }
+        self.pcmcia_sync_pins();
         if let Some(gary) = self.gary.as_mut() {
             gary.reset();
         }
@@ -4876,6 +5378,9 @@ impl Bus {
         if let Some(gayle) = self.gayle.as_mut() {
             released += gayle.release_host_disks();
         }
+        if let Some(card) = self.pcmcia.as_mut() {
+            released += card.release_host_disks();
+        }
         if let Some(ide) = self.ide_a4000.as_mut() {
             released += ide.release_host_disks();
         }
@@ -5021,6 +5526,34 @@ impl Bus {
                             log::warn!(
                                 "scsi: unit {unit} asked for host disk {}, which is not \
                                  available: {error}",
+                                disk.device
+                            );
+                            false
+                        }
+                    }
+                }
+                crate::config::HostDiskAttach::Pcmcia => {
+                    if self.gayle.is_none() {
+                        continue;
+                    }
+                    match crate::ata::IdeDrive::open_host_disk(
+                        &disk.device,
+                        disk.fingerprint.as_deref(),
+                        disk.identity_confirmed,
+                        disk.writable,
+                    ) {
+                        Ok(drive) => {
+                            // A fresh card goes in: power-off released the
+                            // old one's medium, and a re-insert is what a
+                            // real slot sees at power-on anyway.
+                            self.pcmcia_insert(crate::pcmcia::PcmciaCard::cf(
+                                crate::pcmcia::CfCard::new(drive),
+                            ));
+                            true
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "pcmcia: asked for host disk {}, which is not available: {error}",
                                 disk.device
                             );
                             false
@@ -5190,6 +5723,7 @@ impl Bus {
                     crate::zorro_device::BoardDevice::A2091(_)
                         | crate::zorro_device::BoardDevice::A4091(_)
                         | crate::zorro_device::BoardDevice::IdeZorro(_)
+                        | crate::zorro_device::BoardDevice::Sf2000Sd(_)
                 )
             })
     }
@@ -5239,6 +5773,72 @@ impl Bus {
             .or_else(|| self.akiko.as_ref().map(crate::akiko::Akiko::has_disc))
             .or_else(|| self.scsi_cd_ref().map(crate::scsi::ScsiCdRom::has_disc))
             .unwrap_or(false)
+    }
+
+    /// The names of the media in the machine's drives: every connected
+    /// floppy drive with its inserted image, every hard-disk image on every
+    /// controller, and the CD in the drive. For a save state's metadata and
+    /// the state browser; names only, never paths to reopen.
+    pub fn media_names(&self) -> crate::savestate::MediaNames {
+        use crate::savestate::meta::file_name;
+        let floppies = (0..4)
+            .filter(|&drive| self.floppy.drive_connected(drive))
+            .map(|drive| crate::savestate::FloppyMedia {
+                drive: drive as u8,
+                name: self.floppy.inserted_disk_name(drive),
+            })
+            .collect();
+        fn names<'a>(
+            images: impl Iterator<Item = &'a crate::harddrive::HardDriveImage>,
+        ) -> Vec<String> {
+            images
+                .filter_map(|image| crate::savestate::meta::file_name(image.path()))
+                .collect()
+        }
+        let mut hard_disks = Vec::new();
+        if let Some(gayle) = &self.gayle {
+            hard_disks.extend(names(gayle.hard_disk_images()));
+        }
+        if let Some(ide) = &self.ide_a4000 {
+            hard_disks.extend(names(ide.hard_disk_images()));
+        }
+        if let Some(sdmac) = &self.sdmac {
+            hard_disks.extend(names(sdmac.disk_images()));
+        }
+        for device in &self.devices {
+            match device {
+                crate::zorro_device::BoardDevice::A2091(board) => {
+                    hard_disks.extend(names(board.disk_images()))
+                }
+                crate::zorro_device::BoardDevice::A4091(board) => {
+                    hard_disks.extend(names(board.disk_images()))
+                }
+                crate::zorro_device::BoardDevice::IdeZorro(board) => {
+                    hard_disks.extend(names(board.hard_disk_images()))
+                }
+                crate::zorro_device::BoardDevice::Copperhf(board) => {
+                    hard_disks.extend(board.unit_image_names())
+                }
+                _ => {}
+            }
+        }
+        let cd = self
+            .cdtv
+            .as_ref()
+            .and_then(crate::cdtv::CdtvController::disc_ref)
+            .or_else(|| self.akiko.as_ref().and_then(crate::akiko::Akiko::disc_ref))
+            .and_then(|disc| disc.source_paths().into_iter().next())
+            .and_then(|path| file_name(&path))
+            .or_else(|| {
+                self.scsi_cd_ref()
+                    .filter(|cd| cd.has_disc())
+                    .and_then(|cd| file_name(cd.path()))
+            });
+        crate::savestate::MediaNames {
+            floppies,
+            hard_disks,
+            cd,
+        }
     }
 
     /// Runtime disc insert with media-change notification. On CDTV the
@@ -5312,6 +5912,9 @@ impl Bus {
         self.paula
             .serial
             .set_control_outputs(pra & 0x80 == 0, pra & 0x40 == 0);
+        // Likewise the line rate: a host serial port is kept at the guest's
+        // SERPER rate, and this machine's SERPER was restored, not written.
+        self.paula.republish_serial_line_rate();
         std::mem::swap(
             &mut self.paula.serial_observer,
             &mut live.paula.serial_observer,
@@ -5332,7 +5935,27 @@ impl Bus {
         // Drive speed is host configuration, not machine state: a loaded
         // state keeps the running session's setting.
         self.floppy.set_speed_percent(live.floppy.speed_percent());
+        // Host addresses of the RAM banks and the CD32 EEPROM are host
+        // resources too: a frontend that mapped them (libretro memory maps,
+        // save RAM) keeps valid pointers across the restore.
+        // The policy itself belongs to the running session, not to the
+        // state that was just deserialized over it.
+        self.keep_ram_addresses = live.keep_ram_addresses;
+        if self.keep_ram_addresses {
+            self.mem.adopt_allocations_from(&mut live.mem);
+            if let (Some(akiko), Some(live)) = (self.akiko.as_mut(), live.akiko.as_mut()) {
+                akiko.adopt_allocations_from(live);
+            }
+        }
         Ok(())
+    }
+
+    /// Ask for RAM banks to keep their host addresses across a state load.
+    /// The libretro core sets this because it publishes those addresses to
+    /// the frontend as a memory map; every other frontend leaves it off and
+    /// a load simply takes the deserialized buffers.
+    pub fn set_keep_ram_addresses(&mut self, keep: bool) {
+        self.keep_ram_addresses = keep;
     }
 
     /// Why the live machine cannot safely execute frames that are then
@@ -5355,6 +5978,12 @@ impl Bus {
             .is_some_and(crate::akiko::Akiko::persistent_nvram)
         {
             return Some("persistent CD32 NVRAM");
+        }
+        if self.pcmcia.is_some() {
+            // A card inserted from the menu after start-up never passed
+            // through the configuration's check, and its image or backing
+            // file takes writes the same way.
+            return Some("PCMCIA card in the slot");
         }
         if self.rtc_present && !self.rtc.runahead_safe() {
             return Some("live or persistent real-time clock");
@@ -5410,6 +6039,9 @@ impl Bus {
         if let Some(gayle) = &self.gayle {
             gayle.pending_host_disks(&mut pending);
         }
+        if let Some(card) = &self.pcmcia {
+            card.pending_host_disks(&mut pending);
+        }
         if let Some(ide) = &self.ide_a4000 {
             ide.pending_host_disks(&mut pending);
         }
@@ -5438,6 +6070,9 @@ impl Bus {
         let result = (|| {
             if let Some(gayle) = &mut self.gayle {
                 gayle.materialize_host_disks()?;
+            }
+            if let Some(card) = &mut self.pcmcia {
+                card.materialize_host_disks()?;
             }
             if let Some(ide) = &mut self.ide_a4000 {
                 ide.materialize_host_disks()?;
@@ -7076,14 +7711,50 @@ impl Bus {
             self.pending_vbi = 1;
         }
 
-        // Gayle drives INT2 (PORTS) as a level; Paula's INTREQ latch keeps
-        // getting set while the line is asserted.
+        // Gayle drives INT2 (PORTS) and INT6 (EXTER) as levels; Paula's
+        // INTREQ latch keeps getting set while a line is asserted.
         if self
             .gayle
             .as_ref()
             .is_some_and(crate::gayle::Gayle::int2_line)
         {
             self.paula.intreq |= INT_PORTS;
+        }
+        if self
+            .gayle
+            .as_ref()
+            .is_some_and(crate::gayle::Gayle::int6_line)
+        {
+            self.paula.intreq |= INT_EXTER;
+        }
+        // A $DA9000 RESET+BERR write resets the card's configuration; a
+        // card-detect change with RESET armed reboots the machine.
+        let (card_reset, machine_reset) = self.gayle.as_mut().map_or((false, false), |gayle| {
+            (
+                gayle.take_card_reset_request(),
+                gayle.take_machine_reset_request(),
+            )
+        });
+        if card_reset {
+            if let Some(card) = self.pcmcia.as_mut() {
+                card.reset();
+            }
+            self.pcmcia_sync_pins();
+        }
+        if machine_reset {
+            // Kickstart 3.x card.resource arms this bit, which is why a
+            // real A600/A1200 reboots when a memory card is pulled.
+            log::info!("gayle: card-detect change with RESET armed, resetting the machine");
+            self.keyboard_system_reset_pending = true;
+            self.slice_preempted = true;
+        }
+        // An SRAM card used as RAM takes millions of writes; its backing
+        // file is written back about once an emulated second, not per
+        // access (the emulated result does not depend on it).
+        if agnus_tick.new_frames > 0 && self.emulated_frames.is_multiple_of(50) {
+            if let Some(card) = self.pcmcia.as_mut() {
+                card.flush();
+            }
         }
 
         // The A4000's IDE has no interrupt latch of its own: the drive's INTRQ
@@ -8354,6 +9025,14 @@ impl Bus {
             if let Some(byte) = self.parallel_port.read_data(self.emulated_cck) {
                 v = byte;
             }
+            // The four-player adapter's direction switches short data pins
+            // to ground. A pin the guest has switched to an output stays
+            // CIA-driven; the games program the port as inputs (DDRB = 0)
+            // and read the switches through the pull-ups.
+            let pulls = self.input.parallel_data_pull_downs();
+            if pulls != 0 {
+                v &= !(pulls & !self.cia_a.port_b_ddr());
+            }
         }
         trace!("cia_a R reg={:X} sz={} val={:02X}", reg, size, v);
         self.poll_stats.tick_read("cia_a", reg);
@@ -8467,6 +9146,13 @@ impl Bus {
             if let Some(lines) = self.parallel_port.control_lines() {
                 let inputs = !ddr & 0x07;
                 v = (v & !inputs) | (lines & inputs);
+            }
+            // The four-player adapter's fire buttons short SEL (port 3)
+            // and BUSY (port 4) to ground, and a second button POUT; the
+            // same input-only overlay as the data pins.
+            let pulls = self.input.parallel_status_pull_downs();
+            if pulls != 0 {
+                v &= !(pulls & !ddr & 0x07);
             }
             // CIA-B PA3-5 are the RS-232 handshake inputs /DSR, /CTS, and
             // /CD, arriving through the motherboard's inverting 1489
@@ -9047,6 +9733,34 @@ impl Bus {
         regions
     }
 
+    /// The backing bytes of `addr..addr+len` when the whole span lies in
+    /// one writable RAM bank (chip, slow, motherboard, accelerator, or a
+    /// Zorro RAM board), so a digest can hash the bank in place instead of
+    /// peeking it a byte at a time through the CPU map. `None` when the
+    /// span crosses a bank edge or touches anything that is not RAM.
+    pub fn ram_slice(&self, addr: u32, len: usize) -> Option<&[u8]> {
+        let inside = |base: u64, bank: &[u8]| -> Option<usize> {
+            let off = u64::from(addr).checked_sub(base)?;
+            (off + len as u64 <= bank.len() as u64).then_some(off as usize)
+        };
+        let mem = &self.mem;
+        if let Some(off) = inside(crate::memory::CHIP_RAM_BASE, &mem.chip_ram) {
+            return Some(&mem.chip_ram[off..off + len]);
+        }
+        if let Some(off) = inside(crate::memory::SLOW_RAM_BASE, &mem.slow_ram) {
+            return Some(&mem.slow_ram[off..off + len]);
+        }
+        if let Some(off) = inside(mem.mb_ram_base(), &mem.mb_ram) {
+            return Some(&mem.mb_ram[off..off + len]);
+        }
+        if let Some(off) = inside(crate::memory::ACCEL_RAM_BASE, &mem.accel_ram) {
+            return Some(&mem.accel_ram[off..off + len]);
+        }
+        let (board, off) = mem.zorro.region_at(addr, len)?;
+        let ram = mem.zorro.board_ram(board);
+        (off + len <= ram.len()).then(|| &ram[off..off + len])
+    }
+
     /// The regions a debugger pattern search should sweep: every writable
     /// RAM bank plus the Kickstart and extended-ROM windows, in ascending
     /// address order. Sweeping the decoded map rather than a fixed
@@ -9241,6 +9955,7 @@ impl Bus {
             self.emulated_frames,
             self.emulated_seconds(),
             self.agnus.current_frame_lines(),
+            self.agnus.nominal_frame_lines(),
             self.agnus.current_line_cck(),
             self.current_frame_visible_start_vpos,
             self.current_frame_geometry.visible_lines,
@@ -9817,6 +10532,19 @@ fn sprite_dma_first_active_vpos(video_standard: VideoStandard) -> u32 {
         VideoStandard::Pal => PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS,
         VideoStandard::Ntsc => NTSC_SPRITE_DMA_FIRST_ACTIVE_VPOS,
     }
+}
+
+/// What the bus knows about when the Copper's sleeping WAIT can release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CopperWakeBound {
+    /// Not computed since the last change; the next quantum resolves it.
+    #[default]
+    Unknown,
+    /// Computed, and there is no usable bound: the comparator runs every
+    /// eligible slot, as it always did.
+    None,
+    /// The WAIT cannot release before this absolute colour clock.
+    At(u64),
 }
 
 fn next_chip_bus_quantum_at(hpos: u32, line_cck: u32) -> u32 {
@@ -11773,6 +12501,12 @@ fn is_live_collision_bpldat_custom_write(off: u16) -> bool {
 
 fn is_live_collision_sprite_custom_write(off: u16) -> bool {
     matches!(off & 0x01FE, 0x140..=0x17F)
+}
+
+/// The ECS beam-timing registers (HTOTAL through HCENTER, BEAMCON0
+/// among them): a write can change the current line's or frame's length.
+fn is_beam_timing_custom_write(off: u16) -> bool {
+    matches!(off, 0x1C0..=0x1E2)
 }
 
 fn is_audio_timing_custom_write(off: u16) -> bool {

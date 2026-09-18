@@ -110,6 +110,7 @@ impl App {
             status_bar_hidden: crate::video::status_bar_hidden(),
             bezel: self.bezel,
             perf_overlay: self.perf_overlay,
+            vsync: self.vsync,
             warp: !self.emu.paced(),
             warp_speed: self.warp_speed,
             rewind: self.rewind_armed,
@@ -118,10 +119,26 @@ impl App {
             autofire_hz: self.autofire_hz,
             run_ahead_frames: self.run_ahead_frames,
             joystick_input_mode: self.joystick_input_mode,
+            clipboard_share: self
+                .emu
+                .bus()
+                .filesys_board()
+                .is_some_and(|b| b.clipboard_sharing()),
+            clipboard_available: self
+                .emu
+                .bus()
+                .filesys_board()
+                .is_some_and(|b| b.clipboard_fitted()),
             port_devices: [
                 self.emu.bus().input.device(0),
                 self.emu.bus().input.device(1),
             ],
+            pcmcia_slot: self.emu.bus().pcmcia_slot_present(),
+            pcmcia_card: self
+                .emu
+                .bus()
+                .pcmcia_card()
+                .map(crate::pcmcia::PcmciaCard::describe),
             pixel_aspect: crate::video::pixel_aspect(),
             scaling: crate::video::display_scaling(),
             autocrop: crate::video::autocrop(),
@@ -241,11 +258,10 @@ impl App {
         use crate::video::menu::{AudioOutputChoice, MenuAction as A};
         match action {
             A::OpenMachineConfig => self.open_launcher(),
-            A::OpenFrameAnalyzer => self.open_frame_analyzer(),
             A::OpenDebugger => self.open_debugger(),
-            A::OpenConsole => self.open_console(),
             A::FreezeCartridge => self.freeze_cartridge(),
             A::OpenInputMapping => self.open_input_mapping(),
+            A::PasteKeystrokes => self.paste_as_keystrokes(),
             A::OpenCalibration => {
                 self.ui.panel = Some(Panel::Calibration(crate::gamepad::CalibrationSession::new()));
             }
@@ -255,6 +271,10 @@ impl App {
                 self.ui.panel = Some(Panel::About);
             }
             A::LoadRom => self.load_rom_from_dialog(),
+            A::InsertPcmciaCard => self.insert_pcmcia_card_from_dialog(),
+            A::EjectPcmciaCard => {
+                self.eject_pcmcia_card();
+            }
 
             A::SetAudioOutput(choice) => {
                 let want = match choice {
@@ -295,6 +315,14 @@ impl App {
             A::SetPixelAspect(aspect) => self.apply_pixel_aspect(aspect),
             A::SetDisplayScaling(scaling) => self.apply_display_scaling(scaling),
             A::ToggleAutocrop => self.apply_autocrop(!crate::video::autocrop()),
+            A::ToggleVsync => {
+                self.apply_vsync(!self.vsync);
+                self.show_osd(if self.vsync {
+                    "VSync: on"
+                } else {
+                    "VSync: off"
+                });
+            }
             A::StepTvCentre(dh, dv) => self.step_tv_centre(dh, dv),
             A::ResetTvCentre => {
                 self.tv_centre = crate::config::TvCentre::default();
@@ -505,6 +533,7 @@ impl App {
                 self.request_redraw();
             }
             A::ToggleRewind => self.toggle_rewind(),
+            A::ToggleClipboard => self.toggle_clipboard_sharing(),
 
             A::ToggleWarp => self.toggle_warp(),
             A::SetWarpLimit(limit) => {
@@ -521,9 +550,10 @@ impl App {
 
             A::ToggleRecord => self.toggle_recording(),
             A::ToggleRecordInput => self.toggle_input_recording(),
+            A::SaveClip => self.save_clip_gif(),
 
             A::SaveState => self.save_state_interactive(),
-            A::LoadState => self.load_state_from_dialog(event_loop),
+            A::LoadState => self.open_states_browser(),
             A::QuickSave(slot) => self.quick_save_state(slot + 1),
             A::QuickLoad(slot) => self.quick_load_state(slot + 1, event_loop),
             A::StepShaderStrength(dir) => {
@@ -754,6 +784,11 @@ impl App {
             // answered while it is up, Escape included.
             #[cfg(feature = "game-library")]
             if self.login_handle_key(code, text) || self.meta_handle_key(code, text) {
+                return true;
+            }
+            // The Load State browser walks its own list: its keys are
+            // answered here, and Escape first withdraws its delete question.
+            if self.states_handle_key(code, event_loop) {
                 return true;
             }
             if code == KeyCode::Escape {
@@ -1112,18 +1147,6 @@ impl App {
             self.request_redraw();
         }
         handled
-    }
-
-    pub(super) fn ui_handle_tool_key(&mut self, kind: ToolPanelKind, code: KeyCode) -> bool {
-        if code == KeyCode::Escape {
-            self.close_tool_panel(kind);
-            return true;
-        }
-        match kind {
-            ToolPanelKind::Debugger => self.ui_handle_debugger_key(code),
-            ToolPanelKind::FrameAnalyzer => self.ui_handle_frame_analyzer_key(code),
-            ToolPanelKind::Console => self.ui_handle_console_key(code),
-        }
     }
 
     /// Open or close the pop-up menu, from the hamburger button or the

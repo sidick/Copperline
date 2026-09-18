@@ -65,7 +65,8 @@ impl MachineSetup {
                 .as_deref()
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
-            fmv_rom_disabled: raw.fmv_rom.as_deref() == Some(""),
+            fmv_fitted: raw.fmv == Some(true)
+                || raw.fmv_rom.as_deref().is_some_and(|path| !path.is_empty()),
             floppy_drives: raw.floppy.drives.unwrap_or(connected).min(4),
             floppy_speed: cfg.floppy.speed,
             df_playlists: cfg.floppy_playlists.clone(),
@@ -199,6 +200,24 @@ impl MachineSetup {
             lide_drive_boot_off: std::array::from_fn(|i| {
                 boot_is_off(lide_raw_slots[i].as_ref().and_then(|d| d.bootpri))
             }),
+            sf2000sd_card: cfg.sf2000sd.card.as_ref().map(|d| d.path.clone()),
+            sf2000sd_card_name: cfg
+                .sf2000sd
+                .card
+                .as_ref()
+                .and_then(|d| d.volume_name.clone()),
+            sf2000sd_card_fs: cfg
+                .sf2000sd
+                .card
+                .as_ref()
+                .map(|d| d.filesystem)
+                .unwrap_or(crate::diskimage::FileSystem::FFS),
+            sf2000sd_card_is_dir: cfg.sf2000sd.card.as_ref().is_some_and(|d| d.path.is_dir()),
+            sf2000sd_card_bootpri: boot_priority_of(
+                raw.sf2000sd.card.as_ref().and_then(|d| d.bootpri),
+            ),
+            sf2000sd_card_boot_off: boot_is_off(raw.sf2000sd.card.as_ref().and_then(|d| d.bootpri)),
+            sf2000sd_rom: raw.sf2000sd.rom.as_deref().map(PathBuf::from),
             filesys_dirs: std::array::from_fn(|i| {
                 raw.filesys.get(i).map(|m| PathBuf::from(&m.path))
             }),
@@ -241,6 +260,8 @@ impl MachineSetup {
             serial_listen: cfg.serial.listen.clone(),
             serial_connect: cfg.serial.connect.clone(),
             serial_telnet: cfg.serial.telnet.unwrap_or(false),
+            serial_device: cfg.serial.device.clone(),
+            serial_devices: Vec::new(),
             parallel_device: cfg.parallel.device,
             parallel_output: cfg.parallel.printer_output.clone(),
             sampler_input: cfg.parallel.sampler_input.clone(),
@@ -294,6 +315,7 @@ impl MachineSetup {
             bezel: cfg.bezel,
             bezel_stickers: cfg.bezel_stickers.clone(),
             perf_overlay: cfg.perf_overlay,
+            vsync: cfg.vsync,
             mt32_control_rom: cfg.serial.mt32_control_rom.clone(),
             mt32_pcm_rom: cfg.serial.mt32_pcm_rom.clone(),
             mt32_panel: cfg.serial.mt32_panel,
@@ -475,11 +497,10 @@ impl MachineSetup {
         // ROM
         raw.rom = self.rom.as_deref().map(path_string);
         raw.extended_rom = self.extended_rom.as_deref().map(path_string);
-        raw.fmv_rom = match self.fmv_rom.as_deref() {
-            Some(path) => Some(path_string(path)),
-            None if self.fmv_rom_disabled => Some(String::new()),
-            None => None,
-        };
+        // A named ROM fits the module by itself; the bundled ROM needs the
+        // `fmv = true` switch, and an empty slot is the default.
+        raw.fmv_rom = self.fmv_rom.as_deref().map(path_string);
+        raw.fmv = (self.fmv_fitted && self.fmv_rom.is_none()).then_some(true);
     }
 
     fn write_media_config(&self, raw: &mut RawConfig, base: &Config) {
@@ -671,6 +692,15 @@ impl MachineSetup {
             raw.lide.drive2 = slot_raw(2);
             raw.lide.drive3 = slot_raw(3);
         }
+        // `[sf2000sd]` has no controller/personality to gate on -- like
+        // `[copperhf]` above, the card and ROM are always emitted when set.
+        raw.sf2000sd.card = drive_raw(
+            self.sf2000sd_card.as_deref(),
+            self.sf2000sd_card_name.as_deref(),
+            self.effective_bootpri(F::Sf2000SdCardBoot),
+            self.sf2000sd_card_fs,
+        );
+        raw.sf2000sd.rom = self.sf2000sd_rom.as_ref().map(|p| path_string(p));
         // Host FS mounts: the edited slots (empty ones drop out), then any
         // hand-written extras beyond what the GUI shows.
         raw.filesys = (0..FILESYS_GUI_SLOTS)
@@ -769,6 +799,9 @@ impl MachineSetup {
         }
         if self.perf_overlay != base.perf_overlay {
             raw.display.perf_overlay = Some(self.perf_overlay);
+        }
+        if self.vsync != base.vsync {
+            raw.display.vsync = Some(self.vsync);
         }
         if self.tint != base.tint {
             raw.display.tint = Some(tint_name(self.tint).to_string());
@@ -878,6 +911,7 @@ impl MachineSetup {
         // was typed so emptying a box reverts it.
         raw.serial.listen = self.serial_listen.as_deref().map(complete_listen);
         raw.serial.connect = self.serial_connect.as_deref().map(complete_connect);
+        raw.serial.device = self.serial_device.clone();
         // Compared against the resolved value, not the raw tri-state: the
         // toggle is a plain on/off, so "unset" and "explicitly off" look
         // the same to it and must not produce a spurious `telnet = false`
@@ -911,6 +945,9 @@ impl MachineSetup {
                 .is_some()
                 .then(|| ParallelDevice::Printer.label().to_string()),
             ParallelDevice::Sampler => Some(ParallelDevice::Sampler.label().to_string()),
+            ParallelDevice::JoystickAdapter => {
+                Some(ParallelDevice::JoystickAdapter.label().to_string())
+            }
         };
         // Ethernet: no profile fits an A2065 by default, so the board is
         // emitted whenever it is on (absent key = not fitted).

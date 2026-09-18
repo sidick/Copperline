@@ -23,7 +23,7 @@ rom = "kickstart.rom"
 # base = "/somewhere/else"    # move the whole tree in one line
 # states = "states"           # save states, incl. the quick-save slots
 # screenshots = "screenshots"
-# recordings = "recordings"   # video captures and recorded input scripts
+# recordings = "recordings"   # video captures, GIF clips and recorded input scripts
 # nvram = "nvram"             # battery-backed RAMs, incl. CD32 game saves
 # traces = "traces"           # debugger traces and waveform captures
 # configs = "configs"         # configurations saved from the launcher
@@ -74,13 +74,14 @@ pacing_budget = "cycles"
 # one run (set it to 0/false/off to force it off).
 # realtime_priority = false
 
-# Default speed of Warp Speed (turbo) mode. The window presents with vsync,
-# so emulating one frame per presented frame would pin warp to the host
+# Default speed of Warp Speed (turbo) mode. With VSync enabled,
+# emulating one frame per presented frame would pin warp to the host
 # monitor's refresh rate. This is an output frame skip: warp retires this
 # many emulated frames per presented frame, making warp roughly the limit
 # times the refresh rate (host CPU permitting). One of "2x", "4x", "8x",
-# "16x", or "max" (default; run flat out, still presenting at vsync). Adjust
-# it live from Warp Settings > Warp Limit or Cmd+Shift+W / Alt+Shift+W.
+# "16x", or "max" (default; run flat out). With VSync off, presentation
+# frequency depends on host throughput. Adjust it live from Warp Settings >
+# Warp Limit or Cmd+Shift+W / Alt+Shift+W.
 # warp_speed = "max"
 
 # Warp boot: runs in unthrottled warp mode (audio muted) from power-on until
@@ -236,12 +237,13 @@ model = "68000"
 # main rom.
 # extended_rom = "cdtv-extended.rom"
 
-# CD32 Full Motion Video module ROM. The CD32 profile automatically loads
-# Copperline's bundled open-source 256 KiB FMV ROM by default. Specify a custom
-# ROM file (such as the Commodore v40.30 ROM) to override it, or set to an
-# empty string to emulate a CD32 without the FMV cartridge.
+# CD32 Full Motion Video module. The cartridge slot is empty by default, as
+# on a stock CD32 (fitting the module moves the guest's memory layout and
+# boot timing). fmv = true fits it with Copperline's bundled open-source
+# 256 KiB FMV ROM; fmv_rom names a custom ROM file (such as the Commodore
+# v40.30 ROM) to fit instead.
+# fmv = true
 # fmv_rom = "another-fmv.rom"
-# fmv_rom = ""
 
 
 # CD image (a cue sheet, single- or multi-file, with MODE1/2048, MODE1/2352,
@@ -445,7 +447,9 @@ slow = "512K"
 # autoboots on Kickstart 1.3+, so it does not depend on the Kickstart IDE
 # driver (which only probes the master on stock 3.1). Drive paths accept the
 # same images as [ide]: RDB HDFs, bare partition hardfiles, gzip-compressed
-# hardfiles (.hdz), or host directories. A path ending in .cue, .iso, .nrg, or .chd
+# hardfiles (.hdz), CHD hard-disk images (.chd), or host directories. A path
+# ending in .cue, .iso, .nrg, or a .chd holding a CD (chdman createcd; a
+# createhd one is a hard disk -- the CHD's metadata decides, not its name)
 # attaches a SCSI CD-ROM drive at that ID instead (read-only; mount it in the
 # guest with a CD filesystem pointed at the controller's scsi.device and that
 # unit number). CD audio tracks play through the machine's audio output, and
@@ -499,8 +503,10 @@ slow = "512K"
 # One drive key per slot, in (channel, master/slave) order: drive0/drive1 are
 # channel 0's master/slave, drive2/drive3 are channel 1's (ripple only). Each
 # is independent, so a slot can be left empty without ending the list -- the
-# same shape as [ide]'s master/slave and [scsi]'s unit0..unit6. The older
-# positional `drives = [...]` array is still read for existing configs.
+# same shape as [ide]'s master/slave and [scsi]'s unit0..unit6, taking the
+# same image forms (RDB HDFs, bare partition hardfiles, .hdz, .chd, host
+# directories, CD images). The older positional `drives = [...]` array is
+# still read for existing configs.
 # [lide]
 # board = "ripple"
 # rom = "lide.rom"
@@ -512,16 +518,29 @@ slow = "512K"
 # equivalent of WinUAE's uaehf.device), for a high-performance hard disk with
 # none of a real chip's register timing to model. Up to seven units, same
 # bare-path/table drive form as [ide]/[scsi]/[lide]: RDB HDFs, bare partition
-# hardfiles, gzip-compressed hardfiles (.hdz), and host directories all work
-# the same way, RDB and RDB-less images handled identically to the other
-# controllers. Hard disks only -- a CD image path (.cue/.iso/.nrg/.chd) is
-# rejected; attach CD images to [scsi] or [ide]/[lide] instead. No rom key:
+# hardfiles, gzip-compressed hardfiles (.hdz), CHD hard-disk images (.chd),
+# and host directories all work the same way, RDB and RDB-less images
+# handled identically to the other controllers. Hard disks only -- a CD image
+# path (.cue/.iso/.nrg, or a .chd holding a CD) is rejected; attach CD images
+# to [scsi] or [ide]/[lide] instead. No rom key:
 # the board's boot ROM and device driver are built into Copperline itself
 # (an autoboot DiagArea ROM and RDB mounter -- see COPPERHF-DEVICE-PLAN.md
 # and docs/internals/copperhf.md), not a loadable image.
 # [copperhf]
 # unit0 = "workbench.hdf"
 # unit1 = { path = "data.hdf", bootpri = 6 }   # table form, as for [ide]
+
+# The SF2000 accelerator's built-in Zorro II SD card controller: a 64K I/O
+# window over an SPI-mode SD card. card takes the same bare-path/table drive
+# form as [copperhf]'s units -- hard disks only, a CD image path is rejected
+# (the controller speaks the SD card command set, not ATAPI/SCSI-CDROM).
+# Unlike [lide]'s rom, there is no bundled default: the boot ROM is the
+# SF2000 firmware author's own, not Copperline's to ship. rom absent (or "")
+# is hardware-only mode -- registers are live from power-on, no autoboot,
+# but the card still works once a disk-loaded driver finds it.
+# [sf2000sd]
+# card = "workbench.hdf"
+# rom = "sf2000sd.rom"
 
 
 [chipset]
@@ -553,7 +572,12 @@ video = "PAL"
 # of 256 KiB) work - the latter get a synthesized RDB on the fly. A gzip-
 # compressed hardfile (.hdz, or a gzipped .hdf: it is the content that decides,
 # not the name) is unpacked into memory at open time, so the guest may write to
-# it but nothing goes back to the compressed file. A path may also name a host
+# it but nothing goes back to the compressed file. A CHD hard-disk image (as
+# `chdman createhd -i disk.hdf -o disk.chd` writes, recognised by content too)
+# is decompressed a sector at a time and never written: guest writes go to a
+# copy-on-write overlay beside it, disk.chd.wov, which persists across
+# sessions (delete it to return to the pristine image). If the overlay cannot
+# be created the disk attaches write-protected. A path may also name a host
 # directory, mounted as an in-memory FFS or OFS volume (guest writes are
 # likewise not synced back to the host).
 #
@@ -570,14 +594,31 @@ video = "PAL"
 # own RDB, which keeps its label, priorities, and filesystem recorded inside
 # it.
 #
-# A path ending in .cue, .iso, .nrg, or .chd attaches an ATAPI CD-ROM drive at
-# that slot instead of a hard disk (see [scsi], above, for the read-only
-# SCSI-2 command engine both share).
+# A path ending in .cue, .iso, .nrg, or a .chd holding a CD attaches an ATAPI
+# CD-ROM drive at that slot instead of a hard disk (see [scsi], above, for the
+# read-only SCSI-2 command engine both share).
 # [ide]
 # master = "workbench.hdf"
 # slave = "data.hdf"
 # master = { path = "workbench.hdf", bootpri = 6 }
 # master = { path = "/host/Games", filesystem = "ofs" }
+
+
+# The A600/A1200 PCMCIA (credit-card) slot, wired through Gayle. One card:
+# a CompactFlash card over any image [ide] accepts (the Aminet CF drivers
+# -- compactflash.device, cfd.device, the scsi.device PCMCIA patches --
+# talk to it through the CF register layout; Kickstart's card.resource
+# only detects it), or an SRAM memory card that Kickstart adds as
+# credit-card RAM when present at boot. A real card in a reader goes in
+# with [[host_disk]] attach = "pcmcia" instead. More than 4M of [memory]
+# fast covers the slot's $600000-$9FFFFF window and disables the slot, as
+# on a real A1200 with an 8M Zorro II expansion. --pcmcia-cf PATH and
+# --pcmcia-sram SIZE are the command-line forms.
+# [pcmcia]
+# card = "cf"                # "none" (default), "cf", or "sram"
+# path = "card.hdf"          # cf: the image; sram: optional backing file
+# size = "2M"                # sram only: 64K..1M in 64K steps, or 128K..4M in 128K steps
+# read_only = false          # sram only: the write-protect switch
 
 
 # Direct WHDLoad boot (docs/guide/whdload.md): boot straight into a
@@ -624,6 +665,22 @@ video = "PAL"
 # [[filesys]]
 # path = "/data/amiga/downloads"
 # readonly = true
+
+
+# Host <-> guest clipboard sharing: text copied in the guest (an FTXT clip
+# in clipboard.device unit 0) lands on the host clipboard, and host text is
+# available to paste in the guest, with Latin-1 and line-end conversion.
+# The guest side rides the services board's ROM (Kickstart 1.3 and later,
+# no guest configuration). Off by default in every session, because fitting
+# the bridge puts an autoconfig board on the Zorro chain that the machine
+# you configured does not have, and every Exec allocation behind it moves;
+# software that reads memory it has not written yet can tell. share = true
+# fits it, windowed or headless (headless it is reachable through the
+# control protocol's clipboard.get/set, not the host clipboard, so the run
+# stays deterministic). Also --clipboard / --no-clipboard, and Input
+# Settings > Share Clipboard at runtime.
+# [clipboard]
+# share = true
 
 
 # Presentation options. overscan: "tv" (default; mask deep horizontal
@@ -695,6 +752,16 @@ video = "PAL"
 # --show-status-bar / --hide-status-bar, and Cmd/Alt+Shift+F toggles it live).
 # menu_scale: how large the pop-up menu is drawn. "1x" (default) or "2x";
 # also --menu-scale, and Video Settings > Menu Size changes it live.
+# vsync: synchronise desktop presentation to vblank (default true).
+# Video Settings > VSync changes it live. Off may reduce latency but can
+# tear; normal emulation speed is unchanged. PAL on a fixed 60/120 Hz screen
+# can still have an uneven cadence with vsync on.
+# hidpi_texture: draw the presentation texture at the display's device-pixel
+# density (default true), so a 200% (Retina) window is fed a 2x texture.
+# false keeps it at canvas resolution and lets the GPU scale it -- about a
+# quarter of the per-frame copy and upload, for a slow host that falls short
+# of real time in a high-density window. Integer scaling looks the same
+# either way; the smooth fit selects rows a little more coarsely.
 # [display]
 # overscan = "tv"
 # tv_h_centre = 0
@@ -713,6 +780,17 @@ video = "PAL"
 # menu_scale = "1x"
 # full_screen = false
 # status_bar = true
+# vsync = true
+# hidpi_texture = true
+
+# [recording] -- the GIF clip ring behind Save Clip as GIF (Cmd/Alt+Shift+G)
+# and the rate of every GIF clip, including headless --gif-after captures.
+# clip_seconds: emulated seconds of the presented picture the window keeps
+# (default 10, up to 120); 0 switches the ring and the menu item off.
+# clip_fps: GIF frame rate, 1 to 60 (default 0 = 25 on PAL, 30 on NTSC).
+# [recording]
+# clip_seconds = 10
+# clip_fps = 0
 
 
 [audio]
@@ -774,12 +852,26 @@ floppy_sounds_volume = 100
 #   "analogue" analogue paddles / proportional stick on the POT pins,
 #              driven by --pot-after scripting or the CCP input.analogue
 #              method (no live host device maps to it yet)
+#   "lightpen" light pen / light gun (alias "lightgun"): follows the host
+#              pointer over the display, a left click is the pen switch /
+#              trigger (POTxX); --pen-after X Y positions it headless. Its
+#              pulses only reach Agnus from the port the board wires to LP:
+#              port 1 on the A1000, port 2 on every later Amiga
 #   "none"     empty port
 # Defaults: port1 = "mouse", port2 = "joystick" ("cd32" on the CD32
 # profile). Also --port1 DEVICE / --port2 DEVICE per run; the runtime menu
 # and the CCP input.set_port method hot-plug a device live.
 # port1 = "mouse"
 # port2 = "joystick"
+#
+# Ports 3 and 4 are the passive parallel-port four-player adapter's sockets
+# (Kick Off 2, Sensible Soccer, Dyna Blaster...): "joystick" or "none".
+# Naming a joystick fits the adapter ([parallel] device =
+# "joystick-adapter"); an adapter named there fills every socket left
+# unset. Also --port3 /
+# --port4, --joy-after ... 3|4, and the CCP input.joy with port 3 or 4.
+# port3 = "joystick"
+# port4 = "joystick"
 
 # Initial host source for the joystick/CD32-pad port:
 #   "gamepad"  (default) only a physical pad drives the port; the keyboard
@@ -849,6 +941,19 @@ floppy_sounds_volume = 100
 #   "pty"     serial in/out is bridged to a host pseudo-terminal (Unix only).
 #             The slave path (/dev/pts/N) is logged at startup; attach a
 #             terminal with e.g. `minicom -D`, `screen`, or `cu -l`.
+#   "device"  serial in/out is wired to a real host serial port, named by
+#             device: a USB adapter's path (/dev/tty.usbserial-1420 on
+#             macOS, /dev/ttyUSB0 on Linux) or a COM name (COM3) on
+#             Windows; --list-serial-ports names them. The guest's DTR/RTS
+#             drive the port's pins and its CTS/DSR/DCD come back on
+#             CIA-B, so a null-modem link to a real Amiga or PC (Amiga
+#             Explorer, ZMODEM) handshakes as it would on real hardware.
+#             The port follows the guest's SERPER rate (nearest standard
+#             rate) and stop bits; host bytes still arrive at the emulated
+#             rate. A pulled adapter reads as an unplugged cable until it
+#             is back. Host-clocked, so outside byte-identical replay, and
+#             reopened rather than restored by a save state. Needs the
+#             host-serial feature (default on).
 #   "modem"   a Hayes/AT-command modem: the guest dials out with
 #             "ATD host:port" rather than the port being wired to a peer at
 #             startup, so there is no connect key here. listen means
@@ -869,10 +974,12 @@ floppy_sounds_volume = 100
 # See docs/guide/modem.md for the full command set and a BBS quick-start.
 # With an AUX: shell on the Amiga side, "tcp"/"pty" give a remote AmigaDOS
 # console. --serial MODE overrides this per run; --serial-connect HOST:PORT
-# implies "tcp-connect"; --serial-session FILE implies "modem"; --midi-out/
-# --midi-in NAME imply "midi".
+# implies "tcp-connect"; --serial-session FILE implies "modem";
+# --serial-device PATH implies "device"; --midi-out/--midi-in NAME imply
+# "midi".
 # mode = "stdout"
 # connect = "bbs.example.com:1337"
+# device = "/dev/tty.usbserial-1420"  # device mode: host serial port (COM3 on Windows)
 # midi_out = "USB MIDI Interface"
 # midi_in = "USB MIDI Interface"
 # listen = "127.0.0.1:1234"
@@ -924,8 +1031,16 @@ floppy_sounds_volume = 100
 #              prints; omitted = system default). `sampler_gain` is the preamp
 #              gain in decibels (0 dB = unity; ~ -24 to +24 dB). Needs a build
 #              with the `frontend` feature (it uses cpal, like live audio output).
+#   "joystick-adapter" (alias "multitap")
+#              the passive four-player joystick adapter: port 3's
+#              directions on D0-D3 (CIA-A PB0-3) and fire on SEL (CIA-B
+#              PA2), port 4's on D4-D7 and BUSY (PA0), second buttons on
+#              POUT (PA1), all switches to ground on pins the guest has
+#              set as inputs. Sockets are [input] port3 / port4. Supports
+#              up to four host gamepads, with keyboard mappings for spare ports.
 # --parallel DEVICE overrides this per run; --sampler-audio-input /
-# --sampler-input-gain imply "sampler".
+# --sampler-input-gain imply "sampler", and [input] port3/port4 =
+# "joystick" implies "joystick-adapter".
 
 [parallel]
 # device = "printer"
@@ -933,6 +1048,7 @@ floppy_sounds_volume = 100
 # device = "sampler"
 # sampler_input = "MacBook Air Microphone"
 # sampler_gain = 6.0   # dB
+# device = "joystick-adapter"
 
 
 # Optional floppy drives. Set [floppy] drives to wire 0-4 mechanisms. CDTV

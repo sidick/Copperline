@@ -109,100 +109,115 @@ impl App {
                 | LauncherField::CopperhfUnit4
                 | LauncherField::CopperhfUnit5
                 | LauncherField::CopperhfUnit6
+                | LauncherField::Sf2000SdCard
         );
         let title = if hard_drive_slot && cfg!(target_os = "macos") {
             "Select file or folder"
         } else {
             "Select file"
         };
-        let mut dialog = rfd::FileDialog::new().set_title(title);
-        dialog = match field {
-            LauncherField::Rom
-            | LauncherField::ExtendedRom
-            | LauncherField::FmvRom
-            | LauncherField::ScsiRom
-            | LauncherField::ScsiRomOdd
-            | LauncherField::LideRom
-            | LauncherField::LideRomBank2
-            | LauncherField::Mt32ControlRom
-            | LauncherField::Mt32PcmRom => {
-                // Both cases spelled out: ROM dumps are as often shouted as
-                // not, and some hosts match the filter case-sensitively.
-                dialog.add_filter("ROM images", &["rom", "ROM", "bin", "BIN"])
+        let picked = super::native_dialog::pick(move || {
+            let mut dialog = rfd::FileDialog::new().set_title(title);
+            dialog = match field {
+                LauncherField::Rom
+                | LauncherField::ExtendedRom
+                | LauncherField::FmvRom
+                | LauncherField::ScsiRom
+                | LauncherField::ScsiRomOdd
+                | LauncherField::LideRom
+                | LauncherField::LideRomBank2
+                | LauncherField::Sf2000SdRom
+                | LauncherField::Mt32ControlRom
+                | LauncherField::Mt32PcmRom => {
+                    // Both cases spelled out: ROM dumps are as often shouted as
+                    // not, and some hosts match the filter case-sensitively.
+                    dialog.add_filter("ROM images", &["rom", "ROM", "bin", "BIN"])
+                }
+                LauncherField::Df0Image
+                | LauncherField::Df1Image
+                | LauncherField::Df2Image
+                | LauncherField::Df3Image => {
+                    dialog.add_filter("Floppy images", crate::floppy::IMAGE_EXTENSIONS)
+                }
+                // Only formats CdImage::load takes: a cue sheet, a bare ISO,
+                // an NRG, or a CHD (a raw .bin is a cue sheet's payload, not loadable
+                // alone).
+                LauncherField::CdImage => {
+                    dialog.add_filter("CD images", &["cue", "iso", "nrg", "chd"])
+                }
+                // A WHDLoad package however it arrived: as distributed
+                // (`.lha`), zipped, or as a bare `.slave` picked inside an
+                // already-extracted one (stored as its directory, which is
+                // what the stager mounts). Spelled in both cases like the ROM
+                // filters, since the dialog matches exactly.
+                LauncherField::WhdloadGame => dialog.add_filter(
+                    "WHDLoad packages",
+                    &[
+                        "lha", "LHA", "lzh", "LZH", "zip", "ZIP", "slave", "Slave", "slav", "Slav",
+                    ],
+                ),
+                LauncherField::Cd32Nvram => {
+                    dialog.add_filter("NVRAM images", &["bin", "nv", "sav"])
+                }
+                #[cfg(feature = "coppersynth")]
+                LauncherField::CsynthSoundfont => {
+                    dialog.add_filter("SoundFonts", &["sf2", "SF2", "zip", "ZIP"])
+                }
+                // SCSI, IDE, and lide drive slots all take hard disks or CD
+                // images (a cue/iso/nrg/chd attaches a CD-ROM drive at that slot,
+                // over SCSI or ATAPI as appropriate).
+                LauncherField::ScsiUnit0
+                | LauncherField::ScsiUnit1
+                | LauncherField::ScsiUnit2
+                | LauncherField::ScsiUnit3
+                | LauncherField::ScsiUnit4
+                | LauncherField::ScsiUnit5
+                | LauncherField::ScsiUnit6
+                | LauncherField::IdeMaster
+                | LauncherField::IdeSlave
+                | LauncherField::LideDrive0
+                | LauncherField::LideDrive1
+                | LauncherField::LideDrive2
+                | LauncherField::LideDrive3 => dialog
+                    .add_filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                    .add_filter("CD images", &["cue", "iso", "nrg", "chd"]),
+                // copperhf.device serves hard disks only -- no ATAPI/SCSI-CDROM
+                // emulation behind it (`copperhf_drive_image` rejects a CD
+                // extension) -- so its units get no CD filter, unlike the slots
+                // above.
+                LauncherField::CopperhfUnit0
+                | LauncherField::CopperhfUnit1
+                | LauncherField::CopperhfUnit2
+                | LauncherField::CopperhfUnit3
+                | LauncherField::CopperhfUnit4
+                | LauncherField::CopperhfUnit5
+                | LauncherField::CopperhfUnit6 => {
+                    dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                }
+                // The SF2000 SD card controller is hard disks only too --
+                // it speaks the SD card command set, not ATAPI/SCSI-CDROM
+                // (see `copperhf_drive_image`, reused for `[sf2000sd] card`).
+                LauncherField::Sf2000SdCard => {
+                    dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                }
+                _ => dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"]),
+            };
+            if let Some(dir) = start_dir {
+                dialog = dialog.set_directory(dir);
             }
-            LauncherField::Df0Image
-            | LauncherField::Df1Image
-            | LauncherField::Df2Image
-            | LauncherField::Df3Image => {
-                dialog.add_filter("Floppy images", crate::floppy::IMAGE_EXTENSIONS)
-            }
-            // Only formats CdImage::load takes: a cue sheet, a bare ISO,
-            // an NRG, or a CHD (a raw .bin is a cue sheet's payload, not loadable
-            // alone).
-            LauncherField::CdImage => dialog.add_filter("CD images", &["cue", "iso", "nrg", "chd"]),
-            // A WHDLoad package however it arrived: as distributed
-            // (`.lha`), zipped, or as a bare `.slave` picked inside an
-            // already-extracted one (stored as its directory, which is
-            // what the stager mounts). Spelled in both cases like the ROM
-            // filters, since the dialog matches exactly.
-            LauncherField::WhdloadGame => dialog.add_filter(
-                "WHDLoad packages",
-                &[
-                    "lha", "LHA", "lzh", "LZH", "zip", "ZIP", "slave", "Slave", "slav", "Slav",
-                ],
-            ),
-            LauncherField::Cd32Nvram => dialog.add_filter("NVRAM images", &["bin", "nv", "sav"]),
-            #[cfg(feature = "coppersynth")]
-            LauncherField::CsynthSoundfont => {
-                dialog.add_filter("SoundFonts", &["sf2", "SF2", "zip", "ZIP"])
-            }
-            // SCSI, IDE, and lide drive slots all take hard disks or CD
-            // images (a cue/iso/nrg/chd attaches a CD-ROM drive at that slot,
-            // over SCSI or ATAPI as appropriate).
-            LauncherField::ScsiUnit0
-            | LauncherField::ScsiUnit1
-            | LauncherField::ScsiUnit2
-            | LauncherField::ScsiUnit3
-            | LauncherField::ScsiUnit4
-            | LauncherField::ScsiUnit5
-            | LauncherField::ScsiUnit6
-            | LauncherField::IdeMaster
-            | LauncherField::IdeSlave
-            | LauncherField::LideDrive0
-            | LauncherField::LideDrive1
-            | LauncherField::LideDrive2
-            | LauncherField::LideDrive3 => dialog
-                .add_filter("Hard disk images", &["hdf", "hdz", "img", "bin"])
-                .add_filter("CD images", &["cue", "iso", "nrg", "chd"]),
-            // copperhf.device serves hard disks only -- no ATAPI/SCSI-CDROM
-            // emulation behind it (`copperhf_drive_image` rejects a CD
-            // extension) -- so its units get no CD filter, unlike the slots
-            // above.
-            LauncherField::CopperhfUnit0
-            | LauncherField::CopperhfUnit1
-            | LauncherField::CopperhfUnit2
-            | LauncherField::CopperhfUnit3
-            | LauncherField::CopperhfUnit4
-            | LauncherField::CopperhfUnit5
-            | LauncherField::CopperhfUnit6 => {
-                dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin"])
-            }
-            _ => dialog.add_filter("Hard disk images", &["hdf", "hdz", "img", "bin"]),
-        };
-        if let Some(dir) = start_dir {
-            dialog = dialog.set_directory(dir);
-        }
-        #[cfg(target_os = "macos")]
-        let picked = if hard_drive_slot {
-            dialog.pick_file_or_folder()
-        } else {
-            dialog.pick_file()
-        };
-        #[cfg(not(target_os = "macos"))]
-        let picked = {
-            let _ = hard_drive_slot;
-            dialog.pick_file()
-        };
+            #[cfg(target_os = "macos")]
+            let picked = if hard_drive_slot {
+                dialog.pick_file_or_folder()
+            } else {
+                dialog.pick_file()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let picked = {
+                let _ = hard_drive_slot;
+                dialog.pick_file()
+            };
+            picked
+        });
         if let Some(mut path) = picked {
             if field == LauncherField::WhdloadGame {
                 path = whdload_game_config_path(path);
@@ -253,7 +268,8 @@ impl App {
             | LauncherField::CopperhfUnit3
             | LauncherField::CopperhfUnit4
             | LauncherField::CopperhfUnit5
-            | LauncherField::CopperhfUnit6 => crate::paths::harddrives_dir(),
+            | LauncherField::CopperhfUnit6
+            | LauncherField::Sf2000SdCard => crate::paths::harddrives_dir(),
             // The WHDLoad game folder and the NVRAM image have homes of their
             // own that the launcher already knows; nothing to add here.
             LauncherField::WhdloadGame | LauncherField::Cd32Nvram => None,
@@ -275,11 +291,13 @@ impl App {
             })
             .or_else(crate::paths::harddrives_dir);
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new().set_title("Select host directory");
-        if let Some(dir) = start_dir {
-            dialog = dialog.set_directory(dir);
-        }
-        let picked = dialog.pick_folder();
+        let picked = super::native_dialog::pick(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("Select host directory");
+            if let Some(dir) = start_dir {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.pick_folder()
+        });
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
                 state.edit_cancel();
@@ -300,19 +318,25 @@ impl App {
             .and_then(|s| s.setup.path(field))
             .map(|p| p.to_path_buf());
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new().set_title("Choose output file");
         // Seed with the existing path's directory and name, else the default.
-        match current.as_ref().and_then(|p| p.parent()) {
-            Some(dir) if !dir.as_os_str().is_empty() => dialog = dialog.set_directory(dir),
-            _ => {}
-        }
+        let start_dir = current
+            .as_ref()
+            .and_then(|p| p.parent())
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf);
         let name = current
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or(default_name);
-        dialog = dialog.set_file_name(name);
-        let picked = dialog.save_file();
+            .unwrap_or(default_name)
+            .to_string();
+        let picked = super::native_dialog::pick(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("Choose output file");
+            if let Some(dir) = start_dir {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.set_file_name(name).save_file()
+        });
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
                 state.edit_cancel();
@@ -452,11 +476,13 @@ impl App {
     /// right extension.
     #[cfg(feature = "game-library")]
     pub(super) fn meta_choose_art(&mut self) {
-        let Some(picked) = rfd::FileDialog::new()
-            .set_title("Choose cover art")
-            .add_filter("PNG image", &["png"])
-            .pick_file()
-        else {
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Choose cover art")
+                .add_filter("PNG image", &["png"])
+                .pick_file()
+        });
+        let Some(picked) = picked else {
             return;
         };
         let config = crate::paths::library_root();
@@ -919,13 +945,15 @@ impl App {
         } else {
             // The same bytes either way: .hdf is what emulators look for,
             // .img what a card writer expects, so both are offered.
-            ("Amiga hard disk image", vec!["hdf", "img"])
+            ("Amiga hard disk image", vec!["hdf", "img", "chd"])
         };
-        let picked = rfd::FileDialog::new()
-            .set_title("Create disk image")
-            .add_filter(kind, &ext)
-            .set_file_name(&suggested)
-            .save_file();
+        let picked = super::native_dialog::pick(move || {
+            rfd::FileDialog::new()
+                .set_title("Create disk image")
+                .add_filter(kind, &ext)
+                .set_file_name(suggested)
+                .save_file()
+        });
         self.finish_host_io_pause();
 
         let Some(path) = picked else { return };
@@ -1022,10 +1050,12 @@ impl App {
 
     pub(super) fn launcher_add_zorro(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Add Zorro board metadata")
-            .add_filter("Board metadata", &["toml"])
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Add Zorro board metadata")
+                .add_filter("Board metadata", &["toml"])
+                .pick_file()
+        });
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
                 state.setup.add_zorro(path);
@@ -1038,9 +1068,11 @@ impl App {
     /// Pick a file for a plugin board's file-typed config option.
     pub(super) fn launcher_board_browse(&mut self, board: usize, opt: usize) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Choose plugin file")
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Choose plugin file")
+                .pick_file()
+        });
         if let Some(path) = picked {
             if let Some(state) = self.launcher_state_mut() {
                 state.edit_cancel();
@@ -1055,10 +1087,12 @@ impl App {
 
     pub(super) fn launcher_load(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Load configuration")
-            .add_filter("Copperline config", &["toml"])
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Load configuration")
+                .add_filter("Copperline config", &["toml"])
+                .pick_file()
+        });
         let mut run_at_once = false;
         if let Some(path) = picked {
             match MachineSetup::load_from(&path) {
@@ -1243,16 +1277,18 @@ impl App {
             return;
         };
         self.suspend_live_audio_for_host_io();
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Save configuration")
-            .add_filter("Copperline config", &["toml"])
-            .set_file_name("machine.toml");
-        // Where configurations are kept, which is a better first answer than
-        // wherever the last unrelated dialog happened to end up.
-        if let Some(dir) = crate::paths::configs_dir() {
-            dialog = dialog.set_directory(dir);
-        }
-        let picked = dialog.save_file();
+        let picked = super::native_dialog::pick(|| {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save configuration")
+                .add_filter("Copperline config", &["toml"])
+                .set_file_name("machine.toml");
+            // Where configurations are kept, which is a better first answer
+            // than wherever the last unrelated dialog happened to end up.
+            if let Some(dir) = crate::paths::configs_dir() {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.save_file()
+        });
         if let Some(path) = picked {
             match std::fs::write(&path, toml) {
                 Ok(()) => self.set_launcher_status(StatusMessage::ok(format!(
@@ -1362,7 +1398,7 @@ impl App {
         }
         let guest = options
             .as_ref()
-            .is_some_and(|options| options.settings().player == 1);
+            .is_some_and(|options| options.role() != crate::netplay::Role::Host);
         let mut staged = if guest {
             RawConfig::default()
         } else {
@@ -1395,6 +1431,10 @@ impl App {
         if options.is_some() {
             crate::netplay::prepare_config(&mut cfg)?;
         }
+        // A launcher-started machine settles the host clipboard the same
+        // way a command line does: only where the configuration asked for
+        // it, and never under netplay.
+        cfg.resolve_clipboard_share(options.is_some() || guest);
         if guest {
             let _ = crate::config::resolve_bundled_rom(&mut cfg);
         } else {
@@ -1438,7 +1478,7 @@ impl App {
         // ROM is required here.
         let guest = options
             .as_ref()
-            .is_some_and(|options| options.settings().player == 1);
+            .is_some_and(|options| options.role() != crate::netplay::Role::Host);
         let built = crate::emulator::build_machine(cfg, audio, true, guest).and_then(|mut emu| {
             let session = options
                 .map(|options| crate::netplay::Session::new(options, &mut emu, cfg))
@@ -1504,11 +1544,17 @@ impl App {
         self.disk_playlist_index = [0; 4];
         self.overscan = crate::config::resolve_overscan(cfg.overscan);
         self.tv_centre = cfg.tv_centre;
+        // The clip ring belongs to the machine being replaced: its frames
+        // and its automatic rate (the video standard) are that machine's.
+        self.clip_settings = cfg.recording.clip_settings();
+        self.clip_ring = None;
         self.apply_pixel_aspect(crate::config::resolve_pixel_aspect(cfg.pixel_aspect));
         // The bezel before the scaling: the canvas rule reads both, and
         // adopting them in this order moves the canvas at most once.
         self.apply_bezel_style(crate::config::resolve_bezel(cfg.bezel));
         self.apply_display_scaling(cfg.scaling);
+        self.apply_vsync(cfg.vsync);
+        self.apply_hidpi_texture(cfg.hidpi_texture);
         self.apply_autocrop(cfg.autocrop);
         // Apply the configured start-up window state; the runtime toggles
         // (Cmd+F, Cmd+Shift+F) take over from here. Reuse the toggles so the
@@ -1550,6 +1596,9 @@ impl App {
         } else if !self.debugger_wants_time_travel() {
             self.emu.disable_time_travel();
         }
+        // Inspectors left open belong to the host, not to the machine that
+        // was just dropped: re-arm what they capture with on this one.
+        self.rearm_tool_panels();
         self.keyboard_joy_held = [keymap::HeldKeys::default(); keymap::MAPPING_COUNT];
         self.about_machine_lines = crate::config::about_machine_lines(cfg);
         // The threaded path picks the new settings up from the next render
@@ -1573,8 +1622,8 @@ impl App {
                 shader_error = Some(msg);
                 self.crt_shader_kind = crate::config::ShaderKind::None;
             }
-        } else if let Some(r) = self.render.as_mut() {
-            r.crt_shader.clear_custom();
+        } else if let Some(gpu) = self.render.as_mut().and_then(Render::gpu_mut) {
+            gpu.crt_shader.clear_custom();
         }
         self.shader_strength = crate::config::resolve_shader_strength(cfg.shader_strength);
         // The style itself was adopted with the display settings above.

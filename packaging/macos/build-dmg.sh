@@ -6,11 +6,17 @@
 # What it does:
 #   1. Builds the release binary for both Apple architectures with the pinned
 #      dependency graph and lipo-joins them into one universal binary, so a
-#      single download runs natively on Apple Silicon and Intel.
-#   2. Stages a Copperline.app bundle: the universal binary in Contents/MacOS,
-#      the icon and AROS ROM in Contents/Resources. romsearch.rs probes a
-#      bundle's Contents/Resources/aros first, so the bundled AROS ROM is found
-#      with no configuration.
+#      single download runs natively on Apple Silicon and Intel. With
+#      PREBUILT_DIR set the cargo step is skipped and the per-architecture
+#      binaries are taken from that directory instead (the macOS workflow
+#      compiles each slice on its own runner and packages them here).
+#   2. Stages a Copperline.app bundle: the universal binary in Contents/MacOS
+#      beside the copperline-ctl (control protocol / MCP / DAP client) and
+#      copperline-import-uae (config converter) companions, lipo-joined the
+#      same way; the icon and AROS ROM in Contents/Resources. romsearch.rs
+#      probes a bundle's Contents/Resources/aros first, so the bundled AROS
+#      ROM is found with no configuration, and copperline-ctl launches the
+#      copperline next to it.
 #   3. Ad-hoc code-signs the bundle. lipo strips the per-slice signatures Rust
 #      attaches on macOS, and an unsigned arm64 binary will not launch on Apple
 #      Silicon at all, so a signature is mandatory even when it is ad-hoc.
@@ -25,6 +31,8 @@
 #
 # Override knobs (env):
 #   MACOS_UNIVERSAL=0   build only the host architecture (faster local builds)
+#   PREBUILT_DIR=<dir>  skip the cargo build and lipo <dir>/<target>/<binary>
+#                       for each target and shipped binary instead
 #   OUTPUT=<path>       final .dmg file name
 set -euo pipefail
 
@@ -49,14 +57,48 @@ else
   targets=(aarch64-apple-darwin x86_64-apple-darwin)
 fi
 
-echo "==> Building release binary (${targets[*]})"
-for target in "${targets[@]}"; do
-  # Idempotent; ensures hand-builds on a fresh checkout have the cross target.
-  if command -v rustup >/dev/null 2>&1; then
-    rustup target add "$target" >/dev/null
-  fi
-  cargo build --release --locked --target "$target"
-done
+# Executables that ship in Contents/MacOS: the emulator and its command-line
+# companions (all default-feature binaries of one cargo build).
+binaries=(copperline copperline-ctl copperline-import-uae)
+
+# Per-target build directories holding those binaries: either built here or
+# supplied prebuilt.
+slice_dirs=()
+if [ -n "${PREBUILT_DIR:-}" ]; then
+  echo "==> Using prebuilt binaries from $PREBUILT_DIR (${targets[*]})"
+  for target in "${targets[@]}"; do
+    # Catch a slice staged under the wrong target name before lipo would
+    # happily join two copies of the same architecture.
+    case "$target" in
+      aarch64-apple-darwin) want=arm64 ;;
+      x86_64-apple-darwin) want=x86_64 ;;
+      *) want="" ;;
+    esac
+    for name in "${binaries[@]}"; do
+      bin="$PREBUILT_DIR/$target/$name"
+      if [ ! -f "$bin" ]; then
+        echo "error: no prebuilt binary at $bin" >&2
+        exit 1
+      fi
+      got="$(lipo -archs "$bin")"
+      if [ -n "$want" ] && [ "$got" != "$want" ]; then
+        echo "error: $bin is $got, expected $want for $target" >&2
+        exit 1
+      fi
+    done
+    slice_dirs+=("$PREBUILT_DIR/$target")
+  done
+else
+  echo "==> Building release binaries (${targets[*]})"
+  for target in "${targets[@]}"; do
+    # Idempotent; ensures hand-builds on a fresh checkout have the cross target.
+    if command -v rustup >/dev/null 2>&1; then
+      rustup target add "$target" >/dev/null
+    fi
+    cargo build --release --locked --target "$target"
+    slice_dirs+=("target/$target/release")
+  done
+fi
 
 echo "==> Staging $app_name"
 rm -rf "$stage"
@@ -64,12 +106,16 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/aros" \
   "$app/Contents/Resources/a2091" "$app/Contents/Resources/a4091" \
   "$app/Contents/Resources/lide"
 
-# Universal binary from the per-arch builds (a single-arch lipo is a no-op copy).
-bins=()
-for target in "${targets[@]}"; do
-  bins+=("target/$target/release/copperline")
+# Universal binaries from the per-arch slices (a single-arch lipo is a no-op
+# copy). copperline-ctl looks for the emulator next to itself, so all three
+# land in Contents/MacOS together; codesign --deep below signs each of them.
+for name in "${binaries[@]}"; do
+  bins=()
+  for dir in "${slice_dirs[@]}"; do
+    bins+=("$dir/$name")
+  done
+  lipo -create -output "$app/Contents/MacOS/$name" "${bins[@]}"
 done
-lipo -create -output "$app/Contents/MacOS/copperline" "${bins[@]}"
 
 # Info.plist with the version substituted in; plutil -lint catches a botched
 # substitution before the bundle ships.
@@ -94,7 +140,7 @@ for f in \
   cp "assets/aros/$f" "$app/Contents/Resources/aros/$f"
 done
 
-# Bundled open CD32 FMV cartridge ROM (the CD32 profile default).
+# Bundled open CD32 FMV cartridge ROM (fitted by fmv = true on the CD32 profile).
 mkdir -p "$app/Contents/Resources/fmv"
 for f in copperline-fmv.rom README.md; do
   cp "assets/fmv/$f" "$app/Contents/Resources/fmv/$f"
@@ -142,6 +188,17 @@ echo "==> Ad-hoc signing $app_name"
 # identity (no Developer ID needed). This is what lets the universal binary
 # launch on Apple Silicon; it does not satisfy notarization, so downloads are
 # still Gatekeeper-quarantined (see README.txt).
+cp assets/egui/THIRD_PARTY_FONTS.txt "$app/Contents/Resources/THIRD_PARTY_FONTS.txt"
+# The companion tools first: signing the bundle (or its main executable,
+# which codesign treats as the bundle) verifies every nested code object,
+# and lipo has stripped the per-slice signatures, so an unsigned tool in
+# Contents/MacOS fails that pass. An unsigned arm64 copperline-ctl would
+# also be killed on launch. The bundle-level --deep sign then covers the
+# main executable.
+for name in "${binaries[@]}"; do
+  [ "$name" = copperline ] && continue
+  codesign --force --sign - "$app/Contents/MacOS/$name"
+done
 codesign --force --deep --sign - "$app"
 
 echo "==> Laying out disk image contents"

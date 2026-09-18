@@ -6,14 +6,14 @@
 
 use super::ui::{AnalyzerTab, Panel, UiControl};
 use super::{
-    bar_layout, center_present_frame_for_visible_start, center_present_frame_horizontally,
-    control_at, copperline_icon_image, copperline_logo_image, copy_present_frame,
-    copy_tv_aperture_to_window, copy_window_present_frame, cursor_position_in_texture,
-    draw_seven_segment_digit, draw_status_bar, fdd_track_counter_rect, fdd_track_digit_rect,
-    host_shortcut_modifier_pressed, host_to_amiga_rawkey, joystick_toggle_rect, kbdpanel,
-    keyboard_toggle_rect, led_row_rect, mask_present_frame_to_tv, paint_test_screen,
-    parse_amiga_key, pause_button_rect, plan_present_scaling_for, power_button_rect,
-    present_height, presentation_pixels_equal, presentation_source_y_offset,
+    bar_layout, cap_texture_scale, center_present_frame_for_visible_start,
+    center_present_frame_horizontally, control_at, copperline_icon_image, copperline_logo_image,
+    copy_present_frame, copy_tv_aperture_to_window, copy_window_present_frame,
+    cursor_position_in_texture, draw_seven_segment_digit, draw_status_bar, fdd_track_counter_rect,
+    fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey,
+    joystick_toggle_rect, kbdpanel, keyboard_toggle_rect, led_row_rect, mask_present_frame_to_tv,
+    paint_test_screen, parse_amiga_key, pause_button_rect, plan_present_scaling_for,
+    power_button_rect, present_height, presentation_pixels_equal, presentation_source_y_offset,
     raw_device_qualifier_family_held, raw_device_qualifier_rawkey, rawkey_is_held,
     rawkey_transition_is_duplicate, reboot_button_rect, repeated_main_key_should_drop, rgba,
     short_status_error, shorten_status_paths, shot_button_rect, should_render_emulated_frame,
@@ -428,6 +428,7 @@ fn host_routing_assigns_sources_by_device_and_mode() {
         HostRouting {
             mouse,
             gamepad,
+            additional_gamepads: [None; 3],
             gamepad_mouse: None,
             keyboard,
             keyboard2,
@@ -460,7 +461,9 @@ fn host_routing_assigns_sources_by_device_and_mode() {
     // mapping -- and the cursor-key mapping drive one each; the mode
     // picks which pair gets the lower-numbered port.
     set(&mut app, PortDevice::Joystick, PortDevice::Joystick);
-    assert_eq!(app.host_routing(), routing(None, Some(0), Some(1), Some(0)));
+    let mut two_pads = routing(None, Some(0), Some(1), Some(0));
+    two_pads.additional_gamepads[0] = Some(1);
+    assert_eq!(app.host_routing(), two_pads);
     assert!(app.keyboard_mapping_active(1));
     app.joystick_input_mode = JoystickInputMode::Keyboard;
     assert_eq!(app.host_routing(), routing(None, Some(1), Some(0), Some(1)));
@@ -498,6 +501,7 @@ fn a_gamepad_mouse_takes_the_pad_off_the_joystick() {
         HostRouting {
             mouse: Some(0),
             gamepad: None,
+            additional_gamepads: [None; 3],
             gamepad_mouse: Some(0),
             keyboard: Some(1),
             keyboard2: None,
@@ -516,6 +520,7 @@ fn a_gamepad_mouse_takes_the_pad_off_the_joystick() {
         HostRouting {
             mouse: Some(0),
             gamepad: Some(1),
+            additional_gamepads: [None; 3],
             gamepad_mouse: None,
             keyboard: None,
             keyboard2: None,
@@ -925,12 +930,24 @@ fn the_game_page_walks_from_the_button_that_opens_it() {
         LauncherTab::WhdloadLibrary,
     ))));
     fn walk(app: &mut super::App, dir: Dir) -> Option<NavTarget> {
+        // These are individual presses, not one held scroll. Keep the
+        // wall-clock accelerator out of the navigation assertions.
+        app.launcher_state_mut()
+            .unwrap()
+            .library
+            .scroll_rate
+            .reset();
         app.nav_move(dir, None);
         app.nav.focus()
     }
     // Up and down inside a list are the list's own, so they go in by
     // the same door a key does rather than straight to the focus.
     fn press(app: &mut super::App, code: winit::keyboard::KeyCode) {
+        app.launcher_state_mut()
+            .unwrap()
+            .library
+            .scroll_rate
+            .reset();
         app.ui_handle_key(code, None, None);
     }
     let at = |control| Some(NavTarget::Ui(control));
@@ -1868,6 +1885,107 @@ fn the_drawn_latch_matches_what_the_machine_holds() {
     assert_eq!(
         app.keyboard_panel_view().latch[usize::from(SHIFT)],
         kbdpanel::Latch::None
+    );
+}
+
+/// The inspectors are host state and outlive the machine they were opened
+/// on, but everything they capture with is armed on the bus and the CPU. A
+/// machine built by the launcher's Run comes up with none of it, so the swap
+/// has to re-arm whatever is still open. Otherwise the Frame Analyzer sits
+/// dead on the new machine until its own Run happens to re-arm it (a pause
+/// and run, which looks like the pane rather than the machine having
+/// stopped), and Recent PCs, the reverse controls and the heat map stay dead
+/// with it.
+#[test]
+fn running_a_new_machine_rearms_the_open_inspectors() {
+    let mut app = test_app();
+    app.open_frame_analyzer();
+    app.frame_analyzer_set_tab(AnalyzerTab::Memory);
+    app.open_debugger();
+    assert!(app.emu.bus().frame_analyzer_full());
+    assert!(app.emu.bus().heat_map().is_some());
+    assert!(app.emu.time_travel_enabled());
+
+    let raw = crate::config::RawConfig::default();
+    let cfg = crate::config::Config::try_from(raw.clone()).expect("default config");
+    let emu = test_emulator(Box::new(NullSink), crate::config::CpuModel::M68000, &[]);
+    app.run_machine(emu, &cfg, raw);
+
+    // The panes are still open, so they must still be capturing.
+    assert!(app.frame_analyzer_panel.is_some());
+    assert!(app.debugger_panel.is_some());
+    assert!(
+        app.emu.bus().frame_analyzer_full(),
+        "the analyzer captures the new machine without needing a pause and run"
+    );
+    assert!(
+        app.emu.bus().heat_map().is_some(),
+        "the Memory tab's map records the new machine"
+    );
+    assert!(
+        app.emu.time_travel_enabled(),
+        "the reverse controls work on the new machine"
+    );
+    app.debugger_step();
+    app.debugger_step();
+    assert!(
+        !app.emu.machine.ui_pc_history().is_empty(),
+        "Recent PCs records the new machine"
+    );
+}
+
+/// What the beam diagram is laid out against has to come from Agnus, not
+/// from the parity of the captured field.
+///
+/// An interlaced signal alternates a long field and a short field one line
+/// shorter, so the capture's own line count moves every frame. Agnus reckons
+/// the frame height that capture belongs to, and a programmable VARBEAMEN
+/// total -- which overrides interlace and can be any value, odd or even --
+/// is that height as it stands. Reading "short field" out of an even line
+/// count would lay a 200-line programmable frame out as 201.
+#[test]
+fn the_capture_carries_the_frame_height_agnus_reckons() {
+    let mut app = test_app();
+    app.open_frame_analyzer();
+    app.emu.bus_mut().custom_write(0x100, 2, 0x0004); // BPLCON0 LACE
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        app.emu.step_frame().expect("frame");
+        let trace = app.emu.bus().frame_bus_trace().expect("an armed capture");
+        seen.insert((trace.rows, trace.nominal_rows));
+    }
+    let nominals: std::collections::BTreeSet<_> = seen.iter().map(|(_, n)| *n).collect();
+    assert_eq!(
+        nominals.len(),
+        1,
+        "the frame height holds still while the fields alternate, got {seen:?}"
+    );
+    let long = *nominals.iter().next().unwrap();
+    assert!(
+        seen.iter().all(|(rows, _)| *rows <= long),
+        "a field is never longer than the frame it belongs to, got {seen:?}"
+    );
+
+    // A programmable total drives the beam entirely and overrides interlace,
+    // so it is the layout height whether it is odd or even. VTOTAL and
+    // BEAMCON0 are ECS registers, so this half needs an ECS Agnus.
+    let mut raw = crate::config::RawConfig::default();
+    raw.chipset.revision = Some("ECS".into());
+    let cfg = crate::config::Config::try_from(raw.clone()).expect("ECS config");
+    let emu = crate::emulator::build_machine(&cfg, Box::new(NullSink), false, true)
+        .expect("bundled boot ROM");
+    app.run_machine(emu, &cfg, raw);
+    app.open_frame_analyzer();
+    let bus = app.emu.bus_mut();
+    bus.custom_write(0x1C8, 2, 199); // VTOTAL: last line 199 -> 200 lines
+    bus.custom_write(0x1DC, 2, 1 << 5 | 1 << 7); // BEAMCON0 PAL | VARBEAMEN
+    app.emu.step_frame().expect("frame");
+    app.emu.step_frame().expect("frame");
+    let trace = app.emu.bus().frame_bus_trace().expect("an armed capture");
+    assert_eq!(
+        (trace.rows, trace.nominal_rows),
+        (200, 200),
+        "a programmable total is the layout height as it stands"
     );
 }
 
@@ -3096,6 +3214,25 @@ fn status_bar_draws_at_hidpi_texture_scale() {
     );
 }
 
+/// `[display] hidpi_texture = false` pins the backing texture to canvas
+/// resolution and leaves everything else of the plan alone: the integer
+/// multiple still draws its blocks from the 1x texture.
+#[test]
+fn hidpi_texture_off_caps_the_texture_scale_only() {
+    let smooth = plan_present_scaling_for(false, 2.0, (1432, 1074), (716, 537));
+    assert_eq!(smooth.texture_scale, 2);
+    let capped = cap_texture_scale(smooth, false);
+    assert_eq!(capped.texture_scale, 1);
+    assert_eq!(capped.multiple, None);
+    assert_eq!(cap_texture_scale(smooth, true), smooth);
+
+    let integer = plan_present_scaling_for(true, 2.0, (2560, 1600), (716, 537));
+    assert_eq!(integer.multiple, Some(2));
+    let capped = cap_texture_scale(integer, false);
+    assert_eq!(capped.texture_scale, 1);
+    assert_eq!(capped.multiple, Some(2));
+}
+
 #[test]
 fn present_frame_copy_scales_texture_rows_at_hidpi() {
     use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
@@ -3284,6 +3421,104 @@ fn tint_display_rows_leave_the_status_bar_alone() {
     }
     for px in frame[display_bytes..].chunks_exact(4) {
         assert_eq!(px, saturated, "status-bar pixel was tinted");
+    }
+}
+
+/// The live copies resolve the glass column map once per frame and copy
+/// texture rows that repeat a source row -- bookkeeping that must not
+/// change a pixel. Against a per-pixel reference walking
+/// `tv_glass_sample`, `tv_aperture_source_row` and `scaled_source_row`
+/// directly, every texture pixel is identical: on both canvases, at
+/// every texture scale, with the picture nudged off centre so unscanned
+/// glass and clamped edge samples are exercised too.
+#[test]
+fn window_copies_match_a_per_pixel_reference() {
+    use crate::video::deinterlace::{OUT_HEIGHT, OUT_PIXELS};
+    // A pseudo-random picture: every column and row distinct, so a wrong
+    // source column, row or blend weight shows.
+    let mut seed = 0x1234_5678u32;
+    let mut src = vec![0u32; OUT_PIXELS];
+    for px in src.iter_mut() {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *px = seed | 0xFF00_0000;
+    }
+    let black = rgba(0, 0, 0);
+    let at = |frame: &[u8], stride: usize, x: usize, y: usize| -> u32 {
+        u32::from_le_bytes(frame[(y * stride + x) * 4..][..4].try_into().unwrap())
+    };
+    for scale in 1..=3 {
+        let stride = texture_width(scale);
+        for &(present_rows, offset) in &[
+            (crate::video::PRESENT_HEIGHT_TV, (0i32, 0i32)),
+            (crate::video::PRESENT_HEIGHT_TV, (5, -3)),
+            (crate::video::PRESENT_HEIGHT_SQUARE, (0, 0)),
+            (crate::video::PRESENT_HEIGHT_SQUARE, (-7, 4)),
+        ] {
+            let out_rows = present_rows * scale;
+            let mut frame = vec![0u8; stride * out_rows * 4];
+            copy_tv_aperture_to_window(
+                &src,
+                OUT_HEIGHT,
+                &mut frame,
+                scale,
+                TV_PAL_PRESENT_HEIGHT,
+                present_rows,
+                TV_PRESENT_SOURCE_Y,
+                offset,
+            );
+            let square = present_rows == crate::video::PRESENT_HEIGHT_SQUARE;
+            for y in 0..out_rows {
+                let src_y = tv_aperture_source_row(y, present_rows, scale, TV_PAL_PRESENT_HEIGHT)
+                    .map(|crop| (TV_PRESENT_SOURCE_Y + crop).min(OUT_HEIGHT - 1) as i32 + offset.1)
+                    .filter(|sy| (0..OUT_HEIGHT as i32).contains(sy));
+                for x in 0..stride {
+                    let out_x = x / scale;
+                    let expected = match src_y {
+                        None => black,
+                        Some(sy) => {
+                            let row = &src[sy as usize * FB_WIDTH..(sy as usize + 1) * FB_WIDTH];
+                            if !square {
+                                crate::video::present_common::tv_glass_sample(row, out_x, offset.0)
+                            } else if (TV_LIVE_PAD_X..TV_LIVE_PAD_X + TV_CAPTURED_WIDTH)
+                                .contains(&out_x)
+                            {
+                                let sx = TV_CAPTURED_SOURCE_X as i32
+                                    + offset.0
+                                    + (out_x - TV_LIVE_PAD_X) as i32;
+                                if (0..FB_WIDTH as i32).contains(&sx) {
+                                    row[sx as usize]
+                                } else {
+                                    black
+                                }
+                            } else {
+                                black
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        at(&frame, stride, x, y),
+                        expected,
+                        "tv copy scale {scale} rows {present_rows} offset {offset:?} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+
+        // The full-overscan copy: centre-aligned row selection, columns
+        // duplicated across the texture scale.
+        let out_rows = present_height() * scale;
+        let mut frame = vec![0u8; stride * texture_height(scale) * 4];
+        copy_present_frame(&src, OUT_HEIGHT, FB_WIDTH, &mut frame, scale);
+        for y in 0..out_rows {
+            let src_y = crate::screenshot::scaled_source_row(y, OUT_HEIGHT, out_rows);
+            for x in 0..stride {
+                assert_eq!(
+                    at(&frame, stride, x, y),
+                    src[src_y * FB_WIDTH + x / scale],
+                    "full copy scale {scale} at ({x}, {y})"
+                );
+            }
+        }
     }
 }
 
@@ -4056,7 +4291,7 @@ fn pixel(frame: &[u8], x: usize, y: usize, scale: usize) -> [u8; 4] {
 /// reset vectors pointing into it, no audio, unpaced. Lets the
 /// debugger window's actions and view builders run against the real
 /// emulator without a host window.
-fn test_app() -> super::App {
+pub(super) fn test_app() -> super::App {
     let mut app = test_app_with_audio(Box::new(NullSink));
     // The stock wiring the config layer applies on a real machine: mouse
     // in port 1, joystick in port 2.
@@ -4155,6 +4390,9 @@ fn test_app_with_audio_cpu_and_program(
         Vec::new(),
         None,
         Vec::new(),
+        crate::gifclip::ClipSettings::default(),
+        Vec::new(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4177,6 +4415,7 @@ fn test_app_with_audio_cpu_and_program(
         crate::config::BezelStyle::None,
         None,
         false,
+        true,
         crate::config::Tint::None,
         false,
         false,
@@ -4203,6 +4442,42 @@ fn copperhf_temp_hardfile(name: &str) -> PathBuf {
     ));
     std::fs::write(&path, vec![0u8; 256 * 1024]).unwrap();
     path
+}
+
+#[test]
+fn vsync_menu_toggle_preserves_guest_pacing_and_configuration_choice() {
+    use crate::video::menu::MenuAction;
+    use pixels::wgpu::PresentMode;
+
+    let mut app = test_app();
+    app.emu.set_paced(true);
+    let frame = app.emu.bus().emulated_frames();
+    let pc = app.emu.machine.pc();
+    assert!(app.vsync);
+    assert_eq!(super::window_present_mode(app.vsync), PresentMode::Fifo);
+
+    app.run_menu_action(MenuAction::ToggleVsync, None);
+    assert!(!app.vsync);
+    assert_eq!(
+        super::window_present_mode(app.vsync),
+        PresentMode::AutoNoVsync
+    );
+    assert!(app.emu.paced());
+    assert_eq!(app.emu.bus().emulated_frames(), frame);
+    assert_eq!(app.emu.machine.pc(), pc);
+    app.open_launcher();
+    let saved = app.launcher_state().unwrap().setup.to_raw();
+    assert!(!crate::config::Config::try_from(saved).unwrap().vsync);
+
+    // Re-enabling while in warp must not turn normal emulation pacing on.
+    app.emu.set_paced(false);
+    app.run_menu_action(MenuAction::ToggleVsync, None);
+    assert!(app.vsync);
+    assert_eq!(super::window_present_mode(app.vsync), PresentMode::Fifo);
+    assert!(!app.emu.paced());
+    app.open_launcher();
+    let saved = app.launcher_state().unwrap().setup.to_raw();
+    assert!(crate::config::Config::try_from(saved).unwrap().vsync);
 }
 
 /// An interactive App around a real machine with one or more `[copperhf]`
@@ -4232,6 +4507,9 @@ fn test_app_with_copperhf_units(units: &[(usize, PathBuf)]) -> super::App {
         Vec::new(),
         None,
         Vec::new(),
+        crate::gifclip::ClipSettings::default(),
+        Vec::new(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4254,6 +4532,7 @@ fn test_app_with_copperhf_units(units: &[(usize, PathBuf)]) -> super::App {
         crate::config::BezelStyle::None,
         None,
         false,
+        true,
         crate::config::Tint::None,
         false,
         false,
@@ -4275,6 +4554,42 @@ fn copperhf_test_fixture_builds_a_machine_with_the_configured_unit() {
     let mut app = test_app_with_copperhf_units(&[(0, image.clone())]);
     assert!(app.emu.bus_mut().copperhf_board_mut().is_some());
     let _ = std::fs::remove_file(&image);
+}
+
+/// A windowed session builds the machine its configuration describes: the
+/// services board carrying the clipboard unit goes on the Zorro chain only
+/// where it was asked for. Binding a board a real Amiga does not have moves
+/// every Exec allocation behind it, which moves a program's buffers, and a
+/// program that lets the Copper run over a list it has not written yet
+/// reads a different word (Lotus Esprit Turbo Challenge hangs on one that
+/// decodes as a MOVE to INTENA).
+#[test]
+fn clipboard_unit_is_fitted_only_where_the_configuration_asked_for_it() {
+    fn board_fitted(toml: &str) -> bool {
+        std::env::set_var(
+            "COPPERLINE_AROS_DIR",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/aros"),
+        );
+        let raw: crate::config::RawConfig = toml::from_str(toml).expect("test config");
+        let mut cfg = crate::config::Config::try_from(raw).expect("config validates");
+        cfg.resolve_clipboard_share(false);
+        crate::config::resolve_bundled_rom(&mut cfg).expect("bundled AROS ROM resolves");
+        crate::emulator::build_machine(&cfg, Box::new(NullSink), false, false)
+            .expect("machine builds")
+            .bus()
+            .filesys_board()
+            .is_some()
+    }
+
+    assert!(!board_fitted(""), "an unset config fits no services board");
+    assert!(
+        !board_fitted("[clipboard]\nshare = false\n"),
+        "share = false fits no services board"
+    );
+    assert!(
+        board_fitted("[clipboard]\nshare = true\n"),
+        "share = true fits the board carrying the clipboard unit"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -5162,7 +5477,7 @@ fn recording_captures_emulated_frames_with_audio() {
 }
 
 #[test]
-fn debugger_window_pauses_steps_and_restores_run_state() {
+fn debug_layout_pauses_on_first_open_and_preserves_state_in_play() {
     let mut app = test_app();
     assert!(!app.paused);
 
@@ -5194,10 +5509,11 @@ fn debugger_window_pauses_steps_and_restores_run_state() {
     app.debugger_step_frame();
     assert!(app.emu.bus().emulated_frames() > frame_before);
 
-    // Closing restores the pre-debugger (running) state.
+    // Returning to Play retains the inspector and its current pause state.
     app.toggle_debugger();
-    assert!(app.debugger_panel.is_none());
-    assert!(!app.paused);
+    assert!(app.debugger_panel.is_some());
+    assert!(!app.debug_layout_active);
+    assert!(app.paused);
 
     // Run pressed inside the debugger survives closing it.
     app.toggle_debugger();
@@ -5285,6 +5601,25 @@ fn debugger_and_frame_analyzer_can_stay_open_together() {
     app.close_tool_panel(ToolPanelKind::FrameAnalyzer);
     assert!(!app.paused);
     assert!(app.frame_analyzer_panel.is_none());
+}
+
+#[test]
+fn cpu_memory_pane_wraps_row_labels_at_the_machine_address_limit() {
+    for cpu in [
+        crate::config::CpuModel::M68000,
+        crate::config::CpuModel::M68020,
+    ] {
+        let app = test_app_with_audio_and_cpu(Box::new(NullSink), cpu);
+        let mask = app.emu.machine.ui_addr_mask();
+        let mut panel = super::ui::DebuggerPanel::new();
+        panel.mem_addr = mask & !0xf;
+        let view = app.build_debugger_view_with_clipping(&panel, false);
+        let memory = &view.cpu.unwrap().memory;
+        assert_eq!(memory.len(), 16);
+        assert!(memory[0].text.starts_with(&format!("{:06X}:", mask & !0xf)));
+        assert!(memory[1].text.starts_with("000000:"));
+        assert!(memory[15].text.starts_with("0000E0:"));
+    }
 }
 
 #[test]
@@ -5635,6 +5970,177 @@ fn quick_save_slots_round_trip_and_report_empty_slots() {
     assert_eq!(app.emu.machine.pc(), saved_pc);
 }
 
+/// The Load State browser against a real machine: a quick save lands in
+/// the list with its thumbnail and media, the keyboard walks to it and
+/// loads it, Delete asks and then removes it, and a state taken on another
+/// machine is flagged.
+#[test]
+fn state_browser_lists_loads_flags_and_deletes_states() {
+    use winit::keyboard::KeyCode;
+    let root = std::env::temp_dir().join(format!(
+        "copperline-state-browser-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated states root");
+    let slot7 = crate::savestate::slot_path_in(&root, 7).expect("valid slot");
+
+    let mut app = test_app();
+    for _ in 0..6 {
+        app.emu.step_frame().expect("frame");
+    }
+    let saved_frame = app.emu.bus().emulated_frames();
+    app.quick_save_state_at(7, Some(slot7.clone()));
+    assert!(slot7.exists());
+    // A named state from a different machine: the same bytes with a
+    // different descriptor stamped on, which is what a load compares.
+    let other = root.join("copperline-state-20260101000000.clstate");
+    {
+        let mut descriptor = app.emu.machine_descriptor().clone();
+        descriptor.chipset = crate::config::Chipset::Aga;
+        descriptor.machine = Some(crate::config::MachineModel::A1200);
+        let meta = app.emu.state_meta();
+        crate::savestate::save(&app.emu.machine, &descriptor, Some(&meta), &other).unwrap();
+    }
+    std::fs::write(root.join("stray.clstate"), b"not a state").unwrap();
+
+    // The saved metadata describes the machine as the window sees it.
+    let peeked = crate::savestate::peek_path(&slot7).unwrap();
+    let meta = peeked.meta.expect("the window's save carries metadata");
+    assert_eq!(meta.emulated_frames, saved_frame);
+    assert_eq!(
+        (meta.thumbnail_width, meta.thumbnail_height),
+        (
+            crate::savestate::THUMBNAIL_WIDTH as u32,
+            crate::savestate::THUMBNAIL_HEIGHT as u32
+        )
+    );
+    assert!(meta.thumbnail_pixels().unwrap().is_some());
+    assert_eq!(meta.machine, app.emu.machine_descriptor().short_summary());
+    assert_eq!(meta.media.floppies.len(), 1, "the fixture has one drive");
+    assert_eq!(meta.media.floppies[0].drive, 0);
+
+    for _ in 0..6 {
+        app.emu.step_frame().expect("frame");
+    }
+    assert!(app.emu.bus().emulated_frames() > saved_frame);
+
+    app.open_states_browser_at(&root);
+    let panel = match app.ui.panel.as_ref() {
+        Some(Panel::States(panel)) => panel,
+        other => panic!("expected the states browser, got {}", other.is_some()),
+    };
+    assert_eq!(
+        panel.entries.len(),
+        crate::savestate::SLOT_COUNT + 2,
+        "ten slots plus two named files"
+    );
+    let slot = &panel.entries[6];
+    assert_eq!(slot.label, "Slot 7");
+    assert!(!slot.empty && slot.loadable());
+    assert!(slot.thumbnail.is_some());
+    assert_eq!(slot.emulated_seconds, Some(meta.emulated_seconds));
+    assert!(slot.mismatch.is_none());
+    assert!(slot.media.starts_with("DF0: "));
+    assert!(panel.entries[0].empty);
+    // The two named files sort by save time, which the fixture writes
+    // within a second of each other, so find them by name rather than
+    // betting on which side of a second boundary each one landed.
+    let entry = |label: &str| {
+        panel
+            .entries
+            .iter()
+            .find(|e| e.label == label)
+            .unwrap_or_else(|| panic!("{label} is missing from the browser"))
+    };
+    let named = entry("copperline-state-20260101000000.clstate");
+    assert!(named.thumbnail.is_some());
+    let flag = named
+        .mismatch
+        .as_deref()
+        .expect("flagged as another machine");
+    assert!(flag.contains("Aga"), "{flag}");
+    let stray = entry("stray.clstate");
+    assert!(stray.error.is_some());
+    assert!(!stray.loadable() && stray.deletable());
+
+    // Walk down to slot 7 and load it: the machine returns to the saved
+    // frame and the browser closes.
+    for _ in 0..6 {
+        assert!(app.ui_handle_key(KeyCode::ArrowDown, None, None));
+    }
+    if let Some(Panel::States(panel)) = app.ui.panel.as_ref() {
+        assert_eq!(panel.selected, 6);
+    }
+    assert!(app.ui_handle_key(KeyCode::Enter, None, None));
+    assert!(app.ui.panel.is_none(), "a load closes the browser");
+    assert_eq!(app.emu.bus().emulated_frames(), saved_frame);
+
+    // Delete asks, Escape keeps, a second Delete removes; the slot then
+    // shows as empty and the file is gone.
+    app.open_states_browser_at(&root);
+    for _ in 0..6 {
+        app.ui_handle_key(KeyCode::ArrowDown, None, None);
+    }
+    assert!(app.ui_handle_key(KeyCode::Delete, None, None));
+    if let Some(Panel::States(panel)) = app.ui.panel.as_ref() {
+        assert!(panel.confirm_delete);
+    }
+    assert!(app.ui_handle_key(KeyCode::Escape, None, None));
+    assert!(
+        matches!(app.ui.panel.as_ref(), Some(Panel::States(panel)) if !panel.confirm_delete),
+        "Escape withdraws the question, not the browser"
+    );
+    assert!(slot7.exists());
+    app.ui_handle_key(KeyCode::Delete, None, None);
+    assert!(app.ui_handle_key(KeyCode::Delete, None, None));
+    assert!(!slot7.exists(), "slot 7 removed");
+    if let Some(Panel::States(panel)) = app.ui.panel.as_ref() {
+        assert!(panel.entries[6].empty);
+        assert_eq!(panel.status.as_deref(), Some("Deleted Slot 7"));
+    } else {
+        panic!("the browser stays open after a deletion");
+    }
+    // Escape with no question up closes the browser.
+    assert!(app.ui_handle_key(KeyCode::Escape, None, None));
+    assert!(app.ui.panel.is_none());
+
+    // The pad walks the same list: down onto the button row, along it,
+    // and its second button steps out.
+    app.open_states_browser_at(&root);
+    use crate::video::nav::Dir;
+    for _ in 0..(crate::savestate::SLOT_COUNT + 2) {
+        assert!(app.nav_move(Dir::Down, None));
+    }
+    if let Some(Panel::States(panel)) = app.ui.panel.as_ref() {
+        assert_eq!(panel.focus, crate::video::ui::StatesFocus::Button(0));
+    }
+    assert!(app.nav_move(Dir::Right, None));
+    if let Some(Panel::States(panel)) = app.ui.panel.as_ref() {
+        assert_eq!(panel.focus, crate::video::ui::StatesFocus::Button(1));
+    }
+    app.nav_back();
+    assert!(app.ui.panel.is_none());
+
+    // Loading the other machine's state reconfigures, as any load does,
+    // and the OSD names what was loaded.
+    app.open_states_browser_at(&root);
+    app.activate_ui_control_with_event_loop(
+        UiControl::StateRow(crate::savestate::SLOT_COUNT),
+        None,
+    );
+    assert!(app.ui.panel.is_none());
+    assert_eq!(
+        app.emu.machine_descriptor().chipset,
+        crate::config::Chipset::Aga
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn every_slot_addresses_a_file_of_its_own() {
     // The menu and the hotkeys both name a slot outright, so all ten have to
@@ -5864,9 +6370,9 @@ fn modal_panel_swallows_amiga_key_presses() {
         KeyCode::Digit0,
         KeyCode::Digit1,
     ] {
-        assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, key));
+        assert!(app.ui_handle_debugger_key(key));
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::Enter));
+    assert!(app.ui_handle_debugger_key(KeyCode::Enter));
     match app.debugger_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.entry, "C001");
@@ -5906,9 +6412,9 @@ fn tool_windows_are_not_modal_over_the_main_window() {
     // one is open would trap the pointer its controls need.
     assert!(app.ui_wants_cursor());
 
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::Escape));
+    app.close_tool_panel(ToolPanelKind::FrameAnalyzer);
     assert!(app.frame_analyzer_panel.is_none());
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::Escape));
+    app.close_tool_panel(ToolPanelKind::Debugger);
     assert!(app.debugger_panel.is_none());
     assert!(!app.ui_wants_cursor());
 }
@@ -5927,8 +6433,8 @@ fn frame_analyzer_cursor_keys_move_selected_slot() {
         _ => panic!("frame analyzer panel should be open"),
     };
 
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowRight));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowDown));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowRight));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowDown));
     match app.frame_analyzer_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.selected_hpos, start_hpos + 1);
@@ -5937,8 +6443,8 @@ fn frame_analyzer_cursor_keys_move_selected_slot() {
         _ => panic!("frame analyzer panel should be open"),
     }
 
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowLeft));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowUp));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowLeft));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowUp));
     match app.frame_analyzer_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.selected_hpos, start_hpos);
@@ -5951,8 +6457,8 @@ fn frame_analyzer_cursor_keys_move_selected_slot() {
         panel.selected_hpos = 0;
         panel.selected_vpos = 0;
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowLeft));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowUp));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowLeft));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowUp));
     match app.frame_analyzer_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.selected_hpos, 0);
@@ -5976,8 +6482,8 @@ fn frame_analyzer_cursor_keys_move_selected_slot() {
         panel.selected_hpos = max_hpos;
         panel.selected_vpos = max_vpos;
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowRight));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowDown));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowRight));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowDown));
     match app.frame_analyzer_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.selected_hpos, max_hpos);
@@ -6001,7 +6507,7 @@ fn frame_analyzer_underlay_toggles_and_renders() {
     assert!(app.build_frame_analyzer_view(&panel).underlay.is_none());
 
     // The U key ticks the checkbox on.
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::KeyU));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::KeyU));
     assert!(app
         .frame_analyzer_panel
         .as_ref()
@@ -6046,7 +6552,7 @@ fn frame_analyzer_cpu_wait_toggles_and_renders() {
         .frame_analyzer_panel
         .as_ref()
         .is_some_and(|panel| !panel.show_cpu_wait));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::KeyW));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::KeyW));
     assert!(app
         .frame_analyzer_panel
         .as_ref()
@@ -6156,56 +6662,6 @@ fn console_run(app: &mut super::App, cmd: &str) -> Vec<String> {
         .as_ref()
         .map(|panel| panel.output.iter().skip(before).cloned().collect())
         .unwrap_or_default()
-}
-
-#[test]
-fn console_keyboard_path_types_and_executes() {
-    let mut app = test_app();
-    app.open_console();
-    // Type "HELP" through the tool-window key handler and execute it.
-    for code in [KeyCode::KeyH, KeyCode::KeyE, KeyCode::KeyL, KeyCode::KeyP] {
-        assert!(app.ui_handle_tool_key(ToolPanelKind::Console, code));
-    }
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "HELP");
-    // Backspace edits; retype the P.
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Console, KeyCode::Backspace));
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "HEL");
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Console, KeyCode::KeyP));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Console, KeyCode::Enter));
-    let panel = app.console_panel.as_ref().unwrap();
-    assert!(panel.input.is_empty());
-    assert!(panel.output.iter().any(|l| l.contains("execution:")));
-    // Up recalls the command into the prompt.
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Console, KeyCode::ArrowUp));
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "HELP");
-    // Escape (handled a level up) closes the window.
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Console, KeyCode::Escape));
-    assert!(app.console_panel.is_none());
-}
-
-#[test]
-fn console_text_insertion_and_multiline_paste() {
-    let mut app = test_app();
-    app.open_console();
-
-    // Typed/pasted text preserves case and punctuation; the interpreter
-    // is case-insensitive.
-    app.console_insert_text("b $c01000");
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "b $c01000");
-    app.console_insert_text("\n");
-    assert!(app.emu.machine.ui_breaks().is_breakpoint(0x00C0_1000));
-    assert!(app.console_panel.as_ref().unwrap().input.is_empty());
-
-    // A multi-line paste runs each complete line and leaves the trailing
-    // fragment in the prompt. Blank lines are ignored.
-    app.console_insert_text("btrap 100 40\n\nsetreg d2 77\nm 0");
-    assert_eq!(app.emu.bus().ui_beam_traps().len(), 1);
-    assert_eq!(app.emu.machine.d(2), 0x77);
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "m 0");
-
-    // Control characters never reach the prompt.
-    app.console_insert_text("\u{16}\u{7f}");
-    assert_eq!(app.console_panel.as_ref().unwrap().input, "m 0");
 }
 
 /// Lay a minimal exec world into chip RAM: ExecBase with a valid
@@ -6605,7 +7061,7 @@ fn iomap_tab_navigation_and_jump() {
         panel.entry = "DFF180".to_string();
         panel.entry_active = true;
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::Enter));
+    assert!(app.ui_handle_debugger_key(KeyCode::Enter));
     assert_eq!(app.debugger_panel.as_ref().unwrap().iomap_sel, 0x180);
 
     let panel = app.debugger_panel.clone().unwrap();
@@ -6962,6 +7418,52 @@ fn console_inspection_and_stop_commands() {
     // Errors come back prefixed for the accent colour.
     let out = console_run(&mut app, "BOGUS");
     assert!(out[0].starts_with('!'), "{out:?}");
+}
+
+#[test]
+fn console_poke_takes_size_suffixes_and_byte_sequences() {
+    let mut app = test_app();
+    app.open_console();
+    app.emu.bus_mut().mem.overlay = false;
+
+    // The original word form, unchanged; an odd address is rounded down.
+    let out = console_run(&mut app, "POKE 60001 BEEF");
+    assert_eq!(out, ["poked BE EF -> $060000"]);
+    assert_eq!(app.emu.bus().peek_word_any(0x60000), 0xBEEF);
+    // Several values without a suffix are a byte sequence, at any address.
+    let out = console_run(&mut app, "POKE 60011 12 34 56");
+    assert_eq!(out, ["poked 12 34 56 -> $060011"]);
+    assert_eq!(
+        app.emu.machine.debug_read_memory(0x60010, 5),
+        [0x00, 0x12, 0x34, 0x56, 0x00]
+    );
+    console_run(&mut app, "POKE.B 60021 $AB");
+    assert_eq!(app.emu.machine.debug_read_memory(0x60021, 1), [0xAB]);
+    console_run(&mut app, "poke.w 60030 1 CAFE");
+    assert_eq!(app.emu.bus().peek_word_any(0x60030), 0x0001);
+    assert_eq!(app.emu.bus().peek_word_any(0x60032), 0xCAFE);
+    console_run(&mut app, "POKE.L 60041 DEADBEEF");
+    assert_eq!(app.emu.bus().peek_word_any(0x60040), 0xDEAD);
+    assert_eq!(app.emu.bus().peek_word_any(0x60042), 0xBEEF);
+
+    // Values wider than the size, and ROM, are refused rather than truncated.
+    let out = console_run(&mut app, "POKE 60050 123456");
+    assert!(out[0].starts_with('!'), "{out:?}");
+    assert_eq!(app.emu.bus().peek_word_any(0x60050), 0);
+    let out = console_run(&mut app, "POKE.B 60050 123");
+    assert!(out[0].starts_with('!'), "{out:?}");
+    let out = console_run(&mut app, "POKE 60050 1 2 3G");
+    assert!(out[0].starts_with('!'), "{out:?}");
+    let out = console_run(&mut app, "POKE F80000 4E71");
+    assert_eq!(out, ["!$F80000 is not writable RAM"]);
+    let out = console_run(&mut app, "POKE");
+    assert!(out[0].starts_with("!usage: POKE[.B|.W|.L]"), "{out:?}");
+
+    // Like the control protocol's mem.write, a poke rebaselines the word
+    // watches so it does not stop the machine itself.
+    app.emu.machine.ui_toggle_watch(0x60060);
+    console_run(&mut app, "POKE.B 60060 7F");
+    assert_eq!(app.emu.machine.ui_breaks().watches[0].last, 0x7F00);
 }
 
 #[test]
@@ -7335,14 +7837,14 @@ fn debugger_keys_step_and_pin_disassembly() {
 
     // S steps one instruction while the entry box is unfocused.
     let pc_before = app.emu.machine.pc();
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::KeyS));
+    assert!(app.ui_handle_debugger_key(KeyCode::KeyS));
     assert_eq!(app.emu.machine.pc(), pc_before.wrapping_add(2));
 
     // R toggles run; the explicit choice survives closing the panel.
     assert!(app.paused);
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::KeyR));
+    assert!(app.ui_handle_debugger_key(KeyCode::KeyR));
     assert!(!app.paused);
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::KeyR));
+    assert!(app.ui_handle_debugger_key(KeyCode::KeyR));
     assert!(app.paused);
 
     // On the CPU tab, Enter pins the disassembly origin to the typed
@@ -7351,7 +7853,7 @@ fn debugger_keys_step_and_pin_disassembly() {
         panel.entry_active = true;
         panel.entry = "FC0010".to_string();
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::Enter));
+    assert!(app.ui_handle_debugger_key(KeyCode::Enter));
     match app.debugger_panel.as_ref() {
         Some(panel) => {
             assert_eq!(panel.disasm_addr, Some(0xFC0010));
@@ -7365,7 +7867,7 @@ fn debugger_keys_step_and_pin_disassembly() {
         panel.entry_active = true;
         panel.entry.clear();
     }
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::Enter));
+    assert!(app.ui_handle_debugger_key(KeyCode::Enter));
     match app.debugger_panel.as_ref() {
         Some(panel) => assert_eq!(panel.disasm_addr, None),
         _ => panic!("debugger panel should be open"),
@@ -7378,7 +7880,7 @@ fn debugger_keys_step_and_pin_disassembly() {
         panel.entry.clear();
     }
     let pc_before = app.emu.machine.pc();
-    assert!(app.ui_handle_tool_key(ToolPanelKind::Debugger, KeyCode::KeyS));
+    assert!(app.ui_handle_debugger_key(KeyCode::KeyS));
     assert_eq!(app.emu.machine.pc(), pc_before);
     assert_eq!(
         app.debugger_panel.as_ref().map(|p| p.entry.as_str()),
@@ -7444,6 +7946,13 @@ fn dropped_media_classifies_by_extension() {
     assert_eq!(kind("game.CUE"), DroppedMediaKind::Cd);
     assert_eq!(kind("game.iso"), DroppedMediaKind::Cd);
     assert_eq!(kind("game.NRG"), DroppedMediaKind::Cd);
+    // A .chd that cannot be read is a CD, as it always was; one whose
+    // metadata says hard disk goes where hard disks go.
+    assert_eq!(kind("game.chd"), DroppedMediaKind::Cd);
+    let chd = crate::harddrive::chd::tests::temp_path("drop.chd");
+    crate::harddrive::chd::tests::write_hard_disk(&chd, 4, [3; 20]);
+    assert_eq!(classify_dropped_media(&chd), DroppedMediaKind::HardDisk);
+    let _ = std::fs::remove_file(&chd);
     assert_eq!(kind("disk.hdf"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("disk.HDZ"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("disk.img"), DroppedMediaKind::HardDisk);
@@ -8238,10 +8747,343 @@ fn windowless_run_fires_scheduled_input_and_flushes_recording() {
     std::fs::remove_file(&script).ok();
 }
 
+/// The clip ring through the app: presented frames enter at the clip
+/// rate through the screenshot geometry, and Save Clip as GIF writes a
+/// file the gif decoder reads back with the ring's frames at the
+/// capture's shape.
+#[test]
+fn clip_ring_captures_presented_frames_and_saves_a_gif() {
+    let mut app = test_app();
+    let path = temp_capture_path("clip.gif");
+    let mut rendered_frames = 0;
+    let mut quanta = 0;
+    while rendered_frames < 6 {
+        app.emu.step_frame().expect("step frame");
+        let rendered = if app.render_worker.is_some() {
+            app.finish_render_for_current_frame()
+        } else {
+            app.render_emulated_frame_if_needed()
+        };
+        app.capture_clip_frame(rendered);
+        if rendered {
+            rendered_frames += 1;
+        }
+        quanta += 1;
+        assert!(
+            quanta <= 24,
+            "fixture should keep producing renderable frames"
+        );
+    }
+    let ring = app
+        .clip_ring
+        .as_ref()
+        .expect("ring built on the first frame");
+    let expected_fps = crate::gifclip::default_clip_fps(app.emu.bus().agnus.video_standard());
+    assert_eq!(
+        ring.fps(),
+        expected_fps,
+        "automatic rate follows the standard"
+    );
+    // Thinned to the clip rate and stored once per distinct picture.
+    assert!(
+        ring.frame_count() >= 1 && ring.frame_count() <= rendered_frames / 2 + 1,
+        "{} frames from {rendered_frames} presented",
+        ring.frame_count()
+    );
+    assert!(ring.bytes() > 0);
+
+    let written = app.save_clip_gif_to(&path).expect("clip written");
+    assert_eq!(written as usize, ring.frame_count());
+    let bytes = std::fs::read(&path).expect("clip file exists");
+    std::fs::remove_file(&path).ok();
+    assert_eq!(&bytes[..6], b"GIF89a");
+    let mut decoder = gif::DecodeOptions::new()
+        .read_info(&bytes[..])
+        .expect("clip parses");
+    let frame = decoder
+        .read_next_frame()
+        .expect("clip frame parses")
+        .expect("clip has a frame");
+    // The fixture presents its Full-overscan canvas: the clip has the
+    // same shape a screenshot of it would.
+    assert_eq!(usize::from(frame.width), crate::video::FB_WIDTH);
+    assert_eq!(usize::from(frame.height), crate::video::capture_height());
+    assert!(frame.palette.is_some(), "frames carry their own palette");
+
+    // Without a ring there is nothing to save.
+    let bare = test_app();
+    assert!(bare.save_clip_gif_to(&path).is_err());
+}
+
+/// A clip slot reached while `present_fb` still holds the picture the
+/// ring's newest frame was built from is noted without rebuilding it:
+/// the ring's timeline advances, nothing is copied into `clip_fb`, and
+/// the recorded source stays. Once the presentation takes a new picture
+/// the next slot builds again.
+#[test]
+fn clip_ring_notes_an_unchanged_presentation_without_rebuilding_it() {
+    let mut app = test_app();
+    let mut quanta = 0;
+    while app.clip_ring.as_ref().is_none_or(|ring| ring.is_empty()) {
+        app.emu.step_frame().expect("step frame");
+        let rendered = if app.render_worker.is_some() {
+            app.finish_render_for_current_frame()
+        } else {
+            app.render_emulated_frame_if_needed()
+        };
+        app.capture_clip_frame(rendered);
+        quanta += 1;
+        assert!(
+            quanta <= 24,
+            "fixture should present a frame the ring stores"
+        );
+    }
+    let seeded = app
+        .clip_ring_source
+        .expect("a built frame records its source");
+    let (frames, end) = {
+        let ring = app.clip_ring.as_ref().expect("ring seeded");
+        (ring.frame_count(), ring.clip().1)
+    };
+    // Reach the next clip slot without a new picture. The build is the
+    // only writer of `clip_fb`, so an emptied buffer shows whether it ran.
+    app.clip_fb.clear();
+    for _ in 0..3 {
+        app.emu.step_frame().expect("step frame");
+    }
+    app.capture_clip_frame(true);
+    let ring = app.clip_ring.as_ref().expect("ring kept");
+    assert!(
+        app.clip_fb.is_empty(),
+        "an unchanged presentation is not rebuilt"
+    );
+    assert_eq!(app.clip_ring_source, Some(seeded));
+    assert_eq!(ring.frame_count(), frames);
+    assert!(
+        ring.clip().1 > end,
+        "the repeat still advances the ring's timeline"
+    );
+
+    // A new picture in the presentation buffer builds the next slot.
+    app.note_present_fb_changed();
+    for _ in 0..3 {
+        app.emu.step_frame().expect("step frame");
+    }
+    app.capture_clip_frame(true);
+    assert!(
+        !app.clip_fb.is_empty(),
+        "a changed presentation is built again"
+    );
+    let source = app.clip_ring_source.expect("the build records its source");
+    assert!(source.generation > seeded.generation);
+}
+
+/// `--gif-after` through the windowless loop: the clip covers exactly its
+/// window on the emulated timeline, and two runs of the same machine
+/// produce byte-identical files.
+#[test]
+fn windowless_run_writes_a_gif_clip_deterministically() {
+    let run = |name: &str| -> Vec<u8> {
+        let path = temp_capture_path(name);
+        let mut app = test_app();
+        app.pending_gif_captures = vec![super::GifCaptureSpec {
+            start_secs: 0.05,
+            seconds: 0.2,
+            path: path.clone(),
+        }];
+        app.run_headless().expect("windowless gif capture run");
+        let bytes = std::fs::read(&path).expect("clip written");
+        std::fs::remove_file(&path).ok();
+        bytes
+    };
+    let first = run("clip-a.gif");
+    let second = run("clip-b.gif");
+    assert_eq!(
+        first, second,
+        "the same run must produce a byte-identical clip"
+    );
+
+    let mut decoder = gif::DecodeOptions::new()
+        .read_info(&first[..])
+        .expect("clip parses");
+    let mut frames = 0u32;
+    let mut total_delay = 0u32;
+    while let Some(frame) = decoder.read_next_frame().expect("clip frame parses") {
+        frames += 1;
+        total_delay += u32::from(frame.delay);
+    }
+    // 0.2 s at the automatic rate (25 fps PAL, 30 fps NTSC) is five or
+    // six frames whose delays add up to the window: 20 cs.
+    assert!((5..=7).contains(&frames), "{frames} frames");
+    assert!((19..=21).contains(&total_delay), "{total_delay} cs");
+}
+
+/// Scheduled captures of different kinds share one run: a clip that
+/// finishes early must not end the run before a later screenshot fires,
+/// and a screenshot must not end it while a clip is still recording.
+/// Each kind used to end the run the moment its own list emptied, which
+/// silently dropped whatever the other kind still had pending.
+#[test]
+fn a_finished_clip_does_not_cut_a_later_screenshot_short() {
+    let clip = temp_capture_path("mixed-clip.gif");
+    let early = temp_capture_path("mixed-early.png");
+    let late = temp_capture_path("mixed-late.png");
+    let mut app = test_app();
+    // The screenshot before the clip, and one after it: the run must reach
+    // both, whichever capture kind happens to finish first.
+    app.pending_auto_shot = vec![(0.05, early.clone()), (0.4, late.clone())];
+    app.pending_gif_captures = vec![super::GifCaptureSpec {
+        start_secs: 0.1,
+        seconds: 0.1,
+        path: clip.clone(),
+    }];
+    app.run_headless().expect("mixed capture run");
+    for path in [&clip, &early, &late] {
+        assert!(
+            path.exists(),
+            "{} was never written: a capture ended the run early",
+            path.display()
+        );
+        std::fs::remove_file(path).ok();
+    }
+}
+
 #[test]
 fn windowless_run_without_captures_errors_instead_of_spinning() {
     let app = test_app();
     assert!(app.run_headless().is_err());
+}
+
+#[test]
+fn windowless_run_checks_expectations_through_the_screenshot_path() {
+    use crate::expect::{actual_path, diff_path, ExpectShotSpec, Tolerance};
+    // One App per run, built and dropped inside the helper: several live
+    // at once would not fit the test thread's stack.
+    let run = |shots: Vec<(f32, PathBuf)>, expects: Vec<(f32, &PathBuf)>| -> i32 {
+        let mut app = test_app();
+        app.pending_auto_shot = shots;
+        app.set_expect_screenshots(
+            expects
+                .into_iter()
+                .map(|(secs, path)| ExpectShotSpec {
+                    secs,
+                    path: path.clone(),
+                    tolerance: Tolerance::Exact,
+                })
+                .collect(),
+        );
+        app.run_headless().unwrap()
+    };
+    let shot = temp_capture_path("expect-shot.png");
+    // A screenshot of the frame at 0.2s ...
+    assert_eq!(run(vec![(0.2, shot.clone())], vec![]), 0);
+    assert!(shot.is_file());
+
+    // ... is exactly what an expectation of the same frame captures: the
+    // deterministic core and the shared capture path make them identical.
+    assert_eq!(run(vec![], vec![(0.2, &shot)]), 0);
+    assert!(!actual_path(&shot).exists(), "a pass writes nothing");
+
+    // A missing expectation fails the run with status 3 once the later
+    // screenshot has also fired, and leaves the actual frame to bless.
+    let missing = temp_capture_path("expect-missing.png");
+    let late = temp_capture_path("expect-late.png");
+    assert_eq!(
+        run(vec![(0.3, late.clone())], vec![(0.2, &missing)]),
+        crate::expect::EXIT_STATUS_MISMATCH
+    );
+    assert!(
+        late.is_file(),
+        "the failed expectation did not cut the run short"
+    );
+    assert!(actual_path(&missing).is_file());
+    assert!(!diff_path(&missing).exists());
+
+    // Blessed by renaming, the expectation passes on the next run.
+    std::fs::rename(actual_path(&missing), &missing).unwrap();
+    assert_eq!(run(vec![], vec![(0.2, &missing)]), 0);
+
+    // A frame that differs (the 0.2s one, against the 0.3s image) fails
+    // and writes the diff mask too; identical frames would pass instead.
+    let status = run(vec![], vec![(0.2, &late)]);
+    if status == crate::expect::EXIT_STATUS_MISMATCH {
+        assert!(actual_path(&late).is_file());
+        assert!(diff_path(&late).is_file());
+    } else {
+        assert_eq!(status, 0);
+    }
+    for path in [&shot, &missing, &late] {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(actual_path(path)).ok();
+        std::fs::remove_file(diff_path(path)).ok();
+    }
+}
+
+#[test]
+fn windowless_run_ends_with_the_guest_return_code() {
+    let marker = temp_capture_path("done");
+    // The marker already holds a return code: the run ends on its first
+    // frame with that status, no capture needed to bound it.
+    std::fs::write(&marker, b"7\n").unwrap();
+    let mut app = test_app();
+    app.set_exit_on_return(marker.clone());
+    assert_eq!(app.run_headless().unwrap(), 7);
+    std::fs::remove_file(&marker).ok();
+
+    // No return before the last capture: status 4.
+    let shot = temp_capture_path("no-return.png");
+    let mut app = test_app();
+    app.pending_auto_shot = vec![(0.1, shot.clone())];
+    app.set_exit_on_return(marker.clone());
+    assert_eq!(
+        app.run_headless().unwrap(),
+        crate::runprog::EXIT_STATUS_NO_RETURN
+    );
+    std::fs::remove_file(&shot).ok();
+}
+
+#[test]
+fn windowless_run_ends_cleanly_on_guest_exit_emu() {
+    let shot = temp_capture_path("exit-emu.png");
+    let mut app = test_app();
+    let mut lib = crate::uaelib::UaeLib::new();
+    lib.mute_stdout();
+    app.emu.bus_mut().attach_uaelib(lib);
+    app.pending_auto_shot = vec![(30.0, shot.clone())];
+    app.emu.bus_mut().uaelib.as_mut().unwrap().request_exit();
+    let started = std::time::Instant::now();
+    assert_eq!(app.run_headless().unwrap(), 0);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the exit request ended the run, not the 30s capture"
+    );
+    assert!(!shot.exists());
+}
+
+#[test]
+fn typed_text_rides_the_scheduled_key_queue_and_records_in_order() {
+    let shot = temp_capture_path("typed-shot.png");
+    let script = temp_capture_path("typed.clscript");
+    let mut app = test_app();
+    app.pending_auto_shot = vec![(0.5, shot.clone())];
+    app.input_recorder = Some(crate::inputrec::InputRecorder::new(0.0));
+    app.record_input_path = Some(script.clone());
+    let (count, untypable) = app.type_text("A\n", 40);
+    assert_eq!((count, untypable), (3, Vec::new()));
+    app.run_headless().unwrap();
+    let text = std::fs::read_to_string(&script).unwrap();
+    let keys: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("key-after"))
+        .collect();
+    // Shift, then the key it qualifies, then Return: the recording keeps
+    // the order a replay needs.
+    assert_eq!(keys.len(), 3, "{text}");
+    assert!(keys[0].contains("0x60"), "{text}");
+    assert!(keys[1].contains("0x20"), "{text}");
+    assert!(keys[2].contains("0x44"), "{text}");
+    std::fs::remove_file(&shot).ok();
+    std::fs::remove_file(&script).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -8558,14 +9400,14 @@ fn frame_analyzer_m_key_toggles_between_the_beam_and_memory_tabs() {
     let tab = |app: &super::App| app.frame_analyzer_panel.as_ref().map(|panel| panel.tab);
     assert_eq!(tab(&app), Some(AnalyzerTab::Beam));
 
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::KeyM));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::KeyM));
     assert_eq!(tab(&app), Some(AnalyzerTab::Memory));
     assert!(
         app.emu.bus().heat_map().is_some(),
         "arriving on the Memory tab arms the map"
     );
 
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::KeyM));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::KeyM));
     assert_eq!(tab(&app), Some(AnalyzerTab::Beam));
 }
 
@@ -8590,21 +9432,21 @@ fn frame_analyzer_cursor_keys_move_the_pinned_cell_on_the_memory_tab() {
     // With nothing pinned the first arrow starts from the centre cell, and
     // the beam selection the Beam tab owns is left where it was.
     let centre = heatmap::CELLS / 2 + heatmap::GRID / 2;
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowRight));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowRight));
     assert_eq!(pinned(&app), Some(centre + 1));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowDown));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowDown));
     assert_eq!(pinned(&app), Some(centre + 1 + heatmap::GRID));
     assert_eq!(beam_slot(&app), slot_before);
 
     // The grid's edges clamp: the selection never wraps into the next row.
     app.activate_ui_control(UiControl::AnalyzerHeatPick { x: 0, y: 0 });
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowLeft));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowUp));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowLeft));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowUp));
     assert_eq!(pinned(&app), Some(0));
     let last = (heatmap::GRID - 1) as u8;
     app.activate_ui_control(UiControl::AnalyzerHeatPick { x: last, y: last });
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowRight));
-    assert!(app.ui_handle_tool_key(ToolPanelKind::FrameAnalyzer, KeyCode::ArrowDown));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowRight));
+    assert!(app.ui_handle_frame_analyzer_key(KeyCode::ArrowDown));
     assert_eq!(pinned(&app), Some(heatmap::CELLS - 1));
 }
 
@@ -10028,7 +10870,9 @@ fn power_off_releases_a_programmatic_hold() {
 #[cfg(feature = "control")]
 mod warp_control {
     use super::super::app_session::WarpSource;
-    use super::{test_app, test_app_with_audio, SuspensionSink};
+    use super::{
+        test_app, test_app_with_audio, test_app_with_audio_cpu_and_program, SuspensionSink,
+    };
     use crate::control::exec::parse_method;
     use crate::control::windowed::{ControlHandle, CtlMsg};
     use serde_json::{json, Value};
@@ -10108,6 +10952,7 @@ mod warp_control {
             unwind: None,
             relocation_bases: Vec::new(),
             code_ranges: Vec::new(),
+            coverage: false,
             trigger: None,
         }
     }
@@ -10237,6 +11082,40 @@ mod warp_control {
         call(&mut app, &tx, &rx, 2, "warp.set", json!({"on": false}));
         assert!(app.warp_boot.is_none(), "warp off cancels the gate");
         assert!(app.emu.paced());
+    }
+
+    /// A machine parked in STOP with every interrupt masked in SR: no
+    /// interrupt can reach the CPU, so a step that hunts for its wake-up
+    /// shows up as the emulated frames it gives the machine, where the
+    /// single slice this used to take stood still. Paused, because the
+    /// control protocol's bounded step verbs refuse a running machine.
+    fn stopped_app() -> App {
+        let mut app = test_app_with_audio_cpu_and_program(
+            Box::new(crate::audio::NullSink),
+            crate::config::CpuModel::M68000,
+            &[0x4E72, 0x2700], // STOP #$2700
+        );
+        app.powered_on = true;
+        app.paused = true;
+        app
+    }
+
+    #[test]
+    fn a_windowed_control_step_carries_a_cpu_parked_in_stop() {
+        let mut app = stopped_app();
+        let (tx, rx) = attach(&mut app);
+        call(&mut app, &tx, &rx, 1, "step", json!({"n": 1}));
+        assert!(app.emu.machine.stopped(), "the program parks the CPU");
+
+        let before = app.emu.bus().emulated_frames();
+        call(&mut app, &tx, &rx, 2, "step", json!({"n": 1}));
+        let advanced = app.emu.bus().emulated_frames() - before;
+        assert!(
+            (1..=crate::emulator::DEBUG_STOP_WAKEUP_FRAMES).contains(&advanced),
+            "a windowed control step should hunt for the wake-up, bounded: \
+             advanced {advanced} frame(s)"
+        );
+        assert!(app.emu.machine.stopped(), "nothing can wake a masked CPU");
     }
 
     #[test]
@@ -10392,7 +11271,7 @@ mod warp_control {
 
 #[cfg(feature = "gdb")]
 mod gdb_drain {
-    use super::test_app;
+    use super::{test_app, test_app_with_audio_cpu_and_program};
     use crate::gdbstub::core::{checksum, hex_encode};
     use crate::gdbstub::windowed::{GdbHandle, GdbMsg};
     use std::sync::mpsc::{Receiver, Sender};
@@ -10424,6 +11303,39 @@ mod gdb_drain {
             out.push(f);
         }
         out
+    }
+
+    #[test]
+    fn a_windowed_stepi_carries_a_cpu_parked_in_stop() {
+        // STOP #$2700 masks every interrupt, so nothing wakes this CPU:
+        // the hunt for its wake-up is visible as the emulated frames the
+        // `s` packet gives the machine, where a single slice stood still.
+        let mut app = test_app_with_audio_cpu_and_program(
+            Box::new(crate::audio::NullSink),
+            crate::config::CpuModel::M68000,
+            &[0x4E72, 0x2700],
+        );
+        app.powered_on = true;
+        let (handle, cmd_tx, frame_rx) = GdbHandle::test_pair();
+        app.attach_gdb(handle, &crate::gdbstub::Config::new(":0".into()));
+        cmd_tx.send(GdbMsg::Connected).unwrap();
+
+        packet(&cmd_tx, "s");
+        app.drain_gdb();
+        assert!(app.emu.machine.stopped(), "the program parks the CPU");
+        let before = app.emu.bus().emulated_frames();
+
+        packet(&cmd_tx, "s");
+        app.drain_gdb();
+        let advanced = app.emu.bus().emulated_frames() - before;
+        assert!(
+            (1..=crate::emulator::DEBUG_STOP_WAKEUP_FRAMES).contains(&advanced),
+            "stepi should hunt for the wake-up, bounded: advanced {advanced} frame(s)"
+        );
+        assert!(
+            !frames(&frame_rx).is_empty(),
+            "each step replies with a stop"
+        );
     }
 
     #[test]
@@ -10693,12 +11605,12 @@ mod gdb_drain {
 
 /// Part-1 insight-pane tests: guest-registered uaelib resources feeding
 /// the heat presets, the heat view, and the console's DBGRES command.
-mod uaelib_insights {
+pub(super) mod uaelib_insights {
     use super::test_app;
 
     type App = super::super::App;
 
-    fn fit_uaelib(app: &mut App) {
+    pub(in crate::video::window) fn fit_uaelib(app: &mut App) {
         let mut lib = crate::uaelib::UaeLib::new();
         lib.mute_stdout();
         let bus = app.emu.bus_mut();
@@ -10709,7 +11621,7 @@ mod uaelib_insights {
     }
 
     /// The template's 50-byte `struct debug_resource`, big-endian.
-    fn resource_bytes(
+    pub(in crate::video::window) fn resource_bytes(
         address: u32,
         size: u32,
         name: &str,
@@ -10731,7 +11643,7 @@ mod uaelib_insights {
         bytes
     }
 
-    fn register(app: &mut App, staging: u32, bytes: &[u8]) {
+    pub(in crate::video::window) fn register(app: &mut App, staging: u32, bytes: &[u8]) {
         let mask = app.emu.machine.ui_addr_mask();
         let bus = app.emu.bus_mut();
         bus.mem.chip_ram[staging as usize..staging as usize + bytes.len()].copy_from_slice(bytes);
@@ -11630,6 +12542,7 @@ fn netplay_routes_local_inputs_and_blocks_unilateral_menu_actions() -> anyhow::R
                 session: [7; 16],
                 input_delay: 0,
                 rollback_frames: 8,
+                spectators: 0,
             };
             let session = crate::netplay::Session::new(options, &mut app.emu, &cfg)?;
             app.attach_netplay(session);
@@ -11823,6 +12736,140 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
 }
 
 #[test]
+fn netplay_continuous_mouse_corrections_present_every_frame() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            use crate::netplay::{Options, Session};
+            use std::net::UdpSocket;
+            use std::time::{Duration, Instant};
+
+            let reserved = [
+                UdpSocket::bind("127.0.0.1:0")?,
+                UdpSocket::bind("127.0.0.1:0")?,
+            ];
+            let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
+            drop(reserved);
+            // Read the remote mouse's JOYDAT into COLOR00, then repeat. The
+            // framebuffer must change as delayed movement corrects prediction.
+            let program = [0x33f9, 0x00df, 0xf00c, 0x00df, 0xf180, 0x60f4];
+            let mut apps = std::array::from_fn::<_, 2, _>(|_| {
+                test_app_with_audio_cpu_and_program(
+                    Box::new(NullSink),
+                    crate::config::CpuModel::M68000,
+                    &program,
+                )
+            });
+            let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+            cfg.serial.mode = crate::config::SerialMode::Off;
+            cfg.port_devices = [crate::bus::PortDevice::Mouse; 2];
+            for (player, app) in apps.iter_mut().enumerate() {
+                app.emu
+                    .bus_mut()
+                    .rtc
+                    .set_seed(Some(crate::netplay::RTC_SEED), false);
+                app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+                for port in 0..2 {
+                    app.emu
+                        .bus_mut()
+                        .input
+                        .set_port_device(port, crate::bus::PortDevice::Mouse);
+                }
+                let session = Session::new(
+                    Options {
+                        bind: addresses[player],
+                        peer: addresses[1 - player],
+                        player,
+                        session: [32; 16],
+                        input_delay: 2,
+                        rollback_frames: 8,
+                        spectators: 0,
+                    },
+                    &mut app.emu,
+                    &cfg,
+                )?;
+                app.attach_netplay(session);
+                app.render_worker = Some(super::RenderWorker::new());
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !apps
+                .iter()
+                .all(|app| app.netplay.as_ref().unwrap().status().connected)
+            {
+                for app in &mut apps {
+                    app.netplay
+                        .as_mut()
+                        .unwrap()
+                        .step(&mut app.emu, Default::default(), false)?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "setup did not connect");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Keep the host four frames ahead of the guest. With the default
+            // two-frame delay, every moving guest sample arrives too late.
+            for _ in 0..4 {
+                assert!(apps[0].step_netplay()?);
+                apps[0].render_emulated_frame_if_needed();
+            }
+            let mut corrections = 0;
+            let mut changed = 0;
+            for _ in 0..24 {
+                apps[1].add_mouse_delta_i32(7, -3);
+                assert!(apps[1].step_netplay()?);
+                apps[0].add_mouse_delta_i32(-5, 2);
+                let before = apps[0].netplay.as_ref().unwrap().status().rollbacks;
+                let picture = apps[0].present_fb.clone();
+                assert!(apps[0].step_netplay()?);
+                if apps[0].netplay.as_ref().unwrap().status().rollbacks > before {
+                    corrections += 1;
+                    assert_eq!(
+                        apps[0].last_rendered_emulated_frame,
+                        Some(apps[0].emu.bus().emulated_frames()),
+                        "continuous corrections must not starve desktop presentation"
+                    );
+                    changed += usize::from(apps[0].present_fb != picture);
+                    // Compare the worker output with synchronous rendering of
+                    // this corrected machine, and prove rendering is host-only.
+                    let state = apps[0].emu.netplay_snapshot()?;
+                    let threaded = apps[0].present_fb.clone();
+                    apps[0].last_rendered_emulated_frame = None;
+                    assert!(apps[0].render_emulated_frame_sync());
+                    assert!(
+                        apps[0].present_fb == threaded,
+                        "corrected rendering differs"
+                    );
+                    assert!(
+                        apps[0].emu.netplay_snapshot()? == state,
+                        "rendering changed machine state"
+                    );
+                }
+                apps[0].render_emulated_frame_if_needed();
+            }
+            assert!(corrections >= 20, "exercise sustained late mouse movement");
+            assert!(
+                changed >= 20,
+                "corrected mouse input must reach the display"
+            );
+            let target = apps[0].netplay.as_ref().unwrap().status().frame + 2;
+            while !apps.iter().all(|app| {
+                let status = app.netplay.as_ref().unwrap().status();
+                status.frame == target && status.ready_to_capture()
+            }) {
+                for app in &mut apps {
+                    let session = app.netplay.as_mut().unwrap();
+                    let advance = session.status().frame < target;
+                    session.step_local(&mut app.emu, &mut app.netplay_input, advance)?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "mouse input did not converge");
+            }
+            assert!(apps[0].emu.netplay_snapshot()? == apps[1].emu.netplay_snapshot()?);
+            Ok(())
+        })?
+        .join()
+        .unwrap()
+}
+
+#[test]
 fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
     // Two complete machines plus cold setup exceed the default test stack.
     std::thread::Builder::new()
@@ -11852,6 +12899,7 @@ fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
                         session: [31; 16],
                         input_delay: 0,
                         rollback_frames: 8,
+                        spectators: 0,
                     },
                     &mut app.emu,
                     &cfg,
@@ -11882,4 +12930,335 @@ fn netplay_host_mouse_owns_only_the_local_mouse_port() -> anyhow::Result<()> {
         })?
         .join()
         .unwrap()
+}
+
+#[test]
+fn adapter_sockets_queue_behind_the_game_ports_for_host_sources() {
+    use super::{host_routing_for_ports, JoystickInputMode as M};
+    use crate::bus::PortDevice as D;
+    // Stock wiring plus two socket joysticks: the pad keeps port 2, the
+    // cursor-key mapping takes port 3, the numpad stands in on port 2.
+    let r = host_routing_for_ports(
+        [D::Mouse, D::Joystick],
+        [D::Joystick, D::Joystick],
+        M::Gamepad,
+    );
+    assert_eq!(
+        (r.mouse, r.gamepad, r.keyboard, r.keyboard2),
+        (Some(0), Some(1), Some(2), Some(1))
+    );
+    // Four joysticks in keyboard mode: the game ports still come first.
+    let r = host_routing_for_ports(
+        [D::Joystick, D::Joystick],
+        [D::Joystick, D::None],
+        M::Keyboard,
+    );
+    assert_eq!(
+        (r.gamepad, r.keyboard, r.keyboard2),
+        (Some(1), Some(0), Some(1))
+    );
+    // A lone socket joystick gets the pad.
+    let r = host_routing_for_ports([D::Mouse, D::None], [D::None, D::Joystick], M::Gamepad);
+    assert_eq!((r.gamepad, r.keyboard), (Some(3), None));
+    // Empty sockets are not in the queue at all.
+    let r = host_routing_for_ports([D::Mouse, D::Joystick], [D::None, D::None], M::Gamepad);
+    assert_eq!(
+        r,
+        super::host_routing_for([D::Mouse, D::Joystick], M::Gamepad)
+    );
+}
+
+#[test]
+fn field_point_inverts_the_field_placement() {
+    use crate::video::bitplane::ContentRect;
+    use crate::video::present_common::FieldPlacement;
+    let rect = ContentRect {
+        x0: 100,
+        x1: 200,
+        y0: 20,
+        y1: 40,
+    };
+    let placement = FieldPlacement::standard(crate::video::FB_HEIGHT, 0x2C, 10);
+    let placed = placement.content_rect(rect, 570).unwrap();
+    assert_eq!(
+        placement.field_point(placed.x0, placed.y0, 570),
+        Some((100, 20))
+    );
+    assert_eq!(
+        placement.field_point(placed.x1 - 1, placed.y1 - 1, 570),
+        Some((199, 39))
+    );
+    // The centring band above the field shows no field pixel.
+    assert_eq!(placement.field_point(0, 0, 570), None);
+}
+
+#[test]
+fn netplay_gui_spectator_follows_the_players_without_input_or_disk_controls() -> anyhow::Result<()>
+{
+    // Three complete machines plus cold setup exceed the default test stack.
+    std::thread::Builder::new()
+        .stack_size(48 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            use crate::netplay::Role;
+            use crate::video::launcher::{LauncherField as F, LauncherTab};
+            use std::net::UdpSocket;
+            let reserved: Vec<_> = (0..3)
+                .map(|_| UdpSocket::bind("127.0.0.1:0"))
+                .collect::<std::io::Result<_>>()?;
+            let addresses: Vec<_> = reserved
+                .iter()
+                .map(|s| s.local_addr())
+                .collect::<std::io::Result<_>>()?;
+            drop(reserved);
+            let mut apps = [test_app(), test_app(), test_app()];
+            for (player, app) in apps.iter_mut().take(2).enumerate() {
+                app.machine_config.audio.output_enabled = Some(false);
+                app.open_launcher();
+                app.activate_ui_control(UiControl::LauncherToggle(F::NetplayEnabled));
+                let state = app.launcher_state_mut().unwrap();
+                state.netplay.bind = addresses[player].to_string();
+                state.netplay.peer = addresses[1 - player].to_string();
+                state.netplay.player = player;
+                state.netplay.spectators = if player == 0 { 1 } else { 0 };
+                state.netplay.code = "0123456789abcdef0123456789abcdef".into();
+                app.launcher_run();
+                assert!(
+                    app.netplay.is_some(),
+                    "{:?}",
+                    app.launcher_state().and_then(|s| s.status.as_ref())
+                );
+                app.emu.set_paced(false);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let hold_players = |apps: &mut [super::App], frame: u64| -> anyhow::Result<bool> {
+                let mut settled = true;
+                for app in apps.iter_mut().take(2) {
+                    let session = app.netplay.as_mut().unwrap();
+                    let advance = session.status().frame < frame;
+                    session.step(&mut app.emu, Default::default(), advance)?;
+                    let status = session.status();
+                    settled &=
+                        status.connected && status.frame == frame && session.ready_to_capture();
+                }
+                Ok(settled)
+            };
+            while !hold_players(&mut apps, 90)? {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "players did not reach frame 90"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The spectator joins a game already in progress through the
+            // launcher's Watch role.
+            {
+                let app = &mut apps[2];
+                app.machine_config.audio.output_enabled = Some(false);
+                app.open_launcher();
+                app.activate_ui_control(UiControl::LauncherToggle(F::NetplayEnabled));
+                let state = app.launcher_state_mut().unwrap();
+                state.netplay.spectator = true;
+                state.netplay.bind = addresses[2].to_string();
+                state.netplay.peer = addresses[0].to_string();
+                state.netplay.code = "0123456789abcdef0123456789abcdef".into();
+                app.launcher_run();
+                assert!(
+                    app.netplay.is_some(),
+                    "{:?}",
+                    app.launcher_state().and_then(|s| s.status.as_ref())
+                );
+                assert_eq!(app.netplay.as_ref().unwrap().role(), Role::Spectator);
+                assert!(app.mouse_port().is_none());
+                assert!(!app.netplay_keyboard_controller);
+                app.emu.set_paced(false);
+                // Whatever the spectator holds stays on its own side.
+                app.handle_amiga_key_event(0x40, true);
+                app.auto_joy_held[0].red = true;
+                app.apply_auto_joy_state(0);
+            }
+            let mut caught_up = false;
+            loop {
+                hold_players(&mut apps, 90)?;
+                let app = &mut apps[2];
+                app.step_netplay()?;
+                let session = app.netplay.as_ref().unwrap();
+                if session.catching_up() {
+                    caught_up = true;
+                    assert!(!app.emu.paced(), "catch-up runs unpaced");
+                }
+                if session.status().connected && session.status().frame == 90 {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "spectator did not catch up"
+                );
+            }
+            assert!(caught_up, "a late joiner replays its backlog");
+            let spectator = apps[2].netplay.as_ref().unwrap();
+            assert_eq!(spectator.status().checked_frame, 60);
+            assert!(!spectator.catching_up() && apps[2].emu.paced());
+            assert!(!spectator.can_change_disk());
+            assert_eq!(apps[0].netplay.as_ref().unwrap().spectator_count(), 1);
+            assert_eq!(
+                apps[2].emu.netplay_snapshot()?,
+                apps[0].emu.netplay_snapshot()?,
+                "the spectator's machine is the host's, untouched by local input"
+            );
+            // F11 returns to the launcher with the Watch role remembered;
+            // the players carry on without their spectator.
+            apps[2].leave_netplay(None);
+            let state = apps[2].launcher_state().unwrap();
+            assert_eq!(state.tab, LauncherTab::Netplay);
+            assert!(state.netplay.spectator);
+            assert_eq!(state.netplay.peer, addresses[0].to_string());
+            while !hold_players(&mut apps, 100)? {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "players did not reach frame 100"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(
+                apps[0].emu.netplay_snapshot()?,
+                apps[1].emu.netplay_snapshot()?
+            );
+            Ok(())
+        })?
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn multitap_routes_four_pads_and_releases_only_the_disconnected_player() {
+    use crate::bus::PortDevice as D;
+    use crate::gamepad::{JoystickState, PadState};
+    let mut app = test_app();
+    for port in 0..4 {
+        app.emu.bus_mut().input.set_port_device(port, D::Joystick);
+    }
+    let pads = [
+        JoystickState {
+            up: true,
+            fire: true,
+            ..Default::default()
+        },
+        JoystickState {
+            down: true,
+            ..Default::default()
+        },
+        JoystickState {
+            left: true,
+            fire: true,
+            ..Default::default()
+        },
+        JoystickState {
+            right: true,
+            fire: true,
+            ..Default::default()
+        },
+    ]
+    .map(|joystick| {
+        Some(PadState {
+            joystick,
+            ..Default::default()
+        })
+    });
+    app.apply_host_gamepads(pads);
+    let input = &app.emu.bus().input;
+    assert!(input.ports[0].up && input.ports[0].fire);
+    assert!(input.ports[1].down && !input.ports[1].fire);
+    assert!(input.parallel_joysticks[0].left && input.parallel_joysticks[0].fire);
+    assert!(input.parallel_joysticks[1].right && input.parallel_joysticks[1].fire);
+    assert!(!app.keyboard_mapping_active(0));
+    assert!(!app.keyboard_mapping_active(1));
+    let mut unplugged = pads;
+    unplugged[2] = None;
+    app.apply_host_gamepads(unplugged);
+    let input = &app.emu.bus().input;
+    assert!(!input.parallel_joysticks[0].left && !input.parallel_joysticks[0].fire);
+    assert!(input.parallel_joysticks[1].right && input.parallel_joysticks[1].fire);
+    app.ui.menu_open = true;
+    app.apply_host_gamepads(pads);
+    let input = &app.emu.bus().input;
+    assert!(!input.ports[0].fire && !input.ports[1].down);
+    assert!(!input.parallel_joysticks[0].fire && !input.parallel_joysticks[1].fire);
+}
+
+#[test]
+fn multitap_combines_two_keyboards_with_two_pads_and_can_reserve_keyboard_player() {
+    use crate::bus::PortDevice as D;
+    use crate::gamepad::{JoystickState, PadState};
+    let mut app = test_app();
+    for port in 0..4 {
+        app.emu.bus_mut().input.set_port_device(port, D::Joystick);
+    }
+    app.keyboard_joy_held[0].set(KeyCode::ArrowLeft, true);
+    app.keyboard_joy_held[0].set(KeyCode::ControlRight, true);
+    app.keyboard_joy_held[1].set(KeyCode::Numpad6, true);
+    app.keyboard_joy_held[1].set(KeyCode::Numpad0, true);
+    let pad = Some(PadState {
+        joystick: JoystickState {
+            up: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    app.apply_host_gamepads([pad, pad, None, None]);
+    let input = &app.emu.bus().input;
+    assert!(input.ports[0].up && input.ports[1].up);
+    assert!(input.parallel_joysticks[0].left && input.parallel_joysticks[0].fire);
+    assert!(input.parallel_joysticks[1].right && input.parallel_joysticks[1].fire);
+    app.joystick_input_mode = JoystickInputMode::Keyboard;
+    app.apply_host_gamepads([pad; 4]);
+    let input = &app.emu.bus().input;
+    assert!(input.ports[0].left && input.ports[0].fire);
+    assert!(input.ports[1].up);
+    assert!(input.parallel_joysticks[0].up && input.parallel_joysticks[1].up);
+    assert!(app.keyboard_mapping_active(0));
+    assert!(!app.keyboard_mapping_active(1));
+}
+
+#[test]
+fn multitap_keeps_the_primary_pad_on_a_gamepad_mouse() {
+    use crate::bus::PortDevice as D;
+    let r = super::host_routing_for_gamepads(
+        [D::GamepadMouse, D::Joystick],
+        [D::Joystick; 2],
+        JoystickInputMode::Gamepad,
+        [true; 4],
+    );
+    assert_eq!(r.gamepad_mouse, Some(0));
+    assert_eq!(r.gamepad, None);
+    assert_eq!(r.additional_gamepads, [Some(1), Some(2), Some(3)]);
+    assert_eq!(r.keyboard, None);
+    assert_eq!(r.keyboard2, None);
+}
+
+#[test]
+fn multitap_keyboard_takeover_keeps_guest_key_releases_balanced() {
+    use crate::bus::PortDevice as D;
+    use crate::gamepad::PadState;
+    let mut app = test_app();
+    for port in 0..4 {
+        app.emu.bus_mut().input.set_port_device(port, D::Joystick);
+    }
+    app.apply_host_gamepads([Some(PadState::default()); 4]);
+    let raw = host_to_amiga_rawkey(KeyCode::ArrowLeft).unwrap();
+    assert!(!app.handle_keyboard_joystick_key(KeyCode::ArrowLeft, true));
+    app.handle_amiga_key_event(raw, true);
+    app.apply_host_gamepads([None; 4]);
+    assert!(app.keyboard_mapping_active(0));
+    assert!(!app.handle_keyboard_joystick_key(KeyCode::ArrowLeft, false));
+    app.handle_amiga_key_event(raw, false);
+    assert!(!app.amiga_rawkey_held(raw));
+
+    // An autorepeat after the handover must also finish the old guest hold.
+    app.apply_host_gamepads([Some(PadState::default()); 4]);
+    app.handle_amiga_key_event(raw, true);
+    app.apply_host_gamepads([None; 4]);
+    assert!(app.handle_keyboard_joystick_key(KeyCode::ArrowLeft, true));
+    assert!(!app.amiga_rawkey_held(raw));
+    assert!(app.handle_keyboard_joystick_key(KeyCode::ArrowLeft, false));
+    assert!(!app.keyboard_joy_held[0].is_set(KeyCode::ArrowLeft));
 }

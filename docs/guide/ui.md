@@ -4,6 +4,39 @@ Copperline opens a single window: the emulated display presented at a
 TV-like 4:3 aspect ratio, above a status bar with the machine's controls.
 The window scales continuously when resized.
 
+The display defaults to buffered, synchronised presentation (strict FIFO
+vsync) on all desktop platforms. **Video Settings > VSync** changes this
+immediately; it is also in the configuration screen's A/V & Emu > Display
+category and saved as `[display] vsync`. PAL output is roughly 50 Hz, so
+motion can still have an uneven cadence on a fixed 60 Hz
+or 120 Hz display as some Amiga frames stay on screen for an extra refresh.
+Vsync prevents tearing but does not make those refresh rates match or change
+the emulated machine's speed.
+
+On native Wayland, redraws also follow compositor frame callbacks. This
+allows the compositor to throttle a hidden window and schedule visible
+updates, including when VSync is off.
+
+For display diagnostics, launch with `RUST_LOG=info` to log the selected
+presentation mode, supported modes, GPU, graphics backend, and window
+system. The window-system field distinguishes native Wayland from an X11
+window running through XWayland. Add `COPPERLINE_PRESENT_PROFILE=1` to log
+each presentation attempt: its emulated frame number, interval since the
+previous attempt, time acquiring/uploading the surface, time recording draw
+commands, and time submitting/presenting. `submitted=false` means no frame
+was submitted; `-1` marks a stage that was not reached. These are host CPU
+timings, not GPU execution or physical display timestamps. They complement
+the performance overlay, whose FPS measures emulated frames.
+
+On Windows, if the default graphics backend selects a CPU software renderer,
+Copperline tries OpenGL and uses it when its adapter is not reported as a CPU
+renderer. This avoids a slow software DirectX path on systems with accelerated
+OpenGL, including some virtual machines. If OpenGL cannot initialise or also
+selects a CPU renderer, Copperline rebuilds the renderer using the original
+backend. If that also fails to initialise, it reports the startup error.
+Setting `WGPU_BACKEND` or `WGPU_ADAPTER_NAME` disables this automatic fallback
+so explicit selections still apply. The startup log records any switch.
+
 ## Keyboard shortcuts
 
 The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
@@ -15,15 +48,17 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+S` | `Alt+S` | Save a screenshot (`copperline-screenshot-<YYYYMMDDHHmmSS>.png` in the [screenshots folder](#where-files-go); the on-screen confirmation overlay is not part of the saved image) |
 | `Cmd+R` | `Alt+R` | Start / stop a video-with-audio recording (below) |
 | `Cmd+Shift+R` | `Alt+Shift+R` | Start / stop an input recording (below) |
+| `Cmd+Shift+V` | `Alt+Shift+V` | Paste as keystrokes: type the host clipboard's text on the emulated keyboard (also *Input Settings > Paste as Keystrokes*) |
+| `Cmd+Shift+G` | `Alt+Shift+G` | Save the last few seconds of the display as an animated GIF (`copperline-clip-<YYYYMMDDHHmmSS>.gif` in the [recordings folder](#where-files-go); see [Saving a GIF clip](#saving-a-gif-clip)) |
 | `Cmd+Shift+S` | `Alt+Shift+S` | Save a state (`copperline-state-<YYYYMMDDHHmmSS>.clstate` in the [states folder](#where-files-go)) |
-| `Cmd+Shift+L` | `Alt+Shift+L` | Load a save state from a file dialog |
+| `Cmd+Shift+L` | `Alt+Shift+L` | Open the [Load State browser](#load-state-browser) |
 | `Cmd+1`..`Cmd+9`, `Cmd+0` | `Alt+1`..`Alt+9`, `Alt+0` | Quick-save to numbered slot 1-10 |
 | `Cmd+Shift+1`..`Cmd+Shift+0` | `Alt+Shift+1`..`Alt+Shift+0` | Quick-load from that slot |
 | `Cmd+D` | `Alt+D` | Swap to the next disk in a drive's configured playlist |
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
-| `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
+| `Cmd+B` | `Alt+B` | Toggle the [Debug layout](../debugger/window) |
 | `Cmd+Shift+B` | `Alt+Shift+B` | Press the freezer cartridge's button: enter the HRTMon monitor (`[cartridge] model`, see [Configuration](configuration.md#freezer-cartridge)) |
-| `Cmd+K` | `Alt+K` | Open the [debugger console](../debugger/console) |
+| `Cmd+K` | `Alt+K` | Toggle the [Console](../debugger/console) in Debug layout |
 | `Cmd+J` | `Alt+J` | Toggle joystick input mode: gamepad / keyboard (also the status-bar icon) |
 | `Cmd+M` | `Alt+M` | Turn the monitor bezel off, or back on to the chosen front (*Video Settings > Monitor Bezel* picks it; `[display] bezel` sets the start-up value) |
 | `Cmd+Shift+A` | `Alt+Shift+A` | Cycle the audio output: Default, each host device, then Disabled (also *Audio Settings > Audio Output*) |
@@ -36,7 +71,7 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+W` | `Alt+W` | Toggle Warp Speed (turbo) on / off; one press also ends every warp a control client, a GDB client, the guest, or a boot phase engaged |
 | `Cmd+Shift+W` | `Alt+Shift+W` | Cycle the Warp Speed limit: 2x, 4x, 8x, 16x, Max |
 | `Cmd+Z` | `Alt+Z` | Rewind the machine one step (needs `[emulation] rewind` or *Emulation Settings > Rewind*) |
-| `Esc` | `Esc` | Close an open menu or overlay panel (in a tool window, that window); otherwise passed through to the Amiga |
+| `Esc` | `Esc` | Close an open menu or overlay panel (in Debug controls, return to Play); otherwise passed through to the Amiga |
 | `Ctrl+Amiga+Amiga` | `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
 
 Host modifiers that are passed through to the emulated keyboard map onto
@@ -259,6 +294,8 @@ Disk images can be dropped anywhere on the emulator window:
   multi-selection in the disk dialog.
 - **CD images** (`.cue`/`.iso`/`.nrg`/`.chd`) mount in the machine's CD drive
   (CDTV, CD32, or a SCSI CD-ROM unit), with the media-change notification.
+  A `.chd` is read to see what it holds: one made with chdman's `createhd`
+  is a hard-disk image and is treated as such below.
 - **WHDLoad packages** (`.lha`, `.zip`, or a bare `.slave`) reboot the
   machine straight into the game through the [WHDLoad booter](whdload.md),
   keeping any explicit machine choices; dropped on the configuration
@@ -310,33 +347,29 @@ Opening the menu also releases a captured mouse.
 start-up size is `[display] menu_scale`, `--menu-scale`, or *Menu size* on
 the launcher's A/V & Emu page (Display category).
 
-Tool windows are separate native windows so the emulated display remains visible;
-the debugger and frame analyzer can be open at the same time. They take their
-keys and clicks through their own windows, and the main window keeps driving
-the Amiga while they are open -- resume the machine from the debugger and you
-can play on while watching it. Overlay panels are drawn over the display and
-*are* modal: while one is open, key presses and display clicks stay in the UI
-instead of reaching the Amiga. `Esc` in a tool window closes that window;
-`Esc` in the main window closes the menu or overlay panel, and otherwise
-belongs to the Amiga.
+The [Debug workspace](../debugger/window.md) puts the Amiga display beside the
+debugger, Frame Analyzer, and Console in the main window. Switch inspectors with
+the tabs at the top, close one with the close box on its own tab, and resize the
+display using the divider. The title bar's **Play / Debug** switch changes
+layout: **Play** restores the display layout and keeps the inspectors open, with
+their selections, captures, and command history. Switching layouts preserves the
+current run/pause state.
+
+Click the display to send keyboard and mouse input to the Amiga; `Cmd+G` / `Alt+G`
+returns input to the debugger. In the inspector controls, `Esc` leaves a text
+field first, then returns to Play. When the Amiga owns input, `Esc` belongs to
+the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
 
 ### Tools
 
 - **Machine Configuration...**: opens the configuration screen
   ([below](#machine-configuration-screen)) to reconfigure the machine and
   relaunch it. The same screen opens automatically on a no-machine start.
-- **Frame Analyzer...**: pauses the machine and opens a separate diagnostic
-  window with three tabs: which chip-bus owner had each Agnus colour clock
-  across the captured frame, including overscan and blanking, with a CPU
-  wait view that attributes every clock the CPU was denied to the DMA
-  channel that held it and names the stalled instructions; a memory
-  heat map of what last touched each part of the address space; and the
-  debug resources the guest registered through the uaelib trap, with
-  decoded previews; see [](../debugger/window.md#frame-analyzer-pane).
-- **Debugger...** (also `Cmd+B` / `Alt+B`): pauses the machine and opens the
-  tabbed debugger in a tool window; see [](../debugger/window).
-- **Console...** (also `Cmd+K` / `Alt+K`): a GDB-flavoured debugger
-  command line in its own tool window; see [](../debugger/console).
+- **Debugger...** (also `Cmd+B` / `Alt+B`): opens the [Debug workspace](../debugger/window),
+  with the debugger, Frame Analyzer, and Console available from its selectors.
+  The analyzer inspects captured chip-bus activity and registered resources;
+  the [Console](../debugger/console) provides the command line (`Cmd+K` / `Alt+K`
+  opens it directly).
 - **Freeze (HRTMon)** (also `Cmd+Shift+B` / `Alt+Shift+B`): presses the
   freezer cartridge's button, so the machine runs on into the HRTMon
   monitor on its own screen; the monitor's `x` command returns to the
@@ -423,10 +456,18 @@ belongs to the Amiga.
   A window effect only: captures stay untinted, the menu and the status bar
   keep their colours, and RTG scanout is never tinted.
 - **Fullscreen** (also `Cmd+F` / `Alt+F`): borderless fullscreen on the
-  window's current monitor. The picture keeps its aspect and letterboxes as
-  needed, exactly as when resizing the window.
+  window's current monitor. The picture keeps its aspect with black letterbox
+  bars as needed, exactly as when resizing the window.
 - **Status Bar** (also `Cmd+Shift+F` / `Alt+Shift+F`): show or hide the
   status bar. Handy alongside fullscreen for a clean, chrome-free picture.
+- **VSync**: synchronise presentation to the monitor's vertical blank
+  (on by default). Turning it off requests presentation without waiting for
+  vblank where the graphics backend supports it; this may reduce latency
+  but can tear. It takes effect immediately and keeps normal emulation
+  speed unchanged. The choice carries into **Machine Configuration...**
+  when saving a config, as `[display] vsync`. VSync prevents tearing but
+  cannot remove the uneven cadence of PAL output on a mismatched monitor
+  refresh rate.
 - **Monitor Bezel**: which monitor front the picture sits inside instead
   of filling the window -- **Disabled**, **1084** (a two-tone cabinet with
   the tube sunk into its moulding, and the model badge, the Copperline name
@@ -462,6 +503,22 @@ belongs to the Amiga.
   [Configuration](configuration.md).
 - **On-Screen Keyboard** (also the status-bar keyboard icon): draws an
   Amiga keyboard under the display; see [](#on-screen-keyboard).
+- **Paste as Keystrokes** (also `Cmd+Shift+V` / `Alt+Shift+V`): types the
+  host clipboard's text on the emulated keyboard, key by key, the way
+  `--type-after` does from the command line: US keymap, Shift held for upper
+  case and shifted symbols, a newline as Return, a tab as Tab, one key every
+  100 ms of emulated time. Characters the Amiga keyboard has no key for are
+  skipped (the on-screen confirmation says so). Typing starts a moment after
+  the shortcut so its own Shift is up before the first typed Shift goes
+  down. The typed keys go through the scheduled-input queue, so an input
+  recording captures them as individual key events.
+- **Share Clipboard**: host <-> guest clipboard text, both ways (text the
+  guest copies lands on the host clipboard; host text is available to paste
+  in the guest). Off unless the machine was started with `[clipboard] share
+  = true` / `--clipboard`, and greyed out otherwise: the guest side is part
+  of the services board's boot, and that board is not fitted unless it was
+  asked for, because it moves the guest's memory map. See the `[clipboard]`
+  section of [Configuration](configuration.md#clipboard).
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
 - **Input Mapping...**: edits which host keys drive the controller controls,
   for both keyboard mappings; see [](#input-mapping).
@@ -479,6 +536,21 @@ Shown only when something is on the port.
   sampler's host capture device, and its input gain, which the *Increase* and
   *Decrease* rows step (also `Cmd/Alt+Shift +/-`). Both change live. See the
   `[parallel]` section of [Configuration](configuration.md).
+
+### PCMCIA Card
+
+Offered only on an A600 or A1200, whose Gayle carries the credit-card
+slot; the category row shows what is in the slot (or *Empty*).
+
+- **Insert CF Card Image...**: pick a hard-disk image (anything `[ide]`
+  accepts) and push it into the slot as a CompactFlash card, ejecting
+  whatever was there. Gayle latches the card-detect change, so a
+  `card.resource` client sees a real insertion.
+- **Eject Card**: pull the card (greyed with an empty slot). An SRAM
+  card's backing file is written back on the way out.
+
+See the `[pcmcia]` section of [Configuration](configuration.md) for
+boot-time cards, SRAM cards, real card readers, and the fast-RAM rule.
 
 ### Emulation Settings
 
@@ -519,14 +591,15 @@ Shown only when something is on the port.
   independently and releases only its own, such a warp mutes live audio, the
   OSD names who asked, and one press of the shortcut ends them all.
 - **Warp Limit** (also `Cmd+Shift+W` / `Alt+Shift+W`): how fast warp runs.
-  Because the window presents with vsync, emulating one frame per presented
+  With VSync enabled, emulating one frame per presented
   frame would cap warp at the host monitor's refresh rate (about 1.2x for
   50 Hz PAL on a 60 Hz display). The limit sets an output frame skip -- 2x,
   4x, 8x, 16x, or **Max** -- so warp retires that many emulated frames per
   presented frame, making the effective speed roughly the limit times the
   refresh rate (host CPU permitting). `Max` runs flat out and still presents
-  at vsync. The default is set by `[emulation] warp_speed` (see
-  [Configuration](configuration.md)).
+  at vsync when enabled. With VSync off, presentation frequency depends on
+  host throughput and compositor redraw scheduling. The default is set by
+  `[emulation] warp_speed` (see [Configuration](configuration.md)).
 
 ### Recording
 
@@ -535,6 +608,9 @@ Shown only when something is on the port.
 - **Record Input** (also `Cmd+Shift+R` / `Alt+Shift+R`): records every
   input event that reaches the emulated machine; stopping writes a script
   file that `--script` replays deterministically. See below.
+- **Save Clip as GIF** (also `Cmd+Shift+G` / `Alt+Shift+G`): writes the
+  last `[recording] clip_seconds` (ten by default) of the display as an
+  animated GIF. See [Saving a GIF clip](#saving-a-gif-clip).
 
 ### Save State
 
@@ -543,10 +619,14 @@ Shown only when something is on the port.
   visible before it is chosen. No dialog, and no file to name. The hotkeys
   reach the same slots -- `Cmd/Alt+<digit>` saves and
   `Cmd/Alt+Shift+<digit>` loads, with `0` as the tenth. See below.
-- **Save State...** (also `Cmd+Shift+S` / `Alt+Shift+S`) and
-  **Load State...** (also `Cmd+Shift+L` / `Alt+Shift+L`): snapshot the whole
-  emulated machine to a file of your choosing, or restore one and continue
-  from exactly that point. See below.
+- **Save State...** (also `Cmd+Shift+S` / `Alt+Shift+S`): snapshot the
+  whole emulated machine to a timestamped file in the states folder. See
+  below.
+- **Load State...** (also `Cmd+Shift+L` / `Alt+Shift+L`): opens the
+  [Load State browser](#load-state-browser) -- the states folder and the
+  quick-save slots as a list of thumbnails, newest first -- to restore one
+  and continue from exactly that point. Its **Browse...** button is the
+  file dialog, for a state kept somewhere else.
 
 (and-last)=
 ### Application controls
@@ -621,9 +701,10 @@ The layout is:
   **Revision** lines naming what the chosen image is, identified by
   checksum rather than by file name -- blank for an image Copperline does
   not know, and read from the image itself for the bundled AROS. The FMV row
-  shows the bundled open ROM by default on CD32, accepts another 256 KiB module
-  ROM, and has a **Remove** / **Default** action for leaving the cartridge slot
-  empty or restoring the bundled module. It is greyed on non-CD32 profiles;
+  starts as an empty cartridge slot on CD32; its **Fit** action fits the
+  module with the bundled open ROM (saved as `fmv = true`), choosing a file
+  fits it with another 256 KiB module ROM, and **Remove** empties the slot
+  again. It is greyed on non-CD32 profiles;
   see [Configuration](configuration.md),
   *Floppy* (drive count from zero to four -- CDTV/CD32 default to zero -- and
   speed, then each wired drive as a
@@ -682,7 +763,11 @@ The layout is:
   port fields. Leaving a field blank uses the default (host `127.0.0.1` for
   Listen, port `1234`; Connect requires a host/IP). Valid ports are 1-65535;
   on macOS and Linux, binding a Listen port below 1024 requires root
-  privileges (outbound connections have no port restrictions); the
+  privileges (outbound connections have no port restrictions). The
+  **Host port** mode (`device`) shows a **Port** picker instead, stepping
+  through the serial ports the host has at that moment (re-read on every
+  step, so a freshly plugged adapter appears; a saved path the host does
+  not list is kept and marked "not found"); the
   parallel device -- None, Printer, or Sampler -- with, for the printer, its
   capture output file, or for the sampler, its host audio input and input gain;
   and the A2065 Ethernet and HostSocket bsdsocket.library boards, each --
@@ -906,6 +991,40 @@ keep full level regardless of the live output volume. Pausing (or
 powering off) suspends the capture; recording resumes when emulation
 continues.
 
+(saving-a-gif-clip)=
+## Saving a GIF clip
+
+The window keeps a rolling ring of the last ten emulated seconds of the
+picture it presents, so a moment worth sharing can be saved *after* it
+happened: `Cmd+Shift+G` on macOS or `Alt+Shift+G` on Linux/Windows (or the
+menu's "Save Clip as GIF") writes the ring as
+`copperline-clip-<YYYYMMDDHHmmSS>.gif` in the
+[recordings folder](#where-files-go) and confirms the file name on screen
+when it is done. The clip is written on a background thread, so emulation
+never pauses; a second save waits for the first to finish.
+
+The GIF shows exactly what a screenshot would: the presentation's crop,
+TV aperture, H/V centre and pixel aspect, with the status bar, menus and
+the on-screen message left out. Frames are thinned to 25 per second on
+PAL and 30 on NTSC (`[recording] clip_fps` sets another rate) and each
+carries its own palette, so the usual Amiga picture is stored losslessly;
+a frame with more than 256 colours (HAM, AGA truecolour-ish output) is
+reduced to 256 with NeuQuant when the file is written. Frame delays
+follow the emulated timeline, so a clip made under Warp Speed plays at
+normal speed, and a stretch where Warp presented no frames plays as one
+held frame rather than a burst. A clip has no sound; use
+[Record Video](#recording-video) for that.
+
+`[recording] clip_seconds` sets the ring's length (up to 120 seconds; 0
+switches the ring and the menu item off) -- see
+[Configuration](configuration.md#recording-config). The ring holds pictures in
+their palette-indexed form and stores a picture once however long it
+stays on screen, so a ten-second ring costs well under 100 MB of host
+memory in practice; it is bounded at 256 MB regardless. Loading a save
+state, resetting or running a different machine starts the ring over.
+The headless `--gif-after` flag writes the same kind of clip from a
+scheduled emulated time (see [](headless.md#capturing-gif-clips)).
+
 ## Recording input
 
 `Cmd+Shift+R` on macOS or `Alt+Shift+R` on Linux/Windows (or the menu's
@@ -936,16 +1055,33 @@ headless `--record-input` variant are described in
 `copperline-state-<YYYYMMDDHHmmSS>.clstate` in the [states folder](#where-files-go): CPU,
 chip/slow/fast RAM, ROM, the full chipset and CIA state, floppy images
 (including unsaved in-memory changes), expansion boards, and CD/NVRAM
-state. `Cmd+Shift+L` / `Alt+Shift+L` (or "Load State...") restores one; the
-machine continues from exactly the saved point, byte-for-byte -- the core
-is deterministic, so a resumed run is indistinguishable from one that was
-never interrupted.
+state. `Cmd+Shift+L` / `Alt+Shift+L` (or "Load State...") opens the
+[browser below](#load-state-browser) to restore one; the machine continues
+from exactly the saved point, byte-for-byte -- the core is deterministic,
+so a resumed run is indistinguishable from one that was never interrupted.
 
-States are taken at emulated-frame boundaries and are versioned: a file
-from an older, incompatible build is refused with a clear message rather
-than producing a corrupt machine. Save-state format 79 uses stable expansion-board
-identifiers across feature selections; a build still needs support for every
-board present in the snapshot. Format 78 and older states must be recreated.
+Every state also carries a small card about itself, written ahead of the
+machine so it can be read without loading anything: a thumbnail of the
+display at the moment of the save (240 pixels wide, the same picture a
+screenshot would take), the emulated time and the wall-clock time of the
+save, a one-line machine summary, and the names of the media in the
+drives (floppies, hard-drive images, CD). The browser shows it, and
+`copperline-ctl state-info FILE.clstate` prints it as JSON (with
+`--thumbnail FILE.png` to write the picture out; see the
+[control protocol reference](../debugger/control.md#state-snapshot-files)).
+States written before this card existed load exactly as before and show
+in the browser without a picture.
+
+States are taken at emulated-frame boundaries and are versioned per
+subsystem: the file is a set of tagged chunks (CPU, memory, Paula, Agnus,
+floppy, expansion boards, ...) that name their fields, so a state keeps
+loading across releases that add or drop state fields, and a release that
+changes what a subsystem's state means upgrades that chunk on load. A file
+a build cannot read is refused with a message naming the chunk and
+versions rather than producing a corrupt machine. A build still needs
+support for every expansion board present in the snapshot. States written
+by Copperline 0.19 and earlier used a flat layout with a single version
+and must be recreated.
 
 Saving over an existing file replaces it only after the new snapshot has
 been completely written and flushed. A failed save leaves the previous
@@ -969,6 +1105,48 @@ not silently mixed in. Two caveats:
 - CD images are likewise reopened by path; keep the cue sheet and its
   files (or the CHD) where they were.
 
+(load-state-browser)=
+### Load State browser
+
+```{figure} ../images/ui-preview-load-state.png
+:alt: The Load State browser listing quick-save slots and named states with thumbnails
+:width: 75%
+
+The Load State browser: the ten slots, then the folder's states newest
+first. One state was taken on a different machine and is flagged; one
+file is not a state at all and says so.
+```
+
+**Load State...** (or `Cmd+Shift+L` / `Alt+Shift+L`) lists the
+[states folder](#where-files-go): the ten [quick-save slots](#quick-save-slots)
+first, empty ones included, then every other `.clstate` in the folder,
+newest first. Each row shows the state's thumbnail, when it was saved,
+how far into the emulated run it was taken, the machine it was taken on,
+and what was in the drives. A state taken on a different machine than
+the one running -- another model, chipset, memory size, or Kickstart --
+is shown in amber with the difference named; it still loads (a state
+carries its own machine, and the load reconfigures to match it, as
+described above), the flag just says that it will. A file the build
+cannot read is listed with the reason, so a stray or damaged file can
+still be found and deleted from here.
+
+Clicking a row loads it and closes the browser. With the keyboard, up
+and down move the selection (Page Up/Down and Home/End move faster),
+Return loads the selected state, and Delete asks before removing its
+file -- the question comes up with **Cancel** under the focus, so a
+second Return keeps the file and Delete again (or left, then Return)
+removes it. Down off the foot of the list reaches the button row, where
+left and right pick **Load**, **Delete**, or **Browse...**; Esc closes
+the browser (or withdraws the question first). A controller walks the
+same list with its d-pad, fire, and second button, as
+[everywhere else](#keyboard-and-controller-navigation). **Browse...**
+opens the file dialog for a state kept outside the folder.
+
+A deleted slot shows as empty again; a deleted named state leaves the
+list. Loading reports "Loaded Slot 3" or the file's name on the OSD, and
+a state that fails to load puts the browser back up with the reason on
+its status line.
+
 (quick-save-slots)=
 ### Quick-save slots
 
@@ -982,10 +1160,14 @@ as empty.
 A quick save overwrites its slot without asking -- that is the point of it --
 and loading a slot that has never been written reports "Slot N is empty"
 rather than failing. Slots are ordinary `.clstate` files, identical in format
-to a named save, kept in the states folder below. And because they are per
-user and not per machine, a slot may hold a state from a different Amiga
-than the one running. That is safe: as above, the state carries its own
-machine and the load reconfigures to match it and says so.
+to a named save, kept in the states folder below, and the
+[Load State browser](#load-state-browser) lists them first, each with its
+thumbnail, so a slot can be told from another by what it shows rather
+than by its number. And because they are per user and not per machine, a
+slot may hold a state from a different Amiga than the one running. That is
+safe: as above, the state carries its own machine and the load
+reconfigures to match it and says so, and the browser flags such a slot
+before it is picked.
 
 The headless flags `--save-state-after SECS PATH` and `--load-state PATH`
 script the same feature for [debugging workflows](headless.md): snapshot a
@@ -1008,8 +1190,8 @@ directory is:
 | Windows | `%USERPROFILE%\Documents\Copperline\` |
 
 with a folder inside it for each kind of file: `screenshots/`, `states/`
-(named saves and the quick-save slots), `recordings/` (video captures and
-recorded input scripts), `nvram/` (battery-backed clock RAM and CD32 game
+(named saves and the quick-save slots), `recordings/` (video captures, GIF
+clips and recorded input scripts), `nvram/` (battery-backed clock RAM and CD32 game
 saves), `traces/` (debugger traces and waveform captures), and `configs/`
 (configurations saved from the configuration screen). Each folder is created
 on first use, and each can be moved with the `[paths]` section of the
@@ -1036,8 +1218,8 @@ either direction.
 
 An Amiga has two game ports, and either accepts any controller. Copperline
 models that: each port carries a device -- `mouse`, `joystick`, `cd32` pad,
-`analogue` paddles, or `none`, and port 1 additionally `gamepad-mouse` --
-set with `[input] port1`/`port2` in the
+`analogue` paddles, `lightpen`, or `none`, and port 1 additionally
+`gamepad-mouse` -- set with `[input] port1`/`port2` in the
 config (or `--port1`/`--port2`, or the launcher's *Input* tab). The default
 is the stock wiring, a mouse in port 1 and a joystick in port 2 (a CD32 pad
 on the CD32 profile). The runtime menu's **Port 1 Device** / **Port 2
@@ -1084,6 +1266,49 @@ buttons, on either port. An `analogue` device presents pot resistances on
 the POTxX/POTxY pins; no live host device maps to it yet -- drive it with
 `--pot-after` scripting or the control protocol's `input.analogue`.
 
+A `lightpen` device (alias `lightgun`) follows the host pointer over the
+display: wherever the pointer is, the pen's photodetector is held against
+that pixel, and Agnus latches the beam position as it sweeps past (readable
+through `VPOSR`/`VHPOSR` while the guest sets `BPLCON0` `LPEN`). A left
+click over the display presses the pen's tip switch -- a light gun's
+trigger -- which the pen puts on the port's third-button line (`POTxX`),
+since pin 6 is the pulse line itself. Leave the mouse uncaptured: a
+captured pointer has no position to follow. The pen only reaches Agnus from
+the port the board wires to its `LP` input, port 1 on the A1000 and port 2
+on every later Amiga; a pen in the other port is logged at start-up. See
+[Port devices](configuration.md#port-devices) for the headless and
+control-protocol forms.
+
+Ports 3 and 4 are the sockets of the parallel-port **multitap**, also called
+the four-player joystick adapter. Select **I/O Ports > Parallel > Multitap
+(4 joysticks)** in the launcher, or use `--parallel multitap` (the existing
+`joystick-adapter` name also works). Games such as Super Skidmarks, Kick Off 2
+and Dyna Blaster read these sockets as two extra joysticks.
+
+For four local USB/Bluetooth controllers, select **Joystick** for both
+native ports and use **gamepad** input mode:
+
+```sh
+copperline --parallel multitap --port1 joystick --port2 joystick --joystick gamepad
+```
+
+Controllers fill the configured joystick ports in port order. Each has its
+own state and calibration; unplugging one releases its controls without
+moving the other controllers between players. The next controller connected
+fills the vacant slot. The first controller also operates Copperline's menu.
+To calibrate another controller, connect it alone while running calibration.
+
+The cursor-key and numeric-keypad mappings fill remaining player slots.
+Two physical controllers plus the two keyboard mappings can
+therefore drive all four players. **Keyboard** input mode reserves the first
+joystick port for cursor keys, with up to three physical controllers filling
+the rest. With no pads, cursor keys and numpad retain their usual two-player
+assignment. Bindings remain editable through **Input Mapping...**.
+
+Scripted `--joy-after ... 3`/`4` and the control protocol's `input.joy` address
+the adapter sockets directly. The [libretro core](libretro.md) also exposes
+both sockets. Copperline's built-in Netplay remains two-player.
+
 A `gamepad-mouse` device is a mouse a gamepad moves as well as the host's
 own; the machine still sees one mouse. The d-pad moves the pointer,
 gathering speed while a direction is held, and the left stick moves it
@@ -1105,11 +1330,11 @@ keys aren't working" surprise can be spotted and fixed at a glance:
 - **keyboard**: use the keyboard-joystick mapping so the joystick port
   works without a controller.
 
-With joysticks (or pads) in *both* ports -- a two-player setup -- the
-gamepad and the cursor-key mapping drive one port each, and the mode picks
-which source gets the lower-numbered port. Whenever no physical pad is
-present, a second keyboard mapping on the numeric keypad stands in for it,
-so two players can share one keyboard.
+With joysticks (or pads) in both ports, two connected gamepads drive one
+each in **gamepad** mode. With one gamepad, cursor keys drive the other port;
+with none, the numeric keypad substitutes for the gamepad so two players
+can share one keyboard. **Keyboard** mode keeps cursor keys on the first
+joystick port even when multiple gamepads are connected.
 
 With mice in both ports, the host mouse drives the lower-numbered one and
 the cursor-key mapping drives the second as an emulated mouse (in

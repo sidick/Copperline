@@ -32,8 +32,9 @@ pub(crate) fn raw_from_path(path: &Path) -> Result<RawConfig> {
 // the output minimal -- only fields and sections the user actually set are
 // emitted, matching the style of the hand-written `*.example.toml`. The
 // `toml` serializer requires every top-level scalar key to be emitted before
-// any `[table]`, so the top-level scalars (`rom`, `extended_rom`, `fmv_rom`,
-// `identify`) are declared first, ahead of the section tables and the `zorro`
+// any `[table]`, so the top-level scalars (`rom`, `extended_rom`, `fmv`,
+// `fmv_rom`, `identify`) are declared first, ahead of the section tables and
+// the `zorro`
 // array of tables. Field declaration order otherwise mirrors deserialization,
 // which is order-independent.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,8 +50,12 @@ pub struct RawConfig {
     /// Extended ROM image (CD32 512K at $E00000, CDTV 256K at $F00000).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) extended_rom: Option<String>,
-    /// CD32 Full Motion Video cartridge ROM (bundled open 256 KiB default;
-    /// an empty string leaves the module unfitted).
+    /// `fmv = true` fits the CD32 Full Motion Video module with the bundled
+    /// open 256 KiB ROM (default: the cartridge slot is empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fmv: Option<bool>,
+    /// CD32 Full Motion Video cartridge ROM: naming one fits the module with
+    /// that image. An empty string is the older spelling of an empty slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) fmv_rom: Option<String>,
     /// `identify = false` drops the Copperline identification board from the
@@ -76,17 +81,25 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) ide: RawIde,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) pcmcia: RawPcmcia,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) scsi: RawScsi,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) copperhf: RawCopperhf,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) lide: RawLide,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) sf2000sd: RawSf2000Sd,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) a2065: RawA2065,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) toccata: RawToccata,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) clipboard: RawClipboard,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) cartridge: RawCartridge,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) recording: RawRecording,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) mhi: RawMhi,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -258,6 +271,7 @@ impl RawConfig {
             &overlay.display.pixel_aspect,
         );
         take(&mut self.display.scaling, &overlay.display.scaling);
+        take(&mut self.display.vsync, &overlay.display.vsync);
         take(&mut self.display.autocrop, &overlay.display.autocrop);
         take(&mut self.display.menu_scale, &overlay.display.menu_scale);
         take(&mut self.display.shader, &overlay.display.shader);
@@ -272,6 +286,8 @@ impl RawConfig {
         take(&mut self.display.full_screen, &overlay.display.full_screen);
         take(&mut self.input.port1, &overlay.input.port1);
         take(&mut self.input.port2, &overlay.input.port2);
+        take(&mut self.input.port3, &overlay.input.port3);
+        take(&mut self.input.port4, &overlay.input.port4);
         take(&mut self.input.joystick, &overlay.input.joystick);
         take(&mut self.input.autofire_hz, &overlay.input.autofire_hz);
         take(&mut self.audio.output_device, &overlay.audio.output_device);
@@ -356,6 +372,13 @@ pub(crate) struct RawDisplay {
     /// Performance overlay in the top-right of the display (default false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) perf_overlay: Option<bool>,
+    /// Synchronise desktop presentation to vblank (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vsync: Option<bool>,
+    /// Draw the presentation texture at the display's device-pixel
+    /// density (default true); false draws it at canvas resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hidpi_texture: Option<bool>,
     /// Screen tint: "none" (default), "bw", "green", "amber", or "sepia".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tint: Option<String>,
@@ -533,6 +556,15 @@ pub(crate) struct RawInput {
     /// ("cd32" on the CD32 profile).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) port2: Option<String>,
+    /// Joystick in the parallel-port four-player adapter's first socket:
+    /// "joystick" or "none". Naming one fits the adapter
+    /// (`[parallel] device = "joystick-adapter"`); an adapter named there
+    /// fills every socket these keys leave unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) port3: Option<String>,
+    /// Joystick in the adapter's second socket: same values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) port4: Option<String>,
     /// Host mouse sensitivity, 0-100 (default 50).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mouse_sensitivity: Option<u16>,
@@ -549,7 +581,8 @@ pub(crate) struct RawInput {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawSerial {
-    /// "stdout" (default), "off", "midi", "tcp", "tcp-connect", or "pty".
+    /// "stdout" (default), "off", "midi", "tcp", "tcp-connect", "pty",
+    /// "modem", or "device".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mode: Option<String>,
     /// Host MIDI output endpoint name (substring match); MIDI mode only.
@@ -588,6 +621,10 @@ pub(crate) struct RawSerial {
     /// Remote host:port to dial; tcp-connect mode only, and required there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) connect: Option<String>,
+    /// Host serial port path (or Windows COM name); device mode only, and
+    /// required there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) device: Option<String>,
     /// AT*T1/AT*T0 default at power-on: telnet NVT translation (the
     /// WiModem extra) on by default. Modem mode only. Defaults to false.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -769,6 +806,26 @@ pub(crate) struct RawIde {
     pub(crate) slave: Option<RawDrive>,
 }
 
+/// `[pcmcia]`: the card in the A600/A1200 credit-card slot.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPcmcia {
+    /// "none" (the default), "cf" (a CompactFlash/ATA card over a hard-disk
+    /// image), or "sram" (a static-RAM memory card).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) card: Option<String>,
+    /// CF: the image (anything `[ide]` accepts). SRAM: an optional file the
+    /// card's contents are read from and written back to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    /// SRAM: the card's size, up to 4M.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) size: Option<String>,
+    /// SRAM: the card's write-protect switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_only: Option<bool>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawScsi {
@@ -895,6 +952,26 @@ impl RawLide {
     }
 }
 
+/// `[sf2000sd]` SF2000 accelerator Zorro II SD card controller.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawSf2000Sd {
+    /// The SD card image: same bare-path/table drive form as
+    /// `[copperhf]`'s units -- hard disks only, no ATAPI/CD command set
+    /// behind this controller. The board is fitted (added to the Zorro
+    /// chain) when this or `rom` is set; there is no "socket present but
+    /// empty" mode yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) card: Option<RawDrive>,
+    /// Boot ROM image (a 32K byte-wide flash dump). Absent (or `""`) is
+    /// hardware-only mode: no autoboot, the card still works under a
+    /// disk-loaded driver. Unlike `[lide]`'s `rom`, there is no bundled
+    /// default -- this ROM is the SF2000 firmware author's, not
+    /// Copperline's to ship.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rom: Option<String>,
+}
+
 /// `[a2065]` Ethernet board. Fitting the board enables host networking, which
 /// is non-deterministic.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -918,6 +995,19 @@ pub(crate) struct RawToccata {
     pub(crate) enabled: Option<bool>,
 }
 
+/// `[clipboard]` host <-> guest clipboard sharing (`crate::clipboard`).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawClipboard {
+    /// Share the host clipboard with the guest's clipboard.device.
+    /// Absent means off, in every session: sharing fits a unit of the
+    /// services board, and an autoconfig board the configuration did not
+    /// ask for moves the guest's memory map (see
+    /// `Config::resolve_clipboard_share`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) share: Option<bool>,
+}
+
 /// `[cartridge]` freezer cartridge (`crate::cartridge`).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -928,6 +1018,19 @@ pub(crate) struct RawCartridge {
     /// A cartridge image of the user's own instead of the bundled one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rom: Option<String>,
+}
+
+/// `[recording]` GIF clip ring (`crate::gifclip`).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawRecording {
+    /// Emulated seconds the window keeps for Save Clip as GIF (default
+    /// 10; 0 disables the ring).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clip_seconds: Option<u32>,
+    /// Clip frame rate (default 0 = 25 on PAL, 30 on NTSC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clip_fps: Option<u32>,
 }
 
 /// `[mhi]` MHI virtual MPEG audio decoder board.
@@ -1446,18 +1549,39 @@ pub(super) fn drive_image(raw: RawDrive) -> Result<DriveImage> {
     })
 }
 
-/// Convert a parsed `[copperhf]` unit entry into a `DriveImage`, on top of
-/// [`drive_image`]'s validation: `[copperhf]` serves hard disks only, so a
-/// path recognised as a CD image is rejected rather than silently attaching
-/// a unit with no working command set behind it.
-pub(super) fn copperhf_drive_image(raw: RawDrive) -> Result<DriveImage> {
+/// Convert a parsed drive entry for a hard-disk-only controller into a
+/// `DriveImage`, on top of [`drive_image`]'s validation: a path recognised
+/// as a CD image is rejected rather than silently attaching a unit with no
+/// working command set behind it. `section` is the config section the entry
+/// came from and `controller` what would have had to serve the disc, so the
+/// error names what the user actually wrote rather than some other section
+/// that happens to share this rule.
+fn hard_disk_only_drive_image(
+    raw: RawDrive,
+    section: &str,
+    controller: &str,
+) -> Result<DriveImage> {
     let path = PathBuf::from(&raw.path);
     if crate::config::is_cd_image_path(&path) {
         bail!(
-            "[copperhf] {}: copperhf.device serves hard disks only, not CD images \
+            "[{section}] {}: {controller} serves hard disks only, not CD images \
              (attach this to [scsi] or [ide]/[lide] instead)",
             path.display()
         );
     }
     drive_image(raw)
+}
+
+/// Convert a parsed `[copperhf]` unit entry into a `DriveImage`:
+/// copperhf.device serves hard disks only, no ATAPI/SCSI-CDROM command set
+/// behind it.
+pub(super) fn copperhf_drive_image(raw: RawDrive) -> Result<DriveImage> {
+    hard_disk_only_drive_image(raw, "copperhf", "copperhf.device")
+}
+
+/// Convert the parsed `[sf2000sd] card` entry into a `DriveImage`: the same
+/// hard-disks-only rule, since an SD card has no ATAPI/SCSI-CDROM command
+/// set behind it either.
+pub(super) fn sf2000sd_drive_image(raw: RawDrive) -> Result<DriveImage> {
+    hard_disk_only_drive_image(raw, "sf2000sd", "the SF2000 SD card controller")
 }

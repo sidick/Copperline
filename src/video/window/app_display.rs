@@ -22,19 +22,6 @@ impl App {
                 return false;
             }
         }
-        // Tool windows draw through the same canvas height, so their buffers
-        // follow too. Buffer only: their own window sizes are their business.
-        for kind in ToolPanelKind::ALL {
-            if let Some(tool) = self.tool_window_mut(kind) {
-                if let Err(e) = tool.pixels.resize_buffer(
-                    texture_width(tool.texture_scale) as u32,
-                    texture_height(tool.texture_scale) as u32,
-                ) {
-                    warn!("resize tool texture buffer for a canvas-height change failed: {e}");
-                }
-                tool.window.request_redraw();
-            }
-        }
         true
     }
 
@@ -97,33 +84,6 @@ impl App {
         self.apply_surface_size(size);
     }
 
-    /// Tool-window counterpart of `resync_surface_size`, for the same reason:
-    /// these windows are freely resizable too.
-    pub(super) fn resync_tool_surface_size(&mut self, kind: ToolPanelKind) {
-        let Some(tool) = self.tool_window(kind) else {
-            return;
-        };
-        let Some(size) = surface_resize_for_draw(tool.surface_size, tool.window.inner_size())
-        else {
-            return;
-        };
-        self.apply_tool_surface_size(kind, size);
-    }
-
-    /// Tool-window counterpart of `apply_surface_size`, shared by that window's
-    /// Resized event and the synchronous `request_inner_size` path.
-    pub(super) fn apply_tool_surface_size(&mut self, kind: ToolPanelKind, size: PhysicalSize<u32>) {
-        if let Some(tool) = self.tool_window_mut(kind) {
-            // Same minimized-present deadlock guard as the main window.
-            tool.minimized = size.width == 0 || size.height == 0;
-            if tool.minimized {
-                return;
-            }
-            let _ = tool.resize_surface(size);
-        }
-        self.request_redraw();
-    }
-
     /// Size the window to the presentation canvas, unless it is fullscreen: the
     /// request resizes nothing there and instead shrinks the drawable into a
     /// corner (macOS and Windows; Linux window managers ignore it), so leave the
@@ -136,7 +96,7 @@ impl App {
     /// `request_inner_size` is only asynchronous when it returns `None`. Wayland
     /// applies the resize client-side and returns the new size with no `Resized`
     /// event to follow, so the surface must be resized here or the stale extent
-    /// misplaces every click through `cursor_texture_position`.
+    /// misplaces every click through `main_cursor_position`.
     pub(super) fn snap_window_to_canvas(&mut self) {
         let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
             return;
@@ -173,6 +133,11 @@ impl App {
     ///   the canvas a different shape inside an unchanged window, and the
     ///   picture letterboxes on whichever axis has come up short.
     pub(super) fn follow_canvas_change(&mut self, was_canvas_sized: bool, canvas_before: usize) {
+        // Debug owns its pane layout; canvas changes only affect the picture
+        // fitted into that pane, never the size of the inspector workspace.
+        if self.debug_layout_active {
+            return;
+        }
         if was_canvas_sized {
             self.snap_window_to_canvas();
             return;
@@ -231,6 +196,9 @@ impl App {
     /// not read as a drag or the window stops following the canvas for the
     /// rest of the run. A drag onto the canvas size hands it back.
     pub(super) fn note_window_resize(&mut self, size: PhysicalSize<u32>) {
+        if self.debug_layout_active || self.restore_play_geometry() {
+            return;
+        }
         // Read what is needed and let the borrow go: a drag delivers these
         // continuously, so this takes nothing it has to hold on to.
         let Some((fullscreen, scale)) = self
@@ -406,21 +374,21 @@ impl App {
     /// so the front falls back to bare plastic rather than a stale set.
     pub(super) fn reload_bezel_stickers(&mut self) -> Result<(), String> {
         let path = self.bezel_stickers_path.clone();
-        let Some(r) = self.render.as_mut() else {
+        let Some(gpu) = self.render.as_mut().and_then(Render::gpu_mut) else {
             return Ok(());
         };
         match path {
             None => {
-                r.sticker_pass.set_sheet(None);
+                gpu.sticker_pass.set_sheet(None);
                 Ok(())
             }
             Some(dir) => match stickers::load_sheet(&dir) {
                 Ok(sheet) => {
-                    r.sticker_pass.set_sheet(Some(sheet));
+                    gpu.sticker_pass.set_sheet(Some(sheet));
                     Ok(())
                 }
                 Err(msg) => {
-                    r.sticker_pass.set_sheet(None);
+                    gpu.sticker_pass.set_sheet(None);
                     error!("[display] bezel_stickers: {msg}");
                     Err(msg.lines().next().unwrap_or_default().to_string())
                 }
@@ -441,14 +409,17 @@ impl App {
         let Some(path) = self.custom_shader_path.clone() else {
             return fail("no custom shader configured".to_string());
         };
-        let Some(r) = self.render.as_mut() else {
+        let Some(gpu) = self.render.as_mut().and_then(Render::gpu_mut) else {
             return fail(format!(
                 "cannot load shader {} before the window exists",
                 path.display()
             ));
         };
-        let format = r.pixels.render_texture_format();
-        match r.crt_shader.load_custom(r.pixels.device(), format, &path) {
+        let format = gpu.pixels.render_texture_format();
+        match gpu
+            .crt_shader
+            .load_custom(gpu.pixels.device(), format, &path)
+        {
             Ok(()) => Ok(()),
             Err(msg) => fail(msg),
         }
@@ -456,8 +427,8 @@ impl App {
 
     /// Switch the presentation pixel aspect live: the canvas height (and
     /// with it the backing texture and the window) changes between the
-    /// 4:3 and the square-pixel size, so the texture must be rebuilt like
-    /// a DPI change (see resync_render_scale) and the window re-sized.
+    /// 4:3 and the square-pixel size, so the texture must be rebuilt and the
+    /// window resized. Inspector geometry is independent of the display.
     pub(super) fn apply_pixel_aspect(&mut self, aspect: PixelAspect) {
         if aspect == crate::video::pixel_aspect() {
             return;
@@ -487,15 +458,37 @@ impl App {
         self.request_redraw();
     }
 
+    /// Change the host swapchain without restarting or changing guest pacing.
+    /// Keep the configuration screen in sync so Save retains the live choice.
+    /// `[display] hidpi_texture` for a machine started from the launcher:
+    /// set the global and replan the backing texture to the new density.
+    pub(super) fn apply_hidpi_texture(&mut self, enabled: bool) {
+        if enabled == crate::video::hidpi_texture() {
+            return;
+        }
+        crate::video::set_hidpi_texture(enabled);
+        self.replan_main_texture();
+    }
+
+    pub(super) fn apply_vsync(&mut self, enabled: bool) {
+        if self.vsync == enabled {
+            return;
+        }
+        self.vsync = enabled;
+        self.machine_config.display.vsync = Some(enabled);
+        if let Some(gpu) = self.render.as_mut().and_then(Render::gpu_mut) {
+            gpu.pixels.set_present_mode(window_present_mode(enabled));
+            info!("window presentation: mode={:?}", gpu.pixels.present_mode());
+        }
+        self.request_redraw();
+    }
+
     /// Follow a change of the canvas height that came from a presentation
     /// setting -- the pixel aspect, integer scaling under the tv aspect,
     /// the bezel (`video::present_height`): re-plan the main texture for
     /// the new canvas (the integer fit and its supersample factor are
-    /// re-decided for it, and the texture resized like a DPI change, see
-    /// `resync_render_scale`), put the tool windows -- whose texture
-    /// layout is the canvas's, panel centring reading the live height --
-    /// on the new size too, and move the window with it
-    /// (`follow_canvas_change`).
+    /// re-decided for it), and move the main window with it
+    /// (`follow_canvas_change`). Inspector geometry stays independent.
     ///
     /// False when the main texture could not be resized for the new
     /// canvas, and then nothing else is touched. The draw helpers slice
@@ -514,23 +507,6 @@ impl App {
             if let Err(e) = sync_main_present_scaling(r, (surface.width, surface.height)) {
                 warn!("resize texture buffer for the canvas change failed: {e}");
                 return false;
-            }
-        }
-        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
-        for kind in ToolPanelKind::ALL {
-            let mut applied = None;
-            if let Some(tool) = self.tool_window_mut(kind) {
-                if let Err(e) = tool.pixels.resize_buffer(
-                    texture_width(tool.texture_scale) as u32,
-                    texture_height(tool.texture_scale) as u32,
-                ) {
-                    warn!("resize tool texture buffer for the canvas change failed: {e}");
-                }
-                applied = tool.window.request_inner_size(size);
-            }
-            // Synchronous on Wayland, with no Resized event to follow.
-            if let Some(applied) = applied {
-                self.apply_tool_surface_size(kind, applied);
             }
         }
         self.follow_canvas_change(was_canvas_sized, canvas_before);
@@ -749,23 +725,6 @@ impl App {
                 return;
             }
         }
-        // Every tool window (Debugger, Frame Analyzer, Console) draws through
-        // draw_panel_layer, which indexes its buffer by the same canvas height
-        // (window_present_height), so resize all their buffers to match too, or
-        // a later tool draw could index past a now-too-small buffer. Buffer
-        // only: unlike a pixel-aspect switch, leave a tool window's own size
-        // alone.
-        for kind in ToolPanelKind::ALL {
-            if let Some(tool) = self.tool_window_mut(kind) {
-                if let Err(e) = tool.pixels.resize_buffer(
-                    texture_width(tool.texture_scale) as u32,
-                    texture_height(tool.texture_scale) as u32,
-                ) {
-                    warn!("resize tool texture buffer for status bar toggle failed: {e}");
-                }
-                tool.window.request_redraw();
-            }
-        }
         // An unresized window goes on the new canvas size; a resized one
         // keeps the width the user chose and moves by the bar's height.
         self.follow_canvas_change(was_canvas_sized, canvas_before);
@@ -788,14 +747,8 @@ impl App {
     }
 
     pub(super) fn request_redraw(&self) {
+        self.debug_snapshot_dirty.set(true);
         self.request_main_redraw();
-        for kind in ToolPanelKind::ALL {
-            if let Some(tool) = self.tool_window(kind) {
-                if !tool.minimized {
-                    tool.window.request_redraw();
-                }
-            }
-        }
     }
 
     pub(super) fn refresh_present_from_deinterlacer(&mut self) {
@@ -805,6 +758,7 @@ impl App {
         self.present_fb.resize(active, 0);
         self.present_fb
             .copy_from_slice(&self.deinterlacer.output()[..active]);
+        self.note_present_fb_changed();
         self.present_rows = rows;
         self.present_width = width;
     }
@@ -834,6 +788,11 @@ impl App {
     }
 
     pub(super) fn reset_render_pipeline(&mut self) {
+        // Every caller is a timeline discontinuity (cold reset, ROM or
+        // state load, a new machine): the GIF clip ring cannot span one,
+        // and a new machine may pick another clip rate, so it is rebuilt
+        // on the next presented frame.
+        self.clip_ring = None;
         self.render_generation = self.render_generation.wrapping_add(1);
         self.last_rendered_emulated_frame = None;
         self.last_submitted_render_frame = None;
@@ -904,6 +863,7 @@ impl App {
         self.main_presentation_dirty = true;
         let old = std::mem::replace(&mut self.present_fb, result.presentation_fb);
         self.render_recycle_fb = old;
+        self.note_present_fb_changed();
         self.present_rows = result.present_rows;
         self.present_width = result.present_width;
         self.present_tv_aperture_rows = next_tv_aperture_rows;
@@ -1023,6 +983,7 @@ impl App {
         let composed = compose_rtg_present(self.emu.bus(), &mut rtg, &mut present);
         self.rtg_fb = rtg;
         self.present_fb = present;
+        self.note_present_fb_changed();
         let Some((rows, native_w, native_h)) = composed else {
             // rtg_active() is true but the frame did not compose (e.g. MODE
             // set before ORIG_RES): fall back to the chipset render rather
@@ -1107,6 +1068,9 @@ impl App {
             h_shift,
             self.overscan,
         );
+        // Kept so a host pointer over the picture can be traced back to
+        // the rendered pixel under it (the light pen's position).
+        self.present_placement = Some(placement);
         let base = self.emu.bus().frame_render_base();
         // Standard 15 kHz fields line-double / weave to 2x rows; a
         // programmable progressive scan already carries every line.
@@ -1148,6 +1112,7 @@ impl App {
             self.main_presentation_dirty = true;
             let old = std::mem::replace(&mut self.present_fb, next_present_fb);
             self.render_recycle_fb = old;
+            self.note_present_fb_changed();
             self.present_rows = rows;
             self.present_width = width;
             self.present_tv_aperture_rows = next_tv_aperture_rows;

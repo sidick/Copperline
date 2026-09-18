@@ -1,0 +1,707 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+use crate::abi::{AvInfo, Geometry, Timing};
+use crate::input::Controls;
+use crate::media::{self, Disk, MAX_DISKS};
+use anyhow::{ensure, Context, Result};
+use copperline::audio::{AudioSink, MIX_SAMPLE_RATE};
+use copperline::chipset::paula::PAULA_CLOCK_HZ;
+use copperline::config::{
+    machine_profile_defaults, parse_machine_model, parse_video_standard, Config, Overscan,
+};
+use copperline::emulator::{build_machine, Emulator};
+use copperline::serial::NullSerialSink;
+use copperline::video::deinterlace::Deinterlacer;
+use copperline::video::{
+    bitplane, present_common as present, FB_WIDTH, MAX_CANVAS_PIXELS, MAX_VISIBLE_LINES,
+};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+const MAGIC: &[u8; 8] = b"CLRETRO3";
+const PREVIOUS_MAGIC: &[u8; 8] = b"CLRETRO2";
+
+/// The envelope around the machine: the header, the control latches, and up
+/// to the second of pending audio a state may carry.
+const ENVELOPE_BYTES: usize = 1024 + 4 * MIX_SAMPLE_RATE as usize;
+
+/// What a machine checkpoint holds beyond its memory, its ROM images and the
+/// drive's disk image: the chip registers, the Copper and blitter engines,
+/// and the per-line beam events the renderer replays. Over long runs of nine
+/// OCS and AGA titles this stayed under a megabyte; the margin is for a
+/// program that writes far more registers per line than any of them.
+const CHIPSET_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Disk slots a session keeps free for images the frontend adds later, on
+/// top of the playlist it was given. Every slot is paid for in every state,
+/// so a floppy session buys a few rather than all [`MAX_DISKS`].
+const SPARE_DISK_SLOTS: usize = 2;
+
+pub struct BufferedAudio(pub Rc<RefCell<Vec<i16>>>);
+impl AudioSink for BufferedAudio {
+    fn push(&mut self, left: f32, right: f32) {
+        self.0
+            .borrow_mut()
+            .extend([left, right].map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16));
+    }
+    fn flush(&mut self) {}
+    fn reset_live_output_after_timeline_jump(&mut self) {
+        self.0.borrow_mut().clear();
+    }
+}
+
+pub struct Core {
+    pub emu: Emulator,
+    pub netplay: bool,
+    pub state_capacity: usize,
+    /// Disk slots this session's state envelope was sized for.
+    disk_slots: usize,
+    pub cd_mode: bool,
+    cd_paths: copperline::cdrom::StatePaths,
+    whdload: Option<crate::whdload::Prepared>,
+    nvram_save: Option<PathBuf>,
+    pub audio: Rc<RefCell<Vec<i16>>>,
+    pub controls: Controls,
+    pub disks: Vec<Option<Disk>>,
+    pub selected: usize,
+    pub ejected: bool,
+    pub save_dir: PathBuf,
+    pub write_protected: bool,
+    pub pixels: Vec<u32>,
+    pub width: usize,
+    pub height: usize,
+    fb: Vec<u32>,
+    deinterlacer: Deinterlacer,
+    machine_identity: [u8; 32],
+    pub(crate) presentation: present::PresentationLatch,
+}
+
+/// Every byte a state of this session can occupy, which is what
+/// `retro_serialize_size` reports. A frontend allocates that much per state
+/// slot and, under netplay with per-frame checks, checksums a whole buffer
+/// every frame, so the bound is computed from the machine that was actually
+/// built rather than being one flat worst case over every machine.
+///
+/// The terms: the envelope; this core's own copy of every disk slot; and the
+/// machine checkpoint, which holds each RAM bank and ROM image once, chip RAM
+/// twice more for the frame capture the renderer keeps, the drive's disk
+/// image, and the chipset scratch. WHDLoad adds the room its hard-disk
+/// overlays need on top.
+fn state_capacity(
+    memory: &copperline::memory::Memory,
+    fast_ram_bytes: usize,
+    slots: usize,
+    image_bytes: usize,
+    whdload: usize,
+) -> usize {
+    let ram = memory.chip_ram.len()
+        + memory.slow_ram.len()
+        + memory.mb_ram.len()
+        + memory.accel_ram.len()
+        + fast_ram_bytes;
+    let rom = memory.rom.len() + memory.extended_rom.len() + memory.wcs.len();
+    ENVELOPE_BYTES
+        + slots * (4 + image_bytes)
+        + ram
+        + rom
+        + 2 * memory.chip_ram.len()
+        + image_bytes
+        + CHIPSET_SCRATCH_BYTES
+        + whdload
+}
+
+pub fn configuration(model: &str, video: &str, kickstart: bool, system: &Path) -> Result<Config> {
+    ensure!(
+        matches!(model, "A500" | "A1200" | "CD32"),
+        "unsupported machine model"
+    );
+    let mut config = machine_profile_defaults(parse_machine_model(model)?);
+    config.video_standard = parse_video_standard(video)?;
+    config.rtc_seed_unix = Some(946_684_800);
+    config.rtc_present = true;
+    config.floppy_connected = [model != "CD32", false, false, false];
+    config.cd32_nvram_path = None;
+    if kickstart {
+        let named = system.join(format!("kickstart-{}.rom", model.to_ascii_lowercase()));
+        config.rom_path = if named.is_file() {
+            named
+        } else {
+            system.join("kickstart.rom")
+        };
+        if model == "CD32" {
+            let ext = system.join("kickstart-cd32-ext.rom");
+            ensure!(
+                ext.is_file(),
+                "CD32 needs kickstart-cd32-ext.rom in the system directory"
+            );
+            config.extended_rom_path = Some(ext);
+        }
+    }
+    Ok(config)
+}
+
+impl Core {
+    #[cfg(test)]
+    pub fn load(
+        config: &Config,
+        content: Option<&Path>,
+        save_dir: PathBuf,
+        write_protected: bool,
+    ) -> Result<Self> {
+        Self::load_with_system(
+            config,
+            content,
+            save_dir,
+            write_protected,
+            Path::new("."),
+            false,
+        )
+    }
+
+    pub fn load_with_system(
+        config: &Config,
+        content: Option<&Path>,
+        save_dir: PathBuf,
+        write_protected: bool,
+        system: &Path,
+        netplay: bool,
+    ) -> Result<Self> {
+        let mut config = config.clone();
+        let whdload = content
+            .filter(|p| media::is_whdload(p))
+            .map(|p| crate::whdload::prepare(&mut config, p, system, &save_dir))
+            .transpose()?;
+        let disks = match content.filter(|_| whdload.is_none()) {
+            Some(path) => media::playlist(path)?
+                .iter()
+                .map(|path| Disk::open(path, &save_dir).map(Some))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let cd_mode = config.akiko; // CD32 profile owns the optical drive.
+        ensure!(
+            disks.iter().flatten().all(|d| d.cd.is_some() == cd_mode),
+            "CD images require the CD32 machine; ADFs require an Amiga with DF0"
+        );
+        let mut cd_paths = copperline::cdrom::StatePaths::default();
+        for cd in disks.iter().flatten().filter_map(|d| d.cd.as_ref()) {
+            for (local, portable) in &cd.sources {
+                cd_paths.insert(local.clone(), portable.clone())?;
+            }
+        }
+        let audio = Rc::new(RefCell::new(Vec::new()));
+        let aros = config.rom_path == Path::new(copperline::config::BUNDLED_AROS_ROM);
+        let mut emu = build_machine(&config, Box::new(BufferedAudio(audio.clone())), false, aros)?;
+        emu.bus_mut().paula.serial = Box::new(NullSerialSink);
+        if aros {
+            emu.reload_rom(
+                include_bytes!("../../../assets/aros/aros-amiga-m68k-rom.bin").to_vec(),
+                Some(include_bytes!("../../../assets/aros/aros-amiga-m68k-ext.bin").to_vec()),
+            )?;
+        }
+        let machine_identity =
+            Sha256::digest(format!("{:?}", emu.machine_descriptor()).as_bytes()).into();
+        // A CD session's slots cost only their length prefix, so it keeps
+        // every slot the disk-control interface allows; a floppy session pays
+        // a whole image per slot and buys a few spares instead.
+        let image_bytes = if cd_mode { 0 } else { media::MAX_ADF };
+        let disk_slots = if cd_mode {
+            MAX_DISKS
+        } else {
+            (disks.len() + SPARE_DISK_SLOTS).min(MAX_DISKS)
+        };
+        let state_capacity = state_capacity(
+            &emu.bus().mem,
+            emu.machine_descriptor().fast_ram_bytes,
+            disk_slots,
+            image_bytes,
+            whdload.as_ref().map_or(0, |w| w.capacity),
+        );
+        let nvram_save = cd_mode.then(|| save_dir.join("copperline").join("cd32.nvram"));
+        let mut core = Self {
+            netplay,
+            state_capacity,
+            disk_slots,
+            cd_mode,
+            cd_paths,
+            whdload,
+            nvram_save,
+            emu,
+            audio,
+            controls: Controls::default(),
+            disks,
+            selected: 0,
+            ejected: true,
+            save_dir,
+            write_protected,
+            fb: vec![0; MAX_CANVAS_PIXELS],
+            pixels: Vec::new(),
+            width: present::TV_CAPTURED_WIDTH,
+            height: present::TV_GLASS_PRESENT_ROWS,
+            deinterlacer: Deinterlacer::with_settings(false, 0.0),
+            machine_identity,
+            presentation: present::PresentationLatch::default(),
+        };
+        core.controls.cd32 = cd_mode;
+        core.controls.netplay = netplay;
+        // Outside netplay the frontend is handed the RAM banks' host
+        // addresses in a memory map, so a state load has to keep them. A
+        // netplay session publishes no map and rolls back constantly, so it
+        // takes the deserialized buffers and skips the copy.
+        core.emu.bus_mut().set_keep_ram_addresses(!netplay);
+        if let Some(path) = &core.nvram_save {
+            if path.exists() {
+                core.emu
+                    .bus_mut()
+                    .akiko
+                    .as_mut()
+                    .context("missing Akiko")?
+                    .load_nvram_bytes(&media::read_bounded(path, 1024)?)?;
+            }
+        }
+        if let Some(whdload) = &core.whdload {
+            for (slot, path) in whdload.saves.iter().enumerate() {
+                if path.exists() {
+                    core.emu
+                        .bus_mut()
+                        .gayle
+                        .as_mut()
+                        .context("missing IDE controller")?
+                        .hard_disk_mut(slot)
+                        .context("missing WHDLoad disk")?
+                        .restore_session_overlay(&media::read_bounded(path, whdload.capacity)?)?;
+                }
+            }
+        }
+        if !core.disks.is_empty() {
+            core.set_ejected(false)?;
+        }
+        Ok(core)
+    }
+
+    /// The buffer behind a `retro_get_memory_data` region: chip RAM for
+    /// `RETRO_MEMORY_SYSTEM_RAM`, and the CD32 EEPROM for
+    /// `RETRO_MEMORY_SAVE_RAM` outside netplay, where saves stay temporary.
+    /// Both keep their host address for the whole session, including across
+    /// state loads and resets.
+    pub fn memory_region(&mut self, id: u32) -> Option<&mut [u8]> {
+        let bus = self.emu.bus_mut();
+        match id {
+            crate::abi::MEMORY_SYSTEM_RAM => Some(&mut bus.mem.chip_ram),
+            crate::abi::MEMORY_SAVE_RAM if self.cd_mode && !self.netplay => {
+                bus.akiko.as_mut().map(|akiko| akiko.nvram_bytes_mut())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn av_info(&self) -> AvInfo {
+        AvInfo {
+            geometry: Geometry {
+                base_width: self.width as u32,
+                base_height: self.height as u32,
+                max_width: (FB_WIDTH * 2) as u32,
+                max_height: (MAX_VISIBLE_LINES * 2) as u32,
+                aspect_ratio: 4.0 / 3.0,
+            },
+            timing: Timing {
+                fps: f64::from(PAULA_CLOCK_HZ) / self.emu.bus().agnus.nominal_frame_cck(),
+                sample_rate: f64::from(MIX_SAMPLE_RATE),
+            },
+        }
+    }
+
+    pub fn advance(&mut self) -> Result<()> {
+        self.emu.step_video_frame()?;
+        self.render();
+        Ok(())
+    }
+
+    pub fn render(&mut self) {
+        if !self.emu.bus().frame_render_available() {
+            return;
+        }
+        bitplane::render(self.emu.bus_mut(), &mut self.fb);
+        let bus = self.emu.bus();
+        let geometry = bus.frame_geometry();
+        let scale = bus.frame_canvas_scale();
+        let base = bus.frame_render_base();
+        let placement = present::post_process_rendered_field(
+            &mut self.fb,
+            geometry,
+            scale,
+            bus.frame_presentation_h_window(),
+            bus.frame_presentation_v_window(),
+            bus.frame_visible_start_vpos(),
+            0,
+            Overscan::Tv,
+        );
+        let lace = base.bplcon0 & 4 != 0;
+        let double_rows = !geometry.programmable;
+        let woven_rows = placement.rows * if lace || double_rows { 2 } else { 1 };
+        let aperture = present::standard_tv_aperture_frame(geometry, woven_rows, &base);
+        if let Some(rows) = self.presentation.resolve_tv_aperture(aperture) {
+            (self.height, self.width) = self.deinterlacer.present_field_region_into(
+                &self.fb,
+                placement.rows,
+                FB_WIDTH * scale,
+                lace,
+                base.long_field,
+                double_rows,
+                present::TV_CAPTURED_SOURCE_X as i32,
+                present::TV_PRESENT_SOURCE_Y as i32,
+                rows,
+                present::TV_CAPTURED_WIDTH,
+                rows,
+                &mut self.pixels,
+            );
+        } else {
+            (self.height, self.width) = self.deinterlacer.present_field_into(
+                &self.fb,
+                placement.rows,
+                FB_WIDTH * scale,
+                lace,
+                base.long_field,
+                double_rows,
+                &mut self.pixels,
+            );
+        }
+        // Renderer stores RGBA bytes in little-endian u32s; libretro XRGB8888 is a
+        // native integer 0x00RRGGBB, independent of host byte order.
+        for pixel in &mut self.pixels {
+            let [r, g, b, _] = pixel.to_le_bytes();
+            *pixel = u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b);
+        }
+    }
+
+    pub fn capture_disk(&mut self) -> Result<()> {
+        if !self.ejected && !self.cd_mode {
+            if let Some(Some(disk)) = self.disks.get_mut(self.selected) {
+                disk.bytes = self.emu.bus().floppy.export_disk_image(0)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn persist(&mut self) -> Result<()> {
+        // A speculative or remote player's timeline must never reach disk.
+        if self.netplay {
+            return Ok(());
+        }
+        if let Some(path) = &self.nvram_save {
+            media::write_save(
+                path,
+                self.emu
+                    .bus()
+                    .akiko
+                    .as_ref()
+                    .context("missing Akiko")?
+                    .nvram_bytes(),
+            )?;
+        }
+        if let Some(whdload) = &self.whdload {
+            for (slot, path) in whdload.saves.iter().enumerate() {
+                let bytes = self
+                    .emu
+                    .bus_mut()
+                    .gayle
+                    .as_mut()
+                    .context("missing IDE controller")?
+                    .hard_disk_mut(slot)
+                    .context("missing WHDLoad disk")?
+                    .session_overlay()?;
+                media::write_save(path, &bytes)?;
+            }
+        }
+        self.capture_disk()?;
+        if !self.write_protected {
+            for disk in self.disks.iter_mut().flatten() {
+                disk.persist()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_ejected(&mut self, ejected: bool) -> Result<()> {
+        if self.ejected == ejected {
+            return Ok(());
+        }
+        if ejected {
+            self.persist()?;
+            if self.cd_mode {
+                self.emu.bus_mut().cd_eject_disc();
+            } else {
+                self.emu.bus_mut().floppy.eject_disk_image(0)?;
+            }
+        } else if let Some(Some(disk)) = self.disks.get(self.selected) {
+            if let Some(cd) = &disk.cd {
+                self.emu
+                    .bus_mut()
+                    .cd_insert_disc(cd.open_image()?, &cd.path);
+            } else {
+                self.emu.bus_mut().floppy.insert_memory_disk_image_bytes(
+                    0,
+                    disk.bytes.clone(),
+                    disk.label.clone(),
+                    self.write_protected,
+                )?;
+            }
+        }
+        self.ejected = ejected;
+        Ok(())
+    }
+
+    pub fn select(&mut self, index: usize) -> Result<()> {
+        ensure!(
+            self.ejected && index <= self.disks.len(),
+            "eject the disk before choosing another image"
+        );
+        self.selected = index;
+        Ok(())
+    }
+
+    pub fn replace(&mut self, index: usize, path: Option<&Path>) -> Result<()> {
+        ensure!(
+            self.ejected && index < self.disks.len(),
+            "eject the disk before replacing an image"
+        );
+        let replacement = path.map(|p| Disk::open(p, &self.save_dir)).transpose()?;
+        if let Some(disk) = &replacement {
+            ensure!(
+                disk.cd.is_some() == self.cd_mode,
+                "replacement media type differs"
+            );
+        }
+        let mut paths = copperline::cdrom::StatePaths::default();
+        for (slot, disk) in self.disks.iter().enumerate() {
+            let candidate = if slot == index {
+                replacement.as_ref()
+            } else {
+                disk.as_ref()
+            };
+            if let Some(cd) = candidate.and_then(|disk| disk.cd.as_ref()) {
+                for (local, portable) in &cd.sources {
+                    paths.insert(local.clone(), portable.clone())?;
+                }
+            }
+        }
+        self.persist()?;
+        if let Some(disk) = replacement {
+            self.disks[index] = Some(disk);
+        } else {
+            self.disks.remove(index);
+            if self.selected > index {
+                self.selected -= 1;
+            }
+        }
+        self.cd_paths = paths;
+        Ok(())
+    }
+
+    pub fn add(&mut self) -> Result<()> {
+        ensure!(
+            self.ejected && self.disks.len() < self.disk_slots,
+            "eject the disk first; this session holds at most {} disks",
+            self.disk_slots
+        );
+        self.disks.push(None);
+        Ok(())
+    }
+
+    fn identity(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(self.machine_identity);
+        hash.update([u8::from(self.netplay)]);
+        if let Some(whdload) = &self.whdload {
+            hash.update(whdload.identity);
+        }
+        hash.update([u8::from(self.write_protected)]);
+        for disk in &self.disks {
+            hash.update([u8::from(disk.is_some())]);
+            if let Some(disk) = disk {
+                hash.update(disk.source_hash);
+            }
+        }
+        hash.finalize().into()
+    }
+
+    pub fn serialize(&mut self, out: &mut [u8]) -> Result<()> {
+        ensure!(
+            out.len() >= self.state_capacity,
+            "save-state buffer is too small"
+        );
+        self.capture_disk()?;
+        let mut body = Vec::new();
+        body.extend(self.controls.keys.map(u8::from));
+        for port in self.controls.pending {
+            for value in port {
+                body.extend(value.to_le_bytes());
+            }
+        }
+        for device in self.controls.devices {
+            body.extend(device.to_le_bytes());
+        }
+        body.push(u8::from(self.presentation.uses_standard_aperture()));
+        let audio = self.audio.borrow();
+        ensure!(
+            audio.len() <= 2 * MIX_SAMPLE_RATE as usize,
+            "pending audio exceeds one second"
+        );
+        let audio_samples = if self.netplay {
+            &[][..]
+        } else {
+            audio.as_slice()
+        };
+        body.extend((audio_samples.len() as u32).to_le_bytes());
+        for sample in audio_samples {
+            body.extend(sample.to_le_bytes());
+        }
+        drop(audio);
+        body.extend((self.selected as u32).to_le_bytes());
+        body.push(u8::from(self.ejected));
+        body.push(self.disks.len() as u8);
+        for disk in &self.disks {
+            put_bytes(&mut body, disk.as_ref().map_or(&[], |disk| &disk.bytes));
+        }
+        put_bytes(
+            &mut body,
+            &self
+                .cd_paths
+                .scope(|| self.emu.save_frontend_state_bytes())?,
+        );
+        let length = 8 + 32 + 4 + 32 + body.len();
+        ensure!(
+            length <= self.state_capacity,
+            "machine state exceeds this session's state capacity"
+        );
+        out[..self.state_capacity].fill(0);
+        out[..8].copy_from_slice(MAGIC);
+        out[8..40].copy_from_slice(&self.identity());
+        out[40..44].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        out[44..76].copy_from_slice(&Sha256::digest(&body));
+        out[76..length].copy_from_slice(&body);
+        Ok(())
+    }
+
+    pub fn unserialize(&mut self, data: &[u8]) -> Result<()> {
+        ensure!(
+            data.len() >= 76 && (&data[..8] == MAGIC || &data[..8] == PREVIOUS_MAGIC),
+            "not a Copperline libretro state"
+        );
+        ensure!(
+            data[8..40] == self.identity(),
+            "state requires the same machine, ROM, playlist and write-protect option"
+        );
+        let length = u32::from_le_bytes(data[40..44].try_into()?) as usize;
+        ensure!(length <= self.state_capacity - 76, "state exceeds capacity");
+        let body = data.get(76..76 + length).context("incomplete state")?;
+        ensure!(
+            Sha256::digest(body)[..] == data[44..76],
+            "state checksum mismatch"
+        );
+        let mut reader = Reader(body);
+        let mut controls = self.controls.clone();
+        for key in &mut controls.keys {
+            *key = reader.boolean()?;
+        }
+        for port in &mut controls.pending {
+            for value in port {
+                *value = i32::from_le_bytes(reader.take(4)?.try_into()?);
+            }
+        }
+        controls.devices[2..].fill(crate::abi::NONE);
+        let device_count = if &data[..8] == PREVIOUS_MAGIC { 2 } else { 4 };
+        for (port, device) in controls.devices.iter_mut().enumerate().take(device_count) {
+            *device = reader.number()?;
+            ensure!(
+                [crate::abi::AUTO, crate::abi::NONE, crate::abi::JOYPAD].contains(device)
+                    || (port < 2 && [crate::abi::CD32_PAD, crate::abi::MOUSE].contains(device)),
+                "invalid controller"
+            );
+        }
+        let standard_aperture = reader.boolean()?;
+        let samples = reader.number()? as usize;
+        ensure!(
+            samples <= 2 * MIX_SAMPLE_RATE as usize && samples.is_multiple_of(2),
+            "invalid pending stereo audio"
+        );
+        let audio: Vec<_> = reader
+            .take(samples * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i16::from_le_bytes(*sample))
+            .collect();
+        let selected = reader.number()? as usize;
+        let ejected = reader.boolean()?;
+        ensure!(
+            reader.take(1)?[0] as usize == self.disks.len() && selected <= self.disks.len(),
+            "state playlist differs"
+        );
+        let mut disks = Vec::new();
+        for disk in &self.disks {
+            let bytes = reader.bytes()?;
+            if let Some(disk) = disk {
+                if disk.cd.is_none() {
+                    media::validate_adf(bytes)?;
+                }
+                ensure!(
+                    bytes.len() == disk.bytes.len(),
+                    "state disk geometry differs"
+                );
+            } else {
+                ensure!(bytes.is_empty(), "state disk slot differs");
+            }
+            disks.push(bytes);
+        }
+        let machine = reader.bytes()?;
+        ensure!(reader.0.is_empty(), "unexpected state data");
+        self.cd_paths
+            .scope(|| self.emu.load_frontend_state_bytes(machine))?;
+        self.emu.bus_mut().floppy.make_disk_images_memory_backed();
+        *self.audio.borrow_mut() = audio;
+        self.presentation.resolve_tv_aperture(if standard_aperture {
+            present::TvApertureFrame::Standard(0)
+        } else {
+            present::TvApertureFrame::Full
+        });
+        self.controls = controls;
+        self.selected = selected;
+        self.ejected = ejected;
+        for (disk, bytes) in self.disks.iter_mut().zip(disks) {
+            if let Some(disk) = disk {
+                disk.bytes = bytes.to_vec();
+            }
+        }
+        self.deinterlacer.reset_history();
+        self.pixels.clear();
+        Ok(())
+    }
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend((bytes.len() as u32).to_le_bytes());
+    out.extend(bytes);
+}
+struct Reader<'a>(&'a [u8]);
+impl<'a> Reader<'a> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+        let bytes = self.0.get(..length).context("incomplete state payload")?;
+        self.0 = &self.0[length..];
+        Ok(bytes)
+    }
+    fn number(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+    fn boolean(&mut self) -> Result<bool> {
+        let byte = self.take(1)?[0];
+        ensure!(byte <= 1, "invalid boolean");
+        Ok(byte == 1)
+    }
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let length = self.number()? as usize;
+        self.take(length)
+    }
+}

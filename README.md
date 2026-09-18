@@ -21,6 +21,7 @@ It boots out of the box with the bundled open-source AROS Kickstart replacement,
 - **Freezer cartridge**: Action Replay-style cartridge support with bundled HRTMon (`--cartridge hrtmon`), allowing running software to be frozen into the monitor via the menu, a hotkey, headless `--freeze-after`, or the control protocol.
 - **Direct launching**: Boot directly into WHDLoad game packages (`--whdload`) or host-built Amiga executables (`--run`, including bare Kickstart 1.3), with a WinUAE-compatible `uaelib` trap allowing guest code to control warp speed, log debug messages, and register debug resources.
 - **WebAssembly build**: Run directly in modern web browsers at [copperline.dev/try](https://copperline.dev/try/).
+- **Libretro core**: [Run Amiga and CD32 software in RetroArch](docs/guide/libretro.md), with embedded AROS ROMs, WHDLoad, disk playlists, save states and RetroArch rollback netplay.
 
 ## Installation
 
@@ -58,6 +59,16 @@ cargo build --release
 
 Run the resulting `target/release/copperline` binary. `--release` is a Cargo
 build option; unoptimized debug builds are too slow for real-time emulation.
+
+The [Debug workspace](docs/debugger/window.md) puts the Amiga display beside
+its debugger, Frame Analyzer, and Console in one desktop window. Open
+**Debugger...** in the menu or press
+`Cmd+B` on macOS or `Alt+B` on Linux/Windows. Drag the display divider to resize
+the panes; **Return to Play** restores the display layout while keeping the
+inspectors and their state. Click the display to send input to the Amiga, and
+use `Cmd+G` / `Alt+G` to return input to the debugger. Monospace readouts use
+Hack with a slashed zero. Audio scopes stay beside fixed-height channel
+details as DMA and interrupt events change.
 
 Dependencies:
 
@@ -128,7 +139,7 @@ The manual is published at [copperline.dev/docs](https://copperline.dev/docs/) a
 - [WHDLoad Support](docs/guide/whdload.md) - Direct WHDLoad package loading
 - [Direct Executable Launching](docs/guide/run.md) - Running cross-compiled Amiga binaries
 - [Floppy Hardware Bridge](docs/guide/fluxbridge.md) - Real floppy drives via Greaseweazle
-- [Rollback Netplay](docs/guide/netplay.md) - two-player sessions with mice, joysticks or CD32 pads through desktop GUI/CLI (direct IP or encrypted Internet invitations with automatic NAT traversal and relay fallback), or browser WebRTC with QR invitations. Both frontends transfer the host's ROMs, disks and machine settings and synchronize host floppy swaps. Desktop also shares WHDLoad, `--run`, and IDE/SCSI/LIDE game volumes using temporary session storage. Detailed desktop transport logs are opt-in with `COPPERLINE_NETPLAY_DEBUG=1`.
+- [Rollback Netplay](docs/guide/netplay.md) - two-player sessions with mice, joysticks or CD32 pads through desktop GUI/CLI (direct IP or encrypted Internet invitations with automatic NAT traversal and relay fallback), or browser WebRTC with QR invitations. Both frontends transfer the host's ROMs, disks and machine settings and synchronize host floppy swaps. Up to eight spectators can watch through a separate invitation, joining even mid-game by replaying the host's confirmed history. Desktop also shares WHDLoad, `--run`, and IDE/SCSI/LIDE game volumes using temporary session storage, and preserves IPF protection-track timing during disk transfer. Mouse movement is combined per frame, and desktop corrections finish rendering so continuous movement keeps reaching the display. Detailed desktop transport logs are opt-in with `COPPERLINE_NETPLAY_DEBUG=1`.
 - [Headless Mode](docs/guide/headless.md) - Scripted runs and screenshot/frame dumps
 - [Debugging](docs/debugger/window.md) - In-window, headless, and GDB debugging
 - [VS Code](docs/debugger/vscode.md) - Setup and illustrated source debugging; [Bartman with Copperline](docs/debugger/vscode-bartman.md) covers fork installation and visual profiling

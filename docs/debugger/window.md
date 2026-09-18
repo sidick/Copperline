@@ -1,21 +1,131 @@
-# The debugger window
+# The Debug workspace
 
 Press `Cmd+B` on macOS or `Alt+B` on Linux/Windows (or select **Debugger** from
-the status bar menu) to pause emulation and open the debugger tool window.
-Closing the window restores the previous execution state.
+the status bar menu) to enter Debug layout in the main window. Opening the
+first inspector pauses emulation; **Run** resumes it.
 
-The debugger, Frame Analyzer, and [Console](console) operate in separate host
-windows, allowing them to remain open simultaneously while inspecting CPU,
-custom chipset, and bus activity. Inspection reads do not acknowledge hardware
-registers or consume emulated bus cycles. Stepping, register edits, and memory
-writes change the machine as requested.
+The Amiga display sits beside the debugger, Frame Analyzer, and [Console](console).
+Drag the divider to give either side more space. The display retains its scaling,
+CRT effects, and RTG support. Select an inspector from the tab strip; each retains
+its state while another is visible. Opening another inspector preserves the
+current run/pause state. Inspection reads do not acknowledge hardware registers
+or consume emulated bus cycles. Stepping, register edits, and memory writes
+change the machine as requested.
 
-```{figure} ../images/ui-preview-debugger.png
-:alt: The debugger window on the CPU tab
-:width: 90%
+The **Play / Debug** switch in the title bar changes which layout the window
+shows. **Play** restores the previous window size and hides the inspectors
+without closing them: their selections, captures, and command history remain
+available when you return to Debug, and anything they are capturing keeps
+recording meanwhile. Switching layouts keeps the current run/pause state.
+Closing the main window exits Copperline.
 
-Debugger window: register file, live disassembly, and transport controls.
+Click the display to give the Amiga keyboard and mouse input. `Cmd+G` / `Alt+G`
+returns input to the debugger. While the debugger owns input, typing and
+clipboard shortcuts operate its fields and never reach the Amiga. While the
+Amiga owns input, ordinary keys, including `Esc`, go to the guest.
+
+Host shortcuts also work while the debugger owns input. In a text field,
+macOS `Cmd+A` and `Cmd+Z` retain their Select All and Undo/Redo behaviour.
+
+(shared-inspector-window)=
+## Inspectors
+
+The GPU-rendered inspector UI is included in every desktop build. Monospace
+readouts use Hack with a slashed zero to distinguish `0` from `O`. The font
+is bundled; no system installation is needed.
+
+```{figure} ../images/ui-preview-debugger-egui.png
+:alt: Debugger with resizable register, disassembly, and memory panes
+:width: 100%
+
+Inspector-only preview of the CPU tab, rendered from the deterministic test machine.
 ```
+
+On the CPU tab, drag the dividers to resize the register, disassembly, and memory
+panes.
+Text can be selected and copied, and the address/command field supports normal
+text editing and paste. Register **Edit** buttons prepare a command in that
+field; **Set Reg** applies it. Enter in the field pins the disassembly address
+(an empty field follows PC), jumps to a memory address, or selects an IO register,
+according to the active tab.
+
+The CPU memory pane has its own address and page controls. The Memory tab
+has a Goto address box, Find, Save, Writer, Bits, Poke, and in-place editing
+of the dump; the other tabs retain their layer toggles, audio mutes,
+breakpoints, and waveform controls. Scrollbars expose
+content that does not fit the window. Transport keyboard shortcuts work while
+not editing text.
+
+Each inspector's tab reports what it is doing, so an inspector working in the
+background can be told from one that was never opened:
+
+| Tab | Meaning |
+|---|---|
+| Dimmed, no dot | Not open. Click it to open that inspector. |
+| Filled, with a dot and a close box | Open. Its state and its capture are there whether or not it is the inspector on screen. |
+| Blue | Open and on screen. |
+
+The dot is filled while that inspector's capture is armed on the machine in
+front of you, and hollow while it is merely open: showing the state it last
+collected rather than collecting more. An inspector goes hollow when something
+else takes its capture away, such as a profile run over the
+[control protocol](control.md) finishing with the arming it adopted from the
+pane.
+
+The close box on a tab closes that inspector, as does the controller's back
+button for the selected one; the remaining inspectors stay available in the
+shared workspace, and the machine keeps running. Closing an inspector releases
+what it was capturing and restores the execution state from before it was
+opened; an explicit Run/Pause choice takes precedence. Closing the last one
+returns to Play. `Esc` leaves a text field first. Outside a text field it
+returns to Play, retaining the inspectors.
+
+Select **Frame Analyzer** above the debugger tabs to inspect its **Beam**,
+**Blits**, **Memory**, and **Resources** views. **Capture frame** records a
+frame, and **Run** collects live frames. Switching between the debugger and
+analyzer preserves their selections, capture data, and current run/pause state.
+The analyzer stays armed while its view is hidden. Closing it releases captures
+it owns; captures started through the control protocol continue independently.
+
+```{figure} ../images/ui-preview-analyzer-egui.png
+:alt: Frame Analyzer in the shared egui window with beam raster and bus counters
+:width: 100%
+
+Inspector-only preview of the Beam view, rendered from the analyzer test machine.
+```
+
+Click or drag the beam raster or scanline strip to select a slot. Picture,
+beam scrub, CPU waits, and run-to-beam retain their normal controls and
+shortcuts. The Memory view offers address presets and cell picking; Blits
+shows source/result previews with previous/next selection; Resources offers
+paging, previews, and **Save resource**. Text readouts can be selected and copied.
+Click a PC in **Most stalled PCs** to open CPU disassembly there.
+Below the selected beam slot, **Inspect memory**
+opens the Memory tab; a **Copper instruction** link pins the Copper listing at
+that instruction. The heat map's pinned cell also links to memory. **Follow
+Copper** returns the listing to the live Copper. These links inspect the current
+machine at the recorded address; they do not restore historical memory or run
+the guest, and the analyzer's capture and selection remain available.
+
+Select **Console** at the top, or use `Cmd+K` / `Alt+K`, for the same
+[command interpreter](console) and history in this window. Output is selectable;
+the command field supports editing and clipboard paste. Enter or **Execute**
+runs the entered commands. Shift+Enter adds a line, and pasted commands remain
+editable until submitted. Up/Down browse history. Console output continues to
+arrive while another inspector is selected.
+
+The Debug window size, display divider, CPU pane sizes, and debugger and analyzer
+tabs are saved when returning to Play, closing an inspector, or exiting Copperline.
+They are restored on reopening or relaunching. Debug keeps the expanded window
+on its monitor. Returning to Play restores its previous position when that monitor
+is available; switching layouts preserves fullscreen. Preferences live in `inspector-layout.toml` in the
+[host data directory](../guide/ui.md#where-files-go). They contain layout choices
+only, not command text, captures, or machine state. Opening a specific inspector
+always selects the one requested.
+
+Live inspector snapshots and layout updates are limited to 20 Hz; input and
+stepping update immediately. The Amiga display retains its normal presentation
+cadence while the inspectors reuse their last layout between updates.
 
 ## Tabs
 
@@ -50,16 +160,59 @@ sprite layer isolation toggles:
 Decodes Paula audio channels (0-3) and expansion sound devices (CD-DA, MT-32,
 Coppersynth, Toccata, MHI). Displays channel DMA state machine status, period,
 volume, active buffer pointers, and real-time audio waveform scopes. Channels
-can be muted individually.
+can be muted individually. Each source has a fixed-height row with its scope
+beside its details, so pending DMA and interrupt flags cannot move other
+channels. Long detail lines scroll horizontally inside their row.
+
+```{figure} ../images/ui-preview-debugger-audio-egui.png
+:alt: Audio inspector with fixed channel rows and waveform scopes beside the channel details.
+:width: 100%
+
+Audio scopes remain aligned as channel status changes.
+```
 
 ### Memory
 Hexadecimal and ASCII memory dump viewer (256 bytes per page).
+- **Goto:** The page's base address. Drag the value, or click it and type a
+  hex address. The address/command field also jumps: type an address there
+  and press Enter. **Previous page** / **Next page**, `PageUp` / `PageDown`,
+  and the cursor keys (one row) move through memory.
 - **Find:** Searches memory for specified byte sequences.
 - **Save...:** Dumps address ranges to a file.
 - **Writer?:** Queries the reverse execution snapshot ring to identify the instruction
   that last wrote to the specified address.
 - **Bits:** Displays raw 1-bit-per-pixel bitplane visualizations with configurable
   stride.
+- **Poke:** Writes the word in the address/command field (`ADDR VALUE`).
+
+#### Editing memory in place
+
+Click a byte in the hex column to select it, then type hex digits: the
+first digit replaces the high nibble, the second completes the byte and
+moves the selection to the next one. In the ASCII column a typed printable
+character replaces the byte. Edited bytes are shown in blue until they are
+written. While a byte is selected:
+
+- Arrow keys move the selection; at the edge of the page the view scrolls
+  to follow it. `PageUp` / `PageDown` page the view with the selection.
+- `Backspace` forgets a half-typed digit, or steps back one byte.
+- `Enter` writes every edited byte. So does leaving the dump: clicking a
+  button, another tab, or the address box, or focusing any text field.
+- `Esc` discards the edits and clears the selection (it does not leave
+  Debug while a byte is selected).
+
+Typed characters never reach the transport shortcuts, so `C`, `F`, `R`,
+and `S` are hex digits or text while editing. The outcome (bytes written,
+or the address that refused) appears beside the tab's controls. Bytes in
+ROM, the overlay ROM, and device windows are drawn grey and cannot be
+selected; the message names the address.
+
+Edits are plain CPU-visible RAM writes with the semantics of the console's
+`POKE` and the control protocol's `mem.write`: the data changes, no bus
+cycles are charged, no interrupt or DMA state moves, and the Break tab's
+memory watchpoints are rebaselined so the edit itself does not stop the
+machine. As with `mem.write`, a write is not part of the reverse-execution
+journal, so replaying backwards across it can diverge.
 
 ### IO Map
 
@@ -74,7 +227,7 @@ Selecting a register decodes its individual bitfields (e.g. `DMACON`, `INTENA`,
 ### Break
 Manages active breakpoints, memory watchpoints, and custom register write traps.
 
-```{figure} ../images/ui-preview-debugger-break.png
+```{figure} ../images/ui-preview-debugger-break-egui.png
 :alt: The Break tab
 :width: 90%
 
@@ -129,17 +282,29 @@ Examples:
 | **`< Step`** | -- | Step backward one instruction (see [](reverse.md)) |
 | **`< Run`** | -- | Run backward to preceding breakpoint |
 
+A CPU parked in `STOP` (an idle Workbench waiting for a disk, a program
+waiting for its interrupt) executes nothing until an interrupt arrives, so
+**Step**, **Step Over**, **Step Out** and **Run to** carry it to the
+interrupt that wakes it. A single **Step** there runs the machine on to
+that interrupt and retires one instruction -- the first of its handler,
+where control actually goes -- so the PC lands inside the handler instead
+of standing still. The CPU tab shows *CPU stopped* while it is parked.
+When no interrupt can reach the CPU -- the SR mask is 7, or nothing is
+enabled in `INTENA` -- a step gives up after two video frames and leaves
+the machine stopped where the hardware itself is stuck, and says so on the
+display.
+
 (frame-analyzer-pane)=
 ## Frame Analyzer
 
-Open the Frame Analyzer via the status bar menu to inspect chip-bus slot allocations
+Select **Frame Analyzer** in the Debug workspace to inspect chip-bus slot allocations
 and memory access patterns.
 
-```{figure} ../images/ui-preview-frame-analyzer.png
+```{figure} ../images/ui-preview-analyzer-egui.png
 :alt: The Frame Analyzer
 :width: 90%
 
-Frame Analyzer: chip-bus owner heatmap overlaid on rendered frame.
+Frame Analyzer: chip-bus ownership and per-slot inspection.
 ```
 
 ### Beam tab
@@ -147,7 +312,11 @@ Displays a 2D heatmap indexed by raster beam coordinates (`X` = colour clock HPO
 `Y` = scanline VPOS). Each cell indicates which subsystem owned the chip bus during
 that colour clock cycle (CPU, Copper, Blitter, Bitplane, Sprite, Audio, Disk, Refresh, Idle).
 Pointing at a cell shows its full slot record below the raster; clicking pins
-the same readout. It includes the custom register, address, transfer data and
+the same readout. An interlaced display alternates a long field and a short
+field one line shorter, so the raster is laid out against the long field: the
+diagram keeps its size and the cell under the pointer stays put as the fields
+alternate. A short field has no last line, and a position over it reads the
+line before. It includes the custom register, address, transfer data and
 width, owner subtype, CPU-visible IPL, and decoded hardware events.
 Copper MOVE execution slots are cross-shaped markers coloured by destination
 register class (blitter, audio, display/bitplane, sprite, palette, or control).
@@ -176,18 +345,10 @@ slot.
   after AmigaOS has initialised the relevant Exec lists. The
   selected-slot line names the denier whenever the selected slot was a CPU
   wait, in either view.
-- **Stall gutter:** the narrow strip right of the heatmap is drawn in both
+- **Stall gutter:** the narrow strip left of the heatmap is drawn in both
   views: one bar per line, as long as the share of that line's colour clocks
   the CPU spent waiting, in the colour of the line's dominant denier -- a
   profile of where the frame chokes the CPU.
-
-```{figure} ../images/ui-preview-frame-analyzer-cpu-wait.png
-:alt: The Frame Analyzer's CPU wait view
-:width: 90%
-
-Frame Analyzer Beam tab in the CPU wait view: denied slots lit by denier, the
-stall gutter, and the wait breakdown with the top stalled PCs.
-```
 
 The console's `CPUWAIT` command prints the same summary for the traced frame,
 and a [profile capture](profiling) exports it per frame.
@@ -214,7 +375,7 @@ changes the selected blit. The same renderer is available as `blit.render`.
 (frame-analyzer-memory-tab)=
 ### Memory heatmap tab
 
-```{figure} ../images/ui-preview-frame-analyzer-memory.png
+```{figure} ../images/ui-preview-analyzer-memory-egui.png
 :alt: The Frame Analyzer Memory tab
 :width: 90%
 
@@ -233,7 +394,7 @@ resource mapped at that address.
 
 ### Resources tab
 
-```{figure} ../images/ui-preview-frame-analyzer-resources.png
+```{figure} ../images/ui-preview-analyzer-resources-egui.png
 :alt: The Frame Analyzer Resources tab
 :width: 90%
 

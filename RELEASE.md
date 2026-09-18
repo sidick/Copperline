@@ -50,11 +50,12 @@ crates.io library, so the root package remains marked `publish = false`.
 
 ## Version bump
 
-`crates/copperline-web`, `crates/cputest-runner`, and
+`crates/copperline-web`, `crates/copperline-player`,
+`crates/copperline-libretro`, `crates/cputest-runner`, and
 `crates/hostsocket-plugin` are separate workspaces with their own committed
-`Cargo.lock` files, so a root build never refreshes them. The web crate pins
-the root `copperline` version by path, the cputest runner independently pins
-the published `m68k` dependency, and the HostSocket workspace pins the
+`Cargo.lock` files, so a root build never refreshes them. The web, player,
+and libretro crates pin the root `copperline` version by path; the cputest
+runner independently pins the published `m68k` dependency, and the HostSocket workspace pins the
 dependency graph used to build the committed
 `assets/hostsocket/hostsocket_plugin.wasm`. If a manifest changes without
 regenerating its matching nested lock, every `cargo build --locked` in that
@@ -67,6 +68,8 @@ and commit them:
 
 ```sh
 (cd crates/copperline-web && cargo update -p copperline) # root version bump
+(cd crates/copperline-player && cargo update -p copperline)
+(cd crates/copperline-libretro && cargo update -p copperline)
 (cd crates/cputest-runner && cargo update -p m68k)       # m68k requirement change
 (cd crates/hostsocket-plugin && cargo update)            # its manifest/dependencies change
 ```
@@ -94,6 +97,8 @@ missed one; see "Version bump" above):
 
 ```sh
 (cd crates/copperline-web && cargo tree --locked > /dev/null)
+(cd crates/copperline-player && cargo tree --locked > /dev/null)
+(cd crates/copperline-libretro && cargo tree --locked > /dev/null)
 (cd crates/cputest-runner && cargo tree --locked > /dev/null)
 (cd crates/hostsocket-plugin && cargo tree --locked > /dev/null)
 ```
@@ -180,7 +185,7 @@ attaches `Copperline-X.Y.Z-win-x64.zip` and
 `Copperline-X.Y.Z-win-arm64.zip` to the GitHub Release automatically. The
 same workflow runs the full release build on pull requests that touch the
 code, so it doubles as the Windows build check for both architectures (the
-main CI runs on macOS only).
+main CI runs on macOS and Linux).
 
 The zips are self-contained: the MSVC C runtime is linked statically (see
 `.cargo/config.toml`) so they need no Visual C++ Redistributable, and the
@@ -198,7 +203,8 @@ packaging/windows/build-zip.ps1
 
 The prebuilt macOS download is a disk image (`packaging/macos/`): a
 drag-to-Applications `Copperline.app` wrapped in a `.dmg`. The `macOS` workflow
-builds it on `macos-latest` and, on a `v*` tag, attaches
+builds each architecture's binary on its own `macos-latest` runner, joins them
+into the bundle in a package job, and, on a `v*` tag, attaches
 `Copperline-X.Y.Z-macos-universal.dmg` to the GitHub Release automatically.
 Homebrew (above) remains the build-from-source channel; the disk image is the
 no-compiler alternative.
@@ -215,6 +221,18 @@ build one by hand on a macOS host:
 ```sh
 ./packaging/macos/build-dmg.sh
 ```
+
+## Libretro cores
+
+The `Libretro` workflow builds and tests Linux x86-64, macOS Apple Silicon,
+and Windows x86-64 cores. On a `v*` tag, it attaches a versioned ZIP for
+each platform to the GitHub Release. Each ZIP includes the core, its
+`.info` file, WHDLoad support archives, licences, and installation notes.
+These cores are loaded manually in RetroArch; see `docs/guide/libretro.md`.
+
+Before announcing the release, confirm the DMG, AppImage, network helper,
+both Windows ZIPs, PDF manual, and all three libretro ZIPs are attached,
+and that the browser and documentation publishing workflows have passed.
 
 ## Crate packaging
 

@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 
 use copperline::config::ConfigOverrides;
+use copperline::expect::{ExpectShotSpec, Tolerance};
 use copperline::video::window::{
     parse_amiga_key, DiskInsertSpec, FrameDumpSpec, KeyPressSpec, DEFAULT_KEY_HOLD_MS,
 };
@@ -16,6 +17,7 @@ use copperline::video::HOST_SHORTCUT_MODIFIER_LABEL;
 pub struct CliArgs {
     pub netplay: Option<copperline::netplay::ConnectionOptions>,
     pub netplay_invitation_out: Option<PathBuf>,
+    pub netplay_spectator_invitation_out: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub rom_path: Option<PathBuf>,
     /// `--whdload GAME`: stage a WHDLoad package (.lha archive or
@@ -32,6 +34,18 @@ pub struct CliArgs {
     pub run_stack: Option<u32>,
     /// `--run-detach`: start the run program asynchronously and close its CLI.
     pub run_detach: bool,
+    /// `--exit-on-return`: end the session when the `--run` program
+    /// returns and exit with its AmigaDOS return code (clamped to 0-255),
+    /// or with status 4 if the run ends before it returns.
+    pub exit_on_return: bool,
+    /// `--coverage FILE`: count every instruction the `--run` program
+    /// retires from its `LoadSeg()` on and write lcov line/function
+    /// coverage to FILE when it exits or the run ends
+    /// (src/profile/lcov.rs).
+    pub coverage: Option<PathBuf>,
+    /// `--coverage-source-map FROM=TO`: prefix rewrites applied to the
+    /// source paths the coverage file names. Repeatable.
+    pub coverage_source_map: Vec<(String, String)>,
     /// `--warp-boot`: warp boot -- run unpaced from power-on until the
     /// boot storage has been idle for `[emulation] warp_boot_idle`
     /// emulated seconds, then resume real-time pacing (src/warpboot.rs).
@@ -44,11 +58,24 @@ pub struct CliArgs {
     /// occurrence is captured, and the run ends once the last one has
     /// fired.
     pub screenshot_after: Vec<(f32, PathBuf)>,
+    /// `--expect-screenshot SECS PATH [TOLERANCE]`: capture the frame at
+    /// SECS exactly as `--screenshot-after` would and compare it with the
+    /// PNG at PATH (src/expect.rs). Repeatable; a failed comparison makes
+    /// the process exit with status 3 once the run finishes.
+    pub expect_screenshot: Vec<ExpectShotSpec>,
     /// `--save-state-after SECS PATH`: write a save state of the whole
     /// machine after SECS emulated seconds, then keep running (combine
     /// with --screenshot-after/--dump-frames to bound the run).
     /// Repeatable, like `--screenshot-after`.
     pub save_state_after: Vec<(f32, PathBuf)>,
+    /// `--gif-after SECS PATH`: write an animated GIF of the presented
+    /// frames from SECS emulated seconds for `--gif-seconds` (default
+    /// `[recording] clip_seconds`). Repeatable; the run ends once every
+    /// clip is complete.
+    pub gif_after: Vec<(f32, PathBuf)>,
+    /// `--gif-seconds N`: how many emulated seconds each `--gif-after`
+    /// clip covers.
+    pub gif_seconds: Option<f32>,
     /// `--load-state PATH`: restore a save state before entering the
     /// event loop, resuming from its emulated timeline.
     pub load_state: Option<PathBuf>,
@@ -89,7 +116,9 @@ pub struct CliArgs {
     /// signals for GTKWave (see docs/debugger/waveform.md).
     pub waveform: Option<copperline::waveform::WaveOptions>,
     /// Scripted key presses to inject after the window opens. Useful
-    /// for headless testing of menus and modifier chords.
+    /// for headless testing of menus and modifier chords. `--type-after
+    /// SECS TEXT` expands into these too, one press/release per typed
+    /// key (src/typing.rs), so typed text rides the same scheduler.
     pub press_after: Vec<KeyPressSpec>,
     /// `--click-after SECS BUTTON DURATION_MS [PORT]`: at SECS seconds
     /// after the window opens, press the named mouse button
@@ -121,6 +150,12 @@ pub struct CliArgs {
     /// analogue controller's stick/paddle position (each axis 0-255, the
     /// count POTxDAT latches). PORT defaults to 2 (carried 0-based).
     pub pot_after: Vec<(f32, u8, u8, u8)>,
+    /// `--pen-after SECS X Y [PORT]`: at SECS emulated seconds, hold the
+    /// light pen over presented pixel (X, Y) -- the `--mouse-to-after`
+    /// coordinates -- or lift it off the glass with a negative
+    /// coordinate. PORT (carried 0-based) names the port the pen must be
+    /// in; `None` means whichever port has the pen.
+    pub pen_after: Vec<(f32, i32, i32, Option<u8>)>,
     /// `--record-input PATH`: record every input event that reaches the
     /// emulated machine for the whole run and write the scripted-input
     /// file to PATH on exit (the windowed toggle is the host shortcut
@@ -163,6 +198,8 @@ pub struct CliArgs {
     pub calibrate_gamepad: bool,
     /// `--list-midi`: print the host MIDI endpoints and exit.
     pub list_midi: bool,
+    /// `--list-serial-ports`: print the host serial ports and exit.
+    pub list_serial_ports: bool,
     /// `--list-audio-devices`: print the host audio output devices and exit.
     pub list_audio_devices: bool,
     /// `--list-net-interfaces`: print adapters usable for bridging and exit.
@@ -209,15 +246,19 @@ pub fn parse_args() -> Result<CliArgs> {
 /// the flag names (without the leading dashes) whose effects accumulate;
 /// anything else in a script is an error so a typo cannot silently change
 /// emulator configuration.
-const SCRIPT_DIRECTIVES: [&str; 12] = [
+const SCRIPT_DIRECTIVES: [&str; 16] = [
     "press-after",
     "key-after",
+    "type",
+    "type-after",
+    "expect-screenshot",
     "hold-key-after",
     "click-after",
     "joy-after",
     "mouse-after",
     "mouse-to-after",
     "pot-after",
+    "pen-after",
     "insert-disk-after",
     "defer-disk-insert",
     "insert-cd-after",
@@ -293,7 +334,14 @@ fn expand_script_files(args: Vec<String>) -> Result<Vec<String>> {
                     SCRIPT_DIRECTIVES.join(", ")
                 ));
             }
-            out.push(format!("--{directive}"));
+            // `type SECS TEXT` is the natural spelling in a script; the
+            // flag it stands for is --type-after.
+            let flag = if directive == "type" {
+                "type-after"
+            } else {
+                directive.as_str()
+            };
+            out.push(format!("--{flag}"));
             out.extend(rest.iter().cloned());
         }
     }
@@ -326,17 +374,27 @@ fn take_port_token(
     args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
     default_port: u8,
 ) -> u8 {
-    match args.peek().map(String::as_str) {
-        Some("1") => {
-            args.next();
-            0
-        }
-        Some("2") => {
-            args.next();
-            1
-        }
-        _ => default_port - 1,
-    }
+    take_port_token_upto(args, 2).unwrap_or(default_port - 1)
+}
+
+/// Consume an optional trailing PORT token naming one of the first
+/// `max_port` ports (1-based on the command line, returned 0-based), or
+/// leave the argument stream alone when the next token is not one. The
+/// game ports are 1 and 2; the parallel-port adapter's sockets are 3 and 4,
+/// which only the joystick directive can address.
+fn take_port_token_upto(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    max_port: u8,
+) -> Option<u8> {
+    let port = match args.peek().map(String::as_str) {
+        Some("1") => 0,
+        Some("2") => 1,
+        Some("3") if max_port >= 3 => 2,
+        Some("4") if max_port >= 4 => 3,
+        _ => return None,
+    };
+    args.next();
+    Some(port)
 }
 
 pub fn parse_args_from<I>(args: I) -> Result<CliArgs>
@@ -354,6 +412,9 @@ where
     let mut netplay_session = None;
     let mut netplay_delay = None;
     let mut netplay_rollback = None;
+    let mut netplay_spectators: Option<u8> = None;
+    let mut netplay_spectator_invite = None::<PathBuf>;
+    let mut netplay_watch = None::<String>;
     let mut config_path: Option<PathBuf> = None;
     let mut rom_path: Option<PathBuf> = None;
     let mut whdload: Option<PathBuf> = None;
@@ -363,8 +424,14 @@ where
     let mut run_args: Option<String> = None;
     let mut run_stack: Option<u32> = None;
     let mut run_detach = false;
+    let mut exit_on_return = false;
+    let mut coverage: Option<PathBuf> = None;
+    let mut coverage_source_map: Vec<(String, String)> = Vec::new();
     let mut screenshot_after: Vec<(f32, PathBuf)> = Vec::new();
+    let mut expect_screenshot: Vec<ExpectShotSpec> = Vec::new();
     let mut save_state_after: Vec<(f32, PathBuf)> = Vec::new();
+    let mut gif_after: Vec<(f32, PathBuf)> = Vec::new();
+    let mut gif_seconds: Option<f32> = None;
     let mut load_state: Option<PathBuf> = None;
     let mut load_uss = None;
     let mut benchmark_until: Option<f32> = None;
@@ -384,6 +451,7 @@ where
     let mut mouse_after: Vec<(f32, i32, i32, u8)> = Vec::new();
     let mut mouse_to_after: Vec<(f32, i32, i32, u8)> = Vec::new();
     let mut pot_after: Vec<(f32, u8, u8, u8)> = Vec::new();
+    let mut pen_after: Vec<(f32, i32, i32, Option<u8>)> = Vec::new();
     let mut record_input: Option<PathBuf> = None;
     let mut wave_path: Option<PathBuf> = None;
     let mut wave_trigger: Option<copperline::waveform::Trigger> = None;
@@ -402,6 +470,7 @@ where
     let mut live_audio_profile_secs: Option<f32> = None;
     let mut calibrate_gamepad = false;
     let mut list_midi = false;
+    let mut list_serial_ports = false;
     let mut list_audio_devices = false;
     let mut list_net_interfaces = false;
     let mut list_disks = false;
@@ -417,6 +486,9 @@ where
         match a.as_str() {
             "--calibrate-gamepad" => {
                 calibrate_gamepad = true;
+            }
+            "--list-serial-ports" => {
+                list_serial_ports = true;
             }
             "--list-midi" => {
                 list_midi = true;
@@ -445,6 +517,18 @@ where
                     ));
                 }
                 host_disk_broker = Some(rest);
+            }
+            "--pcmcia-cf" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--pcmcia-cf requires PATH (a hard-disk image)"))?;
+                overrides.pcmcia_cf = Some(path);
+            }
+            "--pcmcia-sram" => {
+                let size = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--pcmcia-sram requires SIZE (64K..4M)"))?;
+                overrides.pcmcia_sram = Some(size);
             }
             "--host-disk" | "--host-disk-read-only" => {
                 let read_only = a == "--host-disk-read-only";
@@ -522,6 +606,22 @@ where
                 );
             }
             "--run-detach" => run_detach = true,
+            "--exit-on-return" => exit_on_return = true,
+            "--coverage" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--coverage requires the lcov output path"))?;
+                coverage = Some(PathBuf::from(v));
+            }
+            "--coverage-source-map" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--coverage-source-map requires FROM=TO"))?;
+                let (from, to) = v
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("--coverage-source-map requires FROM=TO"))?;
+                coverage_source_map.push((from.to_string(), to.to_string()));
+            }
             "--warp-boot" => {
                 warp_boot = true;
             }
@@ -614,6 +714,12 @@ where
             }
             "--no-jit" => {
                 overrides.cpu_jit = Some(false);
+            }
+            "--clipboard" => {
+                overrides.clipboard = Some(true);
+            }
+            "--no-clipboard" => {
+                overrides.clipboard = Some(false);
             }
             "--chip" => {
                 overrides.chip = Some(
@@ -752,8 +858,22 @@ where
             }
             "--port2" => {
                 overrides.port2 = Some(args.next().ok_or_else(|| {
-                    anyhow!("--port2 requires a device (mouse/joystick/cd32/analogue/none)")
+                    anyhow!(
+                        "--port2 requires a device (mouse/joystick/cd32/analogue/lightpen/none)"
+                    )
                 })?);
+            }
+            "--port3" => {
+                overrides.port3 = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--port3 requires a device (joystick/none)"))?,
+                );
+            }
+            "--port4" => {
+                overrides.port4 = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--port4 requires a device (joystick/none)"))?,
+                );
             }
             "--autofire" => {
                 let value = args
@@ -828,6 +948,27 @@ where
                         anyhow!("--netplay-session requires 32 hexadecimal digits")
                     })?)
             }
+            "--netplay-spectators" => {
+                netplay_spectators = Some(next_arg::<u8>(
+                    &mut args,
+                    "--netplay-spectators requires a count, 1..8",
+                    "invalid netplay spectator count",
+                )?)
+            }
+            "--netplay-spectator-invite" => {
+                netplay_spectator_invite = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            anyhow!("--netplay-spectator-invite requires an output path")
+                        })?
+                        .into(),
+                );
+            }
+            "--netplay-watch" => {
+                let usage =
+                    "--netplay-watch requires a spectator invitation code or the host's IP:PORT";
+                netplay_watch = Some(args.next().ok_or_else(|| anyhow!(usage))?);
+            }
             "--run-ahead" => {
                 let value = args
                     .next()
@@ -839,7 +980,15 @@ where
             }
             "--serial" => {
                 overrides.serial = Some(args.next().ok_or_else(|| {
-                    anyhow!("--serial requires a mode (off/stdout/midi/tcp/tcp-connect/pty/modem)")
+                    anyhow!(
+                        "--serial requires a mode \
+                         (off/stdout/midi/tcp/tcp-connect/pty/modem/device)"
+                    )
+                })?);
+            }
+            "--serial-device" => {
+                overrides.serial_device = Some(args.next().ok_or_else(|| {
+                    anyhow!("--serial-device requires a host serial port (/dev/tty... or COMn)")
                 })?);
             }
             "--serial-connect" => {
@@ -890,7 +1039,7 @@ where
             }
             "--parallel" => {
                 overrides.parallel = Some(args.next().ok_or_else(|| {
-                    anyhow!("--parallel requires a device (none/printer/sampler)")
+                    anyhow!("--parallel requires a device (none/printer/sampler/joystick-adapter)")
                 })?);
             }
             "--sampler-audio-input" => {
@@ -978,8 +1127,16 @@ where
                 })?;
                 let dur_ms: u32 =
                     next_arg(&mut args, USAGE, "--joy-after DURATION_MS must be a number")?;
-                let port = take_port_token(&mut args, 2);
+                let port = take_port_token_upto(&mut args, 4).unwrap_or(1);
                 joy_after.push((secs, button, dur_ms, port));
+            }
+            "--pen-after" => {
+                const USAGE: &str = "--pen-after requires SECS X Y";
+                let secs: f32 = next_arg(&mut args, USAGE, "--pen-after SECS must be a number")?;
+                let x: i32 = next_arg(&mut args, USAGE, "--pen-after X must be an integer")?;
+                let y: i32 = next_arg(&mut args, USAGE, "--pen-after Y must be an integer")?;
+                let port = take_port_token_upto(&mut args, 2);
+                pen_after.push((secs, x, y, port));
             }
             "--mouse-to-after" => {
                 const USAGE: &str = "--mouse-to-after requires SECS X Y";
@@ -1073,6 +1230,24 @@ where
                     hold_ms: DEFAULT_KEY_HOLD_MS,
                 });
             }
+            "--type-after" => {
+                const USAGE: &str = "--type-after requires SECS TEXT";
+                let secs: f32 = next_arg(&mut args, USAGE, "--type-after SECS must be a number")?;
+                let text = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                let (keys, untypable) =
+                    copperline::typing::keystrokes_for_text(&copperline::typing::unescape(&text));
+                if !untypable.is_empty() {
+                    return Err(anyhow!(
+                        "--type-after TEXT: no key on the Amiga keyboard for {:?}",
+                        untypable.into_iter().collect::<String>()
+                    ));
+                }
+                press_after.extend(keys.into_iter().map(|k| KeyPressSpec {
+                    secs: secs + k.offset_ms as f32 / 1000.0,
+                    rawkey: k.rawkey,
+                    hold_ms: k.hold_ms,
+                }));
+            }
             "--key-after" | "--hold-key-after" => {
                 const USAGE: &str = "--key-after requires SECS KEY DURATION_MS";
                 let secs: f32 = next_arg(&mut args, USAGE, "--key-after SECS must be a number")?;
@@ -1094,12 +1269,52 @@ where
                 let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 screenshot_after.push((secs, PathBuf::from(path)));
             }
+            "--expect-screenshot" => {
+                const USAGE: &str = "--expect-screenshot requires SECS PATH [TOLERANCE]";
+                let secs: f32 = next_arg(
+                    &mut args,
+                    USAGE,
+                    "--expect-screenshot SECS must be a number",
+                )?;
+                let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                // The tolerance is optional and numeric; anything else is
+                // the next flag or a positional path and stays put.
+                let tolerance = match args.peek().and_then(|t| Tolerance::parse(t)) {
+                    Some(tolerance) => {
+                        args.next();
+                        tolerance
+                    }
+                    None => Tolerance::Exact,
+                };
+                expect_screenshot.push(ExpectShotSpec {
+                    secs,
+                    path: PathBuf::from(path),
+                    tolerance,
+                });
+            }
             "--save-state-after" => {
                 const USAGE: &str = "--save-state-after requires SECS PATH";
                 let secs: f32 =
                     next_arg(&mut args, USAGE, "--save-state-after SECS must be a number")?;
                 let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 save_state_after.push((secs, PathBuf::from(path)));
+            }
+            "--gif-after" => {
+                const USAGE: &str = "--gif-after requires SECS PATH";
+                let secs: f32 = next_arg(&mut args, USAGE, "--gif-after SECS must be a number")?;
+                let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                gif_after.push((secs, PathBuf::from(path)));
+            }
+            "--gif-seconds" => {
+                const USAGE: &str = "--gif-seconds requires a number of emulated seconds";
+                let secs: f32 = next_arg(&mut args, USAGE, "--gif-seconds N must be a number")?;
+                if !(secs > 0.0 && secs <= copperline::gifclip::MAX_CLIP_SECONDS as f32) {
+                    return Err(anyhow!(
+                        "--gif-seconds must be between 0 and {} seconds, got {secs}",
+                        copperline::gifclip::MAX_CLIP_SECONDS
+                    ));
+                }
+                gif_seconds = Some(secs);
             }
             "--load-uss" => {
                 load_uss = Some(PathBuf::from(
@@ -1329,6 +1544,9 @@ where
             None
         }
     };
+    if gif_seconds.is_some() && gif_after.is_empty() {
+        return Err(anyhow!("--gif-seconds requires --gif-after SECS PATH"));
+    }
     let waveform = match wave_path {
         Some(path) => {
             let mut opts = copperline::waveform::WaveOptions::new(path);
@@ -1383,10 +1601,17 @@ where
             "--hostsocket-interface conflicts with an explicit non-bridge --hostsocket-net"
         ));
     }
+    // A spectator code addresses the Internet transport; anything else given
+    // to --netplay-watch is the direct UDP host address.
+    let watch_code = netplay_watch
+        .as_deref()
+        .filter(|value| copperline::netplay::is_spectator_code(value))
+        .map(str::to_string);
     let internet_requested = netplay_host.is_some()
         || netplay_join.is_some()
         || netplay_relay.is_some()
-        || netplay_relay_only;
+        || netplay_relay_only
+        || watch_code.is_some();
     let netplay = if internet_requested
         || netplay_bind.is_some()
         || netplay_peer.is_some()
@@ -1394,12 +1619,21 @@ where
         || netplay_session.is_some()
         || netplay_delay.is_some()
         || netplay_rollback.is_some()
+        || netplay_watch.is_some()
+        || netplay_spectators.is_some()
+        || netplay_spectator_invite.is_some()
     {
+        use copperline::netplay::{ConnectionOptions, Role};
+        let spectators = netplay_spectators.unwrap_or(0);
+        if netplay_spectators.is_some() && !(1..=8).contains(&spectators) {
+            bail!("--netplay-spectators must be 1..8");
+        }
         let options = if internet_requested {
             if netplay_bind.is_some()
                 || netplay_peer.is_some()
                 || netplay_player.is_some()
                 || netplay_session.is_some()
+                || (netplay_watch.is_some() && watch_code.is_none())
             {
                 bail!("Internet netplay cannot be combined with direct IP/session/player flags");
             }
@@ -1407,32 +1641,85 @@ where
             bail!("This build does not include Internet netplay");
             #[cfg(feature = "netplay-internet")]
             {
-                use copperline::netplay::{internet, ConnectionOptions};
-                let options = match (&netplay_host, &netplay_join) {
-                    (Some(_), None) => internet::Options::host(
-                        netplay_delay.unwrap_or(2),
-                        netplay_rollback.unwrap_or(8),
-                        netplay_relay.as_deref().unwrap_or(""),
-                        netplay_relay_only,
-                    )?,
-                    (None, Some(code)) => {
+                use copperline::netplay::internet;
+                match (&netplay_host, &netplay_join, &watch_code) {
+                    (Some(_), None, None) => {
+                        if spectators > 0 && netplay_spectator_invite.is_none() {
+                            bail!("Internet spectators need --netplay-spectator-invite PATH to write their code");
+                        }
+                        ConnectionOptions::Internet(Box::new(internet::Options::host(
+                            netplay_delay.unwrap_or(2),
+                            netplay_rollback.unwrap_or(8),
+                            netplay_relay.as_deref().unwrap_or(""),
+                            netplay_relay_only,
+                            spectators,
+                        )?))
+                    }
+                    (None, Some(code), None) => {
                         if netplay_delay.is_some()
                             || netplay_rollback.is_some()
                             || netplay_relay.is_some()
                         {
                             bail!("The Internet invitation supplies the host's timing and relay settings");
                         }
-                        internet::Options::join(code, netplay_relay_only)?
+                        if netplay_spectators.is_some() {
+                            bail!("Only the host admits spectators");
+                        }
+                        ConnectionOptions::Internet(Box::new(internet::Options::join(
+                            code,
+                            netplay_relay_only,
+                        )?))
                     }
-                    _ => bail!("Choose --netplay-host PATH or --netplay-join CODE"),
-                };
-                ConnectionOptions::Internet(Box::new(options))
+                    (None, None, Some(code)) => {
+                        if netplay_delay.is_some()
+                            || netplay_rollback.is_some()
+                            || netplay_relay.is_some()
+                            || netplay_spectators.is_some()
+                        {
+                            bail!("A spectator follows the host's settings; only --netplay-relay-only applies");
+                        }
+                        ConnectionOptions::WatchInternet(Box::new(
+                            internet::SpectatorOptions::watch(code, netplay_relay_only)?,
+                        ))
+                    }
+                    _ => bail!(
+                        "Choose --netplay-host PATH, --netplay-join CODE or --netplay-watch CODE"
+                    ),
+                }
             }
+        } else if let Some(host) = netplay_watch {
+            let usage = "spectating requires --netplay-watch IP:PORT and --netplay-session HEX";
+            if netplay_player.is_some()
+                || netplay_peer.is_some()
+                || netplay_delay.is_some()
+                || netplay_rollback.is_some()
+                || netplay_spectators.is_some()
+            {
+                bail!("A spectator takes no player, peer, timing or spectator flags");
+            }
+            let host: std::net::SocketAddr = host.parse().map_err(|_| {
+                anyhow!("--netplay-watch needs a spectator invitation code or IP:PORT")
+            })?;
+            let code: String = netplay_session.ok_or_else(|| anyhow!(usage))?;
+            let options = copperline::netplay::WatchOptions {
+                bind: netplay_bind.unwrap_or(if host.is_ipv6() {
+                    "[::]:0".parse().unwrap()
+                } else {
+                    "0.0.0.0:0".parse().unwrap()
+                }),
+                host,
+                session: copperline::netplay::parse_session_id(&code)?,
+            };
+            options.validate()?;
+            ConnectionOptions::Watch(options)
         } else {
             let usage = "netplay requires --netplay-bind IP:PORT, --netplay-peer IP:PORT, --netplay-player 1|2 and --netplay-session HEX";
             let player = netplay_player.ok_or_else(|| anyhow!(usage))?;
             if !(1..=2).contains(&player) {
                 bail!("--netplay-player must be 1 or 2");
+            }
+            if player == 2 && netplay_spectators.is_some() {
+                bail!("Only player 1 admits spectators");
             }
             let code: String = netplay_session.ok_or_else(|| anyhow!(usage))?;
             let session = copperline::netplay::parse_session_id(&code)?;
@@ -1443,10 +1730,16 @@ where
                 session,
                 input_delay: netplay_delay.unwrap_or(2),
                 rollback_frames: netplay_rollback.unwrap_or(8),
+                spectators,
             };
             options.validate()?;
-            copperline::netplay::ConnectionOptions::Direct(options)
+            ConnectionOptions::Direct(options)
         };
+        let role = options.role();
+        if netplay_spectator_invite.is_some() && !options.hosts_internet() {
+            bail!("--netplay-spectator-invite applies to an Internet netplay host");
+        }
+        let local_port = options.settings().map(|settings| settings.player);
         if load_state.is_some()
             || load_uss.is_some()
             || benchmark_until.is_some()
@@ -1461,18 +1754,22 @@ where
             || warp_boot
             || warp_until.is_some()
             || !save_state_after.is_empty()
+            || !gif_after.is_empty()
             || !cd_insert_after.is_empty()
             || !freeze_after.is_empty()
             || !click_after.is_empty()
             || !mouse_after.is_empty()
             || !mouse_to_after.is_empty()
             || !pot_after.is_empty()
-            || (options.settings().player == 1 && !disk_insert_after.is_empty())
+            || (role != Role::Host && !disk_insert_after.is_empty())
             || joy_after
                 .iter()
-                .any(|j| usize::from(j.3) != options.settings().player)
+                .any(|j| Some(usize::from(j.3)) != local_port)
         {
             bail!("netplay supports cold boot, host floppy changes, local-port --joy-after and keyboard input; state loads, guest media changes, scripted mouse/analogue input, debugging, warp and recording are unavailable");
+        }
+        if role == Role::Spectator && !press_after.is_empty() {
+            bail!("a spectator sends no input: scripted keys, controllers and media changes are unavailable");
         }
         Some(options)
     } else {
@@ -1481,6 +1778,7 @@ where
     Ok(CliArgs {
         netplay,
         netplay_invitation_out: netplay_host,
+        netplay_spectator_invitation_out: netplay_spectator_invite,
         config_path,
         rom_path,
         whdload,
@@ -1490,8 +1788,14 @@ where
         run_args,
         run_stack,
         run_detach,
+        exit_on_return,
+        coverage,
+        coverage_source_map,
         screenshot_after,
+        expect_screenshot,
         save_state_after,
+        gif_after,
+        gif_seconds,
         load_state,
         load_uss,
         benchmark_until,
@@ -1510,6 +1814,7 @@ where
         mouse_after,
         mouse_to_after,
         pot_after,
+        pen_after,
         record_input,
         disk_insert_after,
         cd_insert_after,
@@ -1522,6 +1827,7 @@ where
         live_audio_profile_secs,
         calibrate_gamepad,
         list_midi,
+        list_serial_ports,
         list_audio_devices,
         list_net_interfaces,
         list_disks,
@@ -1602,6 +1908,13 @@ fn print_help() {
          --run-args STRING              extra guest command-line arguments for --run\n  \
          --run-stack BYTES              issue AmigaDOS Stack BYTES before --run\n  \
          --run-detach                   start --run asynchronously and close the boot CLI\n  \
+         --exit-on-return               exit when the --run program returns, with its AmigaDOS\n  \
+         \x20                            return code (0-255) as the status; 4 if the run ends\n  \
+         \x20                            before it returns\n  \
+         --coverage FILE                write lcov line/function coverage of the --run program\n  \
+         \x20                            to FILE when it exits or the run ends (headless unless\n  \
+         \x20                            --control-gui/--gdb-gui; see docs/debugger/profiling.md)\n  \
+         --coverage-source-map FROM=TO  rewrite a source path prefix in the coverage file\n  \
          --warp-boot                    warp the boot: unthrottled until the boot storage has\n  \
          \x20                            been idle for [emulation] warp_boot_idle seconds\n  \
          --warp-until SECS              warp the boot until an absolute emulated time\n  \
@@ -1614,6 +1927,9 @@ fn print_help() {
          --fpu / --no-fpu               fit / omit a 68881/68882 (68040/68060 on-die)\n  \
          --jit / --no-jit               fast batch/trace-JIT CPU execution (not cycle-exact,\n  \
          \x20                            like an accelerator card; default: off)\n  \
+         --clipboard / --no-clipboard   share the host clipboard with the guest's\n  \
+         \x20                            clipboard.device; fits an extra autoconfig board,\n  \
+         \x20                            so it is off unless asked for (default: off)\n  \
          --cartridge MODEL              freezer cartridge: none (default) or hrtmon (the\n  \
          \x20                            bundled HRTMon monitor, entered with --freeze-after,\n  \
          \x20                            the Freeze menu item, or cartridge.freeze)\n  \
@@ -1630,9 +1946,13 @@ fn print_help() {
          --floppy-speed PERCENT         drive speed: 100, 200, 400, 800, or 0 (turbo)\n  \
          {floppy_bridge}--host-disk DEVICE [ATTACH]    give the machine one of the host's own disks\n  \
          \x20                            (--list-disks names them); ATTACH is ide-master\n  \
-         \x20                            (default), ide-slave, or scsi0..scsi6\n  \
+         \x20                            (default), ide-slave, scsi0..scsi6, or pcmcia\n  \
          --host-disk-read-only DEVICE [ATTACH]\n  \
          \x20                            the same, but the guest cannot write to the disk\n  \
+         --pcmcia-cf PATH               a CompactFlash card in the A600/A1200 PCMCIA slot,\n  \
+         \x20                            over a hard-disk image ([pcmcia] card = \"cf\")\n  \
+         --pcmcia-sram SIZE             an SRAM card in the PCMCIA slot, 64K..4M, session-only\n  \
+         \x20                            ([pcmcia] card = \"sram\")\n  \
          --rtc-time TIME                seed the battery clock (implies fitting one) with\n  \
          \x20                            Unix seconds or \"YYYY-MM-DD HH:MM[:SS]\"; it then\n  \
          \x20                            ticks in emulated time, so runs are deterministic\n  \
@@ -1642,9 +1962,13 @@ fn print_help() {
          --mouse-sensitivity N          host mouse sensitivity 0-100 (50 default = 1:1)\n  \
          --mouse-capture MODE           when to grab the host mouse: click (default), auto, manual\n  \
          --port1 DEVICE                 controller in port 1: mouse (default), joystick,\n  \
-         \x20                            cd32, analogue, or none\n  \
+         \x20                            cd32, analogue, lightpen, or none\n  \
          --port2 DEVICE                 controller in port 2 (default: joystick;\n  \
          \x20                            cd32 on the CD32 profile)\n  \
+         --port3 DEVICE                 joystick or none in the parallel-port four-player\n  \
+         \x20                            adapter's first socket (implies --parallel\n  \
+         \x20                            joystick-adapter)\n  \
+         --port4 DEVICE                 joystick or none in the adapter's second socket\n  \
          --autofire HZ                  pulse a held fire button at HZ (0 = off, the default)\n  \
          --netplay-host PATH            host Internet netplay; write invitation to PATH\n  \
          --netplay-join CODE            join a desktop Internet invitation\n  \
@@ -1656,12 +1980,27 @@ fn print_help() {
          --netplay-session HEX          shared 32-digit hexadecimal session ID\n  \
          --netplay-delay FRAMES         local input delay, 0..6 (default 2)\n  \
          --netplay-rollback FRAMES      prediction limit, 1..12 (default 8)\n  \
+         --netplay-spectators N         host: admit up to N spectators, 1..8\n  \
+         --netplay-spectator-invite PATH\n  \
+         \x20                            Internet host: write the spectator code to PATH\n  \
+         --netplay-watch CODE|IP:PORT   spectate: a CLNS1. spectator code, or the direct\n  \
+         \x20                            IP host with --netplay-session\n  \
          --run-ahead FRAMES             run-ahead input-latency reduction, 0..4 frames\n  \
          \x20                            (0 = off, the default; windowed sessions only)\n  \
          \x20                            (--model/--cpu/etc. override the config file or defaults)\n  \
          --screenshot-after SECS PATH   save a PNG to PATH after SECS emulated seconds, then exit\n  \
+         --expect-screenshot SECS PATH [TOLERANCE]\n  \
+         \x20                            capture the frame at SECS like --screenshot-after and\n  \
+         \x20                            compare it with the PNG at PATH; TOLERANCE is a fraction\n  \
+         \x20                            (0.001) or a pixel count (250) of allowed differences,\n  \
+         \x20                            default exact; a mismatch writes <stem>.actual.png and\n  \
+         \x20                            <stem>.diff.png and exits with status 3 at the end\n  \
          --save-state-after SECS PATH   write a save state to PATH after SECS emulated seconds,\n  \
          \x20                            then keep running\n  \
+         --gif-after SECS PATH          write an animated GIF of the display starting at SECS\n  \
+         \x20                            emulated seconds to PATH, then exit\n  \
+         --gif-seconds N                emulated seconds each --gif-after clip covers\n  \
+         \x20                            (default: [recording] clip_seconds, 10)\n  \
          --load-uss PATH                import a WinUAE state; requires its matching Kickstart\n  \
          --load-state PATH              restore a save state before starting, resuming from\n  \
          \x20                            its emulated timeline\n  \
@@ -1692,12 +2031,18 @@ fn print_help() {
          \x20                            decimal, 0x.., or a name like ctrl/lalt/lami/f1\n  \
          --key-after SECS KEY MS        press KEY after SECS, hold for MS milliseconds,\n  \
          \x20                            then release; may be passed multiple times\n  \
+         --type-after SECS TEXT         type TEXT on the US Amiga keyboard from SECS, one key\n  \
+         \x20                            every 100 ms; \\n Return, \\t Tab, \\e Esc, \\b Backspace\n  \
          --click-after SECS BTN MS [PORT]\n  \
          \x20                            press mouse BTN (left/right/middle) at SECS,\n  \
          \x20                            release MS ms later, on PORT (default 1)\n  \
          --joy-after SECS BTN MS [PORT] press joystick/CD32-pad BTN (up/down/left/right/\n  \
          \x20                            red|fire/blue/green/yellow/play/rwd/ffw) at SECS,\n  \
-         \x20                            release MS ms later, on PORT (default 2)\n  \
+         \x20                            release MS ms later, on PORT 1-4 (default 2;\n  \
+         \x20                            3 and 4 are the parallel-port adapter's sockets)\n  \
+         --pen-after SECS X Y [PORT]    hold the light pen over screen pixel (X, Y) from\n  \
+         \x20                            SECS (the --mouse-to-after coordinates; -1 -1\n  \
+         \x20                            lifts it off), on PORT (default: the pen's port)\n  \
          --mouse-after SECS DX DY [PORT]\n  \
          \x20                            apply a relative mouse motion at SECS on PORT\n  \
          \x20                            (default 1)\n  \
@@ -1752,9 +2097,13 @@ fn print_help() {
          --mt32-pcm-rom PATH            MT-32 PCM ROM\n  \
          --mt32-panel                   show the MT-32 front panel\n  \
          --serial MODE                  Paula serial port: off, stdout, midi, tcp,\n  \
-         \x20                            tcp-connect, pty, or modem\n  \
+         \x20                            tcp-connect, pty, modem, or device\n  \
          --serial-connect HOST:PORT     dial a remote TCP service (a telnet BBS) with the\n  \
          \x20                            serial port (implies --serial tcp-connect)\n  \
+         --serial-device PATH           wire the serial port to a real host serial port\n  \
+         \x20                            (/dev/tty.usbserial-XXXX, /dev/ttyUSB0, COM3;\n  \
+         \x20                            implies --serial device)\n  \
+         --list-serial-ports            list host serial ports and exit\n  \
          --serial-session FILE          modem mode: replay a scripted session from FILE\n  \
          \x20                            instead of dialing out over TCP (implies\n  \
          \x20                            --serial modem); see docs/guide/modem.md\n  \
@@ -1766,7 +2115,8 @@ fn print_help() {
          \x20                            to real host OS sockets, bypassing the emulated\n  \
          \x20                            stack entirely)\n  \
          --hostsocket-interface NAME    bridge adapter; implies --hostsocket-net bridge\n  \
-         --parallel DEVICE              parallel port: none, printer, or sampler\n  \
+         --parallel DEVICE              parallel port: none, printer, sampler, or\n  \
+         \x20                            joystick-adapter (four-player ports 3 and 4)\n  \
          --sampler-audio-input NAME     sampler host capture device (implies --parallel sampler)\n  \
          --sampler-input-gain DB        sampler input gain in dB (implies --parallel sampler)\n  \
          --sampler-list-audio-inputs    list host audio input devices and exit\n  \

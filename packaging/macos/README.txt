@@ -30,9 +30,10 @@ Copperline.app/Contents/Resources/aros. AROS is freely redistributable; see the
 LICENSE next to the ROM. To use a real Kickstart instead, point a config file
 at it, or load it at runtime from the menu (Load Kickstart ROM...).
 
-The CD32 profile also fits Copperline's bundled open Full Motion Video ROM
-from Contents/Resources/fmv. Set fmv_rom = "" in a config to leave that
-cartridge unfitted.
+Copperline's bundled open Full Motion Video ROM ships in
+Contents/Resources/fmv. The CD32 profile leaves that cartridge slot empty,
+as a stock CD32 does; set fmv = true in a config (or press Fit on the
+launcher's FMV row) to fit the module with it.
 
 Configuration
 -------------
@@ -42,6 +43,24 @@ own Kickstart ROM and disk/hard-disk images, and launch from a terminal with:
     /Applications/Copperline.app/Contents/MacOS/copperline --config your-config.toml
 
 Run that binary with --help for the full command-line surface.
+
+Command-line tools
+------------------
+Two companion programs sit next to the emulator inside the bundle, in
+Copperline.app/Contents/MacOS:
+
+  copperline-ctl         Client for the control protocol (scripting and AI
+                         agents), the MCP server mode (--mcp) and the Debug
+                         Adapter Protocol adapter (--dap) used by the VS Code
+                         extension. It launches the copperline beside it.
+                         Add that directory to PATH, or point the VS Code
+                         setting copperline.ctlExecutable at
+                         /Applications/Copperline.app/Contents/MacOS/copperline-ctl
+  copperline-import-uae  Converts a WinUAE, Amiberry or FS-UAE config file
+                         into a Copperline TOML config:
+                         copperline-import-uae --from winuae --in game.uae --out game.toml
+
+Homebrew installs (brew install copperline) put the same two tools on PATH.
 
 Bridged Ethernet
 ----------------

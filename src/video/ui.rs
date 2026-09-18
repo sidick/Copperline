@@ -20,6 +20,7 @@ use crate::debugger::{BreakCond, CondOp, CondOperand};
 use crate::heatmap;
 
 mod configuration;
+mod states;
 pub(crate) use configuration::HOST_DISK_VISIBLE_ROWS;
 use configuration::*;
 pub(in crate::video) use configuration::{clip_path_to_chars, control_live, SAVE_ACTIONS};
@@ -27,6 +28,8 @@ pub(in crate::video) use configuration::{clip_path_to_chars, control_live, SAVE_
 pub(in crate::video) use configuration::{
     library_favourite_rows, library_version_max, library_visible_rows,
 };
+use states::*;
+pub(in crate::video) use states::{states_visible_rows, StatesAction, StatesFocus, StatesPanel};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -120,7 +123,7 @@ pub const DEBUG_TABS: [DebugTab; 9] = [
     DebugTab::Waveform,
 ];
 
-fn debug_tab_label(tab: DebugTab) -> &'static str {
+pub(in crate::video) fn debug_tab_label(tab: DebugTab) -> &'static str {
     match tab {
         DebugTab::Cpu => "CPU",
         DebugTab::Chipset => "Chipset",
@@ -142,6 +145,8 @@ pub struct DebuggerPanel {
     pub mem_addr: u32,
     /// Pinned disassembly origin for the CPU tab; None follows the PC.
     pub disasm_addr: Option<u32>,
+    /// Pinned Copper-list origin; None follows the live Copper.
+    pub copper_addr: Option<u32>,
     /// The hex address being typed into the entry box.
     pub entry: String,
     /// Whether the entry box has keyboard focus.
@@ -156,6 +161,42 @@ pub struct DebuggerPanel {
     pub mem_bitmap_stride: u32,
     /// IO Map tab: the selected custom-register word offset ($000-$1FE).
     pub iomap_sel: u16,
+    /// Memory tab: the in-place edit cursor, when a byte is selected.
+    pub mem_cursor: Option<MemCursor>,
+    /// Memory tab: bytes typed but not yet committed, as (address, value)
+    /// in the order they were first edited. Enter or a click outside the
+    /// dump writes them; Esc drops them.
+    pub mem_pending: Vec<(u32, u8)>,
+    /// Memory tab: the outcome of the last edit or poke, shown beside the
+    /// tab's controls until the next one.
+    pub mem_status: Option<String>,
+}
+
+/// Which column of the Memory tab's dump the edit cursor sits in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemColumn {
+    Hex,
+    Ascii,
+}
+
+/// The Memory tab's in-place edit cursor: one byte, in one column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemCursor {
+    pub addr: u32,
+    pub column: MemColumn,
+    /// Hex column: the next typed digit is the high nibble. False once one
+    /// digit of the byte has been typed.
+    pub high_nibble: bool,
+}
+
+impl MemCursor {
+    pub fn new(addr: u32, column: MemColumn) -> Self {
+        Self {
+            addr,
+            column,
+            high_nibble: true,
+        }
+    }
 }
 
 impl DebuggerPanel {
@@ -164,12 +205,93 @@ impl DebuggerPanel {
             tab: DebugTab::Cpu,
             mem_addr: 0,
             disasm_addr: None,
+            copper_addr: None,
             entry: String::new(),
             entry_active: false,
             mem_last_find: None,
             mem_view_bits: false,
             mem_bitmap_stride: 40,
             iomap_sel: 0x096,
+            mem_cursor: None,
+            mem_pending: Vec::new(),
+            mem_status: None,
+        }
+    }
+
+    /// The staged value of a byte, if it has been edited but not committed.
+    pub fn mem_pending_value(&self, addr: u32) -> Option<u8> {
+        self.mem_pending
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, v)| *v)
+    }
+
+    /// Stage a byte edit, replacing an earlier edit of the same address.
+    pub fn mem_stage(&mut self, addr: u32, value: u8) {
+        match self.mem_pending.iter_mut().find(|(a, _)| *a == addr) {
+            Some(slot) => slot.1 = value,
+            None => self.mem_pending.push((addr, value)),
+        }
+    }
+
+    /// Drop the cursor and every staged edit (Esc).
+    pub fn mem_edit_cancel(&mut self) {
+        self.mem_cursor = None;
+        self.mem_pending.clear();
+    }
+
+    /// Take the staged edits for committing and drop the cursor.
+    pub fn mem_edit_take(&mut self) -> Vec<(u32, u8)> {
+        self.mem_cursor = None;
+        std::mem::take(&mut self.mem_pending)
+    }
+
+    /// Move the edit cursor by `delta` bytes within `mask`, resetting the
+    /// nibble phase. Returns the new address, or None with no cursor.
+    pub fn mem_cursor_move(&mut self, delta: i32, mask: u32) -> Option<u32> {
+        let cursor = self.mem_cursor.as_mut()?;
+        cursor.addr = cursor.addr.wrapping_add_signed(delta) & mask;
+        cursor.high_nibble = true;
+        Some(cursor.addr)
+    }
+
+    /// Type one character at the cursor. In the hex column a hex digit
+    /// fills the next nibble of the byte (`current` is its value before
+    /// this edit); in the ASCII column a printable character replaces the
+    /// byte. Returns true when the byte is complete and the cursor should
+    /// advance; characters that do not fit the column are ignored.
+    pub fn mem_type_char(&mut self, ch: char, current: u8) -> bool {
+        let Some(cursor) = self.mem_cursor else {
+            return false;
+        };
+        match cursor.column {
+            MemColumn::Hex => {
+                let Some(digit) = ch.to_digit(16) else {
+                    return false;
+                };
+                let digit = digit as u8;
+                let staged = self.mem_pending_value(cursor.addr).unwrap_or(current);
+                if cursor.high_nibble {
+                    self.mem_stage(cursor.addr, (digit << 4) | (staged & 0x0F));
+                    if let Some(cursor) = self.mem_cursor.as_mut() {
+                        cursor.high_nibble = false;
+                    }
+                    false
+                } else {
+                    self.mem_stage(cursor.addr, (staged & 0xF0) | digit);
+                    if let Some(cursor) = self.mem_cursor.as_mut() {
+                        cursor.high_nibble = true;
+                    }
+                    true
+                }
+            }
+            MemColumn::Ascii => {
+                if !(' '..='~').contains(&ch) {
+                    return false;
+                }
+                self.mem_stage(cursor.addr, ch as u8);
+                true
+            }
         }
     }
 
@@ -201,7 +323,7 @@ impl DebuggerPanel {
     /// pairs ("C0 FFEE" and "C0FFEE" both match the bytes C0 FF EE).
     pub fn find_pattern(&self) -> Option<Vec<u8>> {
         let joined: String = self.entry.split_whitespace().collect();
-        if joined.is_empty() || !joined.len().is_multiple_of(2) {
+        if joined.is_empty() || !joined.is_ascii() || !joined.len().is_multiple_of(2) {
             return None;
         }
         (0..joined.len())
@@ -274,7 +396,7 @@ pub const ANALYZER_TABS: [AnalyzerTab; 4] = [
     AnalyzerTab::Resources,
 ];
 
-fn analyzer_tab_label(tab: AnalyzerTab) -> &'static str {
+pub(in crate::video) fn analyzer_tab_label(tab: AnalyzerTab) -> &'static str {
     match tab {
         AnalyzerTab::Beam => "Beam",
         AnalyzerTab::Blits => "Blits",
@@ -502,6 +624,9 @@ pub enum Panel {
     /// with no cursor position, so with several connected drives the drop
     /// lands anywhere on the window and the target is picked here.
     DropChooser(DropChooserState),
+    /// The Load State browser: the states folder and the quick-save slots
+    /// with their thumbnails. Boxed: it holds a decoded picture per row.
+    States(Box<StatesPanel>),
 }
 
 /// Menu/panel state owned by the window.
@@ -716,6 +841,11 @@ pub fn panel_control_at(panel: &Panel, pos: (i32, i32)) -> Option<UiControl> {
                 if button_rect.contains(pos) {
                     return Some(control);
                 }
+            }
+        }
+        Panel::States(panel) => {
+            if let Some(control) = states_control_at(rect, panel, pos) {
+                return Some(control);
             }
         }
         Panel::About | Panel::Shortcuts => {}
@@ -1050,6 +1180,15 @@ pub enum UiControl {
     LauncherNetplayAction(LauncherField),
     /// Drop chooser: insert the dropped disk(s) into this drive.
     DropDrive(usize),
+    /// A row of the Load State browser, by entry index.
+    StateRow(usize),
+    /// The browser's footer buttons.
+    StateLoad,
+    StateDelete,
+    StateBrowse,
+    /// The two answers of the browser's delete question.
+    StateConfirmDelete,
+    StateCancelDelete,
 }
 
 fn panel_dims(panel: &Panel) -> (usize, usize) {
@@ -1074,6 +1213,7 @@ fn panel_dims(panel: &Panel) -> (usize, usize) {
                 + state.drives.len() * (DROP_BUTTON_H + DROP_BUTTON_GAP)
                 + DROP_FOOTER_H,
         ),
+        Panel::States(_) => states_panel_dims(),
     }
 }
 
@@ -1088,6 +1228,7 @@ fn panel_title(panel: &Panel) -> &'static str {
         Panel::Console(_) => "Console",
         Panel::Launcher(_) => "Machine Configuration",
         Panel::DropChooser(_) => "Insert Disk",
+        Panel::States(_) => "Load State",
     }
 }
 
@@ -1786,6 +1927,17 @@ impl DbgLine {
     }
 }
 
+/// The Memory tab's hex page as structured data, for the interactive dump:
+/// the bytes behind the text rows plus, per byte, whether the debugger
+/// could write it back (RAM: yes; ROM, overlay ROM, and device windows: no).
+pub struct MemoryPageView {
+    pub base: u32,
+    pub bytes: Vec<u8>,
+    pub writable: Vec<bool>,
+    /// The CPU's address width, for wrapping the edit cursor.
+    pub addr_mask: u32,
+}
+
 /// The Memory tab's 1-bpp bitplane view: `stride` bytes per row of plane
 /// data starting at `base`, drawn as pixels (set bit = light) so bitmap
 /// graphics in RAM can be eyeballed directly.
@@ -1845,12 +1997,28 @@ pub struct DebuggerView {
     pub lines: Vec<DbgLine>,
     /// The Memory tab's bitplane view, when its Bits mode is active.
     pub bitmap: Option<MemBitmapView>,
+    /// The Memory tab's hex page as bytes, when its hex mode is active.
+    pub memory: Option<MemoryPageView>,
     /// The Video tab's layer/palette view. Some only when it is active.
     pub video: Option<VideoView>,
     /// Structured data for the Audio tab's per-channel mute buttons and
     /// oscilloscopes. Some only when the Audio tab is active; the plain text
     /// is also mirrored into `lines` for headless/text use.
     pub audio: Option<AudioScopeView>,
+    pub cpu: Option<CpuView>,
+}
+
+/// Structured CPU snapshot for the resizable debugger panes. Inspection is
+/// side-effect-free; widget actions are applied after the UI finishes a frame.
+pub struct CpuView {
+    pub d: [u32; 8],
+    pub a: [u32; 8],
+    pub pc: u32,
+    pub sr: u16,
+    pub stopped: bool,
+    pub history: Vec<u32>,
+    pub disassembly: Vec<DbgLine>,
+    pub memory: Vec<DbgLine>,
 }
 
 /// Per-channel and line-mixed-source state for the debugger Audio tab.
@@ -1909,7 +2077,7 @@ pub struct AnalyzerMarker {
 }
 
 impl AnalyzerMarker {
-    fn label(&self) -> String {
+    pub(in crate::video) fn label(&self) -> String {
         format!(
             "{} {}=${:04X} v{} h{}{}",
             self.source,
@@ -1926,7 +2094,7 @@ impl AnalyzerMarker {
     /// Whether this marker sits close enough to beam slot
     /// (`vpos`, `hpos`) to be reported for it: within a line vertically
     /// and two colour clocks horizontally, roughly one heatmap pixel.
-    fn near(&self, vpos: usize, hpos: usize) -> bool {
+    pub(in crate::video) fn near(&self, vpos: usize, hpos: usize) -> bool {
         (i64::from(self.vpos) - vpos as i64).abs() <= 1
             && (i64::from(self.hpos) - hpos as i64).abs() <= 2
     }
@@ -1936,6 +2104,9 @@ pub struct AnalyzerTraceView {
     pub frame: u64,
     pub seconds: f64,
     pub rows: usize,
+    /// The frame height to lay out and pick against: see
+    /// `FrameBusTrace::nominal_rows`.
+    pub nominal_rows: usize,
     pub cols: usize,
     pub line_cck: u32,
     pub visible_start_vpos: u32,
@@ -1981,7 +2152,7 @@ pub struct AnalyzerTraceView {
 }
 
 impl AnalyzerTraceView {
-    fn owner_code_at(&self, vpos: usize, hpos: usize) -> u8 {
+    pub(in crate::video) fn owner_code_at(&self, vpos: usize, hpos: usize) -> u8 {
         if vpos >= self.rows || hpos >= self.cols {
             return b'.';
         }
@@ -1996,7 +2167,7 @@ impl AnalyzerTraceView {
         Some(&self.owners[start..start + self.cols])
     }
 
-    fn cpu_wait_code_at(&self, vpos: usize, hpos: usize) -> u8 {
+    pub(in crate::video) fn cpu_wait_code_at(&self, vpos: usize, hpos: usize) -> u8 {
         if vpos >= self.rows || hpos >= self.cols {
             return b'.';
         }
@@ -2006,14 +2177,18 @@ impl AnalyzerTraceView {
             .unwrap_or(b'.')
     }
 
-    fn record_at(&self, vpos: usize, hpos: usize) -> Option<&crate::bus::BusSlotRecord> {
+    pub(in crate::video) fn record_at(
+        &self,
+        vpos: usize,
+        hpos: usize,
+    ) -> Option<&crate::bus::BusSlotRecord> {
         if vpos >= self.rows || hpos >= self.cols {
             return None;
         }
         self.records.as_ref()?.get(vpos * self.cols + hpos)
     }
 
-    fn cpu_wait_row(&self, vpos: usize) -> Option<&[u8]> {
+    pub(in crate::video) fn cpu_wait_row(&self, vpos: usize) -> Option<&[u8]> {
         if vpos >= self.rows || self.cols == 0 {
             return None;
         }
@@ -2023,7 +2198,7 @@ impl AnalyzerTraceView {
 
     /// The share of `total` (the CPU's granted plus waited clocks) it
     /// spent waiting, as a percentage.
-    fn cpu_wait_percent(&self) -> f64 {
+    pub(in crate::video) fn cpu_wait_percent(&self) -> f64 {
         let granted = self.owner_cck[7];
         let total = granted.saturating_add(self.cpu_wait_cck);
         if total == 0 {
@@ -2608,7 +2783,7 @@ pub fn draw_drop_hint(frame: &mut [u8], texture_scale: usize) {
 
 /// Vertical pitch of a shortcut row. The panel is sized from this and the
 /// row count, and must stay inside `present_height()`.
-const SHORTCUT_ROW_H: usize = 18;
+const SHORTCUT_ROW_H: usize = 16;
 /// Trailing note lines under the shortcut table, and their pitch.
 const SHORTCUT_NOTES: [&str; 3] = [
     "Shortcuts: Cmd on macOS, Alt on Linux/Windows",
@@ -2621,7 +2796,7 @@ const SHORTCUT_NOTES_GAP: usize = 6;
 
 /// Panel height that exactly holds the table plus the notes, so adding a row
 /// does not silently push the last one off the bottom. The gap above the
-/// notes and the bottom margin are what a 25-row table leaves within the
+/// notes and the bottom margin are what a 27-row table leaves within the
 /// display.
 fn shortcuts_panel_height() -> usize {
     TITLE_H
@@ -2632,12 +2807,14 @@ fn shortcuts_panel_height() -> usize {
         + 8
 }
 
-const SHORTCUT_ROWS: [(&str, &str, bool); 25] = [
+const SHORTCUT_ROWS: [(&str, &str, bool); 27] = [
     ("Q", "Quit", true),
     ("E", "Open the menu", true),
     ("S", "Save screenshot", true),
     ("R", "Record video on/off", true),
     ("Shift+R", "Record input on/off", true),
+    ("Shift+V", "Paste as keystrokes", true),
+    ("Shift+G", "Save clip as GIF", true),
     ("Shift+S", "Save state", true),
     ("Shift+L", "Load state", true),
     ("1-0", "Quick-save to a slot", true),
@@ -3614,7 +3791,7 @@ fn draw_audio_scope(
     }
 }
 
-fn owner_color(code: u8) -> u32 {
+pub(in crate::video) fn owner_color(code: u8) -> u32 {
     match code {
         b'R' => rgba(68, 180, 190),
         b'B' => rgba(64, 118, 230),
@@ -3628,7 +3805,7 @@ fn owner_color(code: u8) -> u32 {
     }
 }
 
-fn owner_name_for_code(code: u8) -> &'static str {
+pub(in crate::video) fn owner_name_for_code(code: u8) -> &'static str {
     match code {
         b'R' => "refresh",
         b'B' => "bitplane",
@@ -3645,7 +3822,7 @@ fn owner_name_for_code(code: u8) -> &'static str {
 /// Colour of a CPU wait code (`crate::bus::cpu_wait_class_code`): the
 /// denier's owner colour, a hotter red for the BLTPRI-set blitter, grey for
 /// the 020+ port turnaround.
-fn cpu_wait_color(code: u8) -> u32 {
+pub(in crate::video) fn cpu_wait_color(code: u8) -> u32 {
     match code {
         b'N' => rgba(255, 40, 40),
         b'p' => rgba(150, 150, 150),
@@ -3655,7 +3832,7 @@ fn cpu_wait_color(code: u8) -> u32 {
 }
 
 /// Legend name of a CPU wait code, short enough for the legend row.
-fn cpu_wait_name_for_code(code: u8) -> &'static str {
+pub(in crate::video) fn cpu_wait_name_for_code(code: u8) -> &'static str {
     match code {
         b'N' => "bltpri",
         b'p' => "port",
@@ -3855,6 +4032,67 @@ fn underlay_sample(
         .copied()
 }
 
+impl AnalyzerTraceView {
+    /// Shared beam-raster sampling; UI layout and selection overlays stay in
+    /// their renderer, while underlay, scrub and CPU-wait colours agree.
+    pub(in crate::video) fn raster_pixel(
+        &self,
+        underlay: Option<&AnalyzerUnderlayView>,
+        scrub: bool,
+        cpu_wait: bool,
+        size: [usize; 2],
+        point: [usize; 2],
+    ) -> u32 {
+        let vpos = point[1] * self.rows / size[1].max(1);
+        let hpos = point[0] * self.cols / size[0].max(1);
+        let owner_code = self.owner_code_at(vpos, hpos);
+        // The CPU wait view keeps the owner grid faintly visible under
+        // the slots the CPU was denied, so a stall reads against the
+        // DMA pattern that caused it.
+        let (code, mut color) = if cpu_wait {
+            let wait_code = self.cpu_wait_code_at(vpos, hpos);
+            if wait_code != b'.' {
+                (wait_code, cpu_wait_color(wait_code))
+            } else {
+                (owner_code, quarter_rgba(owner_color(owner_code)))
+            }
+        } else {
+            (owner_code, owner_color(owner_code))
+        };
+        if let Some(pix) = underlay.and_then(|under| {
+            underlay_sample(
+                under,
+                self,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: size[0],
+                    h: size[1],
+                },
+                point[0],
+                vpos,
+            )
+        }) {
+            // Picture shows through idle slots; owned slots blend the
+            // owner colour over the dimmed picture so both read. While
+            // scrubbing, beam positions the CRT has not reached yet
+            // ghost at an eighth brightness.
+            let drawn = !scrub || (vpos, hpos) <= (self.selected_vpos, self.selected_hpos);
+            let under_pix = if drawn {
+                dim_rgba(pix)
+            } else {
+                ghost_rgba(pix)
+            };
+            color = if code == b'.' {
+                under_pix
+            } else {
+                super::blend_rgba(under_pix, color, 176)
+            };
+        }
+        color
+    }
+}
+
 fn draw_owner_heatmap(
     frame: &mut [u8],
     rect: Rect,
@@ -3866,42 +4104,8 @@ fn draw_owner_heatmap(
 ) {
     fill_rect(frame, scale_rect(rect, scale), rgba(10, 12, 14), scale);
     for y in 0..rect.h {
-        let vpos = y * trace.rows / rect.h.max(1);
         for x in 0..rect.w {
-            let hpos = x * trace.cols / rect.w.max(1);
-            let owner_code = trace.owner_code_at(vpos, hpos);
-            // The CPU wait view keeps the owner grid faintly visible under
-            // the slots the CPU was denied, so a stall reads against the
-            // DMA pattern that caused it.
-            let (code, mut color) = if cpu_wait {
-                let wait_code = trace.cpu_wait_code_at(vpos, hpos);
-                if wait_code != b'.' {
-                    (wait_code, cpu_wait_color(wait_code))
-                } else {
-                    (owner_code, quarter_rgba(owner_color(owner_code)))
-                }
-            } else {
-                (owner_code, owner_color(owner_code))
-            };
-            if let Some(pix) =
-                underlay.and_then(|under| underlay_sample(under, trace, rect, x, vpos))
-            {
-                // Picture shows through idle slots; owned slots blend the
-                // owner colour over the dimmed picture so both read. While
-                // scrubbing, beam positions the CRT has not reached yet
-                // ghost at an eighth brightness.
-                let drawn = !scrub || (vpos, hpos) <= (trace.selected_vpos, trace.selected_hpos);
-                let under_pix = if drawn {
-                    dim_rgba(pix)
-                } else {
-                    ghost_rgba(pix)
-                };
-                color = if code == b'.' {
-                    under_pix
-                } else {
-                    super::blend_rgba(under_pix, color, 176)
-                };
-            }
+            let color = trace.raster_pixel(underlay, scrub, cpu_wait, [rect.w, rect.h], [x, y]);
             fill_rect(
                 frame,
                 scale_rect(
@@ -4875,7 +5079,7 @@ fn heat_rgba(argb: u32) -> u32 {
 }
 
 /// The address range one grid cell covers, as "$XXXXXX-$YYYYYY".
-fn heat_cell_range(base: u32, bytes_per_cell: u32, cell: usize) -> String {
+pub(in crate::video) fn heat_cell_range(base: u32, bytes_per_cell: u32, cell: usize) -> String {
     let start = base.saturating_add((cell as u32).saturating_mul(bytes_per_cell));
     let end = start.saturating_add(bytes_per_cell.saturating_sub(1));
     format!("${start:06X}-${end:06X}")
@@ -4893,7 +5097,7 @@ fn heat_resource_at(view: &AnalyzerHeatView, cell: usize) -> Option<&AnalyzerHea
 }
 
 /// `  in 'name' (kind)` when a registered resource covers the cell.
-fn heat_resource_suffix(view: &AnalyzerHeatView, cell: usize) -> String {
+pub(in crate::video) fn heat_resource_suffix(view: &AnalyzerHeatView, cell: usize) -> String {
     heat_resource_at(view, cell)
         .map(|resource| format!("  in '{}' ({})", resource.name, resource.kind))
         .unwrap_or_default()
@@ -5509,6 +5713,7 @@ pub fn draw_panel_layer(
         (Panel::DropChooser(state), _) => {
             draw_drop_chooser(frame, rect, state, hover, texture_scale)
         }
+        (Panel::States(panel), _) => draw_states_panel(frame, rect, panel, hover, texture_scale),
         _ => {}
     }
 }

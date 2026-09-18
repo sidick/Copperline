@@ -113,14 +113,16 @@ impl App {
         let scale_factor = r.window.scale_factor();
         let inner = r.window.inner_size();
         let phys = self.last_cursor_phys;
-        let context = r.pixels.context();
         // The rect the display quad is actually drawn into -- the
         // sub-rect's under autocrop or per-axis scaling, the classic
         // letterbox otherwise -- so the trace shows the same mapping the
         // position below went through.
         let layout = main_present_layout(r, display_src);
         let clip = layout.display_dst;
-        let texture = (context.texture_extent.width, context.texture_extent.height);
+        let texture = (
+            texture_width(r.texture_scale) as u32,
+            texture_height(r.texture_scale) as u32,
+        );
         let pos = phys.and_then(|p| layout.cursor_position(p));
         let region = match pos {
             Some(p) if cursor_in_status_bar(p) => "status_bar",
@@ -188,7 +190,11 @@ impl App {
             self.mouse_delta_remainder = (0.0, 0.0);
             self.release_mouse_buttons();
             window.set_cursor_visible(true);
-            window.set_title(window_title());
+            window.set_title(if self.debug_layout_active {
+                "Copperline · Debug"
+            } else {
+                window_title()
+            });
             info!("mouse released");
         }
     }
@@ -436,6 +442,9 @@ impl App {
     }
 
     pub(super) fn handle_raw_device_key_event(&mut self, event: RawKeyEvent) {
+        if self.debug_layout_active && !self.debug_guest_input {
+            return;
+        }
         let PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
@@ -452,23 +461,6 @@ impl App {
             return;
         }
         self.handle_amiga_key_event(rawkey, pressed);
-    }
-
-    pub(super) fn activate_analyzer_pick_at(
-        &mut self,
-        kind: ToolPanelKind,
-        pos: (i32, i32),
-    ) -> bool {
-        if kind != ToolPanelKind::FrameAnalyzer {
-            return false;
-        }
-        let control = self.tool_panel_control_at(kind, pos);
-        let Some(UiControl::AnalyzerPick { x, y, scanline }) = control else {
-            return false;
-        };
-        self.frame_analyzer_select(x, y, scanline);
-        self.request_redraw();
-        true
     }
 
     pub(super) fn update_host_modifiers(&mut self, modifiers: ModifiersState) {
@@ -565,6 +557,61 @@ impl App {
         // Reverse-debug: note the transition so replay can reproduce it.
         self.emu
             .tt_note_input(crate::inputsched::ReplayAction::Key { rawkey, pressed });
+    }
+
+    /// Type `text` on the emulated keyboard, the first key `delay_ms`
+    /// from now, through the same scheduled-key queue `--type-after` and
+    /// `--press-after` use (so it is recorded, journaled, and paced on
+    /// emulated time like any scripted key). Returns how many keys were
+    /// queued and the characters the US keymap could not type.
+    pub(super) fn type_text(&mut self, text: &str, delay_ms: u32) -> (usize, Vec<char>) {
+        let (keys, untypable) = crate::typing::keystrokes_for_text(text);
+        let base = self.emu.bus().emulated_seconds() + f64::from(delay_ms) / 1000.0;
+        for key in &keys {
+            let press_at = base + f64::from(key.offset_ms) / 1000.0;
+            self.auto_keys.push(super::ScheduledKey {
+                press_at_emulated_secs: press_at,
+                release_at_emulated_secs: press_at + f64::from(key.hold_ms) / 1000.0,
+                rawkey: key.rawkey,
+                pressed: false,
+            });
+        }
+        (keys.len(), untypable)
+    }
+
+    /// Paste as Keystrokes (menu / host shortcut modifier + Shift+V): type
+    /// the host clipboard's text into the machine. The typing starts a
+    /// moment after the shortcut so the chord's own Shift is up again
+    /// before the first typed Shift goes down; a held host key and a
+    /// scheduled press of the same key would otherwise merge.
+    pub(super) fn paste_as_keystrokes(&mut self) {
+        const START_DELAY_MS: u32 = 300;
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("paste as keystrokes: clipboard unavailable: {e}");
+                self.show_osd("Clipboard unavailable");
+                return;
+            }
+        };
+        if text.is_empty() {
+            self.show_osd("Clipboard is empty");
+            return;
+        }
+        let (count, untypable) = self.type_text(&text, START_DELAY_MS);
+        if count == 0 {
+            self.show_osd("Nothing in the clipboard can be typed");
+            return;
+        }
+        let mut message = format!("Typing {count} keys");
+        if !untypable.is_empty() {
+            let skipped: String = untypable.into_iter().collect();
+            info!("paste as keystrokes: no Amiga key for {skipped:?}; skipped");
+            message.push_str(" (some characters skipped)");
+        }
+        info!("paste as keystrokes: {count} keys queued");
+        self.show_osd(message);
+        self.request_redraw();
     }
 
     /// Start or stop the input recording (shortcut / menu item). On

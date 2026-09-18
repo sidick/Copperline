@@ -19,8 +19,8 @@
 class Copperline < Formula
   desc "Cycle-driven Amiga emulator (OCS/ECS/AGA) written in Rust"
   homepage "https://copperline.dev/"
-  url "https://github.com/CopperlineHQ/Copperline/archive/refs/tags/v0.19.0.tar.gz"
-  sha256 "7bfeb5bf3af546ede5dc06561a823b9ed162e2a57cabaf476b1f282821569bb9"
+  url "https://github.com/CopperlineHQ/Copperline/archive/refs/tags/v0.20.0.tar.gz"
+  sha256 "39fc5a96956508c78f0fe1072d5de590d42921608f99a84297f149ece6348529"
   license "GPL-3.0-or-later"
   head "https://github.com/CopperlineHQ/Copperline.git", branch: "main"
 
@@ -47,12 +47,18 @@ class Copperline < Formula
     # uses the pinned dependency graph.
     system "cargo", "install", *std_cargo_args
 
+    # Older stable source archives predate the shared inspector UI.
+    if (buildpath/"assets/egui/THIRD_PARTY_FONTS.txt").exist?
+      pkgshare.install "assets/egui/THIRD_PARTY_FONTS.txt"
+    end
+
     # Install the bundled AROS open-source Kickstart replacement (the default
     # boot ROM) where the binary looks for it: <prefix>/share/copperline/aros.
     # AROS is APL-licensed and freely redistributable, unlike a real Kickstart.
     (pkgshare/"aros").install Dir["assets/aros/*"]
 
-    # The CD32 profile's freely redistributable FMV cartridge ROM.
+    # The freely redistributable FMV cartridge ROM that fmv = true fits on the
+    # CD32 profile.
     (pkgshare/"fmv").install Dir["assets/fmv/*"]
 
     # Install the bundled open-source A4091 autoboot ROM (default when a config

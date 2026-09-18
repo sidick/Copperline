@@ -18,7 +18,7 @@ fn player_settings_overlay_field_by_field() -> Result<()> {
     base.set_display_defaults(Some("crt"), Some("1084"), Some(true));
 
     let overlay = RawConfig::parse(
-        "[display]\nshader = \"scanlines\"\nfull_screen = false\n\
+        "[display]\nshader = \"scanlines\"\nfull_screen = false\nvsync = false\n\
              [input]\nport2 = \"cd32\"\n",
     )?;
     base.merge_player_settings(&overlay);
@@ -26,6 +26,7 @@ fn player_settings_overlay_field_by_field() -> Result<()> {
     let cfg: Config = base.try_into()?;
     assert_eq!(cfg.shader, ShaderMode::Scanlines, "overlay wins");
     assert!(!cfg.full_screen, "overlay wins");
+    assert!(!cfg.vsync, "overlay wins");
     assert_eq!(cfg.bezel, BezelStyle::Model1084, "omitted keeps the base");
     assert_eq!(cfg.port_devices[1], crate::bus::PortDevice::Cd32Pad);
     assert_eq!(cfg.machine, Some(MachineModel::Cd32));
@@ -1262,6 +1263,19 @@ fn display_bezel_stickers_names_a_folder_and_defaults_to_none() -> Result<()> {
 }
 
 #[test]
+fn display_hidpi_texture_parses_and_defaults_to_on() -> Result<()> {
+    assert!(parse_config("")?.hidpi_texture);
+    let cfg = parse_config(
+        r#"
+            [display]
+            hidpi_texture = false
+            "#,
+    )?;
+    assert!(!cfg.hidpi_texture);
+    Ok(())
+}
+
+#[test]
 fn display_perf_overlay_parses_and_defaults_to_off() -> Result<()> {
     assert!(!parse_config("")?.perf_overlay);
     let cfg = parse_config(
@@ -1279,6 +1293,20 @@ fn display_perf_overlay_parses_and_defaults_to_off() -> Result<()> {
     }
     .apply_to(&mut raw);
     assert_eq!(raw.display.perf_overlay, Some(true));
+    Ok(())
+}
+
+#[test]
+fn display_vsync_defaults_on_and_round_trips_both_choices() -> Result<()> {
+    assert!(parse_config("")?.vsync);
+    for enabled in [false, true] {
+        let mut raw = RawConfig::parse(&format!("[display]\nvsync = {enabled}\n"))?;
+        // An unrelated player preference must retain this display choice.
+        raw.merge_player_settings(&RawConfig::default());
+        let saved = raw.to_toml_string()?;
+        assert_eq!(parse_config(&saved)?.vsync, enabled);
+    }
+    assert!(parse_config("[display]\nvsync = \"off\"\n").is_err());
     Ok(())
 }
 
@@ -1525,8 +1553,18 @@ fn machine_profile_defaults_match_bare_profile_configs() -> Result<()> {
 
 #[test]
 fn fmv_rom_is_cd32_only() -> Result<()> {
+    // The slot is empty unless asked for: a stock CD32 has no cartridge.
+    let stock = parse_config(
+        r#"
+            [machine]
+            profile = "CD32"
+            "#,
+    )?;
+    assert_eq!(stock.fmv_rom_path, None);
+
     let bundled = parse_config(
         r#"
+            fmv = true
             [machine]
             profile = "CD32"
             "#,
@@ -1553,6 +1591,47 @@ fn fmv_rom_is_cd32_only() -> Result<()> {
             "#,
     )?;
     assert_eq!(unfitted.fmv_rom_path, None);
+
+    let off = parse_config(
+        r#"
+            fmv = false
+            [machine]
+            profile = "CD32"
+            "#,
+    )?;
+    assert_eq!(off.fmv_rom_path, None);
+
+    // The two keys must agree.
+    let err = parse_config(
+        r#"
+            fmv = false
+            fmv_rom = "cd32fmv.rom"
+            [machine]
+            profile = "CD32"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("fmv = false conflicts"), "{err:#}");
+    let err = parse_config(
+        r#"
+            fmv = true
+            fmv_rom = ""
+            [machine]
+            profile = "CD32"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("fmv = true conflicts"), "{err:#}");
+
+    let err = parse_config(
+        r#"
+            fmv = true
+            [machine]
+            profile = "A1200"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("only valid for a CD32"), "{err:#}");
 
     let err = parse_config(
         r#"
@@ -2478,6 +2557,24 @@ fn copperhf_rejects_cd_image_paths() {
 }
 
 #[test]
+fn sf2000sd_rejects_cd_image_paths_and_names_its_own_section() {
+    // The SD card controller shares copperhf's hard-disks-only validation,
+    // but the error must name `[sf2000sd]`, not `[copperhf]` -- a card path
+    // rejected here has nothing to do with the copperhf section.
+    let err = parse_config(
+        r#"
+            [sf2000sd]
+            card = "game.cue"
+            "#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("hard disks only"), "{err:#}");
+    assert!(msg.contains("[sf2000sd]"), "{err:#}");
+    assert!(!msg.contains("copperhf"), "{err:#}");
+}
+
+#[test]
 fn copperhf_rejects_filesystem_key_on_a_file_path() {
     // `filesystem` only means something for a host-directory mount, same
     // rule as [ide]/[scsi]/[lide].
@@ -2757,6 +2854,70 @@ fn cd_images_fit_scsi_units_and_the_ide_port() -> Result<()> {
     Ok(())
 }
 
+/// A `.chd` is a CD image or a hard disk depending on what chdman put in
+/// it: the metadata tag decides, not the extension. A hard-disk CHD is
+/// therefore welcome on `[copperhf]`, which takes hard disks only, while a
+/// CD one is still refused there.
+#[test]
+fn chd_images_classify_by_their_metadata_not_their_extension() -> Result<()> {
+    use crate::harddrive::chd::tests::{write_chd_v5, write_hard_disk};
+    let dir = std::env::temp_dir().join(format!(
+        "copperline-config-chd-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir)?;
+    let hd = dir.join("disk.chd");
+    write_hard_disk(&hd, 8, [1; 20]);
+    let cd = dir.join("game.chd");
+    write_chd_v5(
+        &cd,
+        2448 * 2,
+        2448,
+        &[0u8; 2448 * 4],
+        &[(
+            *b"CHT2",
+            b"TRACK:1 TYPE:MODE1 SUBTYPE:NONE FRAMES:4\0".to_vec(),
+        )],
+        [2; 20],
+    );
+
+    assert!(!is_cd_image_path(&hd), "GDDD metadata makes it a hard disk");
+    assert!(is_cd_image_path(&cd), "CD track metadata makes it a CD");
+    assert!(
+        is_cd_image_path(&dir.join("missing.chd")),
+        "an unreadable .chd keeps its traditional reading"
+    );
+
+    let toml_path = |p: &Path| p.to_string_lossy().replace('\\', "\\\\");
+    let cfg = parse_config(&format!(
+        r#"
+            [copperhf]
+            unit0 = "{}"
+            "#,
+        toml_path(&hd)
+    ))?;
+    assert_eq!(
+        cfg.copperhf.units[0].as_ref().map(|d| d.path.clone()),
+        Some(hd.clone())
+    );
+    let err = parse_config(&format!(
+        r#"
+            [copperhf]
+            unit0 = "{}"
+            "#,
+        toml_path(&cd)
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("hard disks only"), "{err:#}");
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// The A3000's SCSI is motherboard silicon: its drives need no boot ROM,
 /// they are the default on that machine, and they fit nowhere else.
 #[test]
@@ -2817,11 +2978,13 @@ fn the_a3000_scsi_bus_takes_drives_without_a_boot_rom() -> Result<()> {
     Ok(())
 }
 
-/// A CD32 without an FMV-ROM override resolves the bundled open cartridge.
+/// A CD32 asking for the module without naming a ROM resolves the bundled
+/// open cartridge.
 #[test]
-fn cd32_without_fmv_override_resolves_the_bundled_rom() -> Result<()> {
+fn cd32_fmv_switch_resolves_the_bundled_rom() -> Result<()> {
     let mut cfg = parse_config(
         r#"
+            fmv = true
             [machine]
             profile = "CD32"
             "#,
@@ -3682,10 +3845,96 @@ fn emulation_uaelib_files_is_an_explicit_opt_in() -> Result<()> {
 }
 
 #[test]
+fn clipboard_share_is_unset_by_default_and_follows_the_key_or_flag() -> Result<()> {
+    assert_eq!(parse_config("")?.clipboard_share, None);
+    assert_eq!(
+        parse_config("[clipboard]\nshare = true\n")?.clipboard_share,
+        Some(true)
+    );
+    assert_eq!(
+        parse_config("[clipboard]\nshare = false\n")?.clipboard_share,
+        Some(false)
+    );
+    let overrides = ConfigOverrides {
+        clipboard: Some(true),
+        ..Default::default()
+    };
+    assert!(!overrides.is_empty());
+    assert_eq!(load_overrides(&overrides)?.clipboard_share, Some(true));
+    Ok(())
+}
+
+#[test]
+fn resolve_clipboard_share_needs_an_explicit_request() -> Result<()> {
+    // Unset settles off, windowed or headless: the clipboard unit is part
+    // of a services board a real Amiga does not have, and binding it at
+    // boot moves every Exec allocation behind it.
+    let mut cfg = parse_config("")?;
+    cfg.resolve_clipboard_share(false);
+    assert_eq!(cfg.clipboard_share, Some(false));
+
+    let mut cfg = parse_config("[clipboard]\nshare = false\n")?;
+    cfg.resolve_clipboard_share(false);
+    assert_eq!(cfg.clipboard_share, Some(false));
+
+    let mut cfg = parse_config("[clipboard]\nshare = true\n")?;
+    cfg.resolve_clipboard_share(false);
+    assert_eq!(cfg.clipboard_share, Some(true));
+    Ok(())
+}
+
+#[test]
+fn resolve_clipboard_share_refuses_netplay_even_when_asked() -> Result<()> {
+    // Peers must build the same machine, and the unit is part of the
+    // board's layout: a session where one side fitted it could not agree
+    // on a machine at all.
+    for toml in ["", "[clipboard]\nshare = true\n"] {
+        let mut cfg = parse_config(toml)?;
+        cfg.resolve_clipboard_share(true);
+        assert_eq!(cfg.clipboard_share, Some(false), "config: {toml:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn toccata_is_absent_by_default_and_fits_when_enabled() -> Result<()> {
     assert!(!parse_config("")?.toccata);
     let cfg = parse_config("[toccata]\nenabled = true\n")?;
     assert!(cfg.toccata);
+    Ok(())
+}
+
+#[test]
+fn recording_clip_settings_default_and_validate() -> Result<()> {
+    let cfg = parse_config("")?;
+    assert_eq!(
+        cfg.recording,
+        RecordingConfig {
+            clip_seconds: crate::gifclip::DEFAULT_CLIP_SECONDS,
+            clip_fps: 0,
+        }
+    );
+    let cfg = parse_config("[recording]\nclip_seconds = 30\nclip_fps = 15\n")?;
+    assert_eq!(
+        cfg.recording.clip_settings(),
+        crate::gifclip::ClipSettings {
+            seconds: 30,
+            fps: 15
+        }
+    );
+    // 0 switches the ring off; the rate's 0 means automatic.
+    let cfg = parse_config("[recording]\nclip_seconds = 0\nclip_fps = 0\n")?;
+    assert_eq!(cfg.recording.clip_seconds, 0);
+    assert_eq!(cfg.recording.clip_fps, 0);
+
+    let err = parse_config("[recording]\nclip_seconds = 500\n").unwrap_err();
+    assert!(format!("{err:#}").contains("clip_seconds"), "{err:#}");
+    let err = parse_config("[recording]\nclip_fps = 120\n").unwrap_err();
+    assert!(format!("{err:#}").contains("clip_fps"), "{err:#}");
+    assert!(
+        parse_config("[recording]\nclip_len = 3\n").is_err(),
+        "unknown [recording] keys are rejected"
+    );
     Ok(())
 }
 
@@ -5498,5 +5747,312 @@ fn runahead_machine_gate_rejects_host_coupled_storage() -> Result<()> {
         cfg.runahead_machine_block_reason(),
         Some("hard-drive or ATAPI image")
     );
+
+    // A card in the PCMCIA slot is host-coupled storage too: a CF card is
+    // a hard-disk image, and an SRAM card with a backing file persists.
+    for body in [
+        "[pcmcia]\ncard = \"cf\"\npath = \"card.hdf\"",
+        "[pcmcia]\ncard = \"sram\"\nsize = \"1M\"\npath = \"sram.bin\"",
+        "[pcmcia]\ncard = \"sram\"\nsize = \"1M\"",
+    ] {
+        let cfg = parse_config(&format!("[machine]\nprofile = \"A1200\"\n{body}\n"))?;
+        assert_eq!(
+            cfg.runahead_machine_block_reason(),
+            Some("PCMCIA card"),
+            "for {body}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn parallel_adapter_sockets_and_the_light_pen_parse() -> Result<()> {
+    // The adapter alone fills both sockets.
+    let cfg = parse_config("[parallel]\ndevice = \"joystick-adapter\"\n")?;
+    assert_eq!(cfg.parallel.device, ParallelDevice::JoystickAdapter);
+    assert_eq!(cfg.parallel_joysticks, [true, true]);
+    let multitap = parse_config("[parallel]\ndevice = \"multitap\"\n")?;
+    assert_eq!(multitap.parallel.device, ParallelDevice::JoystickAdapter);
+    assert_eq!(multitap.parallel_joysticks, [true, true]);
+    // A socket named implies the adapter; an unnamed socket stays empty.
+    let cfg = parse_config("[input]\nport3 = \"joystick\"\n")?;
+    assert_eq!(cfg.parallel.device, ParallelDevice::JoystickAdapter);
+    assert_eq!(cfg.parallel_joysticks, [true, false]);
+    let cfg =
+        parse_config("[parallel]\ndevice = \"joystick-adapter\"\n[input]\nport4 = \"none\"\n")?;
+    assert_eq!(cfg.parallel_joysticks, [true, false]);
+    assert_eq!(parse_config("")?.parallel_joysticks, [false, false]);
+    // A joystick on a connector another peripheral owns is a conflict.
+    let err = parse_config(
+        "[parallel]\ndevice = \"printer\"\noutput = \"p.raw\"\n[input]\nport3 = \"joystick\"\n",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("port3"), "{err}");
+    // Only switch joysticks fit the adapter.
+    let err = parse_config("[input]\nport4 = \"cd32\"\n").unwrap_err();
+    assert!(err.to_string().contains("port4"), "{err}");
+    // The pen, by any of its names, in either game port.
+    for text in ["lightpen", "lightgun", "light-pen"] {
+        let cfg = parse_config(&format!("[input]\nport2 = {text:?}\n"))?;
+        assert_eq!(cfg.port_devices[1], PortDevice::LightPen, "for {text:?}");
+    }
+    assert_eq!(
+        parse_config("[input]\nport1 = \"lightpen\"\n")?.port_devices[0],
+        PortDevice::LightPen
+    );
+    // The CLI overrides reach the same keys.
+    let overrides = ConfigOverrides {
+        port3: Some("joystick".to_string()),
+        port4: Some("joystick".to_string()),
+        ..ConfigOverrides::default()
+    };
+    assert!(!overrides.is_empty());
+    let cfg = load_overrides(&overrides)?;
+    assert_eq!(cfg.parallel.device, ParallelDevice::JoystickAdapter);
+    assert_eq!(cfg.parallel_joysticks, [true, true]);
+    Ok(())
+}
+
+/// `[pcmcia]` needs the Gayle machines' slot, names its card properly, and
+/// the SRAM size must fit the common window and the CIS size encoding.
+#[test]
+fn pcmcia_section_parses_cf_and_sram_cards_and_needs_a_slot() {
+    let err = parse_config(
+        r#"
+            [pcmcia]
+            card = "cf"
+            path = "card.hdf"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("PCMCIA slot"), "{err:#}");
+
+    let cfg = parse_config(
+        r#"
+            [machine]
+            profile = "A1200"
+            [pcmcia]
+            card = "cf"
+            path = "card.hdf"
+            "#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.pcmcia.card,
+        PcmciaCardConfig::Cf {
+            path: PathBuf::from("card.hdf")
+        }
+    );
+    assert!(!cfg.pcmcia_slot_shadowed(), "2M fast RAM leaves the slot");
+
+    let cfg = parse_config(
+        r#"
+            [machine]
+            profile = "A600"
+            [pcmcia]
+            card = "sram"
+            size = "2M"
+            path = "sram.bin"
+            read_only = true
+            "#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.pcmcia.card,
+        PcmciaCardConfig::Sram {
+            size: 2 * 1024 * 1024,
+            path: Some(PathBuf::from("sram.bin")),
+            read_only: true,
+        }
+    );
+
+    for (body, needle) in [
+        ("card = \"cf\"", "needs path"),
+        ("card = \"sram\"", "needs size"),
+        ("card = \"sram\"\nsize = \"8M\"", "between 64K and 4M"),
+        ("card = \"sram\"\nsize = \"1088K\"", "CIS"),
+        ("card = \"flash\"", "not known"),
+        ("path = \"x.hdf\"", "names no card type"),
+        (
+            "card = \"cf\"\npath = \"x.hdf\"\nsize = \"1M\"",
+            "SRAM card",
+        ),
+    ] {
+        let err = parse_config(&format!(
+            "[machine]\nprofile = \"A1200\"\n[pcmcia]\n{body}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains(needle), "{body}: {err:#}");
+    }
+}
+
+/// The Zorro II fast-RAM rule: more than 4M reaches the slot's common
+/// memory window, and the slot is reported shadowed; the configuration is
+/// still accepted (the machine warns at build time).
+#[test]
+fn pcmcia_slot_is_shadowed_by_more_than_4m_of_fast_ram() {
+    let cfg = parse_config(
+        r#"
+            [machine]
+            profile = "A1200"
+            [memory]
+            fast = "8M"
+            [pcmcia]
+            card = "sram"
+            size = "4M"
+            "#,
+    )
+    .unwrap();
+    assert!(cfg.pcmcia_slot_shadowed());
+    let cfg = parse_config(
+        r#"
+            [machine]
+            profile = "A1200"
+            [memory]
+            fast = "4M"
+            "#,
+    )
+    .unwrap();
+    assert!(!cfg.pcmcia_slot_shadowed());
+    // Not a Gayle machine: no slot to shadow.
+    let cfg = parse_config("[machine]\nprofile = \"A500\"\n[memory]\nfast = \"8M\"\n").unwrap();
+    assert!(!cfg.pcmcia_slot_shadowed());
+}
+
+/// A real disk on the slot needs the slot, and cannot share it with a
+/// `[pcmcia]` card; it does not count as a drive on the IDE port for the
+/// ROM scsi.device default.
+#[test]
+fn host_disk_on_the_pcmcia_slot_needs_a_free_slot() {
+    let err = parse_config(
+        r#"
+            [[host_disk]]
+            device = "sdb"
+            attach = "pcmcia"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("A600 or A1200"), "{err:#}");
+
+    let err = parse_config(
+        r#"
+            [machine]
+            profile = "A1200"
+            [pcmcia]
+            card = "sram"
+            size = "1M"
+            [[host_disk]]
+            device = "sdb"
+            attach = "pcmcia"
+            "#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("one card"), "{err:#}");
+
+    let cfg = parse_config(
+        r#"
+            [machine]
+            profile = "A1200"
+            [[host_disk]]
+            device = "sdb"
+            attach = "pcmcia"
+            "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.host_disks[0].attach, HostDiskAttach::Pcmcia);
+    assert!(
+        cfg.rom_scsi_device_disable,
+        "a card in the slot is not scsi.device's drive"
+    );
+    assert_eq!(
+        HostDiskAttach::from_token("PCMCIA"),
+        Some(HostDiskAttach::Pcmcia)
+    );
+}
+
+/// `--pcmcia-cf` and `--pcmcia-sram` write the `[pcmcia]` section.
+#[test]
+fn pcmcia_command_line_overrides_fill_the_section() -> Result<()> {
+    let cfg = load_overrides(&ConfigOverrides {
+        model: Some("A1200".to_string()),
+        pcmcia_cf: Some("cf.hdf".to_string()),
+        ..ConfigOverrides::default()
+    })?;
+    assert_eq!(
+        cfg.pcmcia.card,
+        PcmciaCardConfig::Cf {
+            path: PathBuf::from("cf.hdf")
+        }
+    );
+    let cfg = load_overrides(&ConfigOverrides {
+        model: Some("A600".to_string()),
+        pcmcia_sram: Some("512K".to_string()),
+        ..ConfigOverrides::default()
+    })?;
+    assert_eq!(
+        cfg.pcmcia.card,
+        PcmciaCardConfig::Sram {
+            size: 512 * 1024,
+            path: None,
+            read_only: false,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn serial_section_selects_device_mode_and_port() -> Result<()> {
+    let cfg = parse_config("[serial]\nmode = \"device\"\ndevice = \"/dev/tty.usbserial-1420\"\n")?;
+    assert_eq!(cfg.serial.mode, SerialMode::Device);
+    assert_eq!(
+        cfg.serial.device.as_deref(),
+        Some("/dev/tty.usbserial-1420")
+    );
+    // A Windows COM name is a plain string too, and whitespace around a
+    // path is not part of it. An empty one is no port at all.
+    let cfg = parse_config("[serial]\nmode = \"device\"\ndevice = \" COM3 \"\n")?;
+    assert_eq!(cfg.serial.device.as_deref(), Some("COM3"));
+    let cfg = parse_config("[serial]\nmode = \"device\"\ndevice = \"\"\n")?;
+    assert_eq!(cfg.serial.device, None);
+    // The path is carried in the other modes (the launcher round-trips
+    // it) and only opened in this one.
+    let cfg = parse_config("[serial]\nmode = \"stdout\"\ndevice = \"COM3\"\n")?;
+    assert_eq!(cfg.serial.mode, SerialMode::Stdout);
+    assert_eq!(cfg.serial.device.as_deref(), Some("COM3"));
+    // The mode list in the rejection names it.
+    let err = parse_config("[serial]\nmode = \"usb\"\n").unwrap_err();
+    assert!(err.to_string().contains("\"device\""), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn cli_serial_device_implies_device_mode() -> Result<()> {
+    // Like --serial-connect implying tcp-connect: naming a host port is
+    // enough, unless --serial explicitly chose another mode.
+    let overrides = ConfigOverrides {
+        serial_device: Some("/dev/ttyUSB0".to_string()),
+        ..Default::default()
+    };
+    let cfg = load_overrides(&overrides)?;
+    assert_eq!(cfg.serial.mode, SerialMode::Device);
+    assert_eq!(cfg.serial.device.as_deref(), Some("/dev/ttyUSB0"));
+
+    let overrides = ConfigOverrides {
+        serial: Some("off".to_string()),
+        serial_device: Some("/dev/ttyUSB0".to_string()),
+        ..Default::default()
+    };
+    let cfg = load_overrides(&overrides)?;
+    assert_eq!(cfg.serial.mode, SerialMode::Off);
+    assert_eq!(cfg.serial.device.as_deref(), Some("/dev/ttyUSB0"));
+
+    // The other implying flags outrank it, as they do each other.
+    let overrides = ConfigOverrides {
+        serial_connect: Some("bbs.example.com:1337".to_string()),
+        serial_device: Some("/dev/ttyUSB0".to_string()),
+        ..Default::default()
+    };
+    let cfg = load_overrides(&overrides)?;
+    assert_eq!(cfg.serial.mode, SerialMode::TcpConnect);
     Ok(())
 }

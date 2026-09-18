@@ -339,6 +339,8 @@ fn every_launcher_tab_row_fits_inside_the_panel() {
         SerialMode::Tcp,
         SerialMode::TcpConnect,
         SerialMode::Pty,
+        SerialMode::Modem,
+        SerialMode::Device,
     ];
     // The strip tabs, plus the sub-pages and A/V categories reached from a
     // nav row rather than the strip.
@@ -794,6 +796,7 @@ fn the_beam_tab_draws_below_the_tab_row() {
         frame: 1,
         seconds: 0.0,
         rows: 4,
+        nominal_rows: 4,
         cols: 4,
         line_cck: 4,
         visible_start_vpos: 0,
@@ -972,6 +975,7 @@ fn analyzer_underlay_sample_maps_display_box_to_framebuffer() {
         frame: 1,
         seconds: 0.0,
         rows: 312,
+        nominal_rows: 312,
         cols: 227,
         line_cck: 227,
         visible_start_vpos: 0x1A,
@@ -1276,6 +1280,44 @@ fn parse_hex_entry() {
 }
 
 #[test]
+fn memory_edit_cursor_types_nibbles_and_ascii() {
+    let mut panel = DebuggerPanel::new();
+    assert!(!panel.mem_type_char('A', 0x00), "no cursor, nothing typed");
+    panel.mem_cursor = Some(MemCursor::new(0x1000, MemColumn::Hex));
+    // Non-hex characters are ignored in the hex column.
+    assert!(!panel.mem_type_char('g', 0x12));
+    assert!(panel.mem_pending.is_empty());
+    // The first digit replaces the high nibble and keeps the low one; the
+    // second completes the byte.
+    assert!(!panel.mem_type_char('a', 0x12));
+    assert_eq!(panel.mem_pending_value(0x1000), Some(0xA2));
+    assert!(!panel.mem_cursor.unwrap().high_nibble);
+    assert!(panel.mem_type_char('B', 0x12));
+    assert_eq!(panel.mem_pending, vec![(0x1000, 0xAB)]);
+    assert!(panel.mem_cursor.unwrap().high_nibble);
+    // Re-editing the same byte replaces the staged value in place.
+    assert!(!panel.mem_type_char('0', 0x12));
+    assert_eq!(panel.mem_pending, vec![(0x1000, 0x0B)]);
+    // Moving wraps within the address mask and resets the nibble phase.
+    assert_eq!(panel.mem_cursor_move(-0x1001, 0xFF_FFFF), Some(0xFF_FFFF));
+    assert!(panel.mem_cursor.unwrap().high_nibble);
+    // ASCII: printable characters only, one per byte.
+    panel.mem_cursor = Some(MemCursor::new(0x2000, MemColumn::Ascii));
+    assert!(!panel.mem_type_char('\u{e9}', 0x00));
+    assert!(!panel.mem_type_char('\n', 0x00));
+    assert!(panel.mem_type_char('Z', 0x00));
+    assert_eq!(panel.mem_pending_value(0x2000), Some(0x5A));
+    let edits = panel.mem_edit_take();
+    assert_eq!(edits, vec![(0x1000, 0x0B), (0x2000, 0x5A)]);
+    assert!(panel.mem_cursor.is_none());
+    assert!(panel.mem_pending.is_empty());
+    panel.mem_cursor = Some(MemCursor::new(0x3000, MemColumn::Hex));
+    panel.mem_stage(0x3000, 1);
+    panel.mem_edit_cancel();
+    assert!(panel.mem_cursor.is_none() && panel.mem_pending.is_empty());
+}
+
+#[test]
 fn entry_box_parses_address_and_poke_tokens() {
     let mut panel = DebuggerPanel::new();
     // The entry only accepts hex, space, and the P/S/R register letters.
@@ -1395,6 +1437,7 @@ fn cpu_wait_view_lights_denied_slots_and_dims_the_rest() {
         frame: 1,
         seconds: 0.0,
         rows: 4,
+        nominal_rows: 4,
         cols: 4,
         line_cck: 4,
         visible_start_vpos: 0,
@@ -1471,6 +1514,7 @@ fn cpu_wait_counters_stop_at_the_column_bottom() {
         frame: 1,
         seconds: 0.0,
         rows: 4,
+        nominal_rows: 4,
         cols: 4,
         line_cck: 4,
         visible_start_vpos: 0,
@@ -1537,6 +1581,7 @@ fn frame_analyzer_top_edge_overlays_clip_to_raster() {
         frame: 1,
         seconds: 0.0,
         rows: 4,
+        nominal_rows: 4,
         cols: 4,
         line_cck: 4,
         visible_start_vpos: 0,
@@ -2053,6 +2098,134 @@ fn panels_render_into_their_rects() {
     }
     save(&frame, "drop-chooser");
 
+    // The Load State browser: slots and named states with thumbnails,
+    // one flagged as another machine's, one empty, one unreadable.
+    let mut frame = vec![0u8; w * h * 4];
+    let thumbnail = |seed: u32| {
+        let (tw, th) = (
+            crate::savestate::THUMBNAIL_WIDTH,
+            crate::savestate::THUMBNAIL_HEIGHT,
+        );
+        let pixels = (0..tw * th)
+            .map(|i| {
+                let (x, y) = ((i % tw) as u32, (i / tw) as u32);
+                let band = if (y / 12 + seed).is_multiple_of(3) {
+                    96
+                } else {
+                    24
+                };
+                rgba(x * 255 / tw as u32, band, 255 - y * 255 / th as u32)
+            })
+            .collect();
+        Some(StateThumbnail {
+            pixels,
+            width: tw,
+            height: th,
+        })
+    };
+    let state_entry = |label: &str, slot: Option<usize>, seed: u32| StateEntry {
+        path: std::path::PathBuf::from(format!("/states/{label}.clstate")),
+        label: label.to_string(),
+        slot,
+        empty: false,
+        saved_at_unix: Some(1_699_956_800 + u64::from(seed) * 3600),
+        emulated_seconds: Some(83.4 + f64::from(seed) * 40.0),
+        machine: "A1200 / M68EC020 / Aga / Pal / chip 2048K fast 8192K".to_string(),
+        media: "DF0: workbench.adf, DF1: -, HD: work.hdf".to_string(),
+        thumbnail: thumbnail(seed),
+        mismatch: None,
+        error: None,
+    };
+    let mut entries = vec![
+        state_entry("Slot 1", Some(1), 0),
+        StateEntry {
+            empty: true,
+            thumbnail: None,
+            ..state_entry("Slot 2", Some(2), 0)
+        },
+        state_entry("copperline-state-20260908213011.clstate", None, 1),
+        StateEntry {
+            mismatch: Some("machine A500 -> A1200, chipset Ocs -> Aga".to_string()),
+            ..state_entry("before-the-boss.clstate", None, 2)
+        },
+        StateEntry {
+            error: Some("not a Copperline save state".to_string()),
+            thumbnail: None,
+            ..state_entry("stray.clstate", None, 0)
+        },
+    ];
+    entries.push(state_entry("older.clstate", None, 1));
+    let ui = UiState {
+        menu_open: false,
+        menu_rows: Vec::new(),
+        menu_nav: menu::MenuNav::default(),
+        panel: Some(Panel::States(Box::new(StatesPanel {
+            dir: std::path::PathBuf::from("/Users/amiga/Documents/Copperline/states"),
+            entries,
+            selected: 2,
+            scroll: 0,
+            focus: StatesFocus::List,
+            confirm_delete: false,
+            status: None,
+        }))),
+    };
+    draw(&mut frame, scale, &ui, Some(UiControl::StateRow(3)), None);
+    assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
+    let panel = ui.panel.as_ref().unwrap();
+    if let Panel::States(state) = panel {
+        let rect = panel_rect(panel);
+        let rows = states_row_rects(rect, state);
+        assert_eq!(rows.len(), states_visible_rows().min(6));
+        assert_eq!(rows[0].0, UiControl::StateRow(0));
+        // The first row's thumbnail lands inside its row: a pixel from the
+        // synthetic picture's bright band, not the panel ground.
+        let row = rows[0].1;
+        let probe = ((row.y + 4 + 2) * w + row.x + 4 + 2) * 4;
+        assert_ne!(&frame[probe..probe + 4], &PANEL_BG.to_le_bytes());
+        assert_ne!(&frame[probe..probe + 4], &ENTRY_BG.to_le_bytes());
+        // The buttons sit under the list, inside the panel.
+        let buttons = states_button_rects(rect, state);
+        assert_eq!(buttons.len(), 3);
+        for (_, b) in &buttons {
+            assert!(b.y + b.h <= rect.y + rect.h);
+        }
+    } else {
+        unreachable!();
+    }
+    save(&frame, "load-state");
+    // With the delete question up, the footer asks it.
+    if let Some(Panel::States(state)) = &mut { ui }.panel {
+        let mut state = std::mem::replace(
+            state,
+            Box::new(StatesPanel {
+                dir: std::path::PathBuf::new(),
+                entries: Vec::new(),
+                selected: 0,
+                scroll: 0,
+                focus: StatesFocus::List,
+                confirm_delete: false,
+                status: None,
+            }),
+        );
+        state.ask_delete();
+        assert!(state.confirm_delete);
+        let ui = UiState {
+            menu_open: false,
+            menu_rows: Vec::new(),
+            menu_nav: menu::MenuNav::default(),
+            panel: Some(Panel::States(state)),
+        };
+        let mut frame = vec![0u8; w * h * 4];
+        draw(&mut frame, scale, &ui, None, None);
+        let panel = ui.panel.as_ref().unwrap();
+        if let Panel::States(state) = panel {
+            let buttons = states_button_rects(panel_rect(panel), state);
+            assert_eq!(buttons.len(), 2);
+            assert_eq!(buttons[1].0, UiControl::StateCancelDelete);
+        }
+        save(&frame, "load-state-confirm");
+    }
+
     // The pre-drop hover hint dims the display without opening a panel.
     let mut frame = vec![0xFFu8; w * h * 4];
     draw_drop_hint(&mut frame, scale);
@@ -2131,8 +2304,10 @@ fn panels_render_into_their_rects() {
         status: "paused frame 1234 24.68s".to_string(),
         lines,
         bitmap: None,
+        memory: None,
         video: None,
         audio: None,
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.entry = "C00000".to_string();
@@ -2172,8 +2347,10 @@ fn panels_render_into_their_rects() {
         status: "paused frame 1234 24.68s".to_string(),
         lines,
         bitmap: None,
+        memory: None,
         video: None,
         audio: None,
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.tab = DebugTab::Break;
@@ -2214,8 +2391,10 @@ fn panels_render_into_their_rects() {
         status: "running frame 1234 24.68s".to_string(),
         lines,
         bitmap: None,
+        memory: None,
         video: None,
         audio: None,
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.tab = DebugTab::Waveform;
@@ -2350,8 +2529,10 @@ fn panels_render_into_their_rects() {
         status: "paused frame 1234 24.68s".to_string(),
         lines: Vec::new(),
         bitmap: None,
+        memory: None,
         video: None,
         audio: Some(audio),
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.tab = DebugTab::Audio;
@@ -2405,8 +2586,10 @@ fn panels_render_into_their_rects() {
         status: "paused frame 1234 24.68s".to_string(),
         lines,
         bitmap: None,
+        memory: None,
         video: None,
         audio: None,
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.tab = DebugTab::IoMap;
@@ -2458,6 +2641,7 @@ fn panels_render_into_their_rects() {
         status: "paused frame 1234 24.68s".to_string(),
         lines: Vec::new(),
         bitmap: None,
+        memory: None,
         video: Some(VideoView {
             header: "BPLCON0 5200: 5 planes lores  HAM   DMACON: BPLEN on SPREN on".to_string(),
             plane_mask: 0xFD,
@@ -2467,6 +2651,7 @@ fn panels_render_into_their_rects() {
             palette,
         }),
         audio: None,
+        cpu: None,
     }));
     let mut panel = DebuggerPanel::new();
     panel.tab = DebugTab::Video;
@@ -2550,6 +2735,7 @@ fn panels_render_into_their_rects() {
         frame: 1234,
         seconds: 24.68,
         rows,
+        nominal_rows: rows,
         cols,
         line_cck: 227,
         visible_start_vpos: 0x1A,
@@ -3419,12 +3605,15 @@ fn panels_render_into_their_rects() {
         status_bar_hidden: false,
         bezel: crate::config::BezelStyle::None,
         perf_overlay: false,
+        vsync: true,
         warp: false,
         warp_speed: WarpSpeed::Max,
         rewind: false,
         recording: false,
         input_recording: false,
         autofire_hz: 0,
+        clipboard_share: false,
+        clipboard_available: false,
         run_ahead_frames: 0,
         joystick_input_mode: JoystickInputMode::Gamepad,
         keyboard_panel: false,
@@ -3432,6 +3621,8 @@ fn panels_render_into_their_rects() {
             crate::bus::PortDevice::Mouse,
             crate::bus::PortDevice::Joystick,
         ],
+        pcmcia_slot: false,
+        pcmcia_card: None,
         pixel_aspect: PixelAspect::Tv,
         scaling: crate::config::DisplayScaling::Smooth,
         autocrop: false,
@@ -3814,10 +4005,11 @@ fn panels_render_into_their_rects() {
         }
     }
 
-    // The FMV module's action is live even with no custom path: Remove writes
-    // the explicit empty-slot state, then the same button offers Default and
-    // restores the bundled ROM. This is a tri-state module control, not an
-    // ordinary path Clear that goes dead while the default is in force.
+    // The FMV module's action is live even with no custom path: from the
+    // default empty slot the button offers Fit and fits the module with the
+    // bundled ROM, then the same button offers Remove and empties the slot
+    // again. This is a module control, not an ordinary path Clear that goes
+    // dead while the default is in force.
     {
         let probe = |setup: launcher::MachineSetup| {
             let mut state = LauncherState::new(setup);
@@ -3860,16 +4052,13 @@ fn panels_render_into_their_rects() {
         setup.select_model(Some(MachineModel::Cd32));
         assert_eq!(
             probe(setup.clone()),
-            (
-                "Remove",
-                Some(UiControl::LauncherClear(LauncherField::FmvRom))
-            )
+            ("Fit", Some(UiControl::LauncherClear(LauncherField::FmvRom)))
         );
         setup.toggle_fmv_module();
         assert_eq!(
             probe(setup),
             (
-                "Default",
+                "Remove",
                 Some(UiControl::LauncherClear(LauncherField::FmvRom))
             )
         );
@@ -4255,23 +4444,26 @@ fn check_netplay_controls(internet: bool, player: usize) {
                 );
                 vec![(at, UiControl::LauncherNetplayEdit(row.field))]
             }
-            RowKind::Action => vec![
-                (
+            RowKind::Action => {
+                let mut targets = vec![(
                     launcher_action_rect(rect, y),
-                    UiControl::LauncherNetplayAction(LauncherField::NetplayNewCode),
-                ),
-                (
-                    launcher_action2_rect(rect, y),
-                    UiControl::LauncherNetplayAction(LauncherField::NetplayCopyCode),
-                ),
-            ],
+                    UiControl::LauncherNetplayAction(row.field),
+                )];
+                if let Some(second) = launcher_second_action(row.field) {
+                    targets.push((
+                        launcher_action2_rect(rect, y),
+                        UiControl::LauncherNetplayAction(second),
+                    ));
+                }
+                targets
+            }
             _ => panic!("unexpected netplay widget"),
         };
         for (at, control) in targets {
-            if control == UiControl::LauncherNetplayAction(LauncherField::NetplayNewCode)
-                && !state.row_applies(LauncherField::NetplayNewCode)
-            {
-                continue;
+            if let UiControl::LauncherNetplayAction(field) = control {
+                if !state.row_applies(field) {
+                    continue;
+                }
             }
             assert!(at.x >= rect.x && at.x + at.w <= rect.x + rect.w);
             assert!(at.y + at.h < launcher_status_y(rect));

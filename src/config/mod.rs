@@ -38,9 +38,10 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// `rom = "..."` or the CLI argument) always replaces it.
 pub const BUNDLED_AROS_ROM: &str = "<bundled-aros>";
 
-/// Sentinel `fmv_rom_path` for the CD32 profile's freely redistributable FMV
-/// cartridge ROM. `fmv_rom = "..."` replaces it; `fmv_rom = ""` explicitly
-/// leaves the cartridge slot empty.
+/// Sentinel `fmv_rom_path` for the freely redistributable FMV cartridge ROM
+/// that `fmv = true` fits on the CD32 profile. `fmv_rom = "..."` fits the
+/// module with that image instead; without either the cartridge slot is
+/// empty.
 pub const BUNDLED_FMV_ROM: &str = "<bundled-fmv>";
 
 /// The player build's persisted end-user settings, an ordinary
@@ -213,9 +214,11 @@ pub struct Config {
     /// Extended ROM image (`extended_rom = "path"`): 512 KiB maps at
     /// $E00000 (CD32), 256 KiB at $F00000 (CDTV).
     pub extended_rom_path: Option<PathBuf>,
-    /// CD32 Full Motion Video cartridge ROM (`fmv_rom = "path"`). The CD32
-    /// profile defaults to Copperline's bundled open ROM; an empty string
-    /// explicitly leaves the physical 1 MiB autoconfig module unfitted.
+    /// CD32 Full Motion Video cartridge ROM: `fmv = true` fits the module
+    /// with Copperline's bundled open ROM, `fmv_rom = "path"` with that
+    /// image. None leaves the physical 1 MiB autoconfig module unfitted,
+    /// the default: a stock CD32 has no cartridge, and fitting one moves
+    /// the guest's memory layout and boot timing.
     pub fmv_rom_path: Option<PathBuf>,
     /// CD image (`[cd] image = "disc.cue"`), mounted on the machine's CD
     /// controller (CD32 Akiko or CDTV DMAC).
@@ -256,6 +259,8 @@ pub struct Config {
     /// Gayle IDE drive images (raw flat HDF, RDB inside), opened
     /// read/write. Only valid on machines with a Gayle gate array.
     pub ide: IdeConfig,
+    /// `[pcmcia]`: the card in the Gayle machines' credit-card slot.
+    pub pcmcia: PcmciaConfig,
     /// SCSI controller (`[scsi]`): the `controller` selects an A2091 (Zorro II),
     /// an A4091 (Zorro III), or the A3000's motherboard SCSI, plus up to seven
     /// drive images on SCSI IDs 0-6. The Zorro boards autoconfig on the chain
@@ -272,6 +277,11 @@ pub struct Config {
     /// defaults to the bundled one for its personality (`rom = ""` opts
     /// out into hardware-only mode).
     pub lide: LideConfig,
+    /// SF2000 accelerator Zorro II SD card controller (`[sf2000sd]`): an
+    /// SPI-mode SD card behind a register-compatible 64K I/O window,
+    /// autoconfigs on the chain like the SCSI/lide boards. See
+    /// `crate::sf2000sd` for the register protocol.
+    pub sf2000sd: Sf2000SdConfig,
     /// A2065 Ethernet board (`[a2065]`): when set, an A2065 NIC autoconfigs on
     /// the Zorro chain using the named host network backend. Networking is
     /// non-deterministic, so a fitted A2065 breaks byte-identical replay.
@@ -281,10 +291,24 @@ pub struct Config {
     /// joins the mixer as the `toccata` audio source. No other options
     /// exist yet (see docs/internals/toccata.md).
     pub toccata: bool,
+    /// Host <-> guest clipboard sharing (`[clipboard] share`,
+    /// `--clipboard`/`--no-clipboard`; `crate::clipboard`). `Some(true)`
+    /// fits the clipboard unit of the services board, windowed or headless
+    /// (headless it is reachable only through the control protocol, so the
+    /// run stays deterministic). Unset means off: the unit is an
+    /// autoconfig board the emulated Amiga does not have, and fitting it
+    /// moves the guest's memory map -- see
+    /// [`Config::resolve_clipboard_share`], which every session calls
+    /// before building a machine.
+    pub clipboard_share: Option<bool>,
     /// Freezer cartridge (`[cartridge]`, `crate::cartridge`): a system
     /// monitor in its own bank at $A10000, entered by a level-7 interrupt
     /// on a freeze.
     pub cartridge: CartridgeConfig,
+    /// GIF clip ring (`[recording]`, `crate::gifclip`): how much of the
+    /// presented picture the window keeps for Save Clip as GIF, and the
+    /// rate clips (interactive and `--gif-after`) are written at.
+    pub recording: RecordingConfig,
     /// The MHI virtual MPEG audio decoder board (`[mhi] enabled = true`):
     /// when true, an MHI board autoconfigs on the Zorro chain and its
     /// decoded-MP3 output joins the mixer as the `mhi` audio source. No
@@ -384,6 +408,17 @@ pub struct Config {
     /// top-right of the display. The `Cmd+P` / `Alt+P` toggle flips it live
     /// without affecting this start-up value.
     pub perf_overlay: bool,
+    /// Synchronise desktop presentation to vblank (`[display] vsync`).
+    /// Enabled by default; independent of the emulator's real-time pacing.
+    pub vsync: bool,
+    /// Draw the window's presentation texture at the display's
+    /// device-pixel density (`[display] hidpi_texture`, default true), so
+    /// a 200% (Retina) window is fed a 2x texture. `false` draws it at
+    /// canvas resolution and leaves the upscale to the GPU's scaler pass:
+    /// a quarter of the per-frame copy and upload, for slow hosts. The
+    /// picture's rows are then selected at canvas resolution rather than
+    /// at the finer texture grid, which fine interlaced detail can show.
+    pub hidpi_texture: bool,
     /// Screen tint applied to the window image: the phosphor colour of a
     /// monochrome monitor, or a sepia treatment. See [`Tint`].
     pub tint: Tint,
@@ -426,6 +461,12 @@ pub struct Config {
     /// `input.set_port`) changes the live machine without affecting this
     /// start-up value.
     pub port_devices: [PortDevice; 2],
+    /// Whether a joystick sits in each socket of the parallel-port
+    /// four-player adapter (`[input] port3` / `port4`, `--port3` /
+    /// `--port4`); index 0 = port 3. Only meaningful with
+    /// `[parallel] device = "joystick-adapter"`, which naming a joystick
+    /// here implies.
+    pub parallel_joysticks: [bool; 2],
     /// Host wiring for Paula's serial port (`[serial]` / `--serial`).
     /// Defaults to [`SerialMode::Stdout`], preserving the historical
     /// terminal-diagnostics behaviour.
@@ -896,6 +937,12 @@ pub enum SerialMode {
     /// [`Tcp`]: SerialMode::Tcp
     /// [`TcpConnect`]: SerialMode::TcpConnect
     Modem,
+    /// Serial in/out is wired to a real host serial port (the path in
+    /// [`SerialConfig::device`]): a USB adapter on a null-modem cable to
+    /// a real Amiga or PC. The host port follows the guest's SERPER rate
+    /// and stop bits, DTR/RTS drive the port's pins, and CTS/DSR/DCD come
+    /// back on CIA-B. Needs a build with the `host-serial` feature.
+    Device,
 }
 
 impl SerialMode {
@@ -909,6 +956,7 @@ impl SerialMode {
             Self::TcpConnect => "tcp-connect",
             Self::Pty => "pty",
             Self::Modem => "modem",
+            Self::Device => "device",
         }
     }
 }
@@ -946,6 +994,11 @@ pub struct SerialConfig {
     /// Remote `host:port` for [`SerialMode::TcpConnect`]. Required in that
     /// mode (there is no sensible default host to dial).
     pub connect: Option<String>,
+    /// Host serial port for [`SerialMode::Device`]: a device path
+    /// (`/dev/tty.usbserial-XXXX`, `/dev/ttyUSB0`) or a Windows COM name
+    /// (`COM3`). Required in that mode; carried through the others so the
+    /// configuration screen round-trips it.
+    pub device: Option<String>,
     /// `AT*T1`/`AT*T0` default at power-on: telnet NVT translation on by
     /// default. [`SerialMode::Modem`] only. Tri-state on purpose: `None` is
     /// "the config never said", which defers to a stored `AT&W` profile's
@@ -1074,6 +1127,10 @@ pub enum ParallelDevice {
     /// An 8-bit audio sampler (digitizer) on the data lines, fed from a host
     /// capture device. Needs a build with the `frontend` feature (cpal).
     Sampler,
+    /// The passive four-player joystick adapter (ports 3 and 4): switch
+    /// joysticks on the data lines and the Centronics status lines, as
+    /// Kick Off 2, Sensible Soccer, Dyna Blaster and the like read them.
+    JoystickAdapter,
 }
 
 impl ParallelDevice {
@@ -1083,6 +1140,7 @@ impl ParallelDevice {
             Self::None => "none",
             Self::Printer => "printer",
             Self::Sampler => "sampler",
+            Self::JoystickAdapter => "joystick-adapter",
         }
     }
 }
@@ -1156,22 +1214,71 @@ pub const HARDFILE_DEFAULT_BOOT_PRI: i8 = 0;
 pub const BOOT_PRI_NEVER: i8 = -128;
 
 /// Whether a drive-image path names a CD image (a cue sheet, a bare ISO,
-/// a Nero NRG, or a CHD). On the SCSI bus such an entry attaches a CD-ROM drive
-/// instead of a hard disk; the file extension is the format signal,
-/// exactly as it is for the hard-drive back ends (HDF vs. directory).
+/// a Nero NRG, or a CD-ROM CHD). On the SCSI bus such an entry attaches a
+/// CD-ROM drive instead of a hard disk; the file extension is the format
+/// signal, exactly as it is for the hard-drive back ends (HDF vs.
+/// directory) -- except for `.chd`, which chdman writes for hard disks
+/// (`createhd`) as well as CDs (`createcd`). A `.chd` is read to see which
+/// it holds; one that cannot be read (not there yet, say) keeps counting
+/// as a CD, so the open that follows reports the real problem.
 pub fn is_cd_image_path(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        e.eq_ignore_ascii_case("cue")
-            || e.eq_ignore_ascii_case("iso")
-            || e.eq_ignore_ascii_case("nrg")
-            || e.eq_ignore_ascii_case("chd")
-    })
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ext.eq_ignore_ascii_case("chd") {
+        return !crate::harddrive::chd::is_hard_disk_chd(path);
+    }
+    ext.eq_ignore_ascii_case("cue")
+        || ext.eq_ignore_ascii_case("iso")
+        || ext.eq_ignore_ascii_case("nrg")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdeConfig {
     pub master: Option<DriveImage>,
     pub slave: Option<DriveImage>,
+}
+
+/// The card `[pcmcia]` puts in the A600/A1200 slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PcmciaCardConfig {
+    /// An empty socket.
+    #[default]
+    None,
+    /// A CompactFlash (PCMCIA ATA) card over a hard-disk image: anything
+    /// the `[ide]` drive backend opens.
+    Cf { path: PathBuf },
+    /// An SRAM memory card of `size` bytes, optionally mirrored to a host
+    /// file, with its write-protect switch set by `read_only`.
+    Sram {
+        size: usize,
+        path: Option<PathBuf>,
+        read_only: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PcmciaConfig {
+    pub card: PcmciaCardConfig,
+}
+
+impl PcmciaConfig {
+    /// Whether a card is configured at all.
+    pub fn is_present(&self) -> bool {
+        self.card != PcmciaCardConfig::None
+    }
+
+    /// One line for logs.
+    pub fn describe(&self) -> String {
+        match &self.card {
+            PcmciaCardConfig::None => "empty".to_string(),
+            PcmciaCardConfig::Cf { path } => format!("CF card {}", path.display()),
+            PcmciaCardConfig::Sram { size, path, .. } => match path {
+                Some(p) => format!("SRAM card {} KiB ({})", size / 1024, p.display()),
+                None => format!("SRAM card {} KiB", size / 1024),
+            },
+        }
+    }
 }
 
 /// Which RTG graphics card the `[rtg]` section fits. A machine has at most
@@ -1266,6 +1373,27 @@ impl CopperhfConfig {
     }
 }
 
+/// `[sf2000sd]`: the SF2000 accelerator's Zorro II SD card controller
+/// (`crate::sf2000sd`), an SPI-mode SD card behind a register-compatible
+/// 64K I/O window. See `crate::sf2000sd` for the register protocol. A
+/// fitted board with no `rom` named stays in hardware-only mode: no
+/// bundled default the way `[lide]`'s is, since this ROM is the SF2000
+/// firmware author's, not Copperline's to ship.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sf2000SdConfig {
+    /// The attached card image, if any.
+    pub card: Option<DriveImage>,
+    /// Boot ROM image, if configured.
+    pub rom: Option<PathBuf>,
+}
+
+impl Sf2000SdConfig {
+    /// Whether a `[sf2000sd]` section asked for a board at all.
+    pub fn enabled(&self) -> bool {
+        self.card.is_some() || self.rom.is_some()
+    }
+}
+
 /// `[lide]`: a built-in Zorro II IDE board compatible with LIV2's
 /// `lide.device`. Drives may be hard disks or ATAPI CD-ROMs. A fitted board
 /// with no ROM named defaults to the bundled ROM for its personality
@@ -1293,6 +1421,37 @@ pub struct LideConfig {
     /// Drive images, in (channel, master/slave) order: 0-1 are channel 0's,
     /// 2-3 are channel 1's (RIPPLE only).
     pub drives: [Option<DriveImage>; 4],
+}
+
+/// `[recording]`: the GIF clip ring behind the window's Save Clip as GIF
+/// and the rate of every GIF clip written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingConfig {
+    /// Emulated seconds of presented frames the window keeps (default
+    /// 10, at most `gifclip::MAX_CLIP_SECONDS`); 0 disables the ring and
+    /// the menu item.
+    pub clip_seconds: u32,
+    /// Clip frame rate, 1 to `gifclip::MAX_CLIP_FPS`; 0 (the default)
+    /// picks 25 on PAL and 30 on NTSC.
+    pub clip_fps: u32,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            clip_seconds: crate::gifclip::DEFAULT_CLIP_SECONDS,
+            clip_fps: 0,
+        }
+    }
+}
+
+impl RecordingConfig {
+    pub fn clip_settings(&self) -> crate::gifclip::ClipSettings {
+        crate::gifclip::ClipSettings {
+            seconds: self.clip_seconds,
+            fps: self.clip_fps,
+        }
+    }
 }
 
 /// `[cartridge]`: which freezer cartridge is fitted, and the image it
@@ -1489,20 +1648,21 @@ pub const WARP_MAX_FRAME_CAP: usize = 1024;
 
 /// Wall-clock budget (milliseconds) for one presented frame in `WarpSpeed::Max`.
 /// The event loop emulates frames back-to-back until this much host time has
-/// elapsed, then presents one frame at vsync. Kept under a 60 Hz refresh
-/// interval (16.6 ms) so input is still polled and a frame still presented every
-/// host refresh while the core runs flat out.
+/// elapsed, then presents one frame (at vsync when enabled). Kept under a
+/// 60 Hz refresh interval (16.6 ms) so input is still polled and a frame still
+/// presented every host refresh while the core runs flat out.
 pub const WARP_MAX_BUDGET_MS: u64 = 12;
 
 /// How fast the UI "Warp Speed" (turbo) mode runs when engaged.
 ///
-/// Presentation is gated to the host monitor's refresh rate (the wgpu surface
-/// presents with vsync), so emulating exactly one frame per presented frame
+/// With vsync enabled, presentation is gated to the host monitor's refresh
+/// rate, so emulating exactly one frame per presented frame
 /// caps warp at the monitor rate -- about 1.2x for a 50 Hz PAL machine on a
 /// 60 Hz display. To decouple emulation speed from the monitor, warp emulates
 /// several frames per *presented* frame (output frame skip): the intermediate
 /// frames are computed but never rendered or presented, so the effective speed
-/// is the level times the refresh rate, host CPU permitting.
+/// is the level times the refresh rate, host CPU permitting. Without vsync,
+/// presentation frequency depends on host throughput instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WarpSpeed {
     /// Two emulated frames per presented frame.
@@ -1514,7 +1674,7 @@ pub enum WarpSpeed {
     /// Sixteen emulated frames per presented frame.
     X16,
     /// As many frames as fit in `WARP_MAX_BUDGET_MS` of host time per presented
-    /// frame (bounded by `WARP_MAX_FRAME_CAP`): run flat out, present at vsync.
+    /// frame (bounded by `WARP_MAX_FRAME_CAP`): run flat out, periodically present.
     #[default]
     Max,
 }
@@ -1698,6 +1858,9 @@ pub enum HostDiskAttach {
     LideSlave(u8),
     /// A unit on whichever SCSI controller the machine has fitted.
     Scsi(u8),
+    /// The A600/A1200 PCMCIA slot, as a CompactFlash card: the card a real
+    /// Amiga's owner carries in a reader goes straight in.
+    Pcmcia,
 }
 
 /// SCSI units a controller addresses. Unit 7 is the controller itself.
@@ -1712,6 +1875,7 @@ impl HostDiskAttach {
             Self::LideMaster(ch) => format!("lide{ch}-master"),
             Self::LideSlave(ch) => format!("lide{ch}-slave"),
             Self::Scsi(unit) => format!("scsi{unit}"),
+            Self::Pcmcia => "pcmcia".to_string(),
         }
     }
 
@@ -1723,7 +1887,13 @@ impl HostDiskAttach {
             Self::LideMaster(ch) => format!("Lide {ch} Master"),
             Self::LideSlave(ch) => format!("Lide {ch} Slave"),
             Self::Scsi(unit) => format!("SCSI Unit {unit}"),
+            Self::Pcmcia => "PCMCIA Slot".to_string(),
         }
+    }
+
+    /// Whether this is the PCMCIA slot.
+    pub fn is_pcmcia(self) -> bool {
+        self == Self::Pcmcia
     }
 
     /// What a machine with no way to attach a host disk at all is missing.
@@ -1740,6 +1910,7 @@ impl HostDiskAttach {
             Self::IdeMaster | Self::IdeSlave => "Attach to IDE requires an A600, A1200 or A4000",
             Self::LideMaster(_) | Self::LideSlave(_) => "Attach to Lide requires a [lide] board",
             Self::Scsi(_) => "Attach to SCSI requires a SCSI controller",
+            Self::Pcmcia => "Attach to PCMCIA requires an A600 or A1200",
         }
     }
 
@@ -1759,6 +1930,7 @@ impl HostDiskAttach {
             Self::LideSlave(1),
         ];
         all.extend((0..SCSI_UNITS).map(Self::Scsi));
+        all.push(Self::Pcmcia);
         all
     }
 
@@ -2256,6 +2428,32 @@ impl MachineDescriptor {
         )
     }
 
+    /// The summary a state browser has room for: model, CPU, chipset, video
+    /// standard, and the memory that is fitted, e.g.
+    /// "A1200 / 68EC020 / AGA / PAL / chip 2048K fast 8192K". RAM banks
+    /// that are empty are left out, and so is the ROM fingerprint.
+    pub fn short_summary(&self) -> String {
+        let profile = match self.machine {
+            Some(m) => format!("{m:?}"),
+            None => "custom".to_string(),
+        };
+        let mut memory = format!("chip {}K", self.chip_ram_bytes / 1024);
+        for (name, bytes) in [
+            ("fast", self.fast_ram_bytes),
+            ("slow", self.slow_ram_bytes),
+            ("mb", self.mb_ram_bytes),
+            ("accel", self.accel_ram_bytes),
+        ] {
+            if bytes > 0 {
+                memory.push_str(&format!(" {name} {}K", bytes / 1024));
+            }
+        }
+        format!(
+            "{profile} / {:?} / {:?} / {:?} / {memory}",
+            self.cpu, self.chipset, self.video_standard
+        )
+    }
+
     /// Human-readable, field-by-field differences between the running machine
     /// (`self`) and a state's machine (`other`), for the load-time log when
     /// they do not match. Empty when the shapes and ROMs are identical.
@@ -2467,12 +2665,16 @@ impl Default for Config {
             video_standard: VideoStandard::Pal,
             audio: AudioConfig::default(),
             ide: IdeConfig::default(),
+            pcmcia: PcmciaConfig::default(),
             scsi: ScsiConfig::default(),
             copperhf: CopperhfConfig::default(),
             lide: LideConfig::default(),
+            sf2000sd: Sf2000SdConfig::default(),
             a2065_net: None,
             toccata: false,
+            clipboard_share: None,
             cartridge: CartridgeConfig::default(),
+            recording: RecordingConfig::default(),
             mhi: false,
             hostsocket_net: None,
             hostsocket_transport: None,
@@ -2493,6 +2695,8 @@ impl Default for Config {
             bezel: BezelStyle::None,
             bezel_stickers: None,
             perf_overlay: false,
+            vsync: true,
+            hidpi_texture: true,
             tint: Tint::None,
             menu_scale: MenuScale::Normal,
             full_screen: false,
@@ -2502,6 +2706,7 @@ impl Default for Config {
             mouse_capture: MouseCapture::Click,
             autofire_hz: 0,
             port_devices: [PortDevice::Mouse, PortDevice::Joystick],
+            parallel_joysticks: [false; 2],
             serial: SerialConfig::default(),
             parallel: ParallelConfig::default(),
             paths: crate::pathconf::Paths::default(),
@@ -2510,6 +2715,27 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Settle host clipboard sharing for a session about to build a
+    /// machine: on only where the configuration asked for it, off
+    /// everywhere else, and off under netplay even when asked.
+    ///
+    /// The bridge is a unit of the Copperline services board, so fitting it
+    /// puts an autoconfig board on the chain that the emulated Amiga does
+    /// not have. Kickstart binds the board at boot and every Exec
+    /// allocation after that lands somewhere else, which is a different
+    /// machine from the one the configuration describes -- enough to move
+    /// where a program's buffers sit, and so what the Copper reads from a
+    /// list the program has pointed at but not yet written. A host
+    /// convenience cannot cost the guest its memory map by default, so it
+    /// is opt-in: `[clipboard] share = true` or `--clipboard`.
+    ///
+    /// Netplay refuses it on either side of the session, and even on an
+    /// explicit request: peers must build the same machine, and a session
+    /// where one side fitted the unit could not agree on one at all.
+    pub fn resolve_clipboard_share(&mut self, netplay: bool) {
+        self.clipboard_share = Some(!netplay && self.clipboard_share == Some(true));
+    }
+
     /// Why this resolved machine shape cannot use per-refresh run-ahead
     /// snapshots. These devices retain or mutate host state outside the
     /// serialized core. Dynamic media and observers are checked on the live
@@ -2526,8 +2752,15 @@ impl Config {
             || self.scsi.units.iter().any(Option::is_some)
             || self.copperhf.units.iter().any(Option::is_some)
             || self.lide.drives.iter().any(Option::is_some)
+            || self.sf2000sd.card.is_some()
         {
             return Some("hard-drive or ATAPI image");
+        }
+        if !matches!(self.pcmcia.card, crate::config::PcmciaCardConfig::None) {
+            // A CF card is a hard-disk image by another name, and an SRAM
+            // card with a backing file persists too: speculative writes
+            // that are then rolled back would still reach the host.
+            return Some("PCMCIA card");
         }
         if self.a2065_net.is_some() {
             return Some("A2065 network board");
@@ -2593,6 +2826,16 @@ impl Config {
         }
     }
 
+    /// Whether Zorro II fast RAM shadows the PCMCIA slot: the slot's common
+    /// memory window is `$600000`-`$9FFFFF`, and fast RAM configures upward
+    /// from `$200000`, so more than 4 MiB of it reaches into the window and
+    /// Gayle's PCMCIA decode gives way to the RAM board. Only meaningful on
+    /// a machine with a slot.
+    pub fn pcmcia_slot_shadowed(&self) -> bool {
+        self.gate_array.gayle_id().is_some()
+            && self.fast_ram_bytes > crate::pcmcia::MAX_FAST_RAM_WITH_SLOT
+    }
+
     /// Build the Zorro autoconfig chain this config asks for: the built-in
     /// Zorro II fast RAM board, the built-in Zorro III RAM board, any
     /// `[[zorro]]` metadata boards in file order, and finally (unless
@@ -2654,9 +2897,18 @@ pub struct ConfigOverrides {
     /// Fast CPU execution via the batch/trace-JIT path (`--jit`/`--no-jit`).
     /// Same semantics as `[cpu] jit`.
     pub cpu_jit: Option<bool>,
+    /// Host clipboard sharing (`--clipboard`/`--no-clipboard`). Same
+    /// semantics as `[clipboard] share`.
+    pub clipboard: Option<bool>,
     pub chip: Option<String>,
     pub fast: Option<String>,
     pub slow: Option<String>,
+    /// A CompactFlash card in the PCMCIA slot (`--pcmcia-cf PATH`): sets
+    /// `[pcmcia] card = "cf"` with that image.
+    pub pcmcia_cf: Option<String>,
+    /// An SRAM card in the PCMCIA slot (`--pcmcia-sram SIZE`): sets
+    /// `[pcmcia] card = "sram"` with that size, session-only.
+    pub pcmcia_sram: Option<String>,
     /// RAM power-on policy (`--ram-init`). Same syntax as `[memory] init`.
     pub ram_init: Option<String>,
     /// Ramsey motherboard fast RAM size (`--motherboard`). Same parser as
@@ -2684,6 +2936,11 @@ pub struct ConfigOverrides {
     pub port1: Option<String>,
     /// Device in game port 2 (`--port2`). Same parser as `[input] port2`.
     pub port2: Option<String>,
+    /// Joystick in the parallel-port adapter's sockets (`--port3` /
+    /// `--port4`): "joystick" or "none". Same parser as `[input] port3` /
+    /// `port4`.
+    pub port3: Option<String>,
+    pub port4: Option<String>,
     /// Autofire rate in Hz (`--autofire`), 0 for off. Same validation as
     /// `[input] autofire_hz`.
     pub autofire_hz: Option<u8>,
@@ -2691,13 +2948,16 @@ pub struct ConfigOverrides {
     /// `[emulation] run_ahead_frames`.
     pub run_ahead_frames: Option<u8>,
     /// Serial port wiring (`--serial`): "off", "stdout", "midi", "tcp",
-    /// "tcp-connect", or "pty" ("none" and "terminal" parse as
-    /// compatibility aliases of the first two). Same parser as
+    /// "tcp-connect", "pty", "modem", or "device" ("none" and "terminal"
+    /// parse as compatibility aliases of the first two). Same parser as
     /// `[serial] mode`.
     pub serial: Option<String>,
     /// Remote host:port the serial port dials (`--serial-connect`),
     /// implying `--serial tcp-connect`.
     pub serial_connect: Option<String>,
+    /// Host serial port to wire the serial port to (`--serial-device`),
+    /// implying `--serial device`. Same as `[serial] device`.
+    pub serial_device: Option<String>,
     /// A scripted session file to replay (`--serial-session`), implying
     /// `--serial modem`. Same as `[serial] session`.
     pub serial_session: Option<String>,
@@ -2825,6 +3085,8 @@ impl ConfigOverrides {
             && self.mouse_capture.is_none()
             && self.port1.is_none()
             && self.port2.is_none()
+            && self.port3.is_none()
+            && self.port4.is_none()
             && self.autofire_hz.is_none()
             && self.run_ahead_frames.is_none()
             && self.serial.is_none()
@@ -2853,6 +3115,7 @@ impl ConfigOverrides {
             && self.mt32_pcm_rom.is_none()
             && self.mt32_panel.is_none()
             && self.cartridge.is_none()
+            && self.clipboard.is_none()
     }
 
     /// Inject the set overrides into the raw config, replacing the values
@@ -2879,6 +3142,9 @@ impl ConfigOverrides {
         if let Some(jit) = self.cpu_jit {
             raw.cpu.jit = Some(jit);
         }
+        if let Some(share) = self.clipboard {
+            raw.clipboard.share = Some(share);
+        }
         if let Some(chip) = &self.chip {
             raw.memory.chip = Some(chip.clone());
         }
@@ -2902,6 +3168,20 @@ impl ConfigOverrides {
         }
         if let Some(speed) = self.floppy_speed {
             raw.floppy.speed = Some(speed);
+        }
+        if let Some(path) = &self.pcmcia_cf {
+            raw.pcmcia = RawPcmcia {
+                card: Some("cf".to_string()),
+                path: Some(path.clone()),
+                ..RawPcmcia::default()
+            };
+        }
+        if let Some(size) = &self.pcmcia_sram {
+            raw.pcmcia = RawPcmcia {
+                card: Some("sram".to_string()),
+                size: Some(size.clone()),
+                ..RawPcmcia::default()
+            };
         }
         // Real host disks named on the command line are added to whatever the
         // file already asked for; the parser is what refuses two disks, or a
@@ -2984,6 +3264,12 @@ impl ConfigOverrides {
         if let Some(port2) = &self.port2 {
             raw.input.port2 = Some(port2.clone());
         }
+        if let Some(port3) = &self.port3 {
+            raw.input.port3 = Some(port3.clone());
+        }
+        if let Some(port4) = &self.port4 {
+            raw.input.port4 = Some(port4.clone());
+        }
         if let Some(hz) = self.autofire_hz {
             raw.input.autofire_hz = Some(hz);
         }
@@ -2998,6 +3284,9 @@ impl ConfigOverrides {
         }
         if let Some(path) = &self.serial_session {
             raw.serial.session = Some(path.clone());
+        }
+        if let Some(device) = &self.serial_device {
+            raw.serial.device = Some(device.clone());
         }
         if let Some(out) = &self.midi_out {
             raw.serial.midi_out = Some(out.clone());
@@ -3024,6 +3313,15 @@ impl ConfigOverrides {
             && self.serial_session.is_some()
         {
             raw.serial.mode = Some(SerialMode::Modem.label().to_string());
+        }
+        if self.serial.is_none()
+            && self.midi_out.is_none()
+            && self.midi_in.is_none()
+            && self.serial_connect.is_none()
+            && self.serial_session.is_none()
+            && self.serial_device.is_some()
+        {
+            raw.serial.mode = Some(SerialMode::Device.label().to_string());
         }
         if let Some(device) = &self.parallel {
             raw.parallel.device = Some(device.clone());

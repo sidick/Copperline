@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::config::{Tint, TvCentre};
+use pixels::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 // The pure post-render helpers live in `video/present_common.rs` so headless
 // consumers can present frames without the winit frontend; re-exported here so
@@ -197,6 +198,52 @@ pub(super) fn render_job_to_presentation(
 /// rather than deriving closed forms: a few hundred iterations, run only
 /// when autocrop is presenting, and immune to drifting out of agreement
 /// with the copy it mirrors.
+/// The presentation-buffer pixel logical canvas pixel (`x`, `y`) shows:
+/// the display copy's forward maps ([`canvas_content_rect`] scans the
+/// same ones) evaluated for one point. `None` for a canvas pixel that
+/// shows no buffer pixel -- the tv canvas's side pads and bezel bands, or
+/// a source row the centre nudge pushes off the buffer.
+pub(super) fn canvas_source_point(
+    x: usize,
+    y: usize,
+    src_rows: usize,
+    src_width: usize,
+    overscan: Overscan,
+    tv_centre: TvCentre,
+    tv_aperture_rows: Option<usize>,
+    canvas_rows: usize,
+) -> Option<(usize, usize)> {
+    if x >= FB_WIDTH || y >= canvas_rows || src_rows == 0 || src_width == 0 {
+        return None;
+    }
+    match tv_aperture_rows {
+        Some(aperture_rows) if overscan == Overscan::Tv => {
+            let (x_off, y_off) = tv_centre_source_offset(tv_centre);
+            let src_y = tv_aperture_source_row(y, canvas_rows, 1, aperture_rows)
+                .map(|crop_y| (TV_PRESENT_SOURCE_Y + crop_y) as i32 + y_off)?;
+            let square = canvas_rows == crate::video::PRESENT_HEIGHT_SQUARE;
+            let src_x = if square {
+                (TV_LIVE_PAD_X..TV_LIVE_PAD_X + TV_CAPTURED_WIDTH)
+                    .contains(&x)
+                    .then(|| TV_CAPTURED_SOURCE_X as i32 + x_off + (x - TV_LIVE_PAD_X) as i32)?
+            } else {
+                let s = (TV_CAPTURED_SOURCE_X as i64 + x_off as i64) * 256
+                    + ((2 * x as i64 + 1) * (TV_CAPTURED_WIDTH as i64) * 256)
+                        / (2 * FB_WIDTH as i64)
+                    - 128;
+                (s >> 8) as i32
+            };
+            ((0..src_width as i32).contains(&src_x) && (0..src_rows as i32).contains(&src_y))
+                .then_some((src_x as usize, src_y as usize))
+        }
+        _ => {
+            let src_y = screenshot::scaled_source_row(y, src_rows, canvas_rows);
+            let src_x = (x * src_width / FB_WIDTH).min(src_width - 1);
+            Some((src_x, src_y))
+        }
+    }
+}
+
 pub(super) fn canvas_content_rect(
     content: bitplane::ContentRect,
     src_rows: usize,
@@ -455,10 +502,6 @@ pub(in crate::video) struct Rect {
     pub(in crate::video) h: usize,
 }
 
-pub(super) fn texture_scale_for_window(window: &Window) -> usize {
-    texture_scale_for_factor(window.scale_factor())
-}
-
 /// Integer supersample factor for the backing texture at a given host DPI
 /// scale factor. The texture is rendered at this multiple of the logical
 /// FB_WIDTH x window-height size so a 2x display stays crisp.
@@ -536,12 +579,29 @@ pub(super) fn plan_present_scaling(
     scale_factor: f64,
     surface: (u32, u32),
 ) -> PresentPlan {
-    plan_present_scaling_for(
+    let plan = plan_present_scaling_for(
         integer_requested,
         scale_factor,
         surface,
         (FB_WIDTH as u32, window_present_height() as u32),
-    )
+    );
+    cap_texture_scale(plan, crate::video::hidpi_texture())
+}
+
+/// Apply `[display] hidpi_texture`: off keeps the backing texture at
+/// canvas resolution whatever the density or integer multiple asked for.
+/// The multiple itself stands -- the scaler pass draws the 1x texture at
+/// the same whole-number blocks, point-sampled, so integer scaling looks
+/// the same; only the smooth fit's row selection coarsens.
+pub(super) fn cap_texture_scale(plan: PresentPlan, hidpi: bool) -> PresentPlan {
+    if hidpi {
+        plan
+    } else {
+        PresentPlan {
+            texture_scale: 1,
+            ..plan
+        }
+    }
 }
 
 /// The live plan for the emulator window, from its configured surface
@@ -660,6 +720,9 @@ pub(super) fn aperture_canvas_rect(tv_aperture_rows: usize) -> (usize, usize, us
 /// or `None` for the classic whole-canvas letterbox (both modes off or
 /// suspended).
 pub(super) fn main_present_layout(r: &Render, src: Option<DisplaySrc>) -> PresentLayout {
+    if let Some(viewport) = r.debug_viewport {
+        return debug_present_layout(viewport, integer_scaling_requested(), src);
+    }
     let surface = (r.surface_size.0.max(1), r.surface_size.1.max(1));
     let Some(src) = src.filter(|src| src.rect.2 > 0 && src.rect.3 > 0) else {
         let plan = main_present_plan(r);
@@ -690,6 +753,26 @@ pub(super) fn main_present_layout(r: &Render, src: Option<DisplaySrc>) -> Presen
     // multiple of the crop (a 700-wide window around a 640-wide game),
     // and display_src_layout takes its own fit against the rect.
     display_src_layout(surface, integer_scaling_requested(), src, chrome_dst)
+}
+
+/// The debug display uses the same scaler and input transform, within its
+/// egui pane. The source contains only the picture; host chrome is outside it.
+pub(super) fn debug_present_layout(
+    viewport: (u32, u32, u32, u32),
+    integer: bool,
+    src: Option<DisplaySrc>,
+) -> PresentLayout {
+    let (x, y, width, height) = viewport;
+    let src = src
+        .filter(|src| src.rect.2 > 0 && src.rect.3 > 0)
+        .unwrap_or(DisplaySrc {
+            rect: (0, 0, FB_WIDTH, present_height()),
+            par: (1, 1),
+        });
+    let mut layout = display_src_layout((width.max(1), height.max(1)), integer, src, None);
+    layout.display_dst.0 += x;
+    layout.display_dst.1 += y;
+    layout
 }
 
 /// The sub-rect layout, pure of the live globals: `src` (canvas pixels
@@ -745,6 +828,7 @@ impl PresentLayout {
             ],
             dst: self.display_dst,
             filter: self.filter,
+            picture: None,
         }];
         if let Some(chrome_dst) = self.chrome_dst {
             let chrome_rows = (window_present_height() - present_height()) as f32;
@@ -757,6 +841,7 @@ impl PresentLayout {
                 ],
                 dst: chrome_dst,
                 filter: scaler::ScaleFilter::SharpBilinear,
+                picture: None,
             });
         }
         draws
@@ -824,44 +909,14 @@ pub(super) fn sync_main_present_scaling(
     );
     let scale = plan.texture_scale;
     let want = (texture_width(scale) as u32, texture_height(scale) as u32);
-    let have = r.pixels.context().texture_extent;
-    if (have.width, have.height) != want {
-        r.pixels.resize_buffer(want.0, want.1)?;
+    if let Some(gpu) = r.gpu_mut() {
+        let have = gpu.pixels.context().texture_extent;
+        if (have.width, have.height) != want {
+            gpu.pixels.resize_buffer(want.0, want.1)?;
+        }
     }
     r.texture_scale = scale;
     Ok(())
-}
-
-/// React to a host DPI scale-factor change for a *tool* window's pixel
-/// surface (the emulator window re-plans through
-/// `sync_main_present_scaling`, whose supersample factor is not the DPI's
-/// under integer scaling).
-///
-/// `cursor_texture_position` maps a host click into texture space using
-/// both the surface size (which the following Resized event updates) and the
-/// texture extent (which nothing updated before this). When the supersample
-/// factor changes -- e.g. dragging between a 1x and a 2x monitor -- the texture
-/// must be rebuilt to the new size, otherwise the two halves of the mapping
-/// disagree and clicks land in the wrong region. The rebuild reallocates a GPU
-/// texture, so it is skipped when the rounded factor is unchanged (a slow drag
-/// across a fractional-scale monitor seam can emit many events); the surface
-/// itself is re-synced by the Resized event that always follows.
-pub(super) fn resync_render_scale(
-    pixels: &mut Pixels<'static>,
-    texture_scale: &mut usize,
-    scale_factor: f64,
-) {
-    let new_scale = texture_scale_for_factor(scale_factor);
-    if new_scale == *texture_scale {
-        return;
-    }
-    match pixels.resize_buffer(
-        texture_width(new_scale) as u32,
-        texture_height(new_scale) as u32,
-    ) {
-        Ok(()) => *texture_scale = new_scale,
-        Err(e) => warn!("resize texture buffer for scale {scale_factor} failed: {e}"),
-    }
 }
 
 /// The size a redraw has to apply to the presentation surface before it draws,
@@ -880,6 +935,18 @@ pub(super) fn surface_resize_for_draw(
     ((inner.width, inner.height) != configured).then_some(inner)
 }
 
+pub(super) fn window_present_mode(vsync: bool) -> pixels::wgpu::PresentMode {
+    // pixels' enable_vsync(true) selects AutoVsync, which prefers
+    // FifoRelaxed where supported (including Vulkan on X11). That permits tearing
+    // whenever a frame arrives after vblank, including normal PAL output on
+    // a faster host display. FIFO keeps every swap on a vblank instead.
+    if vsync {
+        pixels::wgpu::PresentMode::Fifo
+    } else {
+        pixels::wgpu::PresentMode::AutoNoVsync
+    }
+}
+
 pub(super) fn build_pixels_for_window(
     window: Arc<Window>,
     texture_scale: usize,
@@ -891,16 +958,50 @@ pub(super) fn build_pixels_for_window(
         texture_width(texture_scale) as u32,
         texture_height(texture_scale) as u32,
     );
-    let surface_texture = SurfaceTexture::new(surface.0, surface.1, window);
-    let builder = PixelsBuilder::new(texture.0, texture.1, surface_texture).enable_vsync(vsync);
-    let builder = if cfg!(target_os = "linux") {
-        builder.wgpu_backend(
-            pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN),
-        )
-    } else {
-        builder
+    let build = |backends| {
+        let surface_texture = SurfaceTexture::new(surface.0, surface.1, Arc::clone(&window));
+        let builder = PixelsBuilder::new(texture.0, texture.1, surface_texture)
+            .present_mode(window_present_mode(vsync));
+        let builder = if let Some(backends) = backends {
+            builder.wgpu_backend(backends)
+        } else {
+            builder
+        };
+        builder.build()
     };
-    let mut pixels = builder.build()?;
+    let backends = cfg!(target_os = "linux")
+        .then(|| pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN));
+    let pixels = build(backends)?;
+    // Match wgpu's environment lookup, including case-insensitive variable
+    // names on Windows. This runs only while creating the window.
+    let automatic_fallback = cfg!(target_os = "windows")
+        && std::env::var_os("WGPU_BACKEND").is_none()
+        && std::env::var_os("WGPU_ADAPTER_NAME").is_none();
+    let mut pixels = super::adapter::prefer_hardware_renderer(
+        pixels,
+        automatic_fallback,
+        |pixels| pixels.adapter().get_info(),
+        |backend| build(Some(backend.into())),
+    )?;
+    let adapter = pixels.adapter().get_info();
+    let window_system = match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Wayland(_)) => "Wayland",
+        Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)) => "X11",
+        Ok(RawWindowHandle::AppKit(_)) => "AppKit",
+        Ok(RawWindowHandle::Win32(_)) => "Win32",
+        _ => "other",
+    };
+    info!(
+        "window presentation: mode={:?}, supported={:?}, window_system={}, backend={:?}, adapter={:?}, device_type={:?}, driver={:?}, driver_info={:?}",
+        pixels.present_mode(),
+        pixels.context().surface_capabilities.present_modes,
+        window_system,
+        adapter.backend,
+        adapter.name,
+        adapter.device_type,
+        adapter.driver,
+        adapter.driver_info,
+    );
     // The tool windows draw through the built-in Fill renderer (the
     // emulator window's own scaler pass ignores the mode). The scaling
     // matrix and clip rect stay the builder's defaults until a resize
@@ -929,35 +1030,6 @@ pub(in crate::video) fn scale_rect(rect: Rect, scale: usize) -> Rect {
     }
 }
 
-/// Map a host cursor position (surface physical pixels) into a *tool*
-/// window's logical canvas position, or None outside the presented
-/// picture.
-///
-/// Deliberately not pixels' `window_pos_to_pixel`: that helper re-centres
-/// through `min(texture, surface) / 2`, which is only correct while the
-/// texture fits inside the surface. The supersampled texture is *larger* than
-/// the surface whenever the rounded texture scale exceeds a fractional host
-/// scale factor (a 2x texture over a 1.5x surface on a 150% desktop), and the
-/// shifted mapping it produces there lands every status-bar click in the
-/// display region, where it takes the mouse capture instead of the control.
-/// Mapping through the scaling renderer's clip rect -- the surface rect the
-/// Fill pass draws the picture into -- holds on both sides of that boundary,
-/// and agrees with the render by construction: the rect derives from the same
-/// surface and texture extents the render pass scissors with.
-pub(super) fn cursor_texture_position(
-    pixels: &Pixels<'_>,
-    position: winit::dpi::PhysicalPosition<f64>,
-    texture_scale: usize,
-) -> Option<(i32, i32)> {
-    let context = pixels.context();
-    let (x, y) = cursor_position_in_texture(
-        (position.x, position.y),
-        context.scaling_renderer.clip_rect(),
-        (context.texture_extent.width, context.texture_extent.height),
-    )?;
-    Some(((x / texture_scale) as i32, (y / texture_scale) as i32))
-}
-
 /// The emulator window's cursor mapping: host surface position to logical
 /// canvas position, or None outside the presented picture. The emulator
 /// window is drawn by the scaler pass, not the built-in renderer, so the
@@ -973,8 +1045,7 @@ pub(super) fn main_cursor_position(
     main_present_layout(r, src).cursor_position(position)
 }
 
-/// The pure half of [`cursor_texture_position`]: position and clip rect in
-/// surface physical pixels to supersampled-texture pixels.
+/// Map a position and clip rect in surface physical pixels to texture pixels.
 pub(super) fn cursor_position_in_texture(
     position: (f64, f64),
     clip: (u32, u32, u32, u32),
@@ -1054,11 +1125,21 @@ pub(super) fn copy_present_frame(
     // the HiDPI texture scale). Select whole source rows instead of blending
     // adjacent Amiga scanlines; normal presentation should not synthesize
     // intermediate colours from line-to-line dithering.
+    // Texture rows outnumber source rows on a HiDPI texture, so runs of
+    // them show one source row: a run's later rows copy the row just built.
+    let mut built: Option<(usize, usize)> = None;
     for y in 0..out_rows {
         let src_y = screenshot::scaled_source_row(y, src_rows, out_rows);
+        let dst_off = y * dst_stride;
+        if let Some((built_y, built_off)) = built {
+            if built_y == src_y {
+                frame.copy_within(built_off..built_off + dst_stride, dst_off);
+                continue;
+            }
+        }
+        built = Some((src_y, dst_off));
         let row = &src_fb[src_y * src_width..(src_y + 1) * src_width];
 
-        let dst_off = y * dst_stride;
         if src_width == dst_stride_px {
             // A 35 ns canvas whose width matches the HiDPI texture row
             // (the common Retina case): every canvas pixel is one texture
@@ -1105,6 +1186,69 @@ pub(super) fn copy_present_frame(
             }
         }
     }
+}
+
+/// The map the scaler's picture draw reproduces on the GPU in place of
+/// [`copy_window_present_frame`]: the same choice between the TV glass,
+/// the square canvas and the full-overscan copy, from the same inputs.
+/// `src_rows`/`src_width` describe the presentation buffer; the output
+/// is `present_height()` rows at `texture_scale`, like the CPU copy's.
+pub(super) fn picture_map(
+    src_rows: usize,
+    src_width: usize,
+    texture_scale: usize,
+    overscan: Overscan,
+    tv_centre: TvCentre,
+    tv_aperture_rows: Option<usize>,
+    tube_glass: bool,
+) -> scaler::PictureMap {
+    let present_rows = present_height();
+    let out_rows = present_rows * texture_scale;
+    let (x_offset, y_offset) = tv_centre_source_offset(tv_centre);
+    let mut map = scaler::PictureMap {
+        columns: scaler::PictureColumns::Full,
+        scale: texture_scale as i32,
+        out_rows: out_rows as i32,
+        src_rows: src_rows as i32,
+        src_width: src_width as i32,
+        pad_rows: 0,
+        content_rows: out_rows as i32,
+        aperture_rows: 0,
+        source_y: 0,
+        y_offset: 0,
+        x_offset: 0,
+        glass_source_x: TV_CAPTURED_SOURCE_X as i32,
+        glass_width: TV_CAPTURED_WIDTH as i32,
+        pad_x: TV_LIVE_PAD_X as i32,
+        fb_width: FB_WIDTH as i32,
+    };
+    if let Some(aperture_rows) =
+        tv_aperture_rows.filter(|_| overscan == Overscan::Tv && src_width == FB_WIDTH)
+    {
+        let (source_y, aperture_rows) = if tube_glass {
+            (0, tube_aperture_rows(aperture_rows))
+        } else {
+            (TV_PRESENT_SOURCE_Y, aperture_rows)
+        };
+        let square = present_rows == crate::video::PRESENT_HEIGHT_SQUARE;
+        let pad_rows = if square {
+            present_rows.saturating_sub(aperture_rows) / 2 * texture_scale
+        } else {
+            0
+        };
+        map.columns = if square {
+            scaler::PictureColumns::Square
+        } else {
+            scaler::PictureColumns::Glass
+        };
+        map.pad_rows = pad_rows as i32;
+        map.content_rows = (out_rows - 2 * pad_rows) as i32;
+        map.aperture_rows = aperture_rows as i32;
+        map.source_y = source_y as i32;
+        map.y_offset = y_offset;
+        map.x_offset = x_offset;
+    }
+    map
 }
 
 pub(super) fn copy_window_present_frame(
@@ -1183,48 +1327,68 @@ pub(super) fn copy_tv_aperture_to_window(
     let black_px = rgba(0, 0, 0);
     let black = black_px.to_le_bytes();
     let square = present_rows == crate::video::PRESENT_HEIGHT_SQUARE;
-    let pixel_at = |row: &[u32], out_x: usize| -> u32 {
-        if square {
-            if (TV_LIVE_PAD_X..TV_LIVE_PAD_X + TV_CAPTURED_WIDTH).contains(&out_x) {
-                let src_x =
-                    TV_CAPTURED_SOURCE_X as i32 + source_x_offset + (out_x - TV_LIVE_PAD_X) as i32;
-                if (0..FB_WIDTH as i32).contains(&src_x) {
-                    row[src_x as usize]
-                } else {
-                    black_px
-                }
+    // Which captured columns each glass column samples is the same on
+    // every row, so resolve the map once per frame. None is unscanned
+    // glass; a zero weight is a unit column, sampled without blending.
+    let columns: Vec<Option<(usize, usize, u32)>> = (0..FB_WIDTH)
+        .map(|out_x| {
+            if square {
+                (TV_LIVE_PAD_X..TV_LIVE_PAD_X + TV_CAPTURED_WIDTH)
+                    .contains(&out_x)
+                    .then(|| {
+                        TV_CAPTURED_SOURCE_X as i32
+                            + source_x_offset
+                            + (out_x - TV_LIVE_PAD_X) as i32
+                    })
+                    .filter(|src_x| (0..FB_WIDTH as i32).contains(src_x))
+                    .map(|src_x| (src_x as usize, src_x as usize, 0))
             } else {
-                black_px
+                tv_glass_column(out_x, source_x_offset)
             }
-        } else {
-            tv_glass_sample(row, out_x, source_x_offset)
+        })
+        .collect();
+    let sample = |row: &[u32], column: Option<(usize, usize, u32)>| -> u32 {
+        match column {
+            Some((i0, _, 0)) => row[i0],
+            Some((i0, i1, frac)) => crate::video::blend_rgba(row[i0], row[i1], frac),
+            None => black_px,
         }
     };
+    // The texture rows outnumber the aperture's, so runs of them show
+    // one source row: a run's later rows copy the row just built.
+    let mut built: Option<(usize, usize)> = None;
     for y in 0..out_rows {
+        let dst_off = y * dst_stride;
         let src_y = tv_aperture_source_row(y, present_rows, texture_scale, aperture_rows)
             .map(|crop_y| (source_y + crop_y).min(src_rows - 1) as i32 + source_y_offset)
             .filter(|src_y| (0..src_rows as i32).contains(src_y));
         let Some(src_y) = src_y else {
-            let dst = &mut frame[y * dst_stride..(y + 1) * dst_stride];
+            let dst = &mut frame[dst_off..dst_off + dst_stride];
             for px in dst.chunks_exact_mut(4) {
                 px.copy_from_slice(&black);
             }
+            built = None;
             continue;
         };
         let src_y = src_y as usize;
+        if let Some((built_y, built_off)) = built {
+            if built_y == src_y {
+                frame.copy_within(built_off..built_off + dst_stride, dst_off);
+                continue;
+            }
+        }
         let row = &src_fb[src_y * FB_WIDTH..(src_y + 1) * FB_WIDTH];
-        let dst_off = y * dst_stride;
         match texture_scale {
             1 => {
                 let dst = &mut frame[dst_off..dst_off + dst_stride];
-                for x in 0..FB_WIDTH {
-                    let pixel = pixel_at(row, x);
+                for (x, &column) in columns.iter().enumerate() {
+                    let pixel = sample(row, column);
                     dst[x * 4..x * 4 + 4].copy_from_slice(&pixel.to_le_bytes());
                 }
             }
             2 => {
-                for x in 0..FB_WIDTH {
-                    let pixel = pixel_at(row, x);
+                for (x, &column) in columns.iter().enumerate() {
+                    let pixel = sample(row, column);
                     let pair = pixel as u64 | ((pixel as u64) << 32);
                     unsafe {
                         (frame.as_mut_ptr().add(dst_off + x * 8) as *mut u64).write_unaligned(pair);
@@ -1234,11 +1398,12 @@ pub(super) fn copy_tv_aperture_to_window(
             _ => {
                 let dst = &mut frame[dst_off..dst_off + dst_stride];
                 for x in 0..FB_WIDTH * texture_scale {
-                    let pixel = pixel_at(row, x / texture_scale);
+                    let pixel = sample(row, columns[x / texture_scale]);
                     dst[x * 4..x * 4 + 4].copy_from_slice(&pixel.to_le_bytes());
                 }
             }
         }
+        built = Some((src_y, dst_off));
     }
 }
 
@@ -1534,6 +1699,18 @@ pub(super) fn hcenter_enabled() -> bool {
     }
 }
 
+/// Whether frames present from the present worker's thread
+/// (`COPPERLINE_THREADED_PRESENT`, default on).
+pub(super) fn threaded_present_enabled() -> bool {
+    match crate::envcfg::var("COPPERLINE_THREADED_PRESENT") {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
 pub(super) fn threaded_render_enabled() -> bool {
     match crate::envcfg::var("COPPERLINE_THREADED_RENDER") {
         Some(v) => !matches!(
@@ -1575,6 +1752,17 @@ pub(super) fn take_integral_mouse_delta(value: &mut f64) -> i32 {
     }
 }
 
+/// A frame as a screenshot would save it: the pixels in the framebuffer's
+/// RGBA8 format and the saved image's dimensions. Borrowed when the
+/// presentation buffer is saved as is, owned when it was resampled.
+pub(super) struct PresentImage<'a> {
+    pub pixels: std::borrow::Cow<'a, [u32]>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Save the presented frame as `--screenshot-after` and the host
+/// screenshot shortcut do: [`render_present_frame`] encoded as a PNG.
 pub(super) fn save_present_frame(
     path: &std::path::Path,
     present_fb: &[u32],
@@ -1584,15 +1772,67 @@ pub(super) fn save_present_frame(
     tv_centre: TvCentre,
     tv_aperture_rows: Option<usize>,
 ) -> anyhow::Result<()> {
-    if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
-        return screenshot::save(
-            path,
-            &present_fb[..src_rows * src_width],
-            src_width as u32,
-            src_rows as u32,
-        );
-    }
+    let image = render_present_frame(
+        present_fb,
+        src_rows,
+        src_width,
+        overscan,
+        tv_centre,
+        tv_aperture_rows,
+    );
+    screenshot::save(path, &image.pixels, image.width, image.height)
+}
 
+/// The presented frame exactly as a screenshot saves it, before PNG
+/// encoding: the one capture path behind `--screenshot-after`, the
+/// screenshot shortcut, and `--expect-screenshot`, so an expectation
+/// compares against precisely what a screenshot of the same frame holds.
+pub(super) fn render_present_frame(
+    present_fb: &[u32],
+    src_rows: usize,
+    src_width: usize,
+    overscan: Overscan,
+    tv_centre: TvCentre,
+    tv_aperture_rows: Option<usize>,
+) -> PresentImage<'_> {
+    use std::borrow::Cow;
+    if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
+        return PresentImage {
+            pixels: Cow::Borrowed(&present_fb[..src_rows * src_width]),
+            width: src_width as u32,
+            height: src_rows as u32,
+        };
+    }
+    let mut picture = Vec::new();
+    let (width, height) = present_capture_frame(
+        present_fb,
+        src_rows,
+        src_width,
+        overscan,
+        tv_centre,
+        tv_aperture_rows,
+        &mut picture,
+    );
+    PresentImage {
+        pixels: Cow::Owned(picture),
+        width: width as u32,
+        height: height as u32,
+    }
+}
+
+/// The picture a capture shows -- the presentation buffer through the
+/// same crop, aperture and aspect geometry as the live window -- built
+/// into `out` (cleared and resized). Returns its width and height. Shared
+/// by screenshots, frame dumps and GIF clips so they all show one shape.
+pub(super) fn present_capture_frame(
+    present_fb: &[u32],
+    src_rows: usize,
+    src_width: usize,
+    overscan: Overscan,
+    tv_centre: TvCentre,
+    tv_aperture_rows: Option<usize>,
+    out: &mut Vec<u32>,
+) -> (usize, usize) {
     if let Some(aperture_rows) = tv_aperture_rows {
         if overscan == Overscan::Tv && src_width == FB_WIDTH {
             // Both standards' apertures fill the same 4:3 glass, so the
@@ -1605,13 +1845,14 @@ pub(super) fn save_present_frame(
             // as the window shows it.
             let (source_x_offset, source_y_offset) = tv_centre_source_offset(tv_centre);
             let black = rgba(0, 0, 0);
-            let mut glass = vec![0u32; FB_WIDTH * TV_GLASS_PRESENT_ROWS];
+            out.clear();
+            out.resize(FB_WIDTH * TV_GLASS_PRESENT_ROWS, 0);
             for out_y in 0..TV_GLASS_PRESENT_ROWS {
                 let crop_y =
                     screenshot::scaled_source_row(out_y, aperture_rows, TV_GLASS_PRESENT_ROWS);
                 let src_y = (TV_PRESENT_SOURCE_Y + crop_y).min(src_rows.saturating_sub(1)) as i32
                     + source_y_offset;
-                let dst = &mut glass[out_y * FB_WIDTH..(out_y + 1) * FB_WIDTH];
+                let dst = &mut out[out_y * FB_WIDTH..(out_y + 1) * FB_WIDTH];
                 if !(0..src_rows as i32).contains(&src_y) {
                     dst.fill(black);
                     continue;
@@ -1622,7 +1863,7 @@ pub(super) fn save_present_frame(
                     *px = tv_glass_sample(row, out_x, source_x_offset);
                 }
             }
-            return screenshot::save(path, &glass, FB_WIDTH as u32, TV_GLASS_PRESENT_ROWS as u32);
+            return (FB_WIDTH, TV_GLASS_PRESENT_ROWS);
         }
     }
 
@@ -1631,11 +1872,12 @@ pub(super) fn save_present_frame(
     // the window's: a saved picture keeps the aspect's shape whatever
     // the window is drawing.
     let out_rows = crate::video::capture_height() * src_width / FB_WIDTH;
-    screenshot::save_scaled_y(
-        path,
-        present_fb,
-        src_width as u32,
-        src_rows as u32,
-        out_rows as u32,
-    )
+    screenshot::scale_y_into(
+        &present_fb[..src_rows * src_width],
+        src_width,
+        src_rows,
+        out_rows,
+        out,
+    );
+    (src_width, out_rows)
 }

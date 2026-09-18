@@ -106,6 +106,7 @@ src/
     launcher/       # field metadata, value edits and config conversion
     font.rs         # 8x8 overlay font
 crates/copperline-web/   # standalone wasm-bindgen browser frontend (WebEmu + page glue)
+crates/copperline-libretro/ # standalone libretro C ABI frontend
 crates/cputest-runner/   # WinUAE cputest instruction-suite runner for the m68k core
 tests/              # self-contained integration tests and ignored local-asset tests
 timing-test/        # bootable cross-emulator timing-measurement disk
@@ -120,7 +121,11 @@ and chipset: each turn of the loop (`Emulator::step_real`,
 emulated time, cycle-stepping the CPU and the chipset together. By default,
 the completed-frame renderer runs one frame behind on a worker thread; set
 `COPPERLINE_THREADED_RENDER=0` to use the synchronous renderer for
-comparison.
+comparison. A second worker presents the composed frame to the GPU
+surface (`COPPERLINE_THREADED_PRESENT=0` presents from the main thread),
+so neither the texture upload nor the vsync wait sits in the emulation
+loop's turn; with no UI over the picture, the scaler pass samples the
+presentation buffer directly rather than a CPU copy of it.
 
 The winit window is only the default frontend. With the default `frontend`
 cargo feature disabled, the crate builds as the portable headless core plus
@@ -134,6 +139,22 @@ The browser dependency deliberately leaves it disabled: browser status still
 measures coarse core and render cost at the wrapper boundary, but the
 instruction and renderer hot paths do not maintain native-only counters or
 sample host clocks.
+
+The [libretro frontend](../guide/libretro.md) builds against that same portable
+surface. Its caller supplies pacing and synchronous audio/video/input callbacks.
+`Emulator::step_video_frame` advances to the next hardware field using the
+precise stepping path shared with netplay, whereas desktop `step_frame` may
+end a CPU-budget quantum within a field. `Agnus::nominal_frame_cck` supplies
+the mean field length, including alternating interlace fields and NTSC lines,
+for frontend refresh reporting. The adapter uses the shared renderer and TV
+presentation helpers, keeps floppy writes in memory until eject/unload, and
+wraps the shared chunked machine representation with media and pending-input
+state. Frontend checkpoints include a separate CPU/Bus rollback-latch chunk
+and omit zlib compression, since RetroArch takes a checkpoint every field.
+The loader checks the schema and machine before adopting any components.
+CD paths are resolved through a thread-scoped mapping of verified immutable
+sources. WHDLoad uses fixed-timestamp OFS images with session sector overlays,
+so rollback neither accesses a live directory mount nor persists guest writes.
 
 The flow of a frame:
 
@@ -175,6 +196,16 @@ The flow of a frame:
 7. For the interactive window the loop sleeps to pace emulated time to
    wall-clock; for headless captures it does not. The emulated result is
    identical either way -- pacing only schedules host work.
+
+Window presentation goes through `window/presenter.rs`. After a successful
+draw callback, it calls winit's `pre_present_notify` before pixels submits
+and presents the buffer. Native Wayland uses that notification to request
+a compositor frame callback for subsequent redraws. A surface acquisition
+that times out or reports occlusion does not arm a callback, because no
+buffer will be committed. This schedules host redraws independently of the
+emulated clock. `COPPERLINE_PRESENT_PROFILE=1` enables per-attempt CPU
+timings for acquisition/upload, draw-command recording, and submission;
+these do not measure GPU completion or display scanout.
 
 The main presentation path uses the **main thread** (event loop, core,
 and pacer), the **`copperline-render` worker**, and the **cpal audio
@@ -289,7 +320,23 @@ snapshot:
 - Live host-directory mounts expose file contents and timestamps. File-backed
   hard disks and physical disks retain writes made after a snapshot.
 - Network, serial, MIDI, and sampler input can depend on external devices
+  or services. A real host serial port (`[serial] mode = "device"`) is
+  live I/O like networking: its bytes and handshake lines arrive on the
+  host's clock, the port is never part of a save state (a load reopens
+  it and pushes the restored machine's DTR/RTS and line rate onto it),
+  and an adapter pulled mid-run reads as an unplugged cable. Physical
+  floppy drives also require wall-clock pacing.
   or services. Physical floppy drives also require wall-clock pacing.
+- The host clipboard (`[clipboard] share`, `clipboard.rs`) is live host
+  state. It reaches the guest only through the windowed session's poll or
+  a control-protocol `clipboard.set`, never from the board itself, so a
+  headless run never depends on it: a headless run with the bridge fitted
+  (`--clipboard`, so a windowed recording replays on the same machine)
+  executes the same timeline as one with no host traffic. The bridge is
+  fitted only where it was configured, off by default in every session,
+  because it is a unit of the services board and an autoconfig board the
+  guest did not ask for moves every Exec allocation behind it -- a machine
+  the configuration does not describe (`Config::resolve_clipboard_share`).
 
 Use fixed image files and scripted inputs for deterministic regression
 tests. See [save-state boundaries](savestate.md#determinism-boundaries) for

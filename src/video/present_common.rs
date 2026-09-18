@@ -165,18 +165,30 @@ pub const fn tv_centre_source_offset(centre: TvCentre) -> (i32, i32) {
 #[inline]
 pub fn tv_glass_sample(row: &[u32], out_x: usize, source_x_offset: i32) -> u32 {
     debug_assert!(row.len() >= FB_WIDTH);
+    match tv_glass_column(out_x, source_x_offset) {
+        Some((i0, i1, frac)) => crate::video::blend_rgba(row[i0], row[i1], frac),
+        None => rgba(0, 0, 0),
+    }
+}
+
+/// The two source columns and 8-bit blend weight glass column `out_x`
+/// samples ([`tv_glass_sample`] is one such sample), or None where the
+/// glass is pushed past the captured raster. Depends on the column alone,
+/// so the live window builds a frame's map once and applies it to every
+/// row rather than resolving it per pixel.
+#[inline]
+pub fn tv_glass_column(out_x: usize, source_x_offset: i32) -> Option<(usize, usize, u32)> {
     let s = (TV_CAPTURED_SOURCE_X as i64 + source_x_offset as i64) * 256
         + ((2 * out_x as i64 + 1) * (TV_CAPTURED_WIDTH as i64) * 256) / (2 * FB_WIDTH as i64)
         - 128;
     // Half a texel of slack on each side: the default aperture's own edge
     // samples land there and clamp, exactly as before the offset existed.
     if !(-128..=(FB_WIDTH as i64 - 1) * 256 + 128).contains(&s) {
-        return rgba(0, 0, 0);
+        return None;
     }
     let s = s.clamp(0, (FB_WIDTH as i64 - 1) * 256);
     let i = (s >> 8) as usize;
-    let frac = (s & 255) as u32;
-    crate::video::blend_rgba(row[i], row[(i + 1).min(FB_WIDTH - 1)], frac)
+    Some((i, (i + 1).min(FB_WIDTH - 1), (s & 255) as u32))
 }
 
 /// Turn a rendered field into a presentable frame in place, and report
@@ -373,6 +385,40 @@ impl FieldPlacement {
         let y0 = (row_scale * y0).min(present_rows);
         let y1 = (row_scale * y1).clamp(y0, present_rows);
         (x1 > x0 && y1 > y0).then_some(bitplane::ContentRect { x0, x1, y0, y1 })
+    }
+
+    /// The field-space pixel (`x` in the field's canvas pitch, `y` in
+    /// rendered field rows) that placed buffer pixel (`x`, `y`) shows --
+    /// [`Self::content_rect`] run backwards for one point, so a host
+    /// pointer over the presented picture can be turned back into the
+    /// rendered pixel under it (what a light pen sees). `None` for a
+    /// buffer pixel that shows no field pixel: the centring bands, a
+    /// programmable scan's blanked porches, or off the buffer.
+    pub fn field_point(&self, x: usize, y: usize, present_rows: usize) -> Option<(i32, i32)> {
+        let width = FB_WIDTH * self.canvas_scale;
+        if x >= width || y >= present_rows {
+            return None;
+        }
+        let row_scale = if present_rows >= 2 * self.rows { 2 } else { 1 };
+        let placed_y = y / row_scale;
+        if placed_y >= self.rows {
+            return None;
+        }
+        match self.map {
+            PlacementMap::Standard { y_offset, h_shift } => {
+                let fx = x + h_shift;
+                let fy = placed_y.checked_sub(y_offset)?;
+                (fx < width).then_some((fx as i32, fy as i32))
+            }
+            PlacementMap::Programmable { columns, rows } => {
+                let (src_x, _) = columns.source(x, width);
+                let fy = placed_y.checked_sub(rows.pad_top)?;
+                if fy >= rows.content_rows {
+                    return None;
+                }
+                Some((src_x.min(width - 1) as i32, (fy + rows.skip_top) as i32))
+            }
+        }
     }
 }
 
@@ -593,6 +639,13 @@ impl Default for PresentationLatch {
 }
 
 impl PresentationLatch {
+    /// Whether neutral fields retain the standard TV aperture. Frontends
+    /// that save presentation state can restore this classification by
+    /// resolving a `Standard` or `Full` frame before the next field.
+    pub fn uses_standard_aperture(&self) -> bool {
+        self.standard_aperture
+    }
+
     /// Back to the power-on default, for presentation discontinuities
     /// (machine swap, reset, state load).
     pub fn reset(&mut self) {

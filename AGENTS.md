@@ -58,7 +58,11 @@ directory live, so a freshly built binary runs directly
 (`docs/guide/run.md`). Windowed sessions warp-boot until the guest loads
 it; with `--gdb` the session stops at the program's first instruction,
 and CCP scripts can wait on `break.add {"kind": "loadseg", "name": ...}`.
-It composes with every headless flag below.
+It composes with every headless flag below. `--exit-on-return` makes the
+process exit with the program's AmigaDOS return code (0-255; 4 if the run
+ended before it returned), and a guest calling uaelib `ExitEmu` (function
+13) stops the run with status 0. Exit statuses: 0 ok, 1 Copperline error,
+3 screenshot expectation failed, 4 no guest return code.
 
 ## Headless verification
 
@@ -73,7 +77,17 @@ Full reference: `docs/guide/headless.md`.
 # Dump 120 consecutive rendered frames starting at 24s.
 ./target/release/copperline --config my.toml --noaudio \
   --dump-frames /tmp/frames --dump-start 24 --dump-count 120
+
+# Write 5s of the display from 24s as an animated GIF (25 fps PAL /
+# 30 fps NTSC, same crop and aspect as a screenshot), exit.
+./target/release/copperline --config my.toml --noaudio \
+  --gif-after 24 /tmp/clip.gif --gif-seconds 5
 ```
+
+`--gif-after` repeats like `--screenshot-after`; `--gif-seconds` defaults
+to `[recording] clip_seconds` (10). The window's Cmd+Shift+G /
+Alt+Shift+G saves the same kind of clip from a rolling ring of the last
+`clip_seconds` of the display.
 
 Audio: `--noaudio` runs silent; `--audio-wav PATH` captures the mixed output
 as a WAV in emulated time instead of playing it.
@@ -94,14 +108,17 @@ repeat.
 |---|---|
 | `--press-after SECS KEY` | Press and release an Amiga key (~100 ms hold) |
 | `--key-after SECS KEY MS` | Hold a key for exactly MS milliseconds |
+| `--type-after SECS TEXT` | Type TEXT on the US Amiga keyboard from SECS, one key per 100 ms (`\n` Return, `\t` Tab, `\e` Esc) |
 | `--click-after SECS BUTTON MS [PORT]` | Mouse button (`left`/`right`/`middle`) for MS ms (default port 1) |
-| `--joy-after SECS BUTTON MS [PORT]` | Joystick / CD32-pad control (`up`/`down`/`left`/`right`/`red`/`blue`/...) (default port 2) |
+| `--joy-after SECS BUTTON MS [PORT]` | Joystick / CD32-pad control (`up`/`down`/`left`/`right`/`red`/`blue`/...) on port 1-4 (default port 2; 3/4 = parallel-port adapter) |
 | `--mouse-after SECS DX DY [PORT]` | Relative mouse motion (default port 1) |
 | `--mouse-to-after SECS X Y [PORT]` | Steer the pointer to screen pixel (X, Y) via sprite 0 (default port 1) |
 | `--pot-after SECS X Y [PORT]` | Analogue stick/paddle position, 0-255 per axis (default port 2) |
+| `--pen-after SECS X Y [PORT]` | Hold the light pen over screen pixel (X, Y) (`--mouse-to-after` coordinates; negative lifts it off); `--joy-after ... red` is its switch |
 | `--insert-disk-after SECS DFN PATH` | Insert a disk image into `df0`..`df3` |
 | `--insert-cd-after SECS PATH` | Swap the CD image in the machine's CD drive (CDTV/CD32/SCSI CD-ROM) |
-| `--script FILE` | Same directives from a file, one per line, no leading dashes |
+| `--expect-screenshot SECS PATH [TOL]` | Compare the frame at SECS with the PNG at PATH (TOL = fraction or pixel count); mismatch writes `<stem>.actual.png` + `<stem>.diff.png`, exit status 3 at run end |
+| `--script FILE` | Same directives from a file, one per line, no leading dashes (`type SECS TEXT`, `expect-screenshot ...` included) |
 | `--record-input PATH` | Record all machine-bound input as a replayable script |
 
 `KEY` is a raw key code (`0x45`) or a name (`ctrl`, `f1`, `esc`, letters,
@@ -109,7 +126,11 @@ digits). A session played by hand under `--record-input` (or Cmd+Shift+R /
 Alt+Shift+R in the window) replays deterministically via `--script`.
 
 Either controller port takes any device -- `[input] port1/port2` in the
-TOML, or `--port1`/`--port2` (`mouse`/`joystick`/`cd32`/`analogue`/`none`;
+TOML, or `--port1`/`--port2` (`mouse`/`joystick`/`cd32`/`analogue`/
+`lightpen`/`none`; a pen only reaches Agnus from port 2 on post-A1000
+boards). `[parallel] device = "joystick-adapter"` (`--parallel
+joystick-adapter`) adds the four-player adapter's ports 3 and 4
+(`--port3`/`--port4`, `joystick`/`none`;
 default mouse + joystick, CD32 pad on the CD32 profile). The scripted-input
 flags' optional trailing `PORT` token (`1` or `2`) aims an event at either
 port; omitted, each flag keeps its traditional port, so existing scripts

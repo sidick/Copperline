@@ -26,9 +26,7 @@ use crate::config::{
 pub enum MenuAction {
     // Tools.
     OpenMachineConfig,
-    OpenFrameAnalyzer,
     OpenDebugger,
-    OpenConsole,
     /// Press the freezer cartridge's button (`[cartridge] model`).
     FreezeCartridge,
     OpenInputMapping,
@@ -58,6 +56,14 @@ pub enum MenuAction {
     ToggleFullscreen,
     ToggleStatusBar,
     TogglePerfOverlay,
+    ToggleVsync,
+
+    // Media.
+    /// Pick a hard-disk image and push it into the PCMCIA slot as a CF
+    /// card (ejecting whatever is there).
+    InsertPcmciaCard,
+    /// Pull the card out of the PCMCIA slot.
+    EjectPcmciaCard,
 
     // Input.
     SetPortDevice(usize, PortDevice),
@@ -67,6 +73,8 @@ pub enum MenuAction {
     SetRunAhead(u8),
     /// Show or hide the on-screen Amiga keyboard.
     ToggleKeyboardPanel,
+    /// Type the host clipboard's text on the emulated keyboard.
+    PasteKeystrokes,
 
     // Serial / parallel, present only when something is on the port.
     /// `None` unplugs the cable: a MIDI interface with nothing connected.
@@ -89,6 +97,8 @@ pub enum MenuAction {
     // Emulation.
     SetFloppySpeed(u16),
     ToggleRewind,
+    /// Host <-> guest clipboard sharing (`crate::clipboard`).
+    ToggleClipboard,
 
     // Warp.
     ToggleWarp,
@@ -97,6 +107,7 @@ pub enum MenuAction {
     // Recording.
     ToggleRecord,
     ToggleRecordInput,
+    SaveClip,
 
     // Save states.
     SaveState,
@@ -123,14 +134,14 @@ impl MenuAction {
         matches!(
             self,
             MenuAction::OpenMachineConfig
-                | MenuAction::OpenFrameAnalyzer
                 | MenuAction::OpenDebugger
-                | MenuAction::OpenConsole
                 | MenuAction::OpenInputMapping
                 | MenuAction::OpenCalibration
                 | MenuAction::OpenShortcuts
                 | MenuAction::OpenAbout
                 | MenuAction::LoadRom
+                | MenuAction::InsertPcmciaCard
+                | MenuAction::EjectPcmciaCard
                 | MenuAction::SaveState
                 | MenuAction::LoadState
                 | MenuAction::ResetMachine
@@ -461,6 +472,7 @@ pub struct MenuState<'a> {
     /// Which monitor front the bezel pass is drawing, if any.
     pub bezel: BezelStyle,
     pub perf_overlay: bool,
+    pub vsync: bool,
     pub warp: bool,
     pub warp_speed: WarpSpeed,
     pub rewind: bool,
@@ -469,9 +481,18 @@ pub struct MenuState<'a> {
     pub autofire_hz: u8,
     pub run_ahead_frames: u8,
     pub joystick_input_mode: JoystickInputMode,
+    /// Host clipboard sharing is on (`[clipboard] share`).
+    pub clipboard_share: bool,
+    /// The clipboard unit is fitted, so the toggle can act: the guest
+    /// bridge exists only when the machine was built with it.
+    pub clipboard_available: bool,
     /// Whether the on-screen Amiga keyboard is up.
     pub keyboard_panel: bool,
     pub port_devices: [PortDevice; 2],
+    /// Whether the machine has a PCMCIA slot (A600/A1200), and what is
+    /// in it: the category is only offered on a machine with the slot.
+    pub pcmcia_slot: bool,
+    pub pcmcia_card: Option<String>,
     pub pixel_aspect: PixelAspect,
     pub scaling: DisplayScaling,
     /// Whether the window presentation crops to the programmed display
@@ -581,9 +602,7 @@ pub fn build(s: &MenuState) -> Vec<MenuRow> {
     }
     let mut rows = vec![
         MenuRow::action("Machine Configuration...", MenuAction::OpenMachineConfig),
-        MenuRow::action("Frame Analyzer...", MenuAction::OpenFrameAnalyzer),
         MenuRow::action("Debugger...", MenuAction::OpenDebugger),
-        MenuRow::action("Console...", MenuAction::OpenConsole),
         MenuRow::action(
             &format!("Freeze ({})", s.cartridge.unwrap_or("HRTMon")),
             MenuAction::FreezeCartridge,
@@ -606,6 +625,16 @@ pub fn build(s: &MenuState) -> Vec<MenuRow> {
     }
     if !s.sampler_inputs.is_empty() {
         rows.push(MenuRow::submenu("Parallel Port", parallel_rows(s)));
+    }
+
+    // Only a machine with the slot has anything to put in it. The floppy
+    // and CD controls live on the status bar; the slot has no bar icon,
+    // so its insert/eject sit here.
+    if s.pcmcia_slot {
+        rows.push(
+            MenuRow::submenu("PCMCIA Card", pcmcia_rows(s))
+                .with_value(s.pcmcia_card.clone().unwrap_or_else(|| "Empty".to_string())),
+        );
     }
 
     rows.extend([
@@ -812,6 +841,7 @@ fn video_rows(s: &MenuState) -> Vec<MenuRow> {
         // category to fit the longest style name.
         MenuRow::submenu("Monitor Bezel", bezel_rows(s)),
         MenuRow::toggle("Performance", MenuAction::TogglePerfOverlay, s.perf_overlay),
+        MenuRow::toggle("VSync", MenuAction::ToggleVsync, s.vsync),
     ]
 }
 
@@ -829,12 +859,13 @@ fn player_video_rows(s: &MenuState) -> Vec<MenuRow> {
         shader_strength_row(s),
         MenuRow::submenu("Screen Tint", tint_rows(s)),
         MenuRow::toggle("Fullscreen", MenuAction::ToggleFullscreen, s.fullscreen),
+        MenuRow::toggle("VSync", MenuAction::ToggleVsync, s.vsync),
         MenuRow::submenu("Monitor Bezel", bezel_rows(s)),
     ]
 }
 
 fn input_rows(s: &MenuState) -> Vec<MenuRow> {
-    const DEVICES: [PortDevice; 6] = [
+    const DEVICES: [PortDevice; 7] = [
         PortDevice::Mouse,
         // A mouse a gamepad can move as well as the hand on the desk,
         // offered on port 1 alone: that is where a mouse belongs.
@@ -842,6 +873,7 @@ fn input_rows(s: &MenuState) -> Vec<MenuRow> {
         PortDevice::Joystick,
         PortDevice::Cd32Pad,
         PortDevice::Analogue,
+        PortDevice::LightPen,
         PortDevice::None,
     ];
     let port = |n: usize| -> Vec<MenuRow> {
@@ -892,6 +924,18 @@ fn input_rows(s: &MenuState) -> Vec<MenuRow> {
             MenuAction::ToggleKeyboardPanel,
             s.keyboard_panel,
         ),
+        // The clipboard typed into the machine, key by key, for text a
+        // guest has no other way to receive.
+        MenuRow::action("Paste as Keystrokes", MenuAction::PasteKeystrokes),
+        // Host <-> guest clipboard text, both ways. Greyed when the machine
+        // was built without the clipboard unit: the guest-side bridge is
+        // part of the services board's boot, not something to add later.
+        MenuRow::toggle(
+            "Share Clipboard",
+            MenuAction::ToggleClipboard,
+            s.clipboard_share,
+        )
+        .available(s.clipboard_available),
         MenuRow::action("Calibrate Gamepad...", MenuAction::OpenCalibration),
         MenuRow::action("Input Mapping...", MenuAction::OpenInputMapping),
     ]
@@ -1067,6 +1111,14 @@ fn parallel_rows(s: &MenuState) -> Vec<MenuRow> {
     ]
 }
 
+fn pcmcia_rows(s: &MenuState) -> Vec<MenuRow> {
+    vec![
+        MenuRow::action("Insert CF Card Image...", MenuAction::InsertPcmciaCard),
+        MenuRow::action("Eject Card", MenuAction::EjectPcmciaCard)
+            .available(s.pcmcia_card.is_some()),
+    ]
+}
+
 fn emulation_rows(s: &MenuState) -> Vec<MenuRow> {
     let speeds = std::iter::once(crate::floppy::SPEED_TURBO)
         .chain(crate::floppy::SUPPORTED_SPEED_PERCENTS)
@@ -1137,6 +1189,7 @@ fn recording_rows(s: &MenuState) -> Vec<MenuRow> {
             },
             MenuAction::ToggleRecordInput,
         ),
+        MenuRow::action("Save Clip as GIF", MenuAction::SaveClip),
     ]
 }
 
@@ -1336,16 +1389,21 @@ mod tests {
             status_bar_hidden: false,
             bezel: BezelStyle::None,
             perf_overlay: false,
+            vsync: true,
             warp: false,
             warp_speed: WarpSpeed::Max,
             rewind: false,
             recording: false,
             input_recording: false,
             autofire_hz: 0,
+            clipboard_share: false,
+            clipboard_available: false,
             run_ahead_frames: 0,
             joystick_input_mode: JoystickInputMode::Gamepad,
             keyboard_panel: false,
             port_devices: [PortDevice::Mouse, PortDevice::Joystick],
+            pcmcia_slot: false,
+            pcmcia_card: None,
             pixel_aspect: PixelAspect::Tv,
             scaling: DisplayScaling::Smooth,
             autocrop: false,
@@ -1682,7 +1740,7 @@ mod tests {
         assert!(!find(video, "Fullscreen").expect("fullscreen").closes_menu());
         // Every window toggle with a keyboard shortcut is reachable from
         // the menu too: the shortcut is the shortcut, not the only way.
-        for label in ["Status Bar", "Performance"] {
+        for label in ["Status Bar", "Performance", "VSync"] {
             let row = find(video, label).unwrap_or_else(|| panic!("{label} missing"));
             assert!(row.marks_state(), "{label} is not a toggle");
             assert!(!row.closes_menu(), "picking {label} closed the menu");
@@ -1708,8 +1766,10 @@ mod tests {
 
         let save = find(&rows, "Save State").expect("save state");
         let save = save.children().expect("children");
-        // Both of these put a file dialogue up; a quick slot does not.
+        // Save State writes a file and Load State opens the browser panel:
+        // both take the eye elsewhere; a quick slot does not.
         assert!(find(save, "Save State...").expect("save").closes_menu());
+        assert!(find(save, "Load State...").expect("load").closes_menu());
         let quick = find(save, "Quick Save").expect("quick save");
         assert!(!quick.children().expect("slots")[0].closes_menu());
     }
@@ -1821,6 +1881,7 @@ mod tests {
             "Shader Strength",
             "Monitor Bezel",
             "Fullscreen",
+            "VSync",
         ] {
             assert!(find(video, kept).is_some(), "missing {kept}");
         }

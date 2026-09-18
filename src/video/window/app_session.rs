@@ -341,7 +341,7 @@ impl App {
     /// Whether this is a capture run (`--screenshot-after` / `--dump-frames`):
     /// unpaced end to end, one frame per loop, never re-paced.
     pub(super) fn headless_capture_active(&self) -> bool {
-        !self.auto_shot.is_empty() || self.frame_dump.is_some()
+        !self.auto_shot.is_empty() || self.frame_dump.is_some() || !self.gif_captures.is_empty()
     }
 
     /// Drop a pending or engaged warp launch / warp boot. Returns whether
@@ -536,6 +536,121 @@ impl App {
         }
     }
 
+    /// Host <-> guest clipboard sharing (`crate::clipboard`). Every few
+    /// hundred milliseconds: put the text the guest copied on the host
+    /// clipboard and, while the window is focused, stage a changed host
+    /// clipboard for the guest. Polled rather than evented -- no platform
+    /// reports clipboard changes portably -- and slowly, because reading
+    /// the host clipboard can be an IPC round trip that has no business
+    /// on the frame budget. The board's hash of the last text seen keeps
+    /// the two directions from echoing each other.
+    pub(super) fn service_clipboard(&mut self) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(300);
+        let now = Instant::now();
+        if self.clipboard_next_poll.is_some_and(|at| now < at) {
+            return;
+        }
+        self.clipboard_next_poll = Some(now + POLL);
+        let Some(board) = self.emu.bus_mut().filesys_board_mut() else {
+            return;
+        };
+        if !board.clipboard_sharing() {
+            return;
+        }
+        // Guest -> host. The board remembers it so the poll below does
+        // not stage the guest's own text straight back.
+        if let Some(text) = board.take_guest_clipboard() {
+            board.clipboard_host_text_changed(&text);
+            let text = if cfg!(windows) {
+                text.replace('\n', "\r\n")
+            } else {
+                text
+            };
+            match self.host_clipboard() {
+                Some(clip) => {
+                    if let Err(e) = clip.set_text(text) {
+                        warn!("clipboard: host clipboard write failed: {e}");
+                    }
+                }
+                None => log::debug!("clipboard: guest clip dropped, no host clipboard"),
+            }
+            return;
+        }
+        // Host -> guest, only while the window has the focus: that is when
+        // the user is about to paste here, and an unfocused emulator has
+        // no call to read what another application is copying.
+        if !self.main_window_focused {
+            return;
+        }
+        let Some(clip) = self.host_clipboard() else {
+            return;
+        };
+        // An empty or non-text clipboard is not an error worth logging
+        // every poll; a real failure is.
+        let text = match clip.get_text() {
+            Ok(text) => text,
+            Err(arboard::Error::ContentNotAvailable) => return,
+            Err(e) => {
+                log::debug!("clipboard: host clipboard read failed: {e}");
+                return;
+            }
+        };
+        let board = self
+            .emu
+            .bus_mut()
+            .filesys_board_mut()
+            .expect("checked above");
+        if board.clipboard_host_text_changed(&text) {
+            board.stage_host_clipboard(&text);
+        }
+    }
+
+    /// The host clipboard, opened on first use and kept open: on X11 and
+    /// Wayland the owning instance serves the selection, so the handle
+    /// must outlive the copy.
+    ///
+    /// A failure is remembered rather than retried. Nothing about the
+    /// session changes to make a second attempt succeed, and the poll runs
+    /// three times a second: retrying would walk the clipboard protocols
+    /// (and log a warning from inside `arboard`) that often, for the whole
+    /// run. Said once, it tells the user why sharing is doing nothing.
+    fn host_clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.host_clipboard.is_none() && !self.host_clipboard_unavailable {
+            match arboard::Clipboard::new() {
+                Ok(clip) => self.host_clipboard = Some(clip),
+                Err(e) => {
+                    self.host_clipboard_unavailable = true;
+                    warn!("clipboard: no host clipboard ({e}); sharing is off this session");
+                }
+            }
+        }
+        self.host_clipboard.as_mut()
+    }
+
+    /// The Input Settings > Share Clipboard toggle.
+    pub(super) fn toggle_clipboard_sharing(&mut self) {
+        let Some(board) = self
+            .emu
+            .bus_mut()
+            .filesys_board_mut()
+            .filter(|b| b.clipboard_fitted())
+        else {
+            // Off unless asked for: the bridge is part of the services
+            // board's boot, and that board changes the guest's memory map,
+            // so it is a start-time choice and not one to add mid-session.
+            self.show_osd("Clipboard sharing not fitted: start with --clipboard");
+            return;
+        };
+        let on = !board.clipboard_sharing();
+        board.set_clipboard_sharing(on);
+        info!("clipboard: sharing {}", if on { "on" } else { "off" });
+        self.show_osd(if on {
+            "Clipboard sharing on"
+        } else {
+            "Clipboard sharing off"
+        });
+    }
+
     /// The run-ahead level in effect for this burst, or zero while the
     /// machine is transiently stopped or has a host-side incompatibility.
     pub(super) fn runahead_effective_frames(&self) -> u8 {
@@ -576,6 +691,10 @@ impl App {
             return Some("control client attached");
         }
         if let Some(reason) = self.emu.machine.runahead_debug_block_reason() {
+            return Some(reason);
+        }
+        #[cfg(feature = "dap")]
+        if let Some(reason) = self.emu.coverage_run_block_reason() {
             return Some(reason);
         }
         self.runahead_machine_block
@@ -627,7 +746,7 @@ impl App {
     /// an optional wall-clock budget that bounds that burst. Warp's output frame
     /// skip applies only while warp is engaged and not doing headless capture;
     /// real-time pacing and headless capture both run one frame per presented
-    /// frame. The `Max` level returns a budget so the burst presents at vsync
+    /// frame. The `Max` level returns a budget so the burst presents regularly
     /// rather than spinning to its frame cap.
     pub(super) fn warp_burst_plan(
         &self,
@@ -765,10 +884,12 @@ impl App {
     /// the restored Bus. On failure the running machine is untouched.
     pub(super) fn load_state_from_dialog(&mut self, event_loop: Option<&ActiveEventLoop>) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Load save state")
-            .add_filter("Copperline save states", &["clstate"])
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Load save state")
+                .add_filter("Copperline save states", &["clstate"])
+                .pick_file()
+        });
 
         // Re-baseline pacing after the modal dialog, as for floppies; a
         // successful load re-anchors again to the restored timeline inside
@@ -856,17 +977,21 @@ impl App {
     /// On any error the running machine keeps its current ROM.
     pub(super) fn load_rom_from_dialog(&mut self) {
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Load Kickstart ROM (512 or 256 KiB)")
-            .add_filter("Amiga ROM images", &["rom", "bin"])
-            .pick_file();
+        let picked = super::native_dialog::pick(|| {
+            rfd::FileDialog::new()
+                .set_title("Load Kickstart ROM (512 or 256 KiB)")
+                .add_filter("Amiga ROM images", &["rom", "bin"])
+                .pick_file()
+        });
         if let Some(main_path) = picked {
             // Offer an optional extended ROM (AROS/CDTV/CD32). Cancelling skips it
             // and removes any extended ROM currently fitted.
-            let ext_path = rfd::FileDialog::new()
-                .set_title("Load extended ROM (optional; Cancel to skip)")
-                .add_filter("Amiga ROM images", &["rom", "bin"])
-                .pick_file();
+            let ext_path = super::native_dialog::pick(|| {
+                rfd::FileDialog::new()
+                    .set_title("Load extended ROM (optional; Cancel to skip)")
+                    .add_filter("Amiga ROM images", &["rom", "bin"])
+                    .pick_file()
+            });
 
             // The identification comes off the bytes already in hand (the
             // image is handed to the machine straight after), so the OSD and
@@ -1068,6 +1193,286 @@ impl App {
         }
     }
 
+    /// Build the picture a capture shows -- the presentation buffer
+    /// through the same geometry as [`save_screenshot`](Self::save_screenshot)
+    /// -- into `clip_fb`, returning its width and height.
+    fn presented_capture_frame(&mut self) -> (usize, usize) {
+        let src_rows = self.present_rows;
+        if self.rtg_present_dims.is_some() {
+            // An RTG board's frame already has one presentation row per
+            // board row, as the screenshot path saves it.
+            let width = self.present_width;
+            self.clip_fb.clear();
+            self.clip_fb
+                .extend_from_slice(&self.present_fb[..src_rows * width]);
+            return (width, src_rows);
+        }
+        let mut out = std::mem::take(&mut self.clip_fb);
+        let dims = present_capture_frame(
+            &self.present_fb,
+            src_rows,
+            self.present_width,
+            self.overscan,
+            self.tv_centre,
+            self.present_tv_aperture_rows,
+            &mut out,
+        );
+        self.clip_fb = out;
+        dims
+    }
+
+    /// Offer the frame just presented to the clip ring. Called once per
+    /// scheduler pass with whether a new emulated frame was applied to
+    /// the presentation buffer; the ring thins to the clip rate before
+    /// the picture is built, so most passes cost nothing.
+    pub(super) fn capture_clip_frame(&mut self, rendered: bool) {
+        if !rendered || !self.powered_on || self.clip_settings.seconds == 0 {
+            return;
+        }
+        // A capture run renders for its own scheduled captures; the
+        // interactive ring has nobody to save it.
+        if self.headless_capture_active() {
+            return;
+        }
+        let t = self.emu.bus().emulated_seconds();
+        let ring = self.clip_ring.get_or_insert_with(|| {
+            let fps = self
+                .clip_settings
+                .effective_fps(self.emu.bus().agnus.video_standard());
+            crate::gifclip::ClipRing::new(self.clip_settings.seconds, fps)
+        });
+        if !ring.wants(t) {
+            return;
+        }
+        let source = super::ClipRingSource {
+            generation: self.present_fb_generation,
+            overscan: self.overscan,
+            tv_centre: self.tv_centre,
+            tv_aperture_rows: self.present_tv_aperture_rows,
+            capture_rows: crate::video::capture_height(),
+            rtg: self.rtg_present_dims.is_some(),
+        };
+        // The picture on screen is the one the ring's newest frame already
+        // holds: note the repeat without building it. The build is a
+        // full-frame crop plus an exact-palette scan, main-thread work on
+        // every clip slot otherwise.
+        if !ring.is_empty() && self.clip_ring_source == Some(source) {
+            ring.repeat(t);
+            return;
+        }
+        let (width, height) = self.presented_capture_frame();
+        let ring = self.clip_ring.as_mut().expect("ring built above");
+        ring.store(t, width, height, &self.clip_fb);
+        self.clip_ring_source = Some(source);
+    }
+
+    /// `present_fb` took a new picture: whatever the clip ring last built
+    /// from it no longer describes the screen.
+    pub(super) fn note_present_fb_changed(&mut self) {
+        self.present_fb_generation = self.present_fb_generation.wrapping_add(1);
+    }
+
+    /// Save Clip as GIF (shortcut / menu item): write the ring's frames to
+    /// an auto-named file in the recordings folder on a background thread
+    /// and flash the outcome on the OSD when it lands.
+    pub(super) fn save_clip_gif(&mut self) {
+        if self.clip_settings.seconds == 0 {
+            self.show_osd("Clip ring is off ([recording] clip_seconds = 0)");
+            return;
+        }
+        let Some(ring) = self.clip_ring.as_ref().filter(|ring| !ring.is_empty()) else {
+            self.show_osd("No clip yet");
+            return;
+        };
+        if self.clip_save.is_some() {
+            self.show_osd("Still saving the previous clip");
+            return;
+        }
+        let (frames, end) = ring.clip();
+        let fps = ring.fps();
+        let span = ring.span_seconds();
+        let path = crate::gifclip::auto_filename();
+        info!(
+            "saving clip: {} frames ({span:.1}s at {fps} fps) to {}",
+            frames.len(),
+            path.display()
+        );
+        self.show_osd(format!("Saving {}...", display_file_name(&path)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("gif-clip".into())
+            .spawn(move || {
+                let result = crate::gifclip::write_clip(&path, &frames, fps, Some(end))
+                    .map(|written| (path, written, span));
+                // The app may have quit while the file was written; the
+                // file is complete either way.
+                let _ = tx.send(result);
+            })
+            .expect("spawning the clip writer thread");
+        self.clip_save = Some(rx);
+        self.request_redraw();
+    }
+
+    /// Write the ring's frames to `path` now, on this thread: the
+    /// interactive save without its background thread and auto-named file.
+    #[cfg(test)]
+    pub(super) fn save_clip_gif_to(&self, path: &std::path::Path) -> Result<u32> {
+        let ring = self
+            .clip_ring
+            .as_ref()
+            .filter(|ring| !ring.is_empty())
+            .ok_or_else(|| anyhow!("no clip frames captured yet"))?;
+        let (frames, end) = ring.clip();
+        crate::gifclip::write_clip(path, &frames, ring.fps(), Some(end))
+    }
+
+    /// Collect a finished background clip save, if any.
+    pub(super) fn poll_clip_save(&mut self) {
+        let Some(rx) = self.clip_save.as_ref() else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.clip_save = None;
+                warn!("clip save thread ended without a result");
+                self.show_osd("Clip save failed (see log)");
+                return;
+            }
+        };
+        self.clip_save = None;
+        match outcome {
+            Ok((path, frames, span)) => {
+                info!(
+                    "clip saved: {} ({frames} frames, {span:.1}s of emulated time)",
+                    path.display()
+                );
+                self.show_osd(format!("Saved {} ({span:.1}s)", display_file_name(&path)));
+            }
+            Err(e) => {
+                warn!("clip save failed: {e:#}");
+                self.show_osd("Clip save failed (see log)");
+            }
+        }
+    }
+
+    /// Feed every live `--gif-after` capture whose window covers the
+    /// current emulated time with the frame just completed, and close the
+    /// ones whose window has passed. Returns true once every capture is
+    /// finished (the run is complete, like the last screenshot); a capture
+    /// waits for its exact frame while the renderer is still on it.
+    pub(super) fn fire_gif_captures(&mut self) -> bool {
+        if self.gif_captures.is_empty() {
+            return false;
+        }
+        let now = self.emu.bus().emulated_seconds();
+        let emulated_frame = self.emu.bus().emulated_frames();
+        let wants_frame = self.gif_captures.iter().any(|capture| {
+            !capture.finished
+                && now >= f64::from(capture.spec.start_secs)
+                && now < capture.end_secs()
+                && capture.last_captured_emulated_frame != Some(emulated_frame)
+        });
+        if wants_frame {
+            self.finish_render_for_current_frame();
+            if self.last_rendered_emulated_frame != Some(emulated_frame) {
+                return false;
+            }
+            let (width, height) = self.presented_capture_frame();
+            let mut captures = std::mem::take(&mut self.gif_captures);
+            for capture in captures.iter_mut().filter(|capture| {
+                !capture.finished
+                    && now >= f64::from(capture.spec.start_secs)
+                    && now < capture.end_secs()
+                    && capture.last_captured_emulated_frame != Some(emulated_frame)
+            }) {
+                capture.last_captured_emulated_frame = Some(emulated_frame);
+                if !capture.selector.take(now) {
+                    continue;
+                }
+                let result = (|| -> Result<()> {
+                    if capture.writer.is_none() {
+                        let path = &capture.spec.path;
+                        crate::paths::ensure_parent(path).with_context(|| {
+                            format!("creating the directory for {}", path.display())
+                        })?;
+                        let file = std::fs::File::create(path)
+                            .with_context(|| format!("creating clip {}", path.display()))?;
+                        capture.writer = Some(crate::gifclip::GifWriter::new(
+                            std::io::BufWriter::new(file),
+                            width,
+                            height,
+                            capture.selector.fps(),
+                        )?);
+                    }
+                    let frame = crate::gifclip::ClipFrame::new(now, width, height, &self.clip_fb);
+                    capture
+                        .writer
+                        .as_mut()
+                        .expect("writer opened above")
+                        .push(frame)
+                })();
+                if let Err(e) = result {
+                    warn!(
+                        "gif capture failed ({}), stopping it: {e:#}",
+                        capture.spec.path.display()
+                    );
+                    capture.finished = true;
+                    capture.writer = None;
+                }
+            }
+            self.gif_captures = captures;
+        }
+        for capture in self
+            .gif_captures
+            .iter_mut()
+            .filter(|capture| !capture.finished && now >= capture.end_secs())
+        {
+            let end = capture.end_secs();
+            match capture.finish(Some(end)) {
+                Ok(0) => warn!(
+                    "gif capture: {} covered no presented frames",
+                    capture.spec.path.display()
+                ),
+                Ok(frames) => info!(
+                    "gif capture complete: {} ({frames} frames, {:.1}s from {:.1}s)",
+                    capture.spec.path.display(),
+                    capture.spec.seconds,
+                    capture.spec.start_secs
+                ),
+                Err(e) => warn!(
+                    "gif capture failed ({}): {e:#}",
+                    capture.spec.path.display()
+                ),
+            }
+        }
+        if self.gif_captures.iter().any(|capture| !capture.finished) {
+            return false;
+        }
+        // A clip is one scheduled capture among several: a screenshot still
+        // waiting for a later frame keeps the run going, exactly as a
+        // pending clip keeps a finished screenshot from ending it.
+        // Whichever kind finishes last ends the run.
+        if self.other_capture_work_pending() {
+            return false;
+        }
+        self.emu.report_stats();
+        self.emu.bus().poll_stats.dump_top("at gif capture");
+        true
+    }
+
+    /// Scheduled capture work other than the caller's own kind: screenshots
+    /// or expectations still armed, a frame dump still running, or a clip
+    /// still recording. A capture kind that has emptied its own list ends
+    /// the run only when this is false.
+    pub(super) fn other_capture_work_pending(&self) -> bool {
+        !self.auto_shot.is_empty()
+            || !self.auto_expect.is_empty()
+            || self.frame_dump.is_some()
+            || self.gif_captures.iter().any(|capture| !capture.finished)
+    }
+
     pub(super) fn suspend_live_audio_for_host_io(&mut self) {
         self.emu.set_live_audio_suspended(true);
     }
@@ -1152,43 +1557,63 @@ impl App {
         // the moment the launch finishes (or is cancelled).
         // A warp a control client or the guest engaged is silent the same
         // way; the manual toggle is not.
+        // A spectator replaying its backlog is fast-forward noise as well.
         let warp_muted = self.warp_launch.as_ref().is_some_and(|l| l.engaged)
             || self.warp_boot.as_ref().is_some_and(|g| g.engaged)
-            || !self.warp_holds.is_empty();
+            || !self.warp_holds.is_empty()
+            || self.netplay.as_ref().is_some_and(|s| s.catching_up());
         let suspended = !self.powered_on || self.cpu_halted || self.paused || warp_muted;
         self.emu.set_live_audio_suspended(suspended);
     }
 
-    pub(super) fn save_screenshot(&self, path: &std::path::Path) {
-        // COPPERLINE_SHOT_RAW saves the raw woven framebuffer (716x570
-        // for standard fields, the native scan height for programmable
-        // modes): the presentation resampler blends adjacent lines, so
-        // per-scanline forensics need the unscaled field.
+    /// The presented frame as a screenshot captures it, before encoding:
+    /// the single path behind saved screenshots and `--expect-screenshot`.
+    ///
+    /// COPPERLINE_SHOT_RAW captures the raw woven framebuffer (716x570
+    /// for standard fields, the native scan height for programmable
+    /// modes): the presentation resampler blends adjacent lines, so
+    /// per-scanline forensics need the unscaled field.
+    pub(super) fn capture_present_image(&self) -> super::present::PresentImage<'_> {
         let src_rows = self.present_rows;
-        let result = if self.rtg_present_dims.is_some() {
+        if self.rtg_present_dims.is_some() {
             // An RTG board's frame already has one presentation row per
-            // board row: save it at that height, matching the control
+            // board row: capture it at that height, matching the control
             // protocol's capture, instead of scaling to the chipset glass.
-            screenshot::save(
-                path,
-                &self.present_fb[..src_rows * self.present_width],
-                self.present_width as u32,
-                src_rows as u32,
-            )
-        } else {
-            save_present_frame(
-                path,
-                &self.present_fb,
-                src_rows,
-                self.present_width,
-                self.overscan,
-                self.tv_centre,
-                self.present_tv_aperture_rows,
-            )
-        };
-        match result {
+            return super::present::PresentImage {
+                pixels: std::borrow::Cow::Borrowed(
+                    &self.present_fb[..src_rows * self.present_width],
+                ),
+                width: self.present_width as u32,
+                height: src_rows as u32,
+            };
+        }
+        super::present::render_present_frame(
+            &self.present_fb,
+            src_rows,
+            self.present_width,
+            self.overscan,
+            self.tv_centre,
+            self.present_tv_aperture_rows,
+        )
+    }
+
+    pub(super) fn save_screenshot(&self, path: &std::path::Path) {
+        let image = self.capture_present_image();
+        match screenshot::save(path, &image.pixels, image.width, image.height) {
             Ok(()) => info!("screenshot saved: {}", path.display()),
             Err(e) => warn!("screenshot save failed ({}): {e:#}", path.display()),
+        }
+    }
+
+    /// Check one `--expect-screenshot` against the frame just rendered,
+    /// recording a failure in the run's verdict.
+    pub(super) fn check_screenshot_expectation(&mut self, spec: &crate::expect::ExpectShotSpec) {
+        let outcome = {
+            let image = self.capture_present_image();
+            crate::expect::check(spec, &image.pixels, image.width, image.height)
+        };
+        if !outcome.passed {
+            self.verdict.expect_failures += 1;
         }
     }
 

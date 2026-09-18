@@ -29,6 +29,12 @@ const SERIAL_LIVE_IDLE_CAP_CCK: u32 = 256;
 /// (e.g. a permanently halted CPU) cannot spin forever. Far larger than the
 /// instruction distance between two snapshots at any sane capture interval.
 const TT_REPLAY_STEP_CAP: u64 = 100_000_000;
+/// How far a debugger step hunts for the interrupt that wakes a CPU parked
+/// in STOP. A VBlank -- what nearly every STOP waits for -- comes once a
+/// frame, and a CPU whose interrupts are masked never wakes at all, so the
+/// step gives up here and leaves the machine stopped. Shared with the
+/// control session, which runs the same hunt around its scheduled input.
+pub const DEBUG_STOP_WAKEUP_FRAMES: u64 = 2;
 /// Approximate CPU cycles per emulated M68000 instruction for converting
 /// frame-sized instruction budgets and real-mode device cadence. The
 /// instruction-paced backend is not cycle-exact, so use the 68000's
@@ -108,6 +114,11 @@ pub struct Emulator {
     /// host-side only, never serialized.
     #[cfg(feature = "control")]
     profile: Option<crate::profile::ProfileCapture>,
+    /// A `--run PROG --coverage FILE` run: waits for the program's load,
+    /// counts its instructions, writes the lcov file at its exit or the
+    /// run's end. Host-side only, never serialized.
+    #[cfg(feature = "dap")]
+    coverage_run: Option<crate::profile::lcov::CoverageRun>,
 }
 
 /// What a save-state load did, for the caller to surface. A `.clstate` always
@@ -475,6 +486,8 @@ impl Emulator {
             descriptor: crate::config::MachineDescriptor::default(),
             #[cfg(feature = "control")]
             profile: None,
+            #[cfg(feature = "dap")]
+            coverage_run: None,
         })
     }
 
@@ -581,6 +594,12 @@ impl Emulator {
                 "memory snapshots cannot be combined with a deferred trigger",
             ));
         }
+        if opts.coverage && self.machine.coverage_active() {
+            return Err(std::io::Error::other(
+                "coverage is already being collected by --coverage; \
+                 it cannot be shared with a profile capture",
+            ));
+        }
         let requested_full = opts.slots;
         let already = self.bus().frame_analyzer_enabled();
         let already_full = self.bus().frame_analyzer_full();
@@ -616,14 +635,18 @@ impl Emulator {
                 capture.options().registers,
             );
         }
+        if capture.options().coverage {
+            self.machine.start_coverage(&capture.options().code_ranges);
+        }
         log::info!(
-            "profile: capturing up to {} frame(s) into {} (slots {}, screenshots {}, pc {}, samples {})",
+            "profile: capturing up to {} frame(s) into {} (slots {}, screenshots {}, pc {}, samples {}, coverage {})",
             capture.options().frames,
             capture.dir().display(),
             capture.options().slots,
             capture.options().screenshots.name(),
             capture.options().pc_samples,
             capture.options().samples,
+            capture.options().coverage,
         );
         self.profile = Some(capture);
         Ok(())
@@ -643,6 +666,11 @@ impl Emulator {
         };
         capture.set_stack_bounds(crate::amigaos::stack_bounds_on_bus(self.bus()));
         self.machine.stop_profile_samples();
+        if capture.options().coverage {
+            if let Some(collector) = self.machine.stop_coverage() {
+                capture.set_coverage(collector.into_data());
+            }
+        }
         if matches!(
             capture.options().screenshots,
             crate::profile::ScreenshotMode::Last
@@ -933,8 +961,91 @@ impl Emulator {
         }
         if self.profile.as_ref().is_some_and(|profile| profile.done()) {
             self.machine.stop_profile_samples();
+            if opts.coverage {
+                if let Some(collector) = self.machine.stop_coverage() {
+                    if let Some(profile) = self.profile.as_mut() {
+                        profile.set_coverage(collector.into_data());
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Arm a `--run PROG --coverage FILE` run: polled on every committed
+    /// frame from here on.
+    #[cfg(feature = "dap")]
+    pub fn arm_coverage_run(&mut self, run: crate::profile::lcov::CoverageRun) {
+        log::info!(
+            "coverage: waiting for the program to load; lcov file {}",
+            run.out().display()
+        );
+        self.coverage_run = Some(run);
+    }
+
+    #[cfg(feature = "dap")]
+    pub fn coverage_run_armed(&self) -> bool {
+        self.coverage_run.is_some()
+    }
+
+    /// Whether the run wrote its final file (the program exited, or it
+    /// never loaded in time).
+    #[cfg(feature = "dap")]
+    pub fn coverage_run_written(&self) -> bool {
+        self.coverage_run
+            .as_ref()
+            .is_some_and(crate::profile::lcov::CoverageRun::written)
+    }
+
+    /// Why run-ahead is unavailable while a coverage run is pending: its
+    /// speculative frames would be counted twice.
+    #[cfg(feature = "dap")]
+    pub fn coverage_run_block_reason(&self) -> Option<&'static str> {
+        self.coverage_run
+            .as_ref()
+            .and_then(crate::profile::lcov::CoverageRun::runahead_block_reason)
+    }
+
+    #[cfg(feature = "dap")]
+    fn coverage_poll(&mut self) -> Result<()> {
+        let Some(run) = self.coverage_run.as_mut() else {
+            return Ok(());
+        };
+        let frame = self.machine.bus().emulated_frames();
+        match run
+            .poll(&mut self.machine, frame)
+            .map_err(|e| anyhow!("coverage: {e}"))?
+        {
+            crate::profile::lcov::CoveragePoll::Idle => {}
+            crate::profile::lcov::CoveragePoll::Loaded => {
+                log::info!("coverage: program loaded; counting retired instructions");
+            }
+            crate::profile::lcov::CoveragePoll::Written => {
+                log::info!("coverage: program exited; wrote {}", run.out().display());
+            }
+            crate::profile::lcov::CoveragePoll::TimedOut => {
+                log::warn!(
+                    "coverage: the program was not loaded within {:.0} emulated seconds; wrote an empty {}",
+                    crate::runprog::WARP_LAUNCH_TIMEOUT_SECS,
+                    run.out().display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The run is ending: write the coverage file if the program is still
+    /// running (or never loaded). Safe to call on every exit path.
+    #[cfg(feature = "dap")]
+    pub fn finish_coverage_run(&mut self) {
+        let Some(run) = self.coverage_run.as_mut() else {
+            return;
+        };
+        match run.finish(&mut self.machine) {
+            Ok(true) => log::info!("coverage: run ended; wrote {}", run.out().display()),
+            Ok(false) => {}
+            Err(e) => log::warn!("coverage: writing {} failed: {e}", run.out().display()),
+        }
     }
 
     /// Whether the WinUAE-compatible uaelib trap is fitted
@@ -979,6 +1090,15 @@ impl Emulator {
             .uaelib
             .as_mut()
             .and_then(|u| u.take_warp_request())
+    }
+
+    /// Whether the guest asked the emulator to stop through the uaelib
+    /// trap (WinUAE `ExitEmu`, function 13) since the last take.
+    pub fn take_uaelib_exit_request(&mut self) -> bool {
+        self.bus_mut()
+            .uaelib
+            .as_mut()
+            .is_some_and(|u| u.take_exit_request())
     }
 
     /// Queued guest debug events (uaelib functions 86 and 88) and the
@@ -1201,7 +1321,8 @@ impl Emulator {
     /// `src/copperhf.rs`'s module doc).
     pub fn save_state(&mut self, path: &std::path::Path) -> Result<()> {
         self.bus_mut().copperhf_quiesce();
-        crate::savestate::save(&self.machine, &self.descriptor, path)
+        let meta = self.state_meta();
+        crate::savestate::save(&self.machine, &self.descriptor, Some(&meta), path)
     }
 
     /// `save_state` into memory instead of a file, for hosts with no
@@ -1209,9 +1330,82 @@ impl Emulator {
     /// download or IndexedDB). Same bytes, same format version.
     pub fn save_state_bytes(&mut self) -> Result<Vec<u8>> {
         self.bus_mut().copperhf_quiesce();
+        let meta = self.state_meta();
         let mut blob = Vec::new();
-        crate::savestate::save_to_writer(&self.machine, &self.descriptor, &mut blob)?;
+        crate::savestate::save_to_writer(&self.machine, &self.descriptor, Some(&meta), &mut blob)?;
         Ok(blob)
+    }
+
+    /// The machine alone, as `save_state_bytes` writes it but without the
+    /// `META` chunk: the bytes two snapshots of the same machine at the
+    /// same instant agree on, whatever the wall clock says. For
+    /// byte-identity checks (a debugger view that must not disturb the
+    /// machine, an import that must run deterministically), not for files.
+    pub fn machine_state_bytes(&mut self) -> Result<Vec<u8>> {
+        self.bus_mut().copperhf_quiesce();
+        let mut blob = Vec::new();
+        crate::savestate::save_to_writer(&self.machine, &self.descriptor, None, &mut blob)?;
+        Ok(blob)
+    }
+
+    /// What a state written now carries in its `META` chunk: a thumbnail
+    /// of the current frame from the side-effect-free display renderer
+    /// (the same picture `capture.screenshot` saves, so headless and
+    /// windowed saves agree byte for byte), the emulated and wall-clock
+    /// times, the machine summary, and the media names. A frame that
+    /// cannot be rendered leaves the thumbnail empty rather than failing
+    /// the save.
+    pub fn state_meta(&self) -> crate::savestate::StateMeta {
+        let (fb, lines, width) = crate::video::render_capture_frame(self.bus());
+        let chipset_glass = !self.bus().rtg_active();
+        let (thumbnail_png, thumbnail_width, thumbnail_height) =
+            match crate::savestate::meta::encode_thumbnail(&fb, width, lines, chipset_glass) {
+                Ok(thumbnail) => thumbnail,
+                Err(e) => {
+                    log::warn!("save state: no thumbnail: {e:#}");
+                    (Vec::new(), 0, 0)
+                }
+            };
+        // wasm32-unknown-unknown has no std clock (`SystemTime::now`
+        // panics there), and the browser frontend has no folder to browse
+        // anyway: its states carry 0, "unknown", for the wall clock.
+        #[cfg(not(target_arch = "wasm32"))]
+        let saved_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        #[cfg(target_arch = "wasm32")]
+        let saved_at_unix = 0;
+        crate::savestate::StateMeta {
+            thumbnail_png,
+            thumbnail_width,
+            thumbnail_height,
+            emulated_seconds: self.bus().emulated_seconds(),
+            emulated_frames: self.bus().emulated_frames(),
+            saved_at_unix,
+            machine: self.descriptor.short_summary(),
+            media: self.bus().media_names(),
+        }
+    }
+
+    /// Portable checkpoint for synchronous frontends. Unlike a desktop state,
+    /// this includes the CPU interrupt sampling and frame-boundary latches.
+    /// The frontend must configure deterministic, private storage and wrap the
+    /// result with its own content identity and size/integrity checks.
+    pub fn save_frontend_state_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        crate::savestate::save_frontend(&self.machine, &self.descriptor, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Load a frontend checkpoint only into the matching configured machine.
+    /// Components use the bounded save-state reader and are parsed before the
+    /// live machine changes. Immutable media must already be available locally.
+    pub fn load_frontend_state_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        crate::savestate::load_frontend(&mut self.machine, &self.descriptor, bytes)?;
+        self.reset_realtime_quantum();
+        self.reset_live_audio_after_timeline_jump();
+        Ok(())
     }
 
     /// Restore a save state from `path`. The state carries its own machine
@@ -2115,10 +2309,85 @@ impl Emulator {
     /// Execute exactly `count` CPU instructions (interactive debugger
     /// single-step). The cycle-exact core advances the chipset in lockstep,
     /// so device state stays consistent; no wall-clock pacing is applied.
+    ///
+    /// A CPU halted in STOP retires nothing under a single-instruction
+    /// slice: the 68000 is waiting for an interrupt, and only device time
+    /// can bring one. Such a step falls back to the real-time loop's idle
+    /// fast-forward, exactly as the run-to / step-over / step-out helpers
+    /// do, until one instruction has run -- the first of the interrupt
+    /// handler, which is where control actually goes next.
     pub fn debug_step_instructions(&mut self, count: usize) -> Result<()> {
         for _ in 0..count {
+            let retired = self.retired_instructions();
             self.execute_cpu_slice(1)?;
             self.machine.refresh_irq_line();
+            if self.retired_instructions() == retired && self.machine.stopped() {
+                self.debug_step_stopped_to_wakeup(retired)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance a CPU sitting in STOP until one instruction retires: the
+    /// interrupt arrives, the exception is taken, and the step ends on the
+    /// handler's first instruction having run.
+    ///
+    /// The retired instruction, not the exit from STOP, is what ends this:
+    /// an idle fast-forward slice can carry the wake-up and the first
+    /// handler instruction together, while a single-instruction slice
+    /// takes the exception on its own, and a step means the same thing
+    /// either way.
+    ///
+    /// Bounded in emulated time by [`DEBUG_STOP_WAKEUP_FRAMES`]: a CPU
+    /// stopped with its interrupts masked (or with nothing enabled in
+    /// INTENA) never wakes, and a step must still return, so the machine
+    /// is left stopped where it is -- which is what the hardware is doing.
+    fn debug_step_stopped_to_wakeup(&mut self, retired_before: u64) -> Result<()> {
+        let deadline = self
+            .bus()
+            .emulated_frames()
+            .saturating_add(DEBUG_STOP_WAKEUP_FRAMES);
+        while self.retired_instructions() == retired_before {
+            if self.bus().emulated_frames() >= deadline {
+                break;
+            }
+            self.debug_step_one_with_idle()?;
+            // A breakpoint or watchpoint that the wake-up handler trips
+            // ends the step where it hit, as it does on any other run.
+            if self.machine.ui_debug_stop_pending() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// A debugger's "step one instruction" over the control protocol:
+    /// [`Self::debug_step_realtime`], and, when the CPU is parked in STOP
+    /// and the slice therefore retired nothing, the bounded run on to the
+    /// interrupt that wakes it that [`Self::debug_step_instructions`]
+    /// makes. The window's Step and this one then land in the same place.
+    pub fn debug_step_realtime_past_stop(&mut self) -> Result<()> {
+        let retired = self.retired_instructions();
+        self.debug_step_realtime()?;
+        if self.retired_instructions() == retired && self.machine.stopped() {
+            self.debug_step_stopped_to_wakeup(retired)?;
+        }
+        Ok(())
+    }
+
+    /// The same for GDB's `stepi`. Only a step asks for this: `continue`
+    /// runs the machine through STOP by itself, and a caller advancing a
+    /// whole frame one slice at a time (the profiler, a state warm-up)
+    /// would overshoot it, so both keep [`Self::debug_step_for_gdb`].
+    pub fn debug_step_for_gdb_past_stop(&mut self, cpu_idle: &mut bool) -> Result<()> {
+        let retired = self.retired_instructions();
+        self.debug_step_for_gdb(cpu_idle)?;
+        if self.retired_instructions() == retired && self.machine.stopped() {
+            self.debug_step_stopped_to_wakeup(retired)?;
+            // The hunt ran slices of its own, so the caller's idle flag
+            // now describes the CPU it is handed back: idle only if it is
+            // still stopped.
+            *cpu_idle = self.machine.stopped();
         }
         Ok(())
     }
@@ -2323,6 +2592,13 @@ impl Emulator {
         self.step_frame_with_pc_outside(None).map(|_| ())
     }
 
+    /// Advance to the next hardware video-frame boundary. Frontends whose
+    /// caller owns pacing (such as libretro) use this with an unpaced machine;
+    /// `step_frame` instead advances a desktop CPU-budget quantum.
+    pub fn step_video_frame(&mut self) -> Result<()> {
+        self.step_netplay_frame(false)
+    }
+
     /// Advance to the next hardware video frame for netplay. The normal
     /// frontend quantum is a CPU budget and can end within a raster frame;
     /// network inputs need a boundary defined entirely by the guest hardware.
@@ -2395,6 +2671,10 @@ impl Emulator {
         #[cfg(feature = "control")]
         if !self.runahead_speculative {
             self.profile_poll()?;
+        }
+        #[cfg(feature = "dap")]
+        if !self.runahead_speculative {
+            self.coverage_poll()?;
         }
         if !self.runahead_speculative
             && crate::envcfg::flag("COPPERLINE_DIAG_PCSAMPLE")
@@ -3002,6 +3282,24 @@ fn build_serial_sink(cfg: &Config) -> Result<Box<dyn crate::serial::SerialSink>>
         SerialMode::Pty => Err(anyhow!(
             "[serial] mode = \"pty\" is only available on Unix hosts"
         )),
+        #[cfg(feature = "host-serial")]
+        SerialMode::Device => {
+            let path = cfg.serial.device.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "[serial] mode = \"device\" needs a host serial port: set [serial] \
+                     device = \"/dev/tty...\" (or \"COMn\"), pass --serial-device, or pick \
+                     one in the launcher's I/O Ports > Serial > Port row \
+                     (--list-serial-ports names them)"
+                )
+            })?;
+            Ok(Box::new(crate::serial::device::DeviceSerialSink::open(
+                path,
+            )?))
+        }
+        #[cfg(not(feature = "host-serial"))]
+        SerialMode::Device => Err(anyhow!(
+            "[serial] mode = \"device\" needs a build with --features host-serial"
+        )),
         SerialMode::Modem => {
             let options = crate::modem::ModemOptions {
                 listen: cfg.serial.listen.clone(),
@@ -3026,16 +3324,70 @@ fn build_serial_sink(cfg: &Config) -> Result<Box<dyn crate::serial::SerialSink>>
 /// that slot empty, as it would if the drive had been unplugged. Only a disk
 /// that is present is opened, so a missing one never raises the host's
 /// permission prompt.
+/// The card `[pcmcia]` (or a `[[host_disk]]` on the slot) puts in the
+/// socket at power-on. A missing real disk is reported and skipped, as
+/// the IDE ports do; a missing image is an error, as `[ide]`'s is.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_pcmcia_card(cfg: &Config) -> Result<Option<crate::pcmcia::PcmciaCard>> {
+    use crate::config::PcmciaCardConfig;
+    use crate::pcmcia::{CfCard, PcmciaCard, SramCard};
+    match &cfg.pcmcia.card {
+        PcmciaCardConfig::Cf { path } => {
+            let card = CfCard::open(path)
+                .with_context(|| format!("[pcmcia] CF card image {}", path.display()))?;
+            return Ok(Some(PcmciaCard::cf(card)));
+        }
+        PcmciaCardConfig::Sram {
+            size,
+            path,
+            read_only,
+        } => {
+            let card = SramCard::new(*size, path.as_deref(), *read_only)?;
+            return Ok(Some(PcmciaCard::Sram(card)));
+        }
+        PcmciaCardConfig::None => {}
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(disk) = cfg.host_disks.iter().find(|d| d.attach.is_pcmcia()) {
+        match crate::ata::IdeDrive::open_host_disk(
+            &disk.device,
+            disk.fingerprint.as_deref(),
+            disk.identity_confirmed,
+            disk.writable,
+        ) {
+            Ok(drive) => {
+                info!(
+                    "pcmcia: CF card is host disk {}{}",
+                    disk.device,
+                    if disk.writable {
+                        " (WRITABLE)"
+                    } else {
+                        " (read-only)"
+                    }
+                );
+                return Ok(Some(PcmciaCard::cf(CfCard::new(drive))));
+            }
+            Err(error) => warn!(
+                "pcmcia: asked for host disk {}, which is not available: {error}",
+                disk.device
+            ),
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn attach_ide_host_disks(cfg: &Config, mut attach: impl FnMut(usize, crate::ata::IdeDrive)) {
     for disk in &cfg.host_disks {
-        // SCSI units and lide positions are attached elsewhere.
+        // SCSI units, lide positions, and the PCMCIA slot are attached
+        // elsewhere.
         let slot = match disk.attach {
             crate::config::HostDiskAttach::IdeMaster => 0,
             crate::config::HostDiskAttach::IdeSlave => 1,
             crate::config::HostDiskAttach::LideMaster(_)
             | crate::config::HostDiskAttach::LideSlave(_)
-            | crate::config::HostDiskAttach::Scsi(_) => continue,
+            | crate::config::HostDiskAttach::Scsi(_)
+            | crate::config::HostDiskAttach::Pcmcia => continue,
         };
         match crate::ata::IdeDrive::open_host_disk(
             &disk.device,
@@ -3423,7 +3775,7 @@ fn build_machine_inner(
     }
     #[cfg(not(feature = "cd32-fmv"))]
     if cfg.fmv_rom_path.is_some() {
-        anyhow::bail!("fmv_rom needs a build with the cd32-fmv feature");
+        anyhow::bail!("fmv = true / fmv_rom need a build with the cd32-fmv feature");
     }
     // The A3000's motherboard SCSI is not a Zorro board: its drives are fitted
     // to the Super DMAC further down, once the bus exists.
@@ -3581,6 +3933,53 @@ fn build_machine_inner(
         info!("copperhf: virtual hardfile controller on the Zorro chain (slot {slot})");
         devices.push(crate::zorro_device::BoardDevice::Copperhf(board));
     }
+    // SF2000 accelerator Zorro II SD card controller (`[sf2000sd]`): a
+    // single SPI-mode SD card, hard disks only like `[copperhf]` (no
+    // ATAPI/SCSI-CDROM command set behind it).
+    if cfg.sf2000sd.enabled() {
+        let slot = devices.len();
+        let has_rom = cfg.sf2000sd.rom.is_some();
+        let mut rom = Vec::new();
+        if let Some(rom_path) = &cfg.sf2000sd.rom {
+            // Same --load-state placeholder handling as lide/A4091: the
+            // flash is serialized into save states, so a ROM temporarily
+            // unavailable while resuming is fine -- the state replaces it.
+            if rom_optional && !rom_path.is_file() {
+                info!(
+                    "--load-state: sf2000sd ROM {} is unavailable; building with \
+                     a placeholder the save state will replace",
+                    rom_path.display()
+                );
+            } else {
+                rom = crate::sf2000sd::Sf2000Sd::load_rom(rom_path)?;
+            }
+        }
+        let card = match &cfg.sf2000sd.card {
+            Some(drive) => {
+                let disk = open_disk(
+                    &drive.path,
+                    "DH0",
+                    "sf2000sd",
+                    drive.volume_name.as_deref(),
+                    drive.boot_pri,
+                    drive.filesystem,
+                )?;
+                Some(crate::sdcard::SdCard::new(disk))
+            }
+            None => None,
+        };
+        let board = crate::sf2000sd::Sf2000Sd::new(rom, card)?;
+        zorro.add_board(crate::zorro::BoardSpec::sf2000sd(slot, has_rom))?;
+        info!(
+            "sf2000sd: SD card controller on the Zorro chain (slot {slot}){}",
+            cfg.sf2000sd
+                .rom
+                .as_ref()
+                .map(|p| format!(", ROM {}", p.display()))
+                .unwrap_or_default()
+        );
+        devices.push(crate::zorro_device::BoardDevice::Sf2000Sd(board));
+    }
     // WASM plugin boards: assign each a device slot, put its autoconfig
     // identity on the chain, and instantiate the module.
     #[cfg(feature = "wasm-boards")]
@@ -3607,17 +4006,28 @@ fn build_machine_inner(
     // mount table, and per-unit host register banks in one 64K window; see
     // crate::filesys. The scsi.device cull rides the same DiagPoint, so the
     // board is also fitted (with no mounts) when only that is wanted.
-    if !cfg.filesys.is_empty() || cfg.rom_scsi_device_disable {
+    // The clipboard unit (`[clipboard] share`) rides the same board; the
+    // host clipboard only ever reaches the guest through a windowed
+    // session's poll or a control-protocol client, so a headless run with
+    // the unit fitted stays deterministic (see docs/internals/architecture.md).
+    // Every one of these is an explicit request: the board is an autoconfig
+    // board a real Amiga does not have, and binding it at boot moves every
+    // Exec allocation behind it, so nothing fits it on the guest's behalf
+    // (`Config::resolve_clipboard_share`).
+    let clipboard = cfg.clipboard_share == Some(true);
+    if !cfg.filesys.is_empty() || cfg.rom_scsi_device_disable || clipboard {
         let slot = devices.len();
         zorro.add_board(crate::zorro::BoardSpec::copperline_services(slot))?;
-        let mut board = crate::filesys::FilesysBoard::new(cfg.filesys.clone());
+        let mut board =
+            crate::filesys::FilesysBoard::new_with_clipboard(cfg.filesys.clone(), clipboard);
         if cfg.rom_scsi_device_disable {
             info!("romtags: the ROM's scsi.device will not be initialised");
             board.set_cull_rom_scsi_device(true);
         }
         info!(
-            "filesys: services board on the Zorro chain (slot {slot}), {} mount(s)",
-            cfg.filesys.len()
+            "filesys: services board on the Zorro chain (slot {slot}), {} mount(s), clipboard {}",
+            cfg.filesys.len(),
+            if clipboard { "shared" } else { "off" }
         );
         devices.push(crate::zorro_device::BoardDevice::Filesys(board));
     }
@@ -3891,7 +4301,37 @@ fn build_machine_inner(
         // refused by configuration validation rather than silently replaced.
         #[cfg(not(target_arch = "wasm32"))]
         attach_ide_host_disks(cfg, |slot, drive| gayle.attach_drive(slot, drive));
+        // The PCMCIA common-memory window ($600000-$9FFFFF) is Zorro II
+        // space: with more than 4 MiB of fast RAM configured there Gayle's
+        // slot decode gives way to the RAM board, as on a real A1200 where
+        // an 8 MiB Zorro II expansion kills the slot.
+        let shadowed = cfg.pcmcia_slot_shadowed();
+        gayle.set_slot_shadowed(shadowed);
         bus.attach_gayle(gayle);
+        #[cfg(not(target_arch = "wasm32"))]
+        let card = open_pcmcia_card(cfg)?;
+        #[cfg(target_arch = "wasm32")]
+        let card: Option<crate::pcmcia::PcmciaCard> = None;
+        if shadowed {
+            if card.is_some() || cfg.host_disks.iter().any(|d| d.attach.is_pcmcia()) {
+                warn!(
+                    "pcmcia: {} of Zorro II fast RAM covers the slot's common memory window \
+                     ($600000-$9FFFFF); the PCMCIA slot is disabled and the card ({}) will not \
+                     be seen. Use fast = \"4M\" or less to keep the slot",
+                    crate::config::format_size(cfg.fast_ram_bytes),
+                    cfg.pcmcia.describe()
+                );
+            } else {
+                info!(
+                    "pcmcia: slot disabled ({} of Zorro II fast RAM covers its window)",
+                    crate::config::format_size(cfg.fast_ram_bytes)
+                );
+            }
+        }
+        if let Some(card) = card {
+            info!("pcmcia: {}", card.describe());
+            bus.pcmcia_insert(card);
+        }
     }
     if cfg.ide_a4000 {
         let mut ide = crate::ide_a4000::IdeA4000::new();
@@ -4023,6 +4463,32 @@ fn build_machine_inner(
         cfg.port_devices[0].label(),
         cfg.port_devices[1].label()
     );
+    // The four-player adapter is wiring on the Centronics connector, not a
+    // host peripheral: it lives in the deterministic input state.
+    let adapter = cfg.parallel.device == crate::config::ParallelDevice::JoystickAdapter;
+    bus.input
+        .set_parallel_adapter(adapter, cfg.parallel_joysticks);
+    if adapter {
+        info!(
+            "parallel: four-player joystick adapter, port 3 = {}, port 4 = {}",
+            bus.input.device(2).label(),
+            bus.input.device(3).label()
+        );
+    }
+    if let Some(port) = bus.input.light_pen_port() {
+        let wired = bus.light_pen_wired_port();
+        if port == wired {
+            info!("input: light pen in port {} drives Agnus LP", port + 1);
+        } else {
+            warn!(
+                "input: light pen in port {} but this board wires Agnus LP to port {}'s pin 6 \
+                 (port 1 on the A1000, port 2 on later Amigas); the pen's switch works, its \
+                 pulses reach nothing",
+                port + 1,
+                wired + 1
+            );
+        }
+    }
     if cfg.akiko {
         let mut akiko = crate::akiko::Akiko::new();
         if let Some(path) = &cfg.cd32_nvram_path {
@@ -4796,6 +5262,145 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// A program that enables the vertical-blank interrupt and then parks
+    /// the CPU in STOP, the way an idle Amiga waits for work:
+    ///
+    /// ```text
+    /// F80010  MOVE.W #$C020,($DFF09A).L  ; INTENA: master + VERTB
+    /// F80018  STOP   #imm                ; wait for an interrupt
+    /// F8001C  MOVEQ  #1,D0
+    /// F8001E  BRA.S  *
+    /// F80040  MOVE.W #$0020,($DFF09C).L  ; handler: clear INTREQ VERTB
+    /// F80048  RTE
+    /// ```
+    ///
+    /// `stop_sr` is the word STOP loads into SR: `$2000` leaves the
+    /// interrupt mask at 0 so VERTB (level 3) wakes the CPU, `$2700`
+    /// masks every interrupt so nothing ever does.
+    fn emulator_stopped_waiting_for_vblank(stop_sr: u16) -> super::Emulator {
+        let mut rom = vec![0u8; crate::memory::ROM_SIZE];
+        let put = |mem: &mut [u8], off: usize, word: u16| {
+            mem[off..off + 2].copy_from_slice(&word.to_be_bytes());
+        };
+        put(&mut rom, 0x10, 0x33FC); // MOVE.W #imm,(abs).L
+        put(&mut rom, 0x12, 0xC020); // SET | INTEN | VERTB
+        put(&mut rom, 0x14, 0x00DF);
+        put(&mut rom, 0x16, 0xF09A); // INTENA
+        put(&mut rom, 0x18, 0x4E72); // STOP #imm
+        put(&mut rom, 0x1A, stop_sr);
+        put(&mut rom, 0x1C, 0x7001); // MOVEQ #1,D0
+        put(&mut rom, 0x1E, 0x60FE); // BRA.S *
+        put(&mut rom, 0x40, 0x33FC); // handler: MOVE.W #imm,(abs).L
+        put(&mut rom, 0x42, 0x0020); // VERTB
+        put(&mut rom, 0x44, 0x00DF);
+        put(&mut rom, 0x46, 0xF09C); // INTREQ
+        put(&mut rom, 0x48, 0x4E73); // RTE
+
+        let mut chip_ram = vec![0u8; 512 * 1024];
+        chip_ram[0..4].copy_from_slice(&0x0000_4000u32.to_be_bytes()); // reset SSP
+        chip_ram[4..8].copy_from_slice(&0x00F8_0010u32.to_be_bytes()); // reset PC
+        let vertb_vector = 27 * 4; // autovector 27: level 3, where VERTB arrives
+        chip_ram[vertb_vector..vertb_vector + 4].copy_from_slice(&0x00F8_0040u32.to_be_bytes());
+
+        let bus = crate::bus::Bus::new(
+            crate::memory::Memory {
+                chip_ram,
+                slow_ram: Vec::new(),
+                mb_ram: Vec::new(),
+                accel_ram: Vec::new(),
+                rom,
+                overlay: false,
+                zorro: crate::zorro::ZorroChain::default(),
+                extended_rom: Vec::new(),
+                extended_rom_base: 0,
+                wcs: Vec::new(),
+                wcs_write_protected: false,
+            },
+            crate::chipset::paula::Paula::new(
+                Box::new(crate::serial::NullSerialSink),
+                Box::new(crate::audio::NullSink),
+            ),
+            crate::floppy::FloppyController::default(),
+        );
+        let mut emu = super::Emulator::new(
+            bus,
+            crate::config::CpuModel::M68000,
+            false,
+            Default::default(),
+            crate::config::PacingBudget::Cycles,
+            2,
+            false,
+        )
+        .unwrap();
+        // Run the INTENA write and the STOP, leaving the CPU parked.
+        emu.debug_step_instructions(2).unwrap();
+        assert!(emu.machine.stopped(), "the program should be in STOP");
+        emu
+    }
+
+    #[test]
+    fn a_single_step_carries_a_stopped_cpu_to_its_wake_up_interrupt() {
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2000);
+        let retired = emu.retired_instructions();
+
+        emu.debug_step_instructions(1).unwrap();
+
+        // The step ran the VERTB interrupt's arrival, its exception, and
+        // the handler's first instruction -- exactly one instruction, in
+        // the place control went -- rather than standing still on a CPU
+        // that executes nothing.
+        assert!(!emu.machine.stopped(), "the interrupt should have woken it");
+        assert_eq!(emu.retired_instructions(), retired + 1);
+        assert_eq!(emu.machine.pc(), 0x00F8_0048); // the handler's RTE
+    }
+
+    #[test]
+    fn the_control_and_gdb_steps_carry_a_stopped_cpu_the_same_way() {
+        // Every debugger surface agrees on where a step from STOP lands,
+        // so a session driven over the control protocol or by GDB reads
+        // the same as the window's Step button.
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2000);
+        let retired = emu.retired_instructions();
+        emu.debug_step_realtime_past_stop().unwrap();
+        assert!(!emu.machine.stopped());
+        assert_eq!(emu.retired_instructions(), retired + 1);
+        assert_eq!(emu.machine.pc(), 0x00F8_0048);
+
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2000);
+        let retired = emu.retired_instructions();
+        let mut cpu_idle = false;
+        emu.debug_step_for_gdb_past_stop(&mut cpu_idle).unwrap();
+        assert!(!emu.machine.stopped());
+        assert_eq!(emu.retired_instructions(), retired + 1);
+        assert_eq!(emu.machine.pc(), 0x00F8_0048);
+        // The caller's idle flag describes the running CPU it got back,
+        // so its next step does not fast-forward as if still parked.
+        assert!(!cpu_idle);
+    }
+
+    #[test]
+    fn stepping_a_stopped_cpu_that_never_wakes_still_returns() {
+        // Interrupts masked in SR: no interrupt can reach the CPU, so the
+        // step gives up at its bound and leaves the machine stopped where
+        // the hardware itself is stuck.
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2700);
+        let retired = emu.retired_instructions();
+        let frames = emu.bus().emulated_frames();
+
+        emu.debug_step_instructions(1).unwrap();
+
+        assert!(emu.machine.stopped(), "nothing can wake a masked CPU");
+        assert_eq!(emu.retired_instructions(), retired);
+        // Bounded: the step advanced device time looking for a wake-up,
+        // but only as far as the two-frame budget allows.
+        assert!(
+            emu.bus().emulated_frames() <= frames + 2,
+            "step ran past its bound: {} -> {}",
+            frames,
+            emu.bus().emulated_frames()
+        );
     }
 
     #[test]

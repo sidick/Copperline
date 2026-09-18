@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Debugger and frame-analyzer tool windows: transport, breakpoints, memory editing, view data.
+//! Debugger and Frame Analyzer: transport, breakpoints, memory editing, view data.
 
 use super::*;
 
@@ -235,19 +235,18 @@ impl App {
         false
     }
 
-    /// Open the debugger window (pausing the machine), or close it again
-    /// if it is already open (the host shortcut toggle).
+    /// Switch between Play and Debug while retaining the inspectors.
     pub(super) fn toggle_debugger(&mut self) {
-        if self.debugger_panel.is_some() {
-            self.close_tool_panel(ToolPanelKind::Debugger);
+        if self.debug_layout_active && self.egui_selected_tool == ToolPanelKind::Debugger {
+            self.leave_debug_workspace();
         } else {
             self.ui.menu_open = false;
             self.open_debugger();
-            self.request_redraw();
         }
     }
 
     pub(super) fn open_debugger(&mut self) {
+        let shared_pause = self.egui_other_tool_pause(ToolPanelKind::Debugger);
         if self.debugger_panel.is_none() {
             // The debugger shortcut can arrive while the mouse is captured;
             // release it so the window's controls are reachable, and note
@@ -258,6 +257,7 @@ impl App {
             self.paused = true;
             self.sync_live_audio_suspension();
             let mut panel = ui::DebuggerPanel::new();
+            panel.tab = self.egui_layout_preferences().debugger_tab();
             // Start the memory view at the current program counter's
             // neighbourhood; it is usually what you came to look at.
             panel.mem_addr = self.emu.machine.pc() & self.emu.machine.ui_addr_mask() & !0xF;
@@ -274,21 +274,20 @@ impl App {
                 );
             }
         }
+        self.egui_did_open_tool(ToolPanelKind::Debugger, shared_pause);
     }
 
-    /// Open the console window (pausing the machine), or close it again
-    /// if it is already open (the host shortcut toggle).
     pub(super) fn toggle_console(&mut self) {
-        if self.console_panel.is_some() {
-            self.close_tool_panel(ToolPanelKind::Console);
+        if self.debug_layout_active && self.egui_selected_tool == ToolPanelKind::Console {
+            self.leave_debug_workspace();
         } else {
             self.ui.menu_open = false;
             self.open_console();
-            self.request_redraw();
         }
     }
 
     pub(super) fn open_console(&mut self) {
+        let shared_pause = self.egui_other_tool_pause(ToolPanelKind::Console);
         if self.console_panel.is_none() {
             self.suspend_mouse_capture_for_ui();
             self.ui.panel = None;
@@ -308,9 +307,11 @@ impl App {
                 );
             }
         }
+        self.egui_did_open_tool(ToolPanelKind::Console, shared_pause);
     }
 
     pub(super) fn open_frame_analyzer(&mut self) {
+        let shared_pause = self.egui_other_tool_pause(ToolPanelKind::FrameAnalyzer);
         if self.frame_analyzer_panel.is_none() {
             self.suspend_mouse_capture_for_ui();
             self.ui.panel = None;
@@ -319,12 +320,21 @@ impl App {
             self.sync_live_audio_suspension();
             self.emu.bus_mut().set_frame_analyzer_full(true);
             self.frame_analyzer_panel = Some(ui::FrameAnalyzerPanel::new());
+            {
+                let tab = self.egui_layout_preferences().analyzer_tab();
+                self.activate_tool_control(
+                    ToolPanelKind::FrameAnalyzer,
+                    UiControl::AnalyzerTab(tab),
+                );
+            }
         }
+        self.egui_did_open_tool(ToolPanelKind::FrameAnalyzer, shared_pause);
     }
 
     pub(super) fn frame_analyzer_toggle_run(&mut self) {
         self.paused = !self.paused;
         self.paused_before_analyzer = self.paused;
+        self.egui_remember_run_state();
         self.sync_live_audio_suspension();
         if !self.paused {
             self.emu.bus_mut().set_frame_analyzer_full(true);
@@ -732,14 +742,14 @@ impl App {
             })
             .collect();
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Save debug resource")
-            .set_file_name(format!(
-                "{}.png",
-                if name.is_empty() { "resource" } else { &name }
-            ))
-            .add_filter("PNG image", &["png"])
-            .save_file();
+        let file_name = format!("{}.png", if name.is_empty() { "resource" } else { &name });
+        let picked = super::native_dialog::pick(move || {
+            rfd::FileDialog::new()
+                .set_title("Save debug resource")
+                .set_file_name(file_name)
+                .add_filter("PNG image", &["png"])
+                .save_file()
+        });
         if let Some(path) = picked {
             match self.emu.export_uaelib_resource(resource.address, &path) {
                 Ok(_) => self.show_osd(format!("Saved {}", display_file_name(&path))),
@@ -941,7 +951,8 @@ impl App {
                 .map(|panel| panel.selected_vpos as usize)
                 .unwrap_or(trace.visible_start_vpos as usize)
         } else {
-            (usize::from(y) * trace.rows / 1024).min(trace.rows.saturating_sub(1))
+            (usize::from(y) * analyzer_layout_rows(trace.nominal_rows, trace.rows) / 1024)
+                .min(trace.rows.saturating_sub(1))
         };
         if let Some(panel) = self.frame_analyzer_panel.as_mut() {
             panel.selected_hpos = hpos.min(u16::MAX as usize) as u16;
@@ -977,10 +988,14 @@ impl App {
         // Run/Pause inside the debugger is an explicit choice; closing the
         // window must not revert it.
         self.paused_before_debugger = self.paused;
+        self.egui_remember_run_state();
         self.sync_live_audio_suspension();
     }
 
-    /// Execute a single instruction while paused in the debugger.
+    /// Execute a single instruction while paused in the debugger. A CPU in
+    /// STOP runs on to the interrupt that wakes it; one that no interrupt
+    /// can reach stays where it is, and says so rather than looking like a
+    /// step that did nothing.
     pub(super) fn debugger_step(&mut self) {
         self.paused = true;
         self.sync_live_audio_suspension();
@@ -989,6 +1004,9 @@ impl App {
             error!("debugger step halted: {e:?}");
             self.cpu_halted = true;
             self.sync_live_audio_suspension();
+        }
+        if self.emu.machine.stopped() {
+            self.show_osd("CPU is stopped: no interrupt is enabled to wake it");
         }
         self.surface_debug_stop();
     }
@@ -1215,6 +1233,7 @@ impl App {
             !geometry.programmable,
             &mut self.present_fb,
         );
+        self.note_present_fb_changed();
         self.present_rows = rows;
         self.present_width = width;
         self.request_redraw();
@@ -1436,6 +1455,7 @@ impl App {
         self.sync_live_audio_suspension();
         if !consumed {
             self.paused_before_debugger = true;
+            self.egui_remember_run_state();
             self.open_debugger();
         }
         self.last_debug_stop = Some(message.clone());
@@ -1602,10 +1622,13 @@ impl App {
         // above the 24-bit space passes through untouched on 020+.
         let addr = addr & self.emu.machine.ui_addr_mask();
         self.suspend_live_audio_for_host_io();
-        let picked = rfd::FileDialog::new()
-            .set_title("Save memory region")
-            .set_file_name(format!("mem-{addr:06X}-{len:X}.bin"))
-            .save_file();
+        let file_name = format!("mem-{addr:06X}-{len:X}.bin");
+        let picked = super::native_dialog::pick(move || {
+            rfd::FileDialog::new()
+                .set_title("Save memory region")
+                .set_file_name(file_name)
+                .save_file()
+        });
         if let Some(path) = picked {
             let bytes = self.emu.machine.debug_read_memory(addr, len as usize);
             match std::fs::write(&path, &bytes) {
@@ -1718,15 +1741,16 @@ impl App {
         };
         match action {
             Poke::Mem(addr, value) => {
-                let written = self
-                    .emu
-                    .machine
-                    .debug_write_memory(addr, &value.to_be_bytes());
-                if written == 2 {
-                    self.show_osd(format!("Poked ${value:04X} -> ${addr:06X}"));
+                let written = self.debug_poke_bytes(addr, &value.to_be_bytes());
+                let message = if written == 2 {
+                    format!("Poked ${value:04X} -> ${addr:06X}")
                 } else {
-                    self.show_osd(format!("${addr:06X} is not writable RAM"));
+                    format!("${addr:06X} is not writable RAM")
+                };
+                if let Some(panel) = self.debugger_panel.as_mut() {
+                    panel.mem_status = Some(message.clone());
                 }
+                self.show_osd(message);
             }
             Poke::Reg(reg, value) => {
                 self.emu.machine.debug_set_register(reg, value);
@@ -1736,6 +1760,55 @@ impl App {
             Poke::RegHelp => self.show_osd("Set Reg: type \"REG VALUE\" e.g. D0 1234"),
             Poke::None => {}
         }
+    }
+
+    /// The one debugger write path for memory: the console's POKE, the
+    /// Memory tab's Poke button and in-place editor, and the control
+    /// protocol's `mem.write` all land here or do the same. A plain
+    /// CPU-visible RAM write (ROM, overlay ROM, and device windows are
+    /// skipped and not counted), then the word watchpoints are rebaselined
+    /// so the poke itself does not stop the machine. No bus cycles are
+    /// charged and no interrupt or DMA state changes. Returns the bytes
+    /// actually written.
+    pub(super) fn debug_poke_bytes(&mut self, addr: u32, bytes: &[u8]) -> usize {
+        let written = self.emu.machine.debug_write_memory(addr, bytes);
+        self.emu.machine.ui_rebaseline_watches();
+        self.request_redraw();
+        written
+    }
+
+    /// Commit the Memory tab's staged byte edits and report the outcome
+    /// beside the tab's controls.
+    pub(super) fn debugger_mem_commit(&mut self, edits: Vec<(u32, u8)>) {
+        if edits.is_empty() {
+            return;
+        }
+        let mask = self.emu.machine.ui_addr_mask();
+        let mut written = 0usize;
+        let mut refused = None;
+        for (addr, value) in &edits {
+            let addr = *addr & mask;
+            if self.debug_poke_bytes(addr, &[*value]) == 1 {
+                written += 1;
+            } else if refused.is_none() {
+                refused = Some(addr);
+            }
+        }
+        let message = match refused {
+            None => format!(
+                "Wrote {written} byte{} at ${:06X}",
+                if written == 1 { "" } else { "s" },
+                edits[0].0 & mask
+            ),
+            Some(addr) => format!(
+                "Wrote {written} of {} bytes; ${addr:06X} is not writable RAM",
+                edits.len()
+            ),
+        };
+        if let Some(panel) = self.debugger_panel.as_mut() {
+            panel.mem_status = Some(message.clone());
+        }
+        self.show_osd(message);
     }
 
     /// Build the per-redraw view data for the open panel, if any.
@@ -1764,22 +1837,7 @@ impl App {
             Panel::Console(_) => None,
             Panel::Launcher(_) => None,
             Panel::DropChooser(_) => None,
-        }
-    }
-
-    pub(super) fn build_tool_panel_view_data(
-        &self,
-        kind: ToolPanelKind,
-    ) -> Option<ui::PanelViewData> {
-        match kind {
-            ToolPanelKind::Debugger => self.debugger_panel.as_ref().map(|panel| {
-                ui::PanelViewData::Debugger(Box::new(self.build_debugger_view(panel)))
-            }),
-            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_panel.as_ref().map(|panel| {
-                ui::PanelViewData::FrameAnalyzer(Box::new(self.build_frame_analyzer_view(panel)))
-            }),
-            // The console panel carries everything it renders.
-            ToolPanelKind::Console => None,
+            Panel::States(_) => None,
         }
     }
 
@@ -1942,6 +2000,7 @@ impl App {
                 frame: trace.frame,
                 seconds: trace.seconds,
                 rows: trace.rows,
+                nominal_rows: trace.nominal_rows,
                 cols: trace.cols,
                 line_cck: trace.line_cck,
                 visible_start_vpos: trace.visible_start_vpos,
@@ -2103,6 +2162,14 @@ impl App {
     /// Everything reads through side-effect-free peeks, so inspecting
     /// state never perturbs the emulation.
     pub(super) fn build_debugger_view(&self, panel: &ui::DebuggerPanel) -> ui::DebuggerView {
+        self.build_debugger_view_with_clipping(panel, true)
+    }
+
+    pub(super) fn build_debugger_view_with_clipping(
+        &self,
+        panel: &ui::DebuggerPanel,
+        clip_lines: bool,
+    ) -> ui::DebuggerView {
         let machine = &self.emu.machine;
         let bus = self.emu.bus();
         let mut status = format!(
@@ -2125,8 +2192,10 @@ impl App {
         let read = |addr: u32| bus.peek_word_any(addr);
         let mut lines: Vec<ui::DbgLine> = Vec::new();
         let mut bitmap: Option<ui::MemBitmapView> = None;
+        let mut memory: Option<ui::MemoryPageView> = None;
         let mut video: Option<ui::VideoView> = None;
         let mut audio: Option<ui::AudioScopeView> = None;
+        let mut cpu = None;
         match panel.tab {
             ui::DebugTab::Cpu => {
                 let pc = machine.pc();
@@ -2175,6 +2244,7 @@ impl App {
                     )));
                 }
                 let breaks = machine.ui_breaks();
+                let disassembly_start = lines.len();
                 let mut addr = panel.disasm_addr.unwrap_or(pc) & !1;
                 for _ in 0..24 {
                     let (text, len) = crate::disasm::disassemble(read, addr, machine.cpu_type());
@@ -2187,6 +2257,29 @@ impl App {
                         ui::DbgLine::plain(line)
                     });
                     addr = addr.wrapping_add(len);
+                }
+                if !clip_lines {
+                    let base = panel.mem_addr & machine.ui_addr_mask() & !0xF;
+                    let bytes = machine.debug_read_memory(base, ui::MEM_PAGE_BYTES as usize);
+                    cpu = Some(ui::CpuView {
+                        d: std::array::from_fn(|i| machine.d(i)),
+                        a: std::array::from_fn(|i| machine.a(i)),
+                        pc,
+                        sr,
+                        stopped: machine.stopped(),
+                        history: history.iter().rev().take(8).rev().copied().collect(),
+                        disassembly: lines[disassembly_start..].to_vec(),
+                        memory: bytes
+                            .chunks(16)
+                            .enumerate()
+                            .map(|(i, bytes)| {
+                                ui::DbgLine::plain(ui::hex_dump_row(
+                                    base.wrapping_add(i as u32 * 16) & machine.ui_addr_mask(),
+                                    bytes,
+                                ))
+                            })
+                            .collect(),
+                    });
                 }
             }
             ui::DebugTab::Chipset => {
@@ -2391,11 +2484,18 @@ impl App {
                 // shows the head of the COP1 list instead). Breakpointed
                 // addresses are marked with `*`.
                 let stopped = !bus.copper.is_running() && bus.copper.waiting().is_none();
-                let start = if stopped {
-                    agnus.cop1lc
-                } else {
-                    anchor.saturating_sub(5 * 4)
-                };
+                let start = panel.copper_addr.unwrap_or_else(|| {
+                    if stopped {
+                        agnus.cop1lc
+                    } else {
+                        anchor.saturating_sub(5 * 4)
+                    }
+                });
+                if let Some(address) = panel.copper_addr {
+                    lines.push(ui::DbgLine::plain(format!(
+                        "Pinned Copper list at ${address:06X}"
+                    )));
+                }
                 let cbreaks = bus.ui_copper_breaks();
                 for (addr, text) in crate::disasm::dump_copper_list(read, start, 30) {
                     let marker = if cbreaks.contains(&addr) { "*" } else { " " };
@@ -2637,6 +2737,8 @@ impl App {
                     ));
                     lines.push(ui::DbgLine::plain(""));
                     let base = panel.mem_addr & machine.ui_addr_mask() & !0xF;
+                    let mut page = Vec::with_capacity(ui::MEM_PAGE_BYTES as usize);
+                    let mut writable = Vec::with_capacity(ui::MEM_PAGE_BYTES as usize);
                     for row in 0..16u32 {
                         let addr = base.wrapping_add(row * 16) & machine.ui_addr_mask();
                         let mut bytes = [0u8; 16];
@@ -2646,7 +2748,17 @@ impl App {
                             bytes[word as usize * 2 + 1] = value as u8;
                         }
                         lines.push(ui::DbgLine::plain(ui::hex_dump_row(addr, &bytes)));
+                        page.extend_from_slice(&bytes);
+                        writable.extend(
+                            (0..16u32).map(|i| machine.debug_memory_writable(addr.wrapping_add(i))),
+                        );
                     }
+                    memory = Some(ui::MemoryPageView {
+                        base,
+                        bytes: page,
+                        writable,
+                        addr_mask: machine.ui_addr_mask(),
+                    });
                 }
             }
             ui::DebugTab::IoMap => {
@@ -2656,9 +2768,14 @@ impl App {
                 let sel = usize::from(panel.iomap_sel & 0x1FE) / 2;
                 let page = sel / PER_PAGE;
                 lines.push(ui::DbgLine::plain(format!(
-                    "custom registers $DFF000-$DFF1FE  (page {}/{}; arrows/wheel move, $ box jumps)",
+                    "custom registers $DFF000-$DFF1FE  (page {}/{}; {}, $ box jumps)",
                     page + 1,
-                    256usize.div_ceil(PER_PAGE)
+                    256usize.div_ceil(PER_PAGE),
+                    if clip_lines {
+                        "arrows/wheel move"
+                    } else {
+                        "arrows select, scroll to read"
+                    },
                 )));
                 lines.push(ui::DbgLine::plain(""));
                 for row in 0..ROWS {
@@ -2882,9 +2999,12 @@ impl App {
         }
         // Keep lines inside the panel; the blitter clips at the texture
         // edge, not the panel edge.
-        for line in &mut lines {
-            if line.text.len() > 82 {
-                line.text.truncate(82);
+        if clip_lines {
+            for line in &mut lines {
+                if line.text.len() > 82 {
+                    let end = line.text.floor_char_boundary(82);
+                    line.text.truncate(end);
+                }
             }
         }
         ui::DebuggerView {
@@ -2893,8 +3013,10 @@ impl App {
             status,
             lines,
             bitmap,
+            memory,
             video,
             audio,
+            cpu,
         }
     }
 }

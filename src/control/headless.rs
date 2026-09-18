@@ -90,6 +90,9 @@ pub fn run(mut emu: Emulator, config: Config) -> Result<()> {
             SessionEnd::Killed => break,
         }
     }
+    // A --coverage run ends with the server: write what was counted.
+    #[cfg(feature = "dap")]
+    emu.finish_coverage_run();
     if let (Some(rec), Some(path)) = (input.recorder, config.record_input.as_ref()) {
         let events = rec.events_recorded();
         std::fs::write(path, rec.finish())
@@ -514,6 +517,38 @@ impl Session {
                 self.write(&reply)?;
                 Ok(None)
             }
+            HostOp::PcmciaInsert {
+                kind,
+                path,
+                size,
+                read_only,
+            } => {
+                let reply = match exec::pcmcia_insert(
+                    &mut self.emu,
+                    kind,
+                    path.as_deref(),
+                    size,
+                    read_only,
+                ) {
+                    Ok(description) => proto::ok_line(&id, json!({"card": description})),
+                    Err(e) => proto::err_line(&id, &e),
+                };
+                self.write(&reply)?;
+                Ok(None)
+            }
+            HostOp::PcmciaEject => {
+                let reply = if !self.emu.bus().pcmcia_slot_present() {
+                    proto::err_line(
+                        &id,
+                        &CtlError::unsupported("no PCMCIA slot on this machine"),
+                    )
+                } else {
+                    let ejected = self.emu.bus_mut().pcmcia_eject().is_some();
+                    proto::ok_line(&id, json!({"ejected": ejected}))
+                };
+                self.write(&reply)?;
+                Ok(None)
+            }
             HostOp::CopperhfAttach {
                 unit,
                 path,
@@ -671,11 +706,39 @@ impl Session {
         match kind {
             ResumeKind::Step { n } => {
                 for _ in 0..*n {
-                    self.emu.debug_step_realtime()?;
-                    self.input.apply_due_scheduled(&mut self.emu);
-                    self.emit_events()?;
-                    if let Some((reason, detail)) = self.take_stop() {
-                        return stop(reason, detail);
+                    // A CPU parked in STOP retires nothing until an
+                    // interrupt reaches it, so the hunt for its wake-up
+                    // runs here rather than inside the emulator: this
+                    // loop owns the scheduled input, and a key or pad
+                    // press due during those frames is what wakes some
+                    // guests. Applied slice by slice, it still lands at
+                    // the emulated time it was scheduled for.
+                    let retired = self.emu.retired_instructions();
+                    let deadline = self
+                        .emu
+                        .bus()
+                        .emulated_frames()
+                        .saturating_add(crate::emulator::DEBUG_STOP_WAKEUP_FRAMES);
+                    loop {
+                        self.emu.debug_step_realtime()?;
+                        self.input.apply_due_scheduled(&mut self.emu);
+                        self.emit_events()?;
+                        if let Some((reason, detail)) = self.take_stop() {
+                            return stop(reason, detail);
+                        }
+                        if self.emu.retired_instructions() != retired {
+                            // The step's instruction ran.
+                            break;
+                        }
+                        if !self.emu.machine.stopped() {
+                            // Retired nothing and is not parked either:
+                            // a halted CPU has nothing to hunt for.
+                            break;
+                        }
+                        if self.emu.bus().emulated_frames() >= deadline {
+                            // Bounded: no interrupt can reach this CPU.
+                            break;
+                        }
                     }
                 }
                 return stop("step", format!("{n} instruction(s)"));
@@ -990,6 +1053,8 @@ impl Session {
                     | HostOp::FloppyEject { .. }
                     | HostOp::CdInsert { .. }
                     | HostOp::CdEject
+                    | HostOp::PcmciaInsert { .. }
+                    | HostOp::PcmciaEject
                     | HostOp::CopperhfAttach { .. }
                     | HostOp::CopperhfEject { .. }
                     | HostOp::SetPortDevice { .. }
@@ -1778,15 +1843,49 @@ mod tests {
             let ports = c.result("input.get_ports", json!({}));
             assert_eq!(ports["port1"], "cd32");
 
-            // input.joy/analogue take an optional port; port 3 is refused.
+            // input.joy/analogue take an optional port; the mouse and
+            // analogue methods stop at the two game ports.
             c.result("input.joy", json!({"port": 1, "up": true, "red": true}));
             c.result("input.analogue", json!({"port": 2, "x": 50, "y": 200}));
             let ports = c.result("input.get_ports", json!({}));
             assert_eq!(ports["port2"], "analogue");
+            assert_eq!(ports["port3"], "none");
+            assert_eq!(ports["parallel_adapter"], false);
             let bad = c.call("input.mouse", json!({"port": 3, "dx": 1}));
+            assert_eq!(bad["error"]["code"], proto::INVALID_PARAMS);
+            let bad = c.call("input.analogue", json!({"port": 3, "x": 1, "y": 1}));
             assert_eq!(bad["error"]["code"], proto::INVALID_PARAMS);
             let bad = c.call("input.set_port", json!({"port": 1, "device": "trackball"}));
             assert_eq!(bad["error"]["code"], proto::INVALID_PARAMS);
+
+            // Ports 3 and 4 are the parallel-port adapter's sockets: a
+            // joystick fitted there fits the adapter, and input.joy
+            // drives it; nothing but a joystick fits.
+            let set = c.result("input.set_port", json!({"port": 3, "device": "joystick"}));
+            assert_eq!(set["port"], 3);
+            let ports = c.result("input.get_ports", json!({}));
+            assert_eq!(ports["port3"], "joystick");
+            assert_eq!(ports["port4"], "none");
+            assert_eq!(ports["parallel_adapter"], true);
+            c.result("input.joy", json!({"port": 4, "left": true}));
+            let ports = c.result("input.get_ports", json!({}));
+            assert_eq!(ports["port4"], "joystick");
+            let bad = c.call("input.set_port", json!({"port": 4, "device": "cd32"}));
+            assert_eq!(bad["error"]["code"], proto::INVALID_PARAMS);
+            let bad = c.call("input.joy", json!({"port": 5, "up": true}));
+            assert_eq!(bad["error"]["code"], proto::INVALID_PARAMS);
+
+            // A light pen reports its port, whether the board wires it
+            // to Agnus, and where it is held.
+            c.result("input.set_port", json!({"port": 2, "device": "lightpen"}));
+            c.result("input.pen", json!({"x": 300, "y": 100}));
+            let ports = c.result("input.get_ports", json!({}));
+            assert_eq!(ports["port2"], "lightpen");
+            assert_eq!(ports["light_pen"]["port"], 2);
+            assert_eq!(ports["light_pen"]["x"], 300);
+            c.result("input.pen", json!({}));
+            let ports = c.result("input.get_ports", json!({}));
+            assert!(ports["light_pen"]["x"].is_null());
         });
     }
 

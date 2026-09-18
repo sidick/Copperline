@@ -479,22 +479,24 @@ const MOUSE_CAPTURES: [MouseCapture; 3] = [
     MouseCapture::Manual,
 ];
 // Controller devices a game port accepts, in stepper order.
-const PORT_DEVICES: [PortDevice; 5] = [
+const PORT_DEVICES: [PortDevice; 6] = [
     PortDevice::Mouse,
     PortDevice::Joystick,
     PortDevice::Cd32Pad,
     PortDevice::Analogue,
+    PortDevice::LightPen,
     PortDevice::None,
 ];
 // Port 1 offers one more: a mouse a gamepad can move as well as the
 // hand on the desk. Only port 1, because only port 1 is where a mouse
 // belongs -- Workbench and nearly every game read it there.
-const PORT1_DEVICES: [PortDevice; 6] = [
+const PORT1_DEVICES: [PortDevice; 7] = [
     PortDevice::Mouse,
     PortDevice::GamepadMouse,
     PortDevice::Joystick,
     PortDevice::Cd32Pad,
     PortDevice::Analogue,
+    PortDevice::LightPen,
     PortDevice::None,
 ];
 // `None` = no SCSI board fitted; the two boards are mutually exclusive here even
@@ -514,7 +516,7 @@ const LIDE_BOARDS: [Option<LidePersonality>; 4] = [
     Some(LidePersonality::AtBus2008),
 ];
 #[cfg(feature = "midi")]
-const SERIAL_MODES: [SerialMode; 7] = [
+const SERIAL_MODES: [SerialMode; 8] = [
     SerialMode::Off,
     SerialMode::Stdout,
     SerialMode::Midi,
@@ -522,6 +524,7 @@ const SERIAL_MODES: [SerialMode; 7] = [
     SerialMode::TcpConnect,
     SerialMode::Pty,
     SerialMode::Modem,
+    SerialMode::Device,
 ];
 /// Stereo-separation presets the picker steps through (percent), ascending so
 /// the right arrow steps up (wrapping 100 -> 0) and the left arrow steps down.
@@ -589,12 +592,14 @@ pub struct MachineSetup {
     mb_ram: usize,
     accel_ram: usize,
     z3_ram: usize,
-    // ROM (None = bundled default for the boot and CD32 FMV ROMs)
+    // ROM (None = bundled default for the boot ROM, and for the CD32 FMV
+    // ROM once the module is fitted)
     rom: Option<PathBuf>,
     extended_rom: Option<PathBuf>,
     fmv_rom: Option<PathBuf>,
-    /// An explicit `fmv_rom = ""` leaves the CD32 cartridge slot empty.
-    fmv_rom_disabled: bool,
+    /// Whether the CD32 FMV cartridge is fitted (`fmv = true` or a named
+    /// `fmv_rom`); the slot is empty by default.
+    fmv_fitted: bool,
     // Floppy
     floppy_drives: u8,
     /// `[floppy] speed`: a percentage (100/200/400/800) or 0 for turbo.
@@ -725,6 +730,21 @@ pub struct MachineSetup {
     lide_drive_is_dir: [bool; 4],
     lide_drive_bootpri: [Option<i8>; 4],
     lide_drive_boot_off: [bool; 4],
+    /// `[sf2000sd]`: the SF2000 accelerator's Zorro II SD card controller.
+    /// One card slot -- unlike Lide/Copperhf's arrays, so these are scalar
+    /// fields shaped like `ide_master`/`ide_slave` above.
+    sf2000sd_card: Option<PathBuf>,
+    sf2000sd_card_name: Option<String>,
+    sf2000sd_card_fs: crate::diskimage::FileSystem,
+    /// Paralleling `ide_master_is_dir`.
+    sf2000sd_card_is_dir: bool,
+    sf2000sd_card_bootpri: Option<i8>,
+    sf2000sd_card_boot_off: bool,
+    /// No bundled default and no `""` opt-out sentinel to track (unlike
+    /// `lide_rom`/`lide_rom_disabled`): the SF2000's boot ROM is the
+    /// firmware author's own, not Copperline's to ship, so `None` here
+    /// means exactly "hardware-only mode", nothing more to carry.
+    sf2000sd_rom: Option<PathBuf>,
     // Host FS mounts. The GUI edits the first FILESYS_GUI_SLOTS entries
     // (directory + optional volume name + boot priority, -128 = never boot);
     // any further hand-written [[filesys]] entries are carried in
@@ -781,6 +801,14 @@ pub struct MachineSetup {
     /// `AT*T1`/`AT*T0` default at power-on for `mode = "modem"`, toggled by
     /// the Telnet row that mode shows.
     serial_telnet: bool,
+    /// The host serial port for `mode = "device"`, picked in the Port row
+    /// that mode shows. `None` has nothing to open, and the run says so
+    /// rather than the launcher refusing the mode.
+    serial_device: Option<String>,
+    /// The host's serial ports for that picker: filled when the screen
+    /// opens and re-read each time the row is cycled, so a just-plugged
+    /// adapter appears.
+    serial_devices: Vec<String>,
     /// The Centronics parallel-port device (None/Printer/Sampler), edited in the
     /// I/O Ports tab's Parallel section.
     parallel_device: crate::config::ParallelDevice,
@@ -885,6 +913,8 @@ pub struct MachineSetup {
     bezel_stickers: Option<PathBuf>,
     /// Performance overlay in the top-right ([display] perf_overlay).
     perf_overlay: bool,
+    /// Synchronise desktop presentation to vblank ([display] vsync).
+    vsync: bool,
     /// The MT-32's two ROM images, whether its front panel starts up, and
     /// how that panel's display is lit.
     mt32_control_rom: Option<PathBuf>,
@@ -950,6 +980,15 @@ impl MachineSetup {
     #[cfg(feature = "midi")]
     pub fn refresh_midi_endpoints(&mut self) {
         self.midi_endpoints = crate::midi::enumerate();
+    }
+
+    /// Re-read the host serial ports for the Serial section's Port picker.
+    #[cfg(feature = "midi")]
+    pub fn refresh_serial_devices(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.serial_devices = crate::serial::device::available_host_ports();
+        }
     }
 
     /// Re-read the host audio output devices for the "Audio output" picker.
@@ -1064,6 +1103,8 @@ impl MachineSetup {
     pub fn refresh_host_devices(&mut self) {
         #[cfg(feature = "midi")]
         self.refresh_midi_endpoints();
+        #[cfg(feature = "midi")]
+        self.refresh_serial_devices();
         self.refresh_audio_devices();
         self.refresh_sampler_inputs();
         self.refresh_bridge_interfaces();
@@ -1180,7 +1221,7 @@ impl MachineSetup {
         if model != Some(MachineModel::Cd32) {
             self.cd32_nvram = None;
             self.fmv_rom = None;
-            self.fmv_rom_disabled = false;
+            self.fmv_fitted = false;
         }
         // The motherboard SCSI leaves with the motherboard; the drives stay and
         // land on the default Zorro board instead.
@@ -1294,7 +1335,11 @@ impl MachineSetup {
             | F::CopperhfUnit3Boot
             | F::CopperhfUnit4Boot
             | F::CopperhfUnit5Boot
-            | F::CopperhfUnit6Boot => Self::boot_field_drive(field)
+            | F::CopperhfUnit6Boot
+            // The SF2000 SD card controller is likewise always fitted once
+            // configured (no board/personality to pick), so its boot row
+            // hides only when the card slot is empty, the same terms.
+            | F::Sf2000SdCardBoot => Self::boot_field_drive(field)
                 .and_then(|drive| self.drive_holds(drive))
                 .is_none(),
             // Nothing to configure without a board fitted.
@@ -1418,7 +1463,8 @@ impl MachineSetup {
             | F::CopperhfUnit3Boot
             | F::CopperhfUnit4Boot
             | F::CopperhfUnit5Boot
-            | F::CopperhfUnit6Boot => {
+            | F::CopperhfUnit6Boot
+            | F::Sf2000SdCardBoot => {
                 let drive = Self::boot_field_drive(field).expect("boot field");
                 match self.drive_holds(drive) {
                     None => Some("No drive"),
@@ -1515,18 +1561,18 @@ impl MachineSetup {
         }
     }
 
-    /// Whether the CD32 FMV cartridge was explicitly removed rather than
-    /// left to inherit the bundled open ROM.
-    pub fn fmv_rom_disabled(&self) -> bool {
-        self.fmv_rom_disabled
+    /// Whether the CD32 FMV cartridge is fitted, with the bundled open ROM
+    /// or a named one.
+    pub fn fmv_fitted(&self) -> bool {
+        self.fmv_fitted
     }
 
-    /// Switch the CD32 FMV row between the bundled module and an empty slot.
-    /// A named replacement is removed along with the module; the next press
-    /// restores the bundled default.
+    /// Switch the CD32 FMV row between an empty slot and the module with
+    /// the bundled open ROM. A named replacement is removed along with the
+    /// module; fitting it again starts from the bundled ROM.
     pub fn toggle_fmv_module(&mut self) {
         self.fmv_rom = None;
-        self.fmv_rom_disabled = !self.fmv_rom_disabled;
+        self.fmv_fitted = !self.fmv_fitted;
     }
 
     /// The current path of a path field, if any.
@@ -1567,6 +1613,8 @@ impl MachineSetup {
             F::LideDrive1 => self.lide_drives[1].as_deref(),
             F::LideDrive2 => self.lide_drives[2].as_deref(),
             F::LideDrive3 => self.lide_drives[3].as_deref(),
+            F::Sf2000SdRom => self.sf2000sd_rom.as_deref(),
+            F::Sf2000SdCard => self.sf2000sd_card.as_deref(),
             F::Filesys0Dir => self.filesys_dirs[0].as_deref(),
             F::Filesys1Dir => self.filesys_dirs[1].as_deref(),
             F::Filesys2Dir => self.filesys_dirs[2].as_deref(),
@@ -1753,6 +1801,7 @@ impl MachineSetup {
                 | F::LideDrive1
                 | F::LideDrive2
                 | F::LideDrive3
+                | F::Sf2000SdCard
                 | F::Filesys0Dir
                 | F::Filesys1Dir
                 | F::Filesys2Dir
@@ -1783,6 +1832,7 @@ impl MachineSetup {
             F::LideDrive1 => &self.lide_drive_names[1],
             F::LideDrive2 => &self.lide_drive_names[2],
             F::LideDrive3 => &self.lide_drive_names[3],
+            F::Sf2000SdCard => &self.sf2000sd_card_name,
             F::Filesys0Dir => &self.filesys_names[0],
             F::Filesys1Dir => &self.filesys_names[1],
             F::Filesys2Dir => &self.filesys_names[2],
@@ -1818,6 +1868,7 @@ impl MachineSetup {
             F::LideDrive1 => self.lide_drive_fs[1],
             F::LideDrive2 => self.lide_drive_fs[2],
             F::LideDrive3 => self.lide_drive_fs[3],
+            F::Sf2000SdCard => self.sf2000sd_card_fs,
             _ => crate::diskimage::FileSystem::FFS,
         }
     }
@@ -1849,6 +1900,7 @@ impl MachineSetup {
             F::LideDrive1 => self.lide_drive_is_dir[1],
             F::LideDrive2 => self.lide_drive_is_dir[2],
             F::LideDrive3 => self.lide_drive_is_dir[3],
+            F::Sf2000SdCard => self.sf2000sd_card_is_dir,
             _ => false,
         }
     }
@@ -1880,6 +1932,7 @@ impl MachineSetup {
             F::LideDrive1 => &mut self.lide_drive_is_dir[1],
             F::LideDrive2 => &mut self.lide_drive_is_dir[2],
             F::LideDrive3 => &mut self.lide_drive_is_dir[3],
+            F::Sf2000SdCard => &mut self.sf2000sd_card_is_dir,
             _ => return,
         };
         *slot = is_dir;
@@ -1908,6 +1961,7 @@ impl MachineSetup {
             F::LideDrive1 => &mut self.lide_drive_fs[1],
             F::LideDrive2 => &mut self.lide_drive_fs[2],
             F::LideDrive3 => &mut self.lide_drive_fs[3],
+            F::Sf2000SdCard => &mut self.sf2000sd_card_fs,
             _ => return,
         };
         *slot = fs;
@@ -1953,6 +2007,7 @@ impl MachineSetup {
             F::LideDrive1 => &mut self.lide_drive_names[1],
             F::LideDrive2 => &mut self.lide_drive_names[2],
             F::LideDrive3 => &mut self.lide_drive_names[3],
+            F::Sf2000SdCard => &mut self.sf2000sd_card_name,
             F::Filesys0Dir => &mut self.filesys_names[0],
             F::Filesys1Dir => &mut self.filesys_names[1],
             F::Filesys2Dir => &mut self.filesys_names[2],
@@ -1982,7 +2037,11 @@ impl MachineSetup {
                 if self.port_devices[port].is_mouse() {
                     "cursor keys as a mouse (fire keys = buttons)".to_string()
                 } else {
-                    "cursor keys (Ctrl/RAlt = fire, LAlt = button 2)".to_string()
+                    if self.joystick_input_mode == JoystickInputMode::Gamepad {
+                        "gamepad 2, or cursor keys (Ctrl/RAlt = fire)".to_string()
+                    } else {
+                        "cursor keys (Ctrl/RAlt = fire, LAlt = button 2)".to_string()
+                    }
                 }
             } else {
                 match self.port_devices[port] {
@@ -1994,6 +2053,9 @@ impl MachineSetup {
                     }
                     PortDevice::Analogue => {
                         "--pot-after scripting or the control protocol".to_string()
+                    }
+                    PortDevice::LightPen => {
+                        "the host pointer over the display (click = pen switch)".to_string()
                     }
                     PortDevice::None => "nothing (empty port)".to_string(),
                 }
@@ -2048,7 +2110,7 @@ impl MachineSetup {
             F::ExtendedRom => self.extended_rom = Some(path),
             F::FmvRom => {
                 self.fmv_rom = Some(path);
-                self.fmv_rom_disabled = false;
+                self.fmv_fitted = true;
             }
             F::Df0Image => self.set_floppy(0, path),
             F::Df1Image => self.set_floppy(1, path),
@@ -2084,6 +2146,8 @@ impl MachineSetup {
             F::LideDrive1 => self.lide_drives[1] = Some(path),
             F::LideDrive2 => self.lide_drives[2] = Some(path),
             F::LideDrive3 => self.lide_drives[3] = Some(path),
+            F::Sf2000SdRom => self.sf2000sd_rom = Some(path),
+            F::Sf2000SdCard => self.sf2000sd_card = Some(path),
             F::CdImage => self.cd_image = Some(path),
             F::Cd32Nvram => self.cd32_nvram = Some(path),
             F::ParallelOutput => self.parallel_output = Some(path),
@@ -2128,10 +2192,9 @@ impl MachineSetup {
         match field {
             F::Rom => self.rom = None,
             F::ExtendedRom => self.extended_rom = None,
-            F::FmvRom => {
-                self.fmv_rom = None;
-                self.fmv_rom_disabled = false;
-            }
+            // Clearing the ROM keeps the module fitted, on the bundled ROM;
+            // the slot itself is `toggle_fmv_module`'s business.
+            F::FmvRom => self.fmv_rom = None,
             F::Mt32ControlRom => self.mt32_control_rom = None,
             #[cfg(feature = "coppersynth")]
             F::CsynthSoundfont => self.csynth_soundfont = None,
@@ -2170,6 +2233,8 @@ impl MachineSetup {
             F::LideDrive1 => self.lide_drives[1] = None,
             F::LideDrive2 => self.lide_drives[2] = None,
             F::LideDrive3 => self.lide_drives[3] = None,
+            F::Sf2000SdRom => self.sf2000sd_rom = None,
+            F::Sf2000SdCard => self.sf2000sd_card = None,
             F::CdImage => self.cd_image = None,
             F::Cd32Nvram => self.cd32_nvram = None,
             F::ParallelOutput => self.parallel_output = None,
@@ -2213,6 +2278,10 @@ impl MachineSetup {
             F::IdeSlave | F::IdeSlaveBoot => {
                 self.ide_slave_bootpri = None;
                 self.ide_slave_boot_off = false;
+            }
+            F::Sf2000SdCard | F::Sf2000SdCardBoot => {
+                self.sf2000sd_card_bootpri = None;
+                self.sf2000sd_card_boot_off = false;
             }
             _ => {
                 if let Some(i) = scsi_boot_index(field) {
@@ -2264,6 +2333,7 @@ impl MachineSetup {
             F::CopperhfUnit4Boot => F::CopperhfUnit4,
             F::CopperhfUnit5Boot => F::CopperhfUnit5,
             F::CopperhfUnit6Boot => F::CopperhfUnit6,
+            F::Sf2000SdCardBoot => F::Sf2000SdCard,
             _ => return None,
         })
     }
@@ -2283,6 +2353,7 @@ impl MachineSetup {
             F::ScsiUnit4Boot => self.scsi_unit_bootpri[4],
             F::ScsiUnit5Boot => self.scsi_unit_bootpri[5],
             F::ScsiUnit6Boot => self.scsi_unit_bootpri[6],
+            F::Sf2000SdCardBoot => self.sf2000sd_card_bootpri,
             _ => {
                 if let Some(i) = lide_drive_index(field) {
                     self.lide_drive_bootpri[i]
@@ -2306,6 +2377,7 @@ impl MachineSetup {
             F::ScsiUnit4Boot => self.scsi_unit_bootpri[4] = value,
             F::ScsiUnit5Boot => self.scsi_unit_bootpri[5] = value,
             F::ScsiUnit6Boot => self.scsi_unit_bootpri[6] = value,
+            F::Sf2000SdCardBoot => self.sf2000sd_card_bootpri = value,
             _ => {
                 if let Some(i) = lide_drive_index(field) {
                     self.lide_drive_bootpri[i] = value;
@@ -2432,6 +2504,7 @@ impl MachineSetup {
         match field {
             F::IdeMasterBoot => self.ide_master_boot_off,
             F::IdeSlaveBoot => self.ide_slave_boot_off,
+            F::Sf2000SdCardBoot => self.sf2000sd_card_boot_off,
             _ => {
                 scsi_boot_index(field).is_some_and(|i| self.scsi_unit_boot_off[i])
                     || lide_drive_index(field).is_some_and(|i| self.lide_drive_boot_off[i])
@@ -2464,6 +2537,7 @@ impl MachineSetup {
         match field {
             F::IdeMasterBoot => self.ide_master_boot_off = off,
             F::IdeSlaveBoot => self.ide_slave_boot_off = off,
+            F::Sf2000SdCardBoot => self.sf2000sd_card_boot_off = off,
             _ => {
                 if let Some(i) = scsi_boot_index(field) {
                     self.scsi_unit_boot_off[i] = off;
@@ -2741,6 +2815,7 @@ impl MachineSetup {
             A::LideMaster(ch) | A::LideSlave(ch) => self
                 .lide_board
                 .is_some_and(|b| usize::from(ch) < b.channels()),
+            A::Pcmcia => self.has_gayle(),
         }
     }
 
@@ -2962,6 +3037,9 @@ impl MachineSetup {
                     *name = None;
                 }
             }
+            // The launcher has no image row for the slot; `[pcmcia]` is
+            // written by hand, and validation refuses both at once.
+            crate::config::HostDiskAttach::Pcmcia => {}
         }
     }
 
@@ -5735,6 +5813,7 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
         &SERIAL_ROWS_TCP_CONNECT,
         &SERIAL_ROWS_TCP_LISTEN,
         &SERIAL_ROWS_MODEM,
+        &SERIAL_ROWS_DEVICE,
     ];
     #[cfg(all(feature = "midi", feature = "mt32", not(feature = "coppersynth")))]
     let serial: &[&[Row]] = &[
@@ -5743,6 +5822,7 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
         &SERIAL_ROWS_TCP_CONNECT,
         &SERIAL_ROWS_TCP_LISTEN,
         &SERIAL_ROWS_MODEM,
+        &SERIAL_ROWS_DEVICE,
     ];
     #[cfg(all(feature = "midi", not(feature = "mt32"), feature = "coppersynth"))]
     let serial: &[&[Row]] = &[
@@ -5751,6 +5831,7 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
         &SERIAL_ROWS_TCP_CONNECT,
         &SERIAL_ROWS_TCP_LISTEN,
         &SERIAL_ROWS_MODEM,
+        &SERIAL_ROWS_DEVICE,
     ];
     #[cfg(all(feature = "midi", not(feature = "mt32"), not(feature = "coppersynth")))]
     let serial: &[&[Row]] = &[
@@ -5758,6 +5839,7 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
         &SERIAL_ROWS_TCP_CONNECT,
         &SERIAL_ROWS_TCP_LISTEN,
         &SERIAL_ROWS_MODEM,
+        &SERIAL_ROWS_DEVICE,
     ];
     #[cfg(not(feature = "midi"))]
     let serial: &[&[Row]] = &[];
@@ -5773,6 +5855,7 @@ fn rows_contains_kind(field: LauncherField, kind: RowKind) -> bool {
         &CD_ROWS,
         &LIDE_ROWS,
         &COPPERHF_ROWS,
+        &SF2000SD_ROWS,
         &INPUT_ROWS,
         &VIDEO_ROWS,
         &AUDIO_ROWS,
@@ -5955,6 +6038,7 @@ fn drive_boot_field(drive: LauncherField) -> Option<LauncherField> {
         F::CopperhfUnit4 => F::CopperhfUnit4Boot,
         F::CopperhfUnit5 => F::CopperhfUnit5Boot,
         F::CopperhfUnit6 => F::CopperhfUnit6Boot,
+        F::Sf2000SdCard => F::Sf2000SdCardBoot,
         _ => return None,
     })
 }

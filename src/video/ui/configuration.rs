@@ -1486,10 +1486,10 @@ pub(in crate::video::ui) fn launcher_path_inherits(
         return setup.path(field).is_none();
     }
     // The ROMs with bundled defaults read the same way: unset means the
-    // bundled image, dimmed as Copperline's answer.
+    // bundled image (or, on the FMV row, no module at all), dimmed as
+    // Copperline's answer.
     if matches!(field, LauncherField::Rom | LauncherField::FmvRom) {
-        return setup.path(field).is_none()
-            && (field != LauncherField::FmvRom || !setup.fmv_rom_disabled());
+        return setup.path(field).is_none();
     }
     if field == LauncherField::ScsiRom {
         return setup.scsi_bundled_rom_label().is_some() && setup.path(field).is_none();
@@ -1516,17 +1516,18 @@ pub(in crate::video::ui) fn launcher_clear_enabled(
 }
 
 /// The FMV path row's second button controls the physical module, not just a
-/// pathname: it must be usable from the bundled-default state so the launcher
-/// can write `fmv_rom = ""`, and usable again to restore that default.
+/// pathname: from the default empty slot it fits the module with the bundled
+/// ROM (the launcher writes `fmv = true`), and from a fitted module it
+/// empties the slot again.
 pub(in crate::video::ui) fn launcher_clear_label(
     setup: &launcher::MachineSetup,
     field: LauncherField,
 ) -> &'static str {
     if field == LauncherField::FmvRom {
-        if setup.fmv_rom_disabled() {
-            "Default"
-        } else {
+        if setup.fmv_fitted() {
             "Remove"
+        } else {
+            "Fit"
         }
     } else if field.is_paths_field() {
         "Reset"
@@ -2916,11 +2917,13 @@ pub(in crate::video::ui) fn draw_launcher(
         draw_host_disk_page(frame, rect, state, hover, scale);
     }
     if state.tab == LauncherTab::Netplay {
-        let top = launcher_row_y(rect, 10) + row_offset;
+        // One blank row below the page's rows, whichever layout is shown.
+        let top = launcher_row_y(rect, state.rows().len() + 1) + row_offset;
         for (i, line) in if state.netplay.internet {
             [
                 "Use the same build, machine, ROM and floppy contents.",
                 "Host: new invitation, copy code, then Run. Join: paste, Run.",
+                "Watch: paste the host's spectator code, then Run.",
                 "Blank relay uses n0's public service; custom URL optional.",
                 "Run connects. F11 disconnects. Guest uses host timing.",
             ]
@@ -2928,6 +2931,7 @@ pub(in crate::video::ui) fn draw_launcher(
             [
                 "Use the same machine, ROM and floppy contents.",
                 "Share one session code; choose opposite players.",
+                "Spectator: peer address is the host's, same code.",
                 "Netplay sets digital ports, serial off and interpreter.",
                 "Run connects. F11 returns here. Settings last this session.",
             ]

@@ -23,6 +23,11 @@ use std::path::PathBuf;
 /// Longest single memory transfer, matching the wire-line budget.
 pub const MEM_TRANSFER_CAP: usize = 1024 * 1024;
 
+/// Largest `mem.digest` address span: the whole 32-bit map minus nothing
+/// useful, but a span outside RAM is peeked byte by byte, so keep a
+/// runaway request from walking gigabytes of undecoded space.
+pub const MEM_DIGEST_RANGE_CAP: u64 = 256 * 1024 * 1024;
+
 /// Instruction budget for bounded run helpers (step-over, run-to-pc...),
 /// mirroring the debugger window's transports.
 pub const RUN_BUDGET: usize = 5_000_000;
@@ -70,6 +75,11 @@ pub enum CoreOp {
     MemWrite {
         addr: u32,
         data: Vec<u8>,
+    },
+    /// Hash RAM server-side (`mem.digest`), so a lockstep comparison of
+    /// two sessions can check megabytes per frame without moving them.
+    MemDigest {
+        scope: MemDigestScope,
     },
     Disasm {
         addr: Option<u32>,
@@ -135,6 +145,10 @@ pub enum CoreOp {
     DisplayGet,
     InputPortsGet,
     RtcGet,
+    ClipboardGet,
+    ClipboardSet {
+        text: String,
+    },
     RtcSet {
         unix: Option<u64>,
         advance: Option<i64>,
@@ -173,6 +187,8 @@ pub enum CoreOp {
     BreakList,
     BreakClear,
     FloppyQuery,
+    /// What is in the PCMCIA slot, and whether the machine has one.
+    PcmciaQuery,
     EventsSubscribe {
         events: Vec<EventKind>,
         frame_interval: Option<u64>,
@@ -201,6 +217,12 @@ pub enum CoreOp {
     ProfileStatus,
     StateSave {
         path: PathBuf,
+    },
+    /// Read a state file's header and metadata (`savestate::peek`)
+    /// without loading it; `thumbnail` names a file to write its PNG to.
+    StateInfo {
+        path: PathBuf,
+        thumbnail: Option<PathBuf>,
     },
     Digest,
     RegionDigest {
@@ -242,6 +264,7 @@ impl CoreOp {
             CoreOp::Status
                 | CoreOp::RegsGet
                 | CoreOp::MemRead { .. }
+                | CoreOp::MemDigest { .. }
                 | CoreOp::Disasm { .. }
                 | CoreOp::SymbolsResolve { .. }
                 | CoreOp::SymbolsRom
@@ -259,6 +282,7 @@ impl CoreOp {
                 | CoreOp::DisplayGet
                 | CoreOp::InputPortsGet
                 | CoreOp::RtcGet
+                | CoreOp::ClipboardGet
                 | CoreOp::CartridgeGet
                 | CoreOp::DebugResources
                 | CoreOp::DebugIdle
@@ -268,6 +292,7 @@ impl CoreOp {
                 | CoreOp::SegmentsList
                 | CoreOp::BreakList
                 | CoreOp::FloppyQuery
+                | CoreOp::PcmciaQuery
                 | CoreOp::EventsList
                 | CoreOp::TraceStatus
                 | CoreOp::WaveformStatus
@@ -275,8 +300,67 @@ impl CoreOp {
                 | CoreOp::Digest
                 | CoreOp::RegionDigest { .. }
                 | CoreOp::Screenshot { .. }
+                | CoreOp::StateInfo { .. }
         )
     }
+}
+
+/// What `mem.digest` hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemDigestScope {
+    /// The fitted chip RAM bank.
+    Chip,
+    /// Every writable RAM bank (chip, slow, motherboard, accelerator,
+    /// Zorro boards), digested one by one.
+    All,
+    /// One address span through the CPU's memory map.
+    Range { addr: u32, len: usize },
+}
+
+/// The `pcmcia.query` reply: whether the machine has a slot, whether it is
+/// enabled (not shadowed by Zorro II RAM or disabled by the guest), and
+/// the card in it.
+pub fn pcmcia_query(emu: &Emulator) -> Value {
+    let bus = emu.bus();
+    let gayle = bus.gayle.as_ref();
+    json!({
+        "slot": gayle.is_some(),
+        "enabled": gayle.is_some_and(crate::gayle::Gayle::slot_enabled),
+        "shadowed_by_fast_ram": gayle.is_some_and(crate::gayle::Gayle::slot_shadowed),
+        "inserted": bus.pcmcia_card().is_some(),
+        "card": bus.pcmcia_card().map(|c| c.kind().token()),
+        "description": bus.pcmcia_card().map(crate::pcmcia::PcmciaCard::describe),
+        "path": bus.pcmcia_card().and_then(|c| c.path().map(|p| p.display().to_string())),
+        "pins": gayle.map(crate::gayle::Gayle::card_pins),
+        "change_latches": gayle.map(crate::gayle::Gayle::change_latches),
+    })
+}
+
+/// Build the card a `pcmcia.insert` request describes and push it into the
+/// slot. Shared by the headless and windowed control servers.
+pub fn pcmcia_insert(
+    emu: &mut Emulator,
+    kind: crate::pcmcia::CardKind,
+    path: Option<&std::path::Path>,
+    size: usize,
+    read_only: bool,
+) -> Result<String, CtlError> {
+    use crate::pcmcia::{CardKind, CfCard, PcmciaCard, SramCard};
+    if !emu.bus().pcmcia_slot_present() {
+        return Err(CtlError::unsupported("no PCMCIA slot on this machine"));
+    }
+    let card = match kind {
+        CardKind::Cf => {
+            let path = path.ok_or_else(|| CtlError::invalid_params("a CF card needs a path"))?;
+            PcmciaCard::cf(CfCard::open(path).map_err(|e| CtlError::io(format!("{e:#}")))?)
+        }
+        CardKind::Sram => PcmciaCard::Sram(
+            SramCard::new(size, path, read_only).map_err(|e| CtlError::io(format!("{e:#}")))?,
+        ),
+    };
+    let description = card.describe();
+    emu.bus_mut().pcmcia_insert(card);
+    Ok(description)
 }
 
 /// Optional diagnostic layers painted onto a side-effect-free screenshot.
@@ -592,6 +676,18 @@ pub enum HostOp {
         path: PathBuf,
     },
     CdEject,
+    /// Push a card into the A600/A1200 PCMCIA slot: a CF card over a
+    /// hard-disk image, or an SRAM card of `size` bytes (optionally backed
+    /// by `path`). Gayle latches the card-detect change, so a listening
+    /// card.resource sees a real insertion.
+    PcmciaInsert {
+        kind: crate::pcmcia::CardKind,
+        path: Option<PathBuf>,
+        size: usize,
+        read_only: bool,
+    },
+    /// Pull the card out of the slot.
+    PcmciaEject,
     /// Hot-attach a copperhf.device unit's media at runtime (`[copperhf]`'s
     /// own boot-time attach path, driven from a live session): opens
     /// `path` exactly like a configured `[copperhf]` unit and replaces
@@ -705,11 +801,18 @@ impl RunTarget {
 /// and scheduled transitions. Port fields are 0-based (0 = port 1), the
 /// bus convention; the wire protocol's 1-based `port` param is converted
 /// at parse time.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputCmd {
     Key {
         rawkey: u8,
         kind: KeyKind,
+        at_seconds: Option<f64>,
+    },
+    /// `input.type`: the press/release sequence that types `text` on the
+    /// US Amiga keyboard (src/typing.rs), the first key at `at_seconds`
+    /// (default now), the rest paced behind it in emulated time.
+    Type {
+        text: String,
         at_seconds: Option<f64>,
     },
     Mouse {
@@ -730,6 +833,11 @@ pub enum InputCmd {
         port: u8,
         x: u8,
         y: u8,
+        at_seconds: Option<f64>,
+    },
+    /// Light-pen position (`None` lifts the pen off the glass).
+    Pen {
+        position: Option<(i32, i32)>,
         at_seconds: Option<f64>,
     },
 }
@@ -834,6 +942,34 @@ impl InputCmd {
                 y,
                 at_seconds,
             } => emit(at_seconds, InputAction::Pot { port, x, y }),
+            InputCmd::Type {
+                ref text,
+                at_seconds,
+            } => {
+                let start = at_seconds.unwrap_or(now_secs);
+                let (keys, _) = crate::typing::keystrokes_for_text(text);
+                for key in keys {
+                    let press_at = start + f64::from(key.offset_ms) / 1000.0;
+                    emit(
+                        Some(press_at),
+                        InputAction::Key {
+                            rawkey: key.rawkey,
+                            pressed: true,
+                        },
+                    );
+                    emit(
+                        Some(press_at + f64::from(key.hold_ms) / 1000.0),
+                        InputAction::Key {
+                            rawkey: key.rawkey,
+                            pressed: false,
+                        },
+                    );
+                }
+            }
+            InputCmd::Pen {
+                position,
+                at_seconds,
+            } => emit(at_seconds, InputAction::Pen { position }),
         }
         (now, later)
     }
@@ -863,11 +999,25 @@ fn parse_port_param(p: &ParamReader, default: u32) -> Result<u8, CtlError> {
     Ok((port - 1) as u8)
 }
 
-/// Parse a required 1-based `port` param into the 0-based port index.
+/// Parse the optional 1-based `port` param of a joystick method, which
+/// may also name the parallel-port adapter's sockets (3 and 4).
+fn parse_joystick_port_param(p: &ParamReader, default: u32) -> Result<u8, CtlError> {
+    let port = p.u32_or("port", default)?;
+    if !(1..=crate::bus::PORT_COUNT as u32).contains(&port) {
+        return Err(CtlError::invalid_params(
+            "port must be 1-4 (3 and 4 are the parallel-port adapter's sockets)",
+        ));
+    }
+    Ok((port - 1) as u8)
+}
+
+/// Parse a required 1-based `port` param (1-4) into the 0-based port index.
 fn parse_port_req(p: &ParamReader) -> Result<u8, CtlError> {
     let port = p.u32_req("port")?;
-    if !(1..=2).contains(&port) {
-        return Err(CtlError::invalid_params("port must be 1 or 2"));
+    if !(1..=crate::bus::PORT_COUNT as u32).contains(&port) {
+        return Err(CtlError::invalid_params(
+            "port must be 1-4 (3 and 4 are the parallel-port adapter's sockets)",
+        ));
     }
     Ok((port - 1) as u8)
 }
@@ -964,6 +1114,37 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 addr: p.u32_req("addr")?,
                 data: bytes,
             })
+        }
+        "mem.digest" => {
+            let region = p.str_opt("region")?;
+            let addr = p.u32_opt("addr")?;
+            let len = p.u64_opt("len")?;
+            let scope = match (region.as_deref(), addr, len) {
+                (None | Some("chip"), None, None) => MemDigestScope::Chip,
+                (Some("all"), None, None) => MemDigestScope::All,
+                (None, Some(addr), Some(len)) => {
+                    if len == 0 || len > MEM_DIGEST_RANGE_CAP {
+                        return Err(CtlError::invalid_params(format!(
+                            "len must be 1..={MEM_DIGEST_RANGE_CAP}"
+                        )));
+                    }
+                    MemDigestScope::Range {
+                        addr,
+                        len: len as usize,
+                    }
+                }
+                (Some(other), None, None) => {
+                    return Err(CtlError::invalid_params(format!(
+                        "region must be chip|all, got {other}"
+                    )))
+                }
+                _ => {
+                    return Err(CtlError::invalid_params(
+                        "mem.digest takes either region or both addr and len",
+                    ))
+                }
+            };
+            core(CoreOp::MemDigest { scope })
         }
         "disasm" => core(CoreOp::Disasm {
             addr: p.u32_opt("addr")?,
@@ -1106,6 +1287,10 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 frozen,
             })
         }
+        "clipboard.get" => core(CoreOp::ClipboardGet),
+        "clipboard.set" => core(CoreOp::ClipboardSet {
+            text: p.str_req("text")?,
+        }),
         "cartridge.get" => core(CoreOp::CartridgeGet),
         "cartridge.freeze" => core(CoreOp::CartridgeFreeze),
         "copper.list" => {
@@ -1155,6 +1340,23 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 at_seconds: parse_at_seconds(&p)?,
             }))
         }
+        "input.type" => {
+            let text = p.str_req("text")?;
+            let (keys, untypable) = crate::typing::keystrokes_for_text(&text);
+            if !untypable.is_empty() {
+                return Err(CtlError::invalid_params(format!(
+                    "text has no Amiga key for {:?}",
+                    untypable.into_iter().collect::<String>()
+                )));
+            }
+            if keys.is_empty() {
+                return Err(CtlError::invalid_params("text has nothing to type"));
+            }
+            host(HostOp::Input(InputCmd::Type {
+                text,
+                at_seconds: parse_at_seconds(&p)?,
+            }))
+        }
         "input.mouse" => host(HostOp::Input(InputCmd::Mouse {
             port: parse_port_param(&p, 1)?,
             left: p.bool_opt("left")?,
@@ -1176,7 +1378,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 .clamp(1, crate::pointer::FRAME_LIMIT),
         }),
         "input.joy" => host(HostOp::Input(InputCmd::Joy {
-            port: parse_port_param(&p, 2)?,
+            port: parse_joystick_port_param(&p, 2)?,
             state: JoyState {
                 up: p.bool_or("up", false)?,
                 down: p.bool_or("down", false)?,
@@ -1204,11 +1406,19 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 at_seconds: parse_at_seconds(&p)?,
             }))
         }
+        "input.pen" => {
+            let (x, y) = (p.i32_or("x", -1)?, p.i32_or("y", -1)?);
+            host(HostOp::Input(InputCmd::Pen {
+                position: (x >= 0 && y >= 0).then_some((x, y)),
+                at_seconds: parse_at_seconds(&p)?,
+            }))
+        }
         "input.set_port" => {
             let device = p.str_req("device")?;
             let device = crate::bus::PortDevice::parse(&device).ok_or_else(|| {
                 CtlError::invalid_params(format!(
-                    "device must be mouse|gamepad-mouse|joystick|cd32|analogue|none, got {device}"
+                    "device must be mouse|gamepad-mouse|joystick|cd32|analogue|lightpen|none, \
+                     got {device}"
                 ))
             })?;
             let port = parse_port_req(&p)?;
@@ -1219,6 +1429,12 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
             if device == crate::bus::PortDevice::GamepadMouse && port != 0 {
                 return Err(CtlError::invalid_params(
                     "gamepad-mouse is port 1 only".to_string(),
+                ));
+            }
+            // The adapter sockets are passive wiring for switch joysticks.
+            if port as usize >= crate::bus::PARALLEL_PORT_FIRST && !device.fits_parallel_port() {
+                return Err(CtlError::invalid_params(
+                    "ports 3 and 4 (the parallel-port adapter) take joystick or none".to_string(),
                 ));
             }
             host(HostOp::SetPortDevice { port, device })
@@ -1237,6 +1453,45 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
             path: PathBuf::from(p.str_req("path")?),
         }),
         "media.cd.eject" => host(HostOp::CdEject),
+        "pcmcia.insert" => {
+            let kind = match p
+                .str_opt("card")?
+                .unwrap_or_else(|| "cf".to_string())
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "cf" => crate::pcmcia::CardKind::Cf,
+                "sram" => crate::pcmcia::CardKind::Sram,
+                other => {
+                    return Err(CtlError::invalid_params(format!(
+                        "card must be \"cf\" or \"sram\", not {other:?}"
+                    )))
+                }
+            };
+            let path = p.str_opt("path")?.map(PathBuf::from);
+            let size = match p.str_opt("size")? {
+                Some(size) => crate::config::parse_size(&size, "PCMCIA SRAM card")
+                    .map_err(|e| CtlError::invalid_params(format!("{e:#}")))?,
+                None => 0,
+            };
+            match kind {
+                crate::pcmcia::CardKind::Cf if path.is_none() => {
+                    return Err(CtlError::invalid_params("a CF card needs a path"))
+                }
+                crate::pcmcia::CardKind::Sram if size == 0 => {
+                    return Err(CtlError::invalid_params("an SRAM card needs a size"))
+                }
+                _ => {}
+            }
+            host(HostOp::PcmciaInsert {
+                kind,
+                path,
+                size,
+                read_only: p.bool_or("read_only", false)?,
+            })
+        }
+        "pcmcia.eject" => host(HostOp::PcmciaEject),
+        "pcmcia.query" => core(CoreOp::PcmciaQuery),
         "copperhf.attach" => {
             let unit = p.usize_req("unit")?;
             if unit >= crate::copperhf::NUM_UNITS {
@@ -1376,10 +1631,13 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                 ));
             }
             let samples = p.bool_or("samples", false)?;
+            let coverage = p.bool_or("coverage", false)?;
             let registers = p.bool_or("registers", false)?;
             if registers && !samples {
                 return Err(CtlError::invalid_params("registers requires samples=true"));
             }
+            // Relocation data serves both per-instruction modes.
+            let per_instruction = samples || coverage;
             let unwind = match p.get("unwind") {
                 None | Some(Value::Null) => None,
                 Some(Value::Object(obj)) => {
@@ -1410,7 +1668,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
             };
             let relocation_bases = match p.get("relocation_bases") {
                 None | Some(Value::Null) => Vec::new(),
-                Some(Value::Array(values)) if samples => values
+                Some(Value::Array(values)) if per_instruction => values
                     .iter()
                     .map(|value| {
                         value_as_u32(value).ok_or_else(|| {
@@ -1420,7 +1678,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                     .collect::<Result<Vec<_>, _>>()?,
                 Some(Value::Array(_)) => {
                     return Err(CtlError::invalid_params(
-                        "relocation_bases requires samples=true",
+                        "relocation_bases requires samples=true or coverage=true",
                     ))
                 }
                 Some(_) => {
@@ -1431,7 +1689,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
             };
             let code_ranges = match p.get("code_ranges") {
                 None | Some(Value::Null) => Vec::new(),
-                Some(Value::Array(values)) if samples => values
+                Some(Value::Array(values)) if per_instruction => values
                     .iter()
                     .map(|value| {
                         let range = value.as_object().ok_or_else(|| {
@@ -1455,7 +1713,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                     .collect::<Result<Vec<_>, _>>()?,
                 Some(Value::Array(_)) => {
                     return Err(CtlError::invalid_params(
-                        "code_ranges requires samples=true",
+                        "code_ranges requires samples=true or coverage=true",
                     ))
                 }
                 Some(_) => {
@@ -1480,6 +1738,7 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
                     unwind,
                     relocation_bases,
                     code_ranges,
+                    coverage,
                     trigger,
                 },
             })
@@ -1488,6 +1747,10 @@ pub fn parse_method(method: &str, params: &Value) -> Result<Request, CtlError> {
         "profile.status" => core(CoreOp::ProfileStatus),
         "state.save" => core(CoreOp::StateSave {
             path: PathBuf::from(p.str_req("path")?),
+        }),
+        "state.info" => core(CoreOp::StateInfo {
+            path: PathBuf::from(p.str_req("path")?),
+            thumbnail: p.str_opt("thumbnail")?.map(PathBuf::from),
         }),
         "state.load" => host(HostOp::StateLoad {
             path: PathBuf::from(p.str_req("path")?),
@@ -2123,6 +2386,7 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
             }
             Ok(result)
         }
+        CoreOp::MemDigest { scope } => Ok(mem_digest_value(emu, *scope)),
         CoreOp::Disasm { addr, count } => {
             let cpu_type = emu.machine.cpu_type();
             let mut pc = addr.unwrap_or_else(|| emu.machine.pc());
@@ -2354,9 +2618,21 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
         }
         CoreOp::InputPortsGet => {
             let input = &emu.bus().input;
+            let light_pen = input.light_pen_port().map(|port| {
+                json!({
+                    "port": port + 1,
+                    "wired": port == emu.bus().light_pen_wired_port(),
+                    "x": input.light_pen.position.map(|p| p.0),
+                    "y": input.light_pen.position.map(|p| p.1),
+                })
+            });
             Ok(json!({
                 "port1": input.ports[0].device.label(),
                 "port2": input.ports[1].device.label(),
+                "port3": input.device(2).label(),
+                "port4": input.device(3).label(),
+                "parallel_adapter": input.parallel_adapter,
+                "light_pen": light_pen,
             }))
         }
         CoreOp::DebugResources => {
@@ -2417,6 +2693,47 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
                 "unix": bus.rtc.current_unix(secs),
                 "time": bus.rtc.current_display(secs),
             }))
+        }
+        CoreOp::ClipboardGet => {
+            let board = emu.bus().filesys_board();
+            let unit = board
+                .filter(|b| b.clipboard_fitted())
+                .map(|b| b.clipboard());
+            Ok(json!({
+                "fitted": unit.is_some(),
+                "sharing": board.is_some_and(|b| b.clipboard_sharing()),
+                "guest_ready": unit.is_some_and(|c| c.guest_ready()),
+                "host_gen": unit.map_or(0, |c| c.host_gen()),
+                "guest_gen": unit.map_or(0, |c| c.guest_gen()),
+                "text": unit.and_then(|c| c.guest_text()),
+            }))
+        }
+        CoreOp::ClipboardSet { text } => {
+            let Some(board) = emu
+                .bus_mut()
+                .filesys_board_mut()
+                .filter(|b| b.clipboard_fitted())
+            else {
+                return Err(CtlError::not_found(
+                    "no clipboard unit fitted ([clipboard] share = true or --clipboard)",
+                ));
+            };
+            if !board.clipboard_sharing() {
+                return Err(CtlError::invalid_state("clipboard sharing is off"));
+            }
+            // Recorded as seen so a windowed poll does not restage it.
+            board.clipboard_host_text_changed(text);
+            let gen = board.stage_host_clipboard(text);
+            let mut result = json!({
+                "staged": gen.is_some(),
+                "host_gen": gen.unwrap_or_else(|| board.clipboard().host_gen()),
+            });
+            if emu.time_travel_enabled() {
+                // Like mem.write, host text is not part of the replay
+                // journal, so a reverse replay across it can diverge.
+                result["replay_unsafe"] = Value::Bool(true);
+            }
+            Ok(result)
         }
         CoreOp::RtcSet {
             unix,
@@ -2601,6 +2918,7 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
                 .collect();
             Ok(json!({"drives": drives}))
         }
+        CoreOp::PcmciaQuery => Ok(pcmcia_query(emu)),
         CoreOp::EventsSubscribe {
             events,
             frame_interval,
@@ -2659,6 +2977,22 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
             emu.save_state(path)
                 .map_err(|e| CtlError::io(format!("saving state: {e:#}")))?;
             Ok(json!({"path": path.display().to_string()}))
+        }
+        CoreOp::StateInfo { path, thumbnail } => {
+            let peeked = crate::savestate::peek_path(path)
+                .map_err(|e| CtlError::io(format!("reading state: {e:#}")))?;
+            let mut reply = state_info_value(path, &peeked);
+            if let (Some(thumbnail), Some(meta)) = (thumbnail, &peeked.meta) {
+                if !meta.thumbnail_png.is_empty() {
+                    crate::paths::ensure_parent(thumbnail)
+                        .and_then(|()| std::fs::write(thumbnail, &meta.thumbnail_png))
+                        .map_err(|e| {
+                            CtlError::io(format!("writing thumbnail {}: {e}", thumbnail.display()))
+                        })?;
+                    reply["thumbnail_path"] = json!(thumbnail.display().to_string());
+                }
+            }
+            Ok(reply)
         }
         CoreOp::CustomWriter { off } => {
             if !emu.bus().chipset_validation_armed() {
@@ -3309,25 +3643,39 @@ fn wave_status_value(status: &crate::waveform::WaveStatus) -> Value {
     })
 }
 
+/// The `state.info` reply (also what `copperline-ctl state-info` prints):
+/// the container version, the machine the state was taken on, and the
+/// metadata chunk when the state has one.
+pub fn state_info_value(path: &std::path::Path, peeked: &crate::savestate::StatePeek) -> Value {
+    let descriptor = &peeked.descriptor;
+    json!({
+        "path": path.display().to_string(),
+        "version": peeked.version,
+        "machine": {
+            "summary": descriptor.summary(),
+            "short": descriptor.short_summary(),
+            "model": descriptor.machine.map(|m| format!("{m:?}")),
+            "cpu": format!("{:?}", descriptor.cpu),
+            "chipset": format!("{:?}", descriptor.chipset),
+            "video_standard": format!("{:?}", descriptor.video_standard),
+            "chip_ram_bytes": descriptor.chip_ram_bytes,
+            "fast_ram_bytes": descriptor.fast_ram_bytes,
+            "slow_ram_bytes": descriptor.slow_ram_bytes,
+            "mb_ram_bytes": descriptor.mb_ram_bytes,
+            "accel_ram_bytes": descriptor.accel_ram_bytes,
+            "rom": descriptor.rom.label(),
+            "extended_rom": descriptor.extended_rom.as_ref().map(|id| id.label()),
+        },
+        "meta": peeked.meta.as_ref().map(|meta| meta.to_json()),
+    })
+}
+
 /// Render the current frame into a fresh buffer via the side-effect-free
 /// display path, returning the buffer and its visible line count. Both
 /// `capture.digest` and `capture.screenshot` use this in BOTH server
 /// modes, so captures are mode-identical and comparable.
 pub(crate) fn render_frame(emu: &Emulator) -> (Vec<u32>, usize, usize) {
-    // An RTG board driving the display supersedes the chipset output,
-    // exactly as the window presentation does.
-    let mut fb = Vec::new();
-    let mut scratch = Vec::new();
-    if let Some((rows, _, _)) =
-        crate::video::present_common::compose_rtg_present(emu.bus(), &mut scratch, &mut fb)
-    {
-        return (fb, rows, FB_WIDTH);
-    }
-    fb = vec![0u32; MAX_CANVAS_PIXELS];
-    crate::video::bitplane::render_display_only(emu.bus(), &mut fb);
-    let lines = emu.bus().frame_geometry().visible_lines;
-    let width = FB_WIDTH * emu.bus().frame_canvas_scale();
-    (fb, lines, width)
+    crate::video::render_capture_frame(emu.bus())
 }
 
 fn render_frame_with_overlays(
@@ -3612,6 +3960,87 @@ fn fnv1a64_from(mut hash: u64, words: &[u32]) -> u64 {
         }
     }
     hash
+}
+
+/// FNV-1a over raw bytes: the same hash as the frame digest, so a memory
+/// digest is comparable across builds that agree on the function.
+pub(crate) fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A64_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Digest one span through the CPU map: in place when it is one RAM
+/// bank, byte-peeked otherwise (ROM, custom-register windows, spans that
+/// straddle a bank edge).
+fn digest_span(emu: &Emulator, addr: u32, len: usize) -> u64 {
+    match emu.bus().ram_slice(addr, len) {
+        Some(bank) => fnv1a64_bytes(bank),
+        None => fnv1a64_bytes(&emu.machine.debug_read_memory(addr, len)),
+    }
+}
+
+/// `mem.digest`: per-bank digests for a scope, and one over the whole,
+/// so a client that sees a mismatch can tell which bank moved without a
+/// second round trip.
+pub(crate) fn mem_digest_value(emu: &Emulator, scope: MemDigestScope) -> Value {
+    let spans: Vec<(u32, usize)> = match scope {
+        MemDigestScope::Chip => {
+            let len = emu.bus().mem.chip_ram.len();
+            if len == 0 {
+                Vec::new()
+            } else {
+                vec![(crate::memory::CHIP_RAM_BASE as u32, len)]
+            }
+        }
+        MemDigestScope::All => emu
+            .bus()
+            .writable_ram_regions()
+            .into_iter()
+            .map(|(base, len)| (base, len as usize))
+            .collect(),
+        MemDigestScope::Range { addr, len } => vec![(addr, len)],
+    };
+    let digests: Vec<u64> = spans
+        .iter()
+        .map(|&(base, len)| digest_span(emu, base, len))
+        .collect();
+    // One bank reports its own digest; several chain theirs, so the
+    // top-level value still changes when any bank does.
+    let combined = match digests.as_slice() {
+        [single] => *single,
+        many => {
+            let mut hash = FNV1A64_OFFSET;
+            for digest in many {
+                for byte in digest.to_le_bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            hash
+        }
+    };
+    let regions: Vec<Value> = spans
+        .iter()
+        .zip(&digests)
+        .map(|(&(base, len), digest)| {
+            json!({"base": base, "len": len, "digest": format!("{digest:016x}")})
+        })
+        .collect();
+    let mut value = json!({
+        "algo": "fnv1a64",
+        "digest": format!("{combined:016x}"),
+        "regions": regions,
+        "frame": emu.bus().emulated_frames(),
+    });
+    if let MemDigestScope::Range { addr, len } = scope {
+        value["addr"] = Value::from(addr);
+        value["len"] = Value::from(len);
+    }
+    value
 }
 
 /// Frame digest payload shared by the request/response capture method and the
@@ -4019,6 +4448,89 @@ mod tests {
             proto::decode_base64(read["data"].as_str().unwrap()).unwrap(),
             vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02]
         );
+    }
+
+    #[test]
+    fn mem_digest_hashes_banks_in_place_and_tracks_writes() {
+        let mut emu = test_emulator();
+        let mut ctx = SessionCtx::new();
+        let chip_len = emu.bus().mem.chip_ram.len();
+        assert!(chip_len > 0);
+        let chip = exec_core(&mut emu, &mut ctx, &core("mem.digest", json!({}))).unwrap();
+        assert_eq!(chip["algo"], "fnv1a64");
+        assert_eq!(chip["regions"].as_array().unwrap().len(), 1);
+        assert_eq!(chip["regions"][0]["base"], 0);
+        assert_eq!(chip["regions"][0]["len"], chip_len);
+        // The whole-bank span through the CPU map hashes the same bytes.
+        let span = exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.digest", json!({"addr": 0, "len": chip_len})),
+        )
+        .unwrap();
+        assert_eq!(span["digest"], chip["digest"]);
+        assert_eq!(span["addr"], 0);
+        assert_eq!(span["len"], chip_len);
+        // The in-place path and the byte-peeked path agree on RAM.
+        let peeked = fnv1a64_bytes(&emu.machine.debug_read_memory(0x1000, 0x2000));
+        let sliced = exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.digest", json!({"addr": 0x1000, "len": 0x2000})),
+        )
+        .unwrap();
+        assert_eq!(sliced["digest"], format!("{peeked:016x}"));
+        // `all` covers at least the chip bank and moves when chip RAM does.
+        let all = exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.digest", json!({"region": "all"})),
+        )
+        .unwrap();
+        assert!(all["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["base"] == 0));
+        exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.write", json!({"addr": 0x1800, "data": "5a"})),
+        )
+        .unwrap();
+        let chip_after = exec_core(&mut emu, &mut ctx, &core("mem.digest", json!({}))).unwrap();
+        assert_ne!(chip_after["digest"], chip["digest"]);
+        let all_after = exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.digest", json!({"region": "all"})),
+        )
+        .unwrap();
+        assert_ne!(all_after["digest"], all["digest"]);
+        // A span outside the write is unchanged.
+        let elsewhere = exec_core(
+            &mut emu,
+            &mut ctx,
+            &core("mem.digest", json!({"addr": 0x2000, "len": 0x1000})),
+        )
+        .unwrap();
+        let elsewhere_before = fnv1a64_bytes(&emu.machine.debug_read_memory(0x2000, 0x1000));
+        assert_eq!(elsewhere["digest"], format!("{elsewhere_before:016x}"));
+        assert!(core("mem.digest", json!({})).collectable());
+    }
+
+    #[test]
+    fn mem_digest_rejects_mixed_or_unknown_scopes() {
+        for params in [
+            json!({"region": "fast"}),
+            json!({"region": "chip", "addr": 0, "len": 4}),
+            json!({"addr": 0}),
+            json!({"addr": 0, "len": 0}),
+            json!({"addr": 0, "len": MEM_DIGEST_RANGE_CAP + 1}),
+        ] {
+            let err = parse_method("mem.digest", &params).unwrap_err();
+            assert_eq!(err.code, proto::INVALID_PARAMS, "{params}");
+        }
     }
 
     #[test]
@@ -4683,6 +5195,94 @@ mod tests {
     }
 
     #[test]
+    fn input_type_expands_to_paced_press_release_pairs() {
+        use crate::typing::{
+            RAWKEY_LSHIFT, TYPE_KEY_HOLD_MS, TYPE_KEY_PITCH_MS, TYPE_SHIFT_LEAD_MS,
+        };
+        let cmd = InputCmd::Type {
+            text: "A\n".to_string(),
+            at_seconds: None,
+        };
+        let (now, mut later) = cmd.expand(2.0);
+        // The drivers queue by time (stably), so read the schedule that way.
+        later.sort_by(|a, b| a.at_seconds.total_cmp(&b.at_seconds));
+        // Only Shift is due at once: its key follows by the lead.
+        assert_eq!(
+            now,
+            vec![InputAction::Key {
+                rawkey: RAWKEY_LSHIFT,
+                pressed: true
+            }]
+        );
+        let at = |i: usize| later[i].at_seconds;
+        let lead = f64::from(TYPE_SHIFT_LEAD_MS) / 1000.0;
+        let hold = f64::from(TYPE_KEY_HOLD_MS) / 1000.0;
+        let pitch = f64::from(TYPE_KEY_PITCH_MS) / 1000.0;
+        assert_eq!(later.len(), 5);
+        assert_eq!(
+            later[0].action,
+            InputAction::Key {
+                rawkey: 0x20,
+                pressed: true
+            }
+        );
+        assert!((at(0) - (2.0 + lead)).abs() < 1e-9);
+        assert_eq!(
+            later[1].action,
+            InputAction::Key {
+                rawkey: 0x20,
+                pressed: false
+            }
+        );
+        assert!((at(1) - (2.0 + lead + hold)).abs() < 1e-9);
+        assert_eq!(
+            later[2].action,
+            InputAction::Key {
+                rawkey: RAWKEY_LSHIFT,
+                pressed: false
+            }
+        );
+        assert_eq!(
+            later[3].action,
+            InputAction::Key {
+                rawkey: 0x44,
+                pressed: true
+            }
+        );
+        assert!((at(3) - (2.0 + pitch)).abs() < 1e-9);
+        assert_eq!(
+            later[4].action,
+            InputAction::Key {
+                rawkey: 0x44,
+                pressed: false
+            }
+        );
+        // A future start schedules everything.
+        let cmd = InputCmd::Type {
+            text: "a".to_string(),
+            at_seconds: Some(5.0),
+        };
+        let (now, later) = cmd.expand(2.0);
+        assert!(now.is_empty());
+        assert_eq!(later.len(), 2);
+        assert!((later[0].at_seconds - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn input_type_parses_text_and_rejects_untypable_or_empty() {
+        match parse_method("input.type", &json!({"text": "dir\n", "at_seconds": 3.0})) {
+            Ok(Request::Host(HostOp::Input(InputCmd::Type { text, at_seconds }))) => {
+                assert_eq!(text, "dir\n");
+                assert_eq!(at_seconds, Some(3.0));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(parse_method("input.type", &json!({"text": "caf\u{e9}"})).is_err());
+        assert!(parse_method("input.type", &json!({"text": ""})).is_err());
+        assert!(parse_method("input.type", &json!({})).is_err());
+    }
+
+    #[test]
     fn stop_reason_mapping_names_the_hardware_event() {
         let (reason, detail) = stop_reason_of(&DebugStop::Beam {
             vpos: 100,
@@ -4832,6 +5432,26 @@ mod tests {
         };
         assert_eq!(options.relocation_bases, vec![0x1000, 0x3000]);
         assert_eq!(options.code_ranges, vec![(0x1000, 0x400)]);
+        assert!(!options.coverage);
+        // Coverage takes the relocation data without precise samples.
+        let CoreOp::ProfileStart { options } = core(
+            "profile.start",
+            json!({
+                "coverage": true,
+                "relocation_bases": [0x1000],
+                "code_ranges": [{"base": 0x1000, "size": 0x400}]
+            }),
+        ) else {
+            panic!("expected ProfileStart");
+        };
+        assert!(options.coverage && !options.samples);
+        assert_eq!(options.code_ranges, vec![(0x1000, 0x400)]);
+        let err = parse_method(
+            "profile.start",
+            &json!({"code_ranges": [{"base": 0x1000, "size": 0x400}]}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("coverage=true"), "{}", err.message);
         for trigger in [
             json!({}),
             json!({"frame": 1, "busy_cck_over": 2}),
@@ -4876,6 +5496,7 @@ mod tests {
             unwind: None,
             relocation_bases: Vec::new(),
             code_ranges: Vec::new(),
+            coverage: false,
             trigger: None,
         };
         let start = CoreOp::ProfileStart {
@@ -4915,6 +5536,7 @@ mod tests {
                     unwind: None,
                     relocation_bases: Vec::new(),
                     code_ranges: Vec::new(),
+                    coverage: false,
                     trigger: None,
                 },
             },
@@ -4959,6 +5581,7 @@ mod tests {
                     unwind: None,
                     relocation_bases: Vec::new(),
                     code_ranges: Vec::new(),
+                    coverage: false,
                     trigger: None,
                 },
             },
@@ -5003,6 +5626,7 @@ mod tests {
             unwind: None,
             relocation_bases: Vec::new(),
             code_ranges: Vec::new(),
+            coverage: false,
             trigger: None,
         };
 
@@ -5101,6 +5725,7 @@ mod tests {
                     unwind: None,
                     relocation_bases: Vec::new(),
                     code_ranges: Vec::new(),
+                    coverage: false,
                     trigger: None,
                 },
             },
@@ -5223,6 +5848,7 @@ mod tests {
                     unwind: None,
                     relocation_bases: Vec::new(),
                     code_ranges: Vec::new(),
+                    coverage: false,
                     trigger: None,
                 },
             },
@@ -5347,6 +5973,7 @@ mod tests {
                     unwind: None,
                     relocation_bases: Vec::new(),
                     code_ranges: Vec::new(),
+                    coverage: false,
                     trigger: None,
                 },
             },
@@ -5382,6 +6009,7 @@ mod tests {
                 unwind: None,
                 relocation_bases: Vec::new(),
                 code_ranges: Vec::new(),
+                coverage: false,
                 trigger: None,
             })
             .unwrap();

@@ -86,6 +86,38 @@ from the [releases page](https://github.com/CopperlineHQ/Copperline/releases),
 matching your Windows architecture. Extract the whole archive and run
 `copperline.exe`; keep the bundled ROMs and other assets alongside it.
 
+### The console window
+
+`copperline.exe` is one program doing two jobs, and it is built for the
+command line: run it from a prompt and it behaves like any other tool there.
+The shell waits for it, and `--help`, the log and every
+[headless flag](headless.md)'s output go to that terminal.
+
+Started from Explorer or the Start menu, there is no prompt to write to, so
+Copperline closes the console window Windows opens for it and
+leaves only the emulator. The window may still flash briefly: Windows puts it
+on screen before Copperline gets to run.
+
+(command-line-tools)=
+## Command-line tools
+
+Every package also carries two companion programs: `copperline-ctl`, the
+[control protocol](../debugger/control.md) client whose `--mcp` and `--dap`
+modes serve coding agents and the [VS Code extension](../debugger/vscode.md),
+and `copperline-import-uae`, the [WinUAE/Amiberry/FS-UAE config
+converter](import-uae.md). Where they land depends on the package:
+
+| Package | Location |
+|---|---|
+| Homebrew | On PATH, next to `copperline`. |
+| macOS dmg | Inside the bundle, `Copperline.app/Contents/MacOS/`. Add that directory to PATH or name the files in the VS Code settings. |
+| Windows zip | Next to `copperline.exe` in the extracted folder. Add the folder to PATH or name the `.exe` files in the VS Code settings. |
+| AppImage | The separate `Copperline-X.Y.Z-<arch>-tools.tar.gz` release asset. Unpack it anywhere; set `COPPERLINE_BIN` to the AppImage path so `copperline-ctl` can launch the emulator. |
+| Flatpak | In the sandbox: `flatpak run --command=copperline-ctl dev.copperline.Copperline ...` (and likewise `copperline-import-uae`). |
+
+`copperline-ctl` launches the `copperline` beside it when one is there; the
+[DAP chapter](../debugger/dap.md) lists the full lookup order.
+
 ## Building from source
 
 ```sh

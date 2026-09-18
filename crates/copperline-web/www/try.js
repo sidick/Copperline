@@ -112,8 +112,11 @@ let netplayPreparing = null;
 let netplayMachineReady = false;
 let netplayTimer = null;
 let machineGeneration = 0;
-const netplayBusy = () => !!netplayPanel?.link;
-const netplayMouse = () => netplayBusy() && netplayPanel.link.settings?.controller === 'mouse';
+// A session owns the page from the moment its media is captured (prepare)
+// until stop; a host still waiting for player 2 keeps its page to itself.
+const netplayBusy = () => !!netplayPanel?.link && !!netplayPreparing;
+// A spectator's mouse never drives the machine, whatever the players use.
+const netplayMouse = () => netplayBusy() && !netplayPanel.link.spectate && netplayPanel.link.settings?.controller === 'mouse';
 const netplayDisabled = new Map();
 const NETPLAY_LOCKED_IDS = ['boot', 'machine', 'video', 'reset', 'pause', 'savestate',
   'loadstate', 'quicksave', 'quickload', 'savedstates', 'kick', 'kickurl', 'kicklist',
@@ -913,7 +916,12 @@ async function boot(request = null) {
     machine.set_phosphor?.(phosphorPersistence);
     if (request) {
       const settings = request.settings;
-      machine.start_netplay(request.player, settings.session, settings.delay, settings.window, settings.controller);
+      if (request.player === 'watch') machine.start_spectating(settings.controller);
+      else {
+        machine.start_netplay(request.player, settings.session, settings.delay, settings.window, settings.controller);
+        // The host keeps its confirmed history so spectators can join late.
+        if (request.spectators) machine.netplay_enable_spectators();
+      }
     }
     emu?.free();
     emu = machine;
@@ -1173,7 +1181,7 @@ function stepMachine(nowMs, deferRender) {
     if (netplayMachineReady) netplayPanel.link.receive(emu);
     const deferred = deferRender && typeof emu.run_hidden === 'function';
     const stepped = deferred ? emu.run_hidden(nowMs, max) : emu.run(nowMs, max);
-    if (netplayMachineReady) netplayPanel.link.send(emu);
+    if (netplayMachineReady) { netplayPanel.link.send(emu); netplayPanel.link.hub?.pump(emu); }
     const stepElapsed = performance.now() - stepStart;
     updateRenderStrideController(nowMs, stepElapsed, stepped, !deferred);
     if (
@@ -2577,8 +2585,9 @@ function updateFsUi() {
 }
 
 // The pinned fallback is plain inline styles so it works with any page
-// shell. The z-index clears the page's fixed overlays (the scanline layer
-// sits at 9999); real fullscreen renders above them via the top layer.
+// shell. The z-index clears the page's fixed overlays (the hosted site's
+// scanline layer sits at 9999); real fullscreen renders above them via
+// the top layer.
 const CSS_FS_SHELL = {
   position: 'fixed',
   inset: '0',
@@ -2938,9 +2947,12 @@ function ensureKeyboard() {
   // viewport in the page, against the fullscreen area in real fullscreen,
   // and against the visible area under the pinned CSS fallback - one
   // placement for all three - and it escapes the shell's overflow:hidden.
-  // Above the sticky page furniture but below the site's cosmetic scanline
-  // layer (9999, pointer-events:none), so the keys wear the same CRT
-  // texture as everything else.
+  // Above the sticky page furniture. The keyboard is a child of the
+  // shell, so a page that gives the shell a z-index (the hosted try page
+  // lifts it above the site's cosmetic scanline overlay, which would
+  // otherwise run across the drawn bezel) carries the keys up with it;
+  // in a shell without one this sits just below that overlay's level
+  // (9999, pointer-events:none).
   root.style.cssText =
     'position:fixed;left:0;right:0;bottom:0;z-index:9998;display:none;' +
     'box-sizing:border-box;overflow:hidden;background:rgba(12,15,24,0.94);' +
@@ -3638,6 +3650,8 @@ let netplayHostKeyFrame = 0;
 
 function pumpHostKeys() {
   if (netplayMachineReady) {
+    // Spectators type nothing into the shared machine.
+    if (netplayPanel.link.spectate) return;
     const [connected, frame] = emu.netplay_status();
     if (!connected || document.hidden || !document.hasFocus() || frame < netplayHostKeyFrame) return;
     if (hostKeyQueue.length) {
@@ -7543,12 +7557,23 @@ if (typeof WebEmu.prototype.start_netplay === 'function') {
     $('reset').closest('.try-side-section')?.parentElement ?? shell.parentElement,
     {
       getMachine: link => netplayPanel?.link === link && netplayMachineReady ? emu : null,
+      build: () => WebEmu.build_info(),
       diskChanged: (link, disk) => {
         if (netplayPanel?.link !== link) return;
         diskNames[disk.drive] = disk.size ? disk.name : null;
         lastFddTrack = null;
         updateStatusDisks();
         updateFloppyImageControls();
+      },
+      // What a host needs before it can share: a ROM, and every inserted
+      // disk still on hand. Checked when hosting starts and again when the
+      // media is captured for the connection.
+      check: () => {
+        if (!wasm || !bootRom) throw new Error('Load a ROM before setting up netplay');
+        keepUploadedDisksForRebuild();
+        for (let drive = 0; drive < PAGE_FLOPPY_DRIVES; drive++) {
+          if (diskNames[drive] && !pendingDisks[drive]) throw new Error(`Load the DF${drive} image again before netplay`);
+        }
       },
       prepare: async (link, { receiveMedia }) => {
         if (!wasm || (!receiveMedia && !bootRom)) throw new Error('Load a ROM before setting up netplay');
@@ -7596,15 +7621,25 @@ if (typeof WebEmu.prototype.start_netplay === 'function') {
       start: async (link, settings, player) => {
         const snapshot = netplayPreparing;
         if (snapshot?.link !== link || netplayPanel.link !== link) return;
-        if (!await boot({ link, settings, player, snapshot })) return;
+        const watching = player === 'watch';
+        if (!await boot({ link, settings, player, snapshot, spectators: !!link.hub })) return;
         if (netplayPanel.link !== link) return;
         netplayMachineReady = true;
-        // Send our initial fingerprint before consuming the peer's. Both
-        // machines can then report a mismatch even if one closes first.
-        emu.run_hidden(performance.now(), 0);
-        link.send(emu);
-        setJoyMode(settings.controller === 'mouse' ? 'off' : hasTouch ? 'touch' : settings.controller === 'cd32' ? 'cd32' : 'keys');
+        if (watching) {
+          // A spectator only reports its fingerprint; the host streams the
+          // game once it matches. Keyboard joystick mode stays off: there
+          // is no port to drive.
+          setJoyMode('off');
+        } else {
+          // Send our initial fingerprint before consuming the peer's. Both
+          // machines can then report a mismatch even if one closes first.
+          emu.run_hidden(performance.now(), 0);
+          link.send(emu);
+          setJoyMode(settings.controller === 'mouse' ? 'off' : hasTouch ? 'touch' : settings.controller === 'cd32' ? 'cd32' : 'keys');
+          link.hub?.start();
+        }
         let lastStatus = 0;
+        let lastSwaps = 0;
         netplayTimer = setInterval(() => {
           if (!netplayMachineReady || netplayPanel.link !== link || !emu) return;
           try {
@@ -7612,10 +7647,28 @@ if (typeof WebEmu.prototype.start_netplay === 'function') {
             link.receive(emu);
             emu.run_hidden(performance.now(), 0);
             link.send(emu);
-            if (performance.now() - lastStatus > 1000) {
+            link.hub?.pump(emu);
+            if (watching) {
+              const [, frame, behind, checked, swaps] = emu.spectate_status();
+              if (swaps !== lastSwaps) {
+                // The host changed a disk at this frame; show what it holds.
+                lastSwaps = swaps;
+                for (let drive = 0; drive < PAGE_FLOPPY_DRIVES; drive++) diskNames[drive] = emu.disk_name(drive) ?? null;
+                lastFddTrack = null;
+                updateStatusDisks();
+                updateFloppyImageControls();
+              }
+              if (performance.now() - lastStatus > 1000) {
+                netplayPanel.status(behind > 25
+                  ? `Watching: frame ${frame}, catching up (${behind} frames behind), checked ${checked}`
+                  : `Watching: frame ${frame}, ${behind} behind, checked ${checked}`);
+                lastStatus = performance.now();
+              }
+            } else if (performance.now() - lastStatus > 1000) {
               const [connected, frame, confirmed, , rollbacks, , checked] = emu.netplay_status();
+              const spectators = link.hub ? `, ${link.hub.watching} watching` : '';
               netplayPanel.status(connected
-                ? `Player ${player}: frame ${frame}, confirmed ${confirmed}, ${rollbacks} rollbacks, checked ${checked}`
+                ? `Player ${player}: frame ${frame}, confirmed ${confirmed}, ${rollbacks} rollbacks, checked ${checked}${spectators}`
                 : 'Waiting for a matching machine...');
               lastStatus = performance.now();
             }

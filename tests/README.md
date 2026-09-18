@@ -39,6 +39,18 @@ needed. Outputs live in `target/ci/` (or `target/<triple>/ci/` with
 full suite and directly reuses those executables for the extra ignored
 audio and network checks, avoiding further build-script runs and recompiles.
 
+The standard desktop suite includes the shared inspector's egui tests; no extra
+feature flag, GPU, or display is needed. The macOS **Inspector UI tests** step
+runs them from the prebuilt library test executable and checks that the suite
+is present. Run just those tests locally with:
+
+```sh
+cargo test --locked --lib video::window::egui_debugger::
+```
+
+GPU preview renders remain ignored; see the
+[video internals](../docs/internals/video.md) for their commands.
+
 The native CI builders publish `cargo-timings-*` artifacts from `--timings`
 for seven days. To inspect build costs locally, add `--timings` and open
 `target/cargo-timings/cargo-timing.html`. CI and packaging use distinct
@@ -70,6 +82,22 @@ Both boot a shell from a `[[filesys]]` host-directory mount, type `mkfile`
 into it (the committed guest probe from `guest/hostfs-test/`), and assert
 the file the probe creates arrives on the host side -- autoboot, handler
 startup, LoadSeg off the volume, and a write back through it, end to end.
+
+### Clipboard sharing
+
+`clipboard_text_crosses_both_ways_under_aros` (`tests/clipboard.rs`) boots
+the bundled AROS ROM but needs one asset: a guest `clipboard.device`,
+which is disk-based on AROS as on Kickstart (the ROM carries none). Point
+`COPPERLINE_CLIPBOARD_DEVICE` at one, or put it in the asset directory as
+`clipboard.device` or `Devs/clipboard.device` (the `Devs` drawer of any
+Workbench 2.0+ or AROS distribution has it); the test skips otherwise. It
+`--run`s the committed `guest/clipboard-test/` probe with `--clipboard`
+and a headless control server; the probe installs the device into
+`DEVS:`, posts an FTXT clip, which the services ROM's bridge pushes and
+the test reads back through `clipboard.get`, then the test stages a reply
+with `clipboard.set` and asserts the probe wrote the text it found in
+`clipboard.device` into its host directory -- the whole register protocol
+against the real guest ROM code, both ways.
 
 ### ATAPI CD-ROM firmware compatibility
 
@@ -243,6 +271,53 @@ files, alongside the earlier `tests/copperhf_device.rs` (M2),
     build_image` already supports building it directly via
     `FileSystem { ffs: true, variant: Variant::Intl }` -- no bespoke FFS
     emitter was needed. Verified the same bootmark way as the OFS axis.
+  - **FFS-from-LSEG on Kickstart 1.3** (`kick13_ffs_from_lseg_boots_without_crashing`,
+    needs `KICK13.ROM` plus `test-assets/lide/wb13/Workbench1.3/l/
+    FastFileSystem`) -- currently **passes**. Unlike 3.1, Kickstart 1.3 has
+    no ROM-resident FFS at all (not even DOS\1), so a real 1.3 FFS hard
+    disk always loaded its handler off the RDB -- exactly this path,
+    tagged plain DOS\1 (no DOS\3 trick needed, since nothing on 1.3
+    short-circuits it). Verified by `assert_not_guru` (a screenshot
+    pixel-color check for the Guru Meditation screen's distinctive red,
+    since 1.3 has no ROM-resident `Echo` for the bootmark trick and no
+    golden was ever blessed for this case) rather than
+    `assert_golden`/bootmark.
+
+    **Investigation history (2026-09-14), kept for anyone who hits this
+    again**: this test originally used `test-assets/copperhf/
+    FastFileSystem` (the modern/community `$VER: fs 46.13 (23.9.2018)`
+    release the Kickstart 3.1 FFS-from-LSEG case above uses), following a
+    real user crash report on Kickstart 1.3. That combination reliably
+    took a Guru Meditation partway through mounting DH0. Traced
+    (instruction-level `COPPERLINE_DBG_WATCH`/`COPPERLINE_DBG_TRACE`,
+    `docs/debugger/headless.md`) to exec.library's own jump table (just
+    behind SysBase, e.g. the `Permit()` LVO slot) getting overwritten with
+    unrelated data around the time that binary starts running as DH0's
+    handler process, crashing on the next call through the clobbered
+    vector -- entirely inside real, unmodified Kickstart ROM code doing
+    what looks like exec's own internal InitResident()/MakeLibrary()
+    machinery, not `guest/copperhf/mounter.c`'s own code (already handed
+    off by that point; its hunk-loader/relocation code
+    (`chf_load_lseg_chain`) was re-audited against this finding and looks
+    correct).
+
+    **Root cause CONFIRMED, not a copperhf.device or Copperline bug**: the
+    46.13 binary links `utility.library` (per `strings` on the binary) --
+    a Kickstart 2.0+ (V36+) component Kickstart 1.3 (V34) never shipped at
+    all. Confirmed by A/B test: swapping in the genuinely period-correct
+    `test-assets/lide/wb13/Workbench1.3/l/FastFileSystem` (`$VER: V34.85
+    (8/10/88)` -- the matching V34 designation, and no `utility.library`
+    in its much shorter dependency list) makes the identical mount
+    sequence complete cleanly every time, with no code changes anywhere.
+    A real Amiga 500 running 1.3 with a hard disk formatted by the modern
+    46.13 binary would hit the exact same fault on real hardware -- this
+    is a genuine binary/Kickstart version incompatibility, not an
+    emulation defect. Lesson for any future "it crashed on Kickstart 1.3"
+    report involving copperhf: check which FastFileSystem version the
+    disk actually carries before assuming a Copperline bug -- many
+    real-world disks get reformatted with whatever modern FFS shipped in
+    someone's install media, regardless of which Kickstart they're
+    actually paired with.
   - **PFS3-DS beyond 4 GiB**, Kickstart 3.1 plus a bundled-AROS variant
     (`aros_pfs3_...`, `#[ignore]`d for the pfs3aio asset only). Needs
     `test-assets/copperhf/pfs3aio`, the real PFS3 "all-in-one" binary.
@@ -277,10 +352,11 @@ files, alongside the earlier `tests/copperhf_device.rs` (M2),
 
   | Asset | Used by |
   | --- | --- |
-  | `KICK13.ROM` | the 1.3 OFS axes (golden-screenshot verified) |
+  | `KICK13.ROM` | the 1.3 OFS axes (golden-screenshot verified) and the 1.3 FFS-from-LSEG axis |
   | `KICK31.ROM` | the 3.1 OFS, FFS-from-LSEG, and PFS3 axes |
   | `KICK32.ROM` | the 3.2 OFS axes |
-  | `test-assets/copperhf/FastFileSystem` | the FFS-from-LSEG axis |
+  | `test-assets/copperhf/FastFileSystem` | the 3.1 FFS-from-LSEG axis |
+  | `test-assets/lide/wb13/Workbench1.3/l/FastFileSystem` | the 1.3 FFS-from-LSEG axis (period-correct V34.85 binary; golden-screenshot verified) |
   | `test-assets/copperhf/pfs3aio` | the PFS3-DS >4 GiB axis |
 
   Run the whole file with:
@@ -366,6 +442,7 @@ baselines to maintain.
 | `reset_dsksync_boot_regression_reaches_boot_display` | `KICK13.ROM` |
 | `hostfs_boot_aros_runs_a_guest_binary_and_writes_to_the_host` | *(none)* |
 | `hostfs_boot_kick13_runs_a_guest_binary_and_writes_to_the_host` | `KICK13.ROM` |
+| `clipboard_text_crosses_both_ways_under_aros` | `clipboard.device` (or `Devs/clipboard.device`; `COPPERLINE_CLIPBOARD_DEVICE` overrides) |
 | `cannon_fodder_streams_cleanly_through_the_aros_open_rom` | AROS main/ext ROMs with PR 1089 merged (the bundled pair qualifies), generated `copperline-fmv.rom`, Cannon Fodder CUE and tracks |
 | `cannon_fodder_streams_cleanly_through_the_standalone_kickstart_rom` | CD32 Kickstart 3.1 main/ext ROMs, generated `copperline-fmv.rom`, Cannon Fodder CUE and tracks; supplied through the `COPPERLINE_FMV_*` variables above |
 | `ocs_bpu7_ham_captures_*` (incl. live-audio variant) | `kickstart205.rom`, `DESiRE-InsideTheMachine.adf` |
@@ -378,6 +455,8 @@ baselines to maintain.
 | `picasso2_p96cts_reports_all_modes_clean` | `Kickstart v3.1 r40.68 (1993)(Commodore)(A4000).rom`, `p96-picasso2-cts.hdf` (startup runs p96cts at 8/16/24 bpp and writes `P96OUT:p96cts.result`) |
 | `graffity_z2_workbench_opens_640x480x8` / `graffity_z3_workbench_opens_640x480x8` | `Kickstart v3.1 r40.68 (1993)(Commodore)(A4000).rom`, `p96-graffity.hdf` (WB + Picasso96 with `Graffity.card`, default 640x480x8 screen) |
 | `chd_cd32_disc_serves_iso9660_data_and_smooth_audio` | `Pinball Fantasies (EU).chd` (a chdman v5 CD32 disc with a MODE1_RAW data track and CD audio tracks) |
+| `chd_hard_disk_matches_its_source_hdf_and_takes_writes_in_the_overlay` | `AmigaSYS3PlusAGA-rdb.hdf` and `AmigaSYS3PlusAGA-rdb.chd`, its conversion (`chdman createhd -i AmigaSYS3PlusAGA-rdb.hdf -o AmigaSYS3PlusAGA-rdb.chd`; `brew install rom-tools`) |
+| `chd_hard_disk_boots_amigasys_under_kick31` | `KICK31.ROM`, `AmigaSYS3PlusAGA-rdb.chd` (as above) |
 | `nrg_cd32_disc_serves_iso9660_data_and_smooth_audio` | `30 Games Compilation CD (2005)(Stuermer, A.).nrg` (a Nero 5 DAO CD32 disc with one MODE1/2048 data track and nine CD audio tracks) |
 | `toccata_ahi_driver_recognizes_the_board` | `Kickstart v3.1 r40.68 (1993)(Commodore)(A4000).rom`, `toccata-ahi.hdf` (WB3.1 + AHI 4.18 with `toccata.audio` staged into `Devs/AHI` and Unit 0 set to Toccata) |
 | `zz9k_sdk_tools_pass_on_zorro_ii` / `zz9k_sdk_tools_pass_on_zorro_iii` | `zz9k/C/zz9k-{info,hash,chacha,aead,irqtest}` -- the unmodified ZZ9000 SDK m68k tools, built from the zz9000-sdk revision pinned in `docs/internals/zz9k.md` (build recipe in `tests/zz9k_sdk_tools.rs`'s module comment) |

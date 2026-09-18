@@ -82,6 +82,8 @@ pub(crate) struct HostRouting {
     pub(crate) mouse: Option<usize>,
     /// Port the physical gamepad drives (joystick/CD32 devices only).
     pub(crate) gamepad: Option<usize>,
+    /// Ports driven by physical controllers 2 through 4.
+    pub(crate) additional_gamepads: [Option<usize>; 3],
     /// Port the gamepad drives as a mouse, in Gamepad Mouse mode: the
     /// same port the host mouse has, since the machine is given one
     /// mouse and two hands on it rather than two mice.
@@ -99,23 +101,41 @@ pub(crate) struct HostRouting {
 /// launcher's Input-tab summary, so what the GUI promises is exactly what
 /// the pump does. The rules are documented on [`App::host_routing`].
 pub(crate) fn host_routing_for(devices: [PortDevice; 2], mode: JoystickInputMode) -> HostRouting {
+    host_routing_for_ports(devices, [PortDevice::None; 2], mode)
+}
+
+/// The primary gamepad and keyboard assignment, including parallel sockets.
+/// The runtime extends this with the other connected gamepads in
+/// [`host_routing_for_gamepads`].
+pub(crate) fn host_routing_for_ports(
+    devices: [PortDevice; 2],
+    parallel: [PortDevice; 2],
+    mode: JoystickInputMode,
+) -> HostRouting {
     let mouse = devices.iter().position(|&d| d.is_mouse());
-    let mut remaining = (0..2).filter(|&p| {
-        Some(p) != mouse
-            && matches!(
-                devices[p],
-                PortDevice::Mouse
-                    | PortDevice::GamepadMouse
-                    | PortDevice::Joystick
-                    | PortDevice::Cd32Pad
-            )
-    });
+    let mut remaining = (0..2)
+        .filter(|&p| {
+            Some(p) != mouse
+                && matches!(
+                    devices[p],
+                    PortDevice::Mouse
+                        | PortDevice::GamepadMouse
+                        | PortDevice::Joystick
+                        | PortDevice::Cd32Pad
+                )
+        })
+        .chain(
+            (0..2)
+                .filter(|&s| parallel[s] == PortDevice::Joystick)
+                .map(|s| s + crate::bus::PARALLEL_PORT_FIRST),
+        );
     let first = remaining.next();
     let second = remaining.next();
+    let is_mouse = |p: usize| p < 2 && devices[p].is_mouse();
     let (gamepad, keyboard, keyboard2) = match (first, second, mode) {
         (None, _, _) => (None, None, None),
         (Some(p), None, JoystickInputMode::Gamepad) => {
-            if devices[p].is_mouse() {
+            if is_mouse(p) {
                 (None, None, None)
             } else {
                 (Some(p), None, None)
@@ -141,10 +161,61 @@ pub(crate) fn host_routing_for(devices: [PortDevice; 2], mode: JoystickInputMode
     HostRouting {
         mouse,
         gamepad,
+        additional_gamepads: [None; 3],
         gamepad_mouse: pad_mouse,
         keyboard,
         keyboard2,
     }
+}
+
+/// Extend the familiar one-pad routing with stable slots for three more
+/// controllers. Keyboards fill vacancies, while Keyboard mode reserves the
+/// cursor-key player's port even when every physical controller is present.
+fn host_routing_for_gamepads(
+    devices: [PortDevice; 2],
+    parallel: [PortDevice; 2],
+    mode: JoystickInputMode,
+    available: [bool; 4],
+) -> HostRouting {
+    let mut r = host_routing_for_ports(devices, parallel, mode);
+    let all = [devices[0], devices[1], parallel[0], parallel[1]];
+    let eligible = |p: usize| matches!(all[p], PortDevice::Joystick | PortDevice::Cd32Pad);
+    let reserved_keyboard = (mode == JoystickInputMode::Keyboard)
+        .then_some(r.keyboard)
+        .flatten();
+    let mut extra =
+        (0..4).filter(|&p| eligible(p) && Some(p) != r.gamepad && Some(p) != reserved_keyboard);
+    for port in &mut r.additional_gamepads {
+        *port = extra.next();
+    }
+    let pad_ports = [
+        r.gamepad,
+        r.additional_gamepads[0],
+        r.additional_gamepads[1],
+        r.additional_gamepads[2],
+    ];
+    let occupied = |p: usize| {
+        pad_ports
+            .iter()
+            .zip(available)
+            .any(|(&port, present)| present && port == Some(p))
+    };
+    if r.keyboard.is_some_and(occupied) {
+        r.keyboard = (0..4).find(|&p| eligible(p) && Some(p) != r.gamepad && !occupied(p));
+    }
+    // Keep the two-keyboard fallback order: cursor keys on their usual
+    // player, numpad on the absent primary pad, then any spare socket.
+    if r.keyboard2.is_some()
+        || (r.keyboard.is_some()
+            && all
+                .iter()
+                .filter(|&&d| d == PortDevice::Joystick || d == PortDevice::Cd32Pad)
+                .count()
+                > 1)
+    {
+        r.keyboard2 = (0..4).find(|&p| eligible(p) && Some(p) != r.keyboard && !occupied(p));
+    }
+    r
 }
 
 /// How the pad moves the mouse in Gamepad Mouse mode, in quadrature
@@ -627,6 +698,21 @@ struct PerfOverlay {
     baseline: Option<PerfBaseline>,
 }
 
+/// What the newest clip-ring frame was built from: the presentation
+/// buffer's generation and the crop knobs that shape the saved picture.
+/// A pass whose source still matches skips building the picture; the
+/// ring then treats it as the frame staying on screen longer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClipRingSource {
+    generation: u64,
+    overscan: crate::config::Overscan,
+    tv_centre: crate::config::TvCentre,
+    tv_aperture_rows: Option<usize>,
+    /// The capture's row count, which follows the pixel aspect.
+    capture_rows: usize,
+    rtg: bool,
+}
+
 /// One sample of the cumulative counters the overlay derives rates from.
 struct PerfBaseline {
     at: Instant,
@@ -731,6 +817,15 @@ pub struct FrameDumpSpec {
     pub count: u32,
 }
 
+/// A scheduled `--gif-after SECS PATH` clip: `seconds` of presented frames
+/// from `start_secs`, written to `path` at the configured clip rate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GifCaptureSpec {
+    pub start_secs: f32,
+    pub seconds: f32,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiskInsertSpec {
     pub secs: f32,
@@ -741,7 +836,7 @@ pub struct DiskInsertSpec {
 
 use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
-use pixels::{Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
+use pixels::{wgpu, Pixels, PixelsBuilder, ScalingMode, SurfaceTexture};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{
@@ -923,6 +1018,20 @@ fn analyzer_heat_presets(bus: &crate::bus::Bus) -> Vec<ui::HeatPreset> {
     presets
 }
 
+/// The line count to lay the beam diagram out against, and to map screen
+/// positions through.
+///
+/// An interlaced signal alternates a long field and a short field one line
+/// shorter, so following the captured field would resize the pane and move
+/// the row under the pointer on every frame. Agnus reckons the frame height
+/// this capture belongs to -- the long field, or a programmable VARBEAMEN
+/// total used as it stands -- and that is what presentation uses; callers
+/// clamp the row to the field actually captured. A trace from before the
+/// height was recorded falls back to the captured field.
+fn analyzer_layout_rows(nominal_rows: usize, rows: usize) -> usize {
+    nominal_rows.max(rows)
+}
+
 /// The window the Memory tab arms when nothing has armed the map yet: the
 /// chip RAM bank. It is the bank every chip-bus engine works out of and
 /// usually the smallest fitted one, so its cells cover the fewest bytes
@@ -941,8 +1050,19 @@ pub struct App {
     netplay_keyboard_controller: bool,
     netplay_setup: Option<crate::video::launcher::NetplaySetup>,
     netplay_disk_picker: Option<(usize, app_netplay::DiskPicker)>,
+    /// When a spectator's catch-up progress was last announced.
+    netplay_catchup_notice: Option<Instant>,
     // Linux serves clipboard selections from the owning instance.
     host_clipboard: Option<arboard::Clipboard>,
+    /// Set once opening the host clipboard has failed. Whether a session
+    /// has one at all is fixed when it starts -- a Wayland compositor
+    /// without a data-control protocol and no X11 display to fall back on
+    /// has none -- so the 300 ms poll must not keep reopening it: every
+    /// attempt walks the protocols again and logs from inside `arboard`.
+    host_clipboard_unavailable: bool,
+    /// When the host clipboard is next polled for the guest
+    /// (`service_clipboard`).
+    clipboard_next_poll: Option<Instant>,
     emu: Emulator,
     fb: Vec<u32>,
     /// Merges rendered fields into the double-height presentation
@@ -975,6 +1095,10 @@ pub struct App {
     /// shows, in woven presentation-buffer space (see [`AutocropLatch`]);
     /// `None` until a standard frame has painted playfield.
     present_content_rect: Option<bitplane::ContentRect>,
+    /// How the last rendered field was placed on the presentation
+    /// buffer, so a canvas pixel can be traced back to the rendered pixel
+    /// it shows (see `canvas_to_field_pixel`).
+    present_placement: Option<crate::video::present_common::FieldPlacement>,
     /// The last layout the COPPERLINE_DIAG_AUTOCROP trace logged, so the
     /// trace reports changes rather than every redraw. Unused while the
     /// flag is off.
@@ -994,9 +1118,13 @@ pub struct App {
     /// The draw path uploads `rtg_fb` to the RTG texture when set.
     rtg_present_dims: Option<(u32, u32)>,
     render: Option<Render>,
-    debugger_tool_window: Option<ToolWindow>,
-    frame_analyzer_tool_window: Option<ToolWindow>,
-    console_tool_window: Option<ToolWindow>,
+    debugger_ui: Option<egui_debugger::DebuggerUi>,
+    debug_layout_active: bool,
+    debug_guest_input: bool,
+    debug_snapshot_dirty: std::cell::Cell<bool>,
+    debug_play_geometry: Option<egui_debugger::workspace::PlayGeometry>,
+    egui_selected_tool: ToolPanelKind,
+    egui_preferences: Option<egui_debugger::preferences::Preferences>,
     /// When the frame loop last requested a paced tool window repaint
     /// (see TOOL_REDRAW_INTERVAL).
     last_tool_redraw: Instant,
@@ -1047,6 +1175,18 @@ pub struct App {
     /// ends once the last of them has been saved.
     auto_shot: Vec<(f32, PathBuf)>,
     pending_auto_shot: Vec<(f32, PathBuf)>,
+    /// `--expect-screenshot` checks, armed like `auto_shot` (deadline
+    /// order) and captured through the same frame path.
+    auto_expect: Vec<crate::expect::ExpectShotSpec>,
+    pending_auto_expect: Vec<crate::expect::ExpectShotSpec>,
+    /// What the run has concluded so far; the process exit status.
+    verdict: crate::verdict::RunVerdict,
+    /// `--exit-on-return`: the `--run` completion marker to poll for the
+    /// guest program's return code, which ends the run.
+    run_return_marker: Option<PathBuf>,
+    /// The guest stopped the emulator through uaelib `ExitEmu`; the event
+    /// loop exits on its next pass.
+    guest_exit_requested: bool,
     /// Scheduled --save-state-after captures, earliest deadline first:
     /// write a save state once emulated time reaches each deadline, then
     /// keep running. Repeats like --screenshot-after.
@@ -1067,8 +1207,12 @@ pub struct App {
     /// release.
     auto_joys: Vec<ScheduledJoy>,
     pending_auto_joys: Vec<(f32, JoyButtonKind, u32, u8)>,
-    auto_joy_held: [AutoJoyHeld; 2],
-    auto_joy_engaged: [bool; 2],
+    auto_joy_held: [AutoJoyHeld; crate::bus::PORT_COUNT],
+    auto_joy_engaged: [bool; crate::bus::PORT_COUNT],
+    /// Scheduled light-pen positions from --pen-after (one-shot each):
+    /// (at_emulated_secs, x, y, port or None for the pen's port).
+    auto_pens: Vec<(f64, i32, i32, Option<u8>)>,
+    pending_auto_pens: Vec<(f32, i32, i32, Option<u8>)>,
     /// The windowed control-protocol server (`--control-gui`), attached
     /// after construction via [`App::attach_control`]; its commands are
     /// drained at the top of `about_to_wait` (see window/control.rs).
@@ -1296,6 +1440,8 @@ pub struct App {
     /// a live emulation-performance readout in the top-right of the
     /// display. Presentation only, like the OSD: captures never include it.
     perf_overlay: bool,
+    /// Live desktop vsync preference, also used when recreating the surface.
+    vsync: bool,
     /// The overlay's formatted lines and sampling baseline.
     perf: PerfOverlay,
     /// Screen tint in effect ([display] tint). Presentation only, applied
@@ -1314,6 +1460,7 @@ pub struct App {
     /// input backend is available (e.g. headless CI) or the pad is not yet
     /// calibrated.
     gamepad: crate::gamepad::GamepadReader,
+    gamepad_available: [bool; 4],
     /// When the pad's Quit hotkey started being held, if it is down right
     /// now. Cleared by a release before the hold completes.
     gamepad_quit_hold: Option<Instant>,
@@ -1378,7 +1525,7 @@ pub struct App {
     sampler_stream: Option<cpal::Stream>,
     /// Output frame-skip level for warp/turbo mode: how many emulated frames
     /// are retired per presented frame while warp is engaged. Presentation is
-    /// vsync-gated, so this is what decouples warp speed from the host monitor
+    /// normally vsync-gated, so this decouples warp speed from the host monitor
     /// refresh rate. Adjustable from the Emulator menu and the keyboard.
     warp_speed: WarpSpeed,
     /// Rewind capture settings from `[emulation]`, kept so the Rewind menu
@@ -1478,6 +1625,32 @@ pub struct App {
     /// Scratch for narrowing a 35 ns-canvas presentation to the recorder's
     /// fixed FB_WIDTH frame.
     record_scratch_fb: Vec<u32>,
+    /// `[recording]` clip settings. The ring itself is built on the first
+    /// presented frame, once the machine's video standard (which picks the
+    /// automatic clip rate) is known.
+    clip_settings: crate::gifclip::ClipSettings,
+    /// The rolling last-N-seconds ring behind Save Clip as GIF; None
+    /// until the first frame, or for good when `clip_seconds` is 0.
+    clip_ring: Option<crate::gifclip::ClipRing>,
+    /// A clip being written on a background thread: its outcome flashes
+    /// on the OSD when it lands.
+    clip_save: Option<std::sync::mpsc::Receiver<Result<(PathBuf, u32, f64)>>>,
+    /// Scratch presentation picture for the clip ring and the headless
+    /// GIF captures (same geometry as a screenshot).
+    clip_fb: Vec<u32>,
+    /// Bumped whenever `present_fb` takes a new picture, so the clip ring
+    /// can tell a repeat of the frame it last built from without
+    /// rebuilding and comparing it.
+    present_fb_generation: u64,
+    /// What the newest clip-ring frame was built from.
+    clip_ring_source: Option<ClipRingSource>,
+    /// The picture buffer of a frame presented on the main thread, kept
+    /// for the next such frame's copy.
+    picture_scratch: Vec<u32>,
+    /// Live `--gif-after` captures, armed from `pending_gif_captures` with
+    /// the other scheduled flags.
+    gif_captures: Vec<GifCaptureState>,
+    pending_gif_captures: Vec<GifCaptureSpec>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1525,10 +1698,152 @@ struct FrameDumpState {
     last_saved_emulated_frame: Option<u64>,
 }
 
+/// A live `--gif-after` capture. The writer opens on the first frame
+/// inside the window and closes once emulated time passes its end.
+struct GifCaptureState {
+    spec: GifCaptureSpec,
+    writer: Option<crate::gifclip::GifWriter<std::io::BufWriter<std::fs::File>>>,
+    selector: crate::gifclip::FrameSelector,
+    last_captured_emulated_frame: Option<u64>,
+    finished: bool,
+}
+
+impl GifCaptureState {
+    fn new(spec: GifCaptureSpec, fps: u32) -> Self {
+        Self {
+            spec,
+            writer: None,
+            selector: crate::gifclip::FrameSelector::new(fps),
+            last_captured_emulated_frame: None,
+            finished: false,
+        }
+    }
+
+    fn end_secs(&self) -> f64 {
+        f64::from(self.spec.start_secs) + f64::from(self.spec.seconds)
+    }
+
+    /// Write the last frame and the trailer. `end` is the emulated time
+    /// the clip stops at (None on an early exit: the final frame then
+    /// gets one nominal period).
+    fn finish(&mut self, end: Option<f64>) -> Result<u32> {
+        self.finished = true;
+        match self.writer.take() {
+            Some(writer) => {
+                let (mut out, frames) = writer.finish(end)?;
+                std::io::Write::flush(&mut out)?;
+                Ok(frames)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
+impl Drop for GifCaptureState {
+    /// Best-effort finalize so a run that ends early (another capture's
+    /// schedule finished first, the window closed) still leaves a playable
+    /// file of what was captured.
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        match self.finish(None) {
+            Ok(frames) => info!(
+                "gif capture: {} closed early with {frames} frames",
+                self.spec.path.display()
+            ),
+            Err(e) => warn!(
+                "gif capture: finalizing {} on exit failed: {e:#}",
+                self.spec.path.display()
+            ),
+        }
+    }
+}
+
 struct Render {
     window: Arc<Window>,
-    pixels: Pixels<'static>,
+    /// The GPU side, at home on the main thread. None while it is lent to
+    /// the present worker; `gpu_mut` brings it back.
+    gpu: Option<Box<Gpu>>,
+    /// Presents frames off the main thread (`COPPERLINE_THREADED_PRESENT`);
+    /// None presents synchronously from the redraw handler.
+    present_worker: Option<PresentWorker>,
     texture_scale: usize,
+    debug_viewport: Option<(u32, u32, u32, u32)>,
+    /// True while the host window is minimized (Windows delivers a 0x0
+    /// Resized). Presenting while minimized deadlocks on Windows: DWM stops
+    /// consuming swapchain frames, so once the in-flight buffers fill,
+    /// pixels.render() blocks the main thread, the message pump dies, and
+    /// the window can never be restored (which is what would unblock the
+    /// present). Skip all rendering until a nonzero resize restores it.
+    minimized: bool,
+    /// The physical surface size `pixels` was last configured with, so a
+    /// redraw can tell that the host window has outgrown it (see
+    /// `resync_surface_size`).
+    surface_size: (u32, u32),
+}
+
+impl Render {
+    /// Resize the presentation surface, recording the size it was configured
+    /// with. Every resize goes through here (the first configure is
+    /// `build_pixels_for_window`'s, whose size this struct is built with):
+    /// `pixels` reconfigures its swapchain from its own copy of this size and
+    /// nothing else can correct it, so the record must never lag behind what
+    /// `pixels` holds.
+    fn resize_surface(&mut self, size: PhysicalSize<u32>) -> Result<(), pixels::TextureError> {
+        let (width, height) = (size.width.max(1), size.height.max(1));
+        if let Some(gpu) = self.gpu_mut() {
+            gpu.pixels.resize_surface(width, height)?;
+        }
+        self.surface_size = (width, height);
+        Ok(())
+    }
+
+    /// The GPU side for a main-thread operation: reconfiguring the
+    /// surface or texture, loading a shader, presenting a frame that
+    /// carries something only this thread has. Reclaims it from the
+    /// present worker first, waiting out a frame in flight; it stays home
+    /// until the next threaded frame lends it again.
+    fn gpu_mut(&mut self) -> Option<&mut Gpu> {
+        if self.gpu.is_none() {
+            if let Some(worker) = self.present_worker.as_mut() {
+                self.gpu = worker.reclaim();
+                if self.gpu.is_none() {
+                    error!("present worker lost the GPU side; presenting nothing further");
+                    self.present_worker = None;
+                }
+            }
+        }
+        self.gpu.as_deref_mut()
+    }
+
+    /// Hand the GPU side to the present worker. A no-op without a worker
+    /// or when the worker already holds it.
+    fn lend_gpu(&mut self) {
+        if let Some(worker) = self.present_worker.as_mut() {
+            if let Some(gpu) = self.gpu.take() {
+                if let Err(gpu) = worker.lend(gpu) {
+                    self.gpu = Some(gpu);
+                    self.present_worker = None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Render {
+    fn drop(&mut self) {
+        // The surface and its layer go away on the thread that made them.
+        let _ = self.gpu_mut();
+    }
+}
+
+/// The GPU side of the window: the pixels surface and the passes drawn
+/// into it. Frames present from the present worker's thread; the rare
+/// operations that reconfigure it run on the main thread with it at home.
+struct Gpu {
+    pixels: Pixels<'static>,
+    presenter: presenter::Presenter,
     /// The pass that puts the composited buffer on the surface (see
     /// [`scaler`]): the emulator window's replacement for the `pixels`
     /// built-in scaling renderer, so the displayed integer multiple is
@@ -1552,58 +1867,403 @@ struct Render {
     /// Built with the window whatever the setting, like the passes above;
     /// it draws nothing until a sheet is loaded into it.
     sticker_pass: stickers::StickerPass,
-    /// True while the host window is minimized (Windows delivers a 0x0
-    /// Resized). Presenting while minimized deadlocks on Windows: DWM stops
-    /// consuming swapchain frames, so once the in-flight buffers fill,
-    /// pixels.render() blocks the main thread, the message pump dies, and
-    /// the window can never be restored (which is what would unblock the
-    /// present). Skip all rendering until a nonzero resize restores it.
-    minimized: bool,
-    /// The physical surface size `pixels` was last configured with, so a
-    /// redraw can tell that the host window has outgrown it (see
-    /// `resync_surface_size`).
-    surface_size: (u32, u32),
 }
 
-impl Render {
-    /// Resize the presentation surface, recording the size it was configured
-    /// with. Every resize goes through here (the first configure is
-    /// `build_pixels_for_window`'s, whose size this struct is built with):
-    /// `pixels` reconfigures its swapchain from its own copy of this size and
-    /// nothing else can correct it, so the record must never lag behind what
-    /// `pixels` holds.
-    fn resize_surface(&mut self, size: PhysicalSize<u32>) -> Result<(), pixels::TextureError> {
-        let (width, height) = (size.width.max(1), size.height.max(1));
-        self.pixels.resize_surface(width, height)?;
-        self.surface_size = (width, height);
-        Ok(())
+// The GPU side crosses between the main thread and the present worker.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Gpu>();
+};
+
+/// The main-thread paint that follows the passes on a frame presented in
+/// place: the inspector's egui, which cannot cross to the worker.
+type PresentAfter<'a> =
+    &'a mut dyn FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView);
+
+/// One frame for the GPU passes: the composed texture image (None when
+/// it was composed straight into the pixels buffer) and everything the
+/// passes need, resolved on the main thread so the worker reads no
+/// window state.
+struct PresentJob {
+    frame: Option<Vec<u8>>,
+    emulated_frame: Option<u64>,
+    draws: Vec<scaler::ScalerDraw>,
+    pass: PresentPass,
+    /// The presentation buffer for a display draw that samples it on the
+    /// GPU (`ScalerDraw::picture`), instead of a CPU copy into `frame`.
+    picture: Option<PictureFrame>,
+}
+
+struct PictureFrame {
+    fb: Vec<u32>,
+    width: u32,
+    rows: u32,
+}
+
+enum PresentPass {
+    Plain,
+    /// The RTG board's own texture over the display rect.
+    Rtg {
+        rect: (f32, f32, f32, f32),
+        integer_scaling: bool,
+    },
+    Crt(CrtPresent),
+}
+
+/// The CRT and bezel passes' inputs for one frame.
+struct CrtPresent {
+    kind: crate::config::ShaderKind,
+    style: BezelStyle,
+    crt_active: bool,
+    bezel_active: bool,
+    uniforms: crt_shader::CrtUniforms,
+    viewport: (f32, f32, f32, f32),
+}
+
+/// Draw one frame through the GPU passes and present it. The present
+/// worker runs this for the normal display; the main thread runs it for a
+/// frame that carries something only it has (the RTG texture upload, the
+/// inspector's egui paint through `after`). `notify` is the window whose
+/// `pre_present_notify` runs after the draw and before the present, as it
+/// always did; see `worker_notify_window` for why the worker passes None
+/// on macOS.
+fn present_job(
+    gpu: &mut Gpu,
+    notify: Option<&Window>,
+    job: &PresentJob,
+    mut after: Option<PresentAfter<'_>>,
+) -> Result<(), pixels::Error> {
+    let Gpu {
+        pixels,
+        presenter,
+        scaler,
+        rtg_texture,
+        crt_shader,
+        bezel_shader,
+        sticker_pass,
+    } = gpu;
+    if let Some(frame) = &job.frame {
+        let dst = pixels.frame_mut();
+        if dst.len() != frame.len() {
+            // The texture was replanned after this frame was composed;
+            // the next redraw composes at the new size.
+            return Ok(());
+        }
+        dst.copy_from_slice(frame);
+    }
+    if let Some(picture) = &job.picture {
+        scaler.upload_picture(
+            pixels.device(),
+            pixels.queue(),
+            &picture.fb,
+            picture.width,
+            picture.rows,
+        );
+    }
+    presenter.render(
+        pixels,
+        notify,
+        job.emulated_frame,
+        |encoder, target, ctx| {
+            scaler.render(
+                &ctx.device,
+                &ctx.queue,
+                &ctx.texture,
+                encoder,
+                target,
+                &job.draws,
+            );
+            match &job.pass {
+                PresentPass::Plain => {}
+                PresentPass::Rtg {
+                    rect,
+                    integer_scaling,
+                } => rtg_texture.render(&ctx.queue, encoder, target, *rect, *integer_scaling),
+                PresentPass::Crt(crt) => {
+                    if crt.bezel_active {
+                        let opening = bezel::opening_rect(crt.style, crt.viewport);
+                        if crt.crt_active {
+                            crt_shader.render(
+                                &ctx.device,
+                                &ctx.queue,
+                                &ctx.texture,
+                                encoder,
+                                target,
+                                opening,
+                                crt.kind,
+                                crt.uniforms.with_viewport(opening),
+                            );
+                        }
+                        bezel_shader.render(
+                            &ctx.device,
+                            &ctx.queue,
+                            &ctx.texture,
+                            encoder,
+                            target,
+                            crt.viewport,
+                            crt.style,
+                            bezel::uniforms_from(
+                                &crt.uniforms,
+                                crt.viewport,
+                                opening,
+                                crt.crt_active,
+                            ),
+                        );
+                        sticker_pass.render(
+                            &ctx.device,
+                            &ctx.queue,
+                            encoder,
+                            target,
+                            crt.viewport,
+                            opening,
+                        );
+                    } else {
+                        crt_shader.render(
+                            &ctx.device,
+                            &ctx.queue,
+                            &ctx.texture,
+                            encoder,
+                            target,
+                            crt.viewport,
+                            crt.kind,
+                            crt.uniforms,
+                        );
+                    }
+                }
+            }
+            if let Some(after) = after.as_mut() {
+                after(&ctx.device, &ctx.queue, encoder, target);
+            }
+            Ok(())
+        },
+    )
+}
+
+enum PresentCmd {
+    Lend(Box<Gpu>),
+    Frame(PresentJob),
+    Return,
+}
+
+enum PresentBack {
+    Gpu(Option<Box<Gpu>>),
+    /// A presented frame's buffers, back for reuse.
+    Frame {
+        frame: Vec<u8>,
+        picture: Option<Vec<u32>>,
+    },
+}
+
+/// Frames the worker may hold at once: the one it is presenting and the
+/// next, composed while it waits on vsync. A third redraw waits.
+const PRESENT_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Presents frames on its own thread, so the main thread's redraw ends at
+/// hand-off instead of at the surface's vsync wait and the upload. It
+/// holds the GPU side while frames are threaded and hands it back for
+/// main-thread operations (`Render::gpu_mut`).
+struct PresentWorker {
+    cmd_tx: Option<SyncSender<PresentCmd>>,
+    back_rx: Receiver<PresentBack>,
+    handle: Option<JoinHandle<()>>,
+    /// The window, shared with the thread. Held here so the thread's
+    /// clone is never the last reference: a winit `Window` dropped off
+    /// the main thread dispatches its drop to the main thread and waits
+    /// (macOS), and the main thread is the one joining the worker in
+    /// `Drop` -- the thread would then be releasing the window into a
+    /// join that waits for the thread. This reference outlives the join
+    /// and drops on the main thread, after it. Held for that drop alone.
+    _window: Arc<Window>,
+    lent: bool,
+    in_flight: usize,
+    /// Frame buffers the worker returned, ready to compose into.
+    recycled: Vec<Vec<u8>>,
+    /// Picture buffers the worker returned, ready to copy into.
+    recycled_pictures: Vec<Vec<u32>>,
+}
+
+/// The window the present worker hands to `present_job` for the
+/// pre-present hint. On macOS every winit `Window` method dispatches to
+/// the main thread and waits for it -- a deadlock against a main thread
+/// waiting in `reclaim` -- and the hint is a no-op there anyway, so the
+/// worker passes None. Elsewhere (Wayland is where the hint matters) the
+/// window is thread-safe and the worker notifies in the established
+/// order: after a successful draw, right before submission.
+fn worker_notify_window(window: &Arc<Window>) -> Option<&Window> {
+    if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(window)
     }
 }
 
-struct ToolWindow {
-    window: Arc<Window>,
-    pixels: Pixels<'static>,
-    texture_scale: usize,
-    cursor_pos: Option<(i32, i32)>,
-    /// Same Windows minimized-present deadlock hazard as Render::minimized.
-    minimized: bool,
-    /// Same configured-surface-size record as Render::surface_size.
-    surface_size: (u32, u32),
-}
+impl PresentWorker {
+    fn new(window: Arc<Window>) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PresentCmd>(PRESENT_FRAMES_IN_FLIGHT + 2);
+        let (back_tx, back_rx) = mpsc::channel::<PresentBack>();
+        let thread_window = Arc::clone(&window);
+        let handle = std::thread::Builder::new()
+            .name("copperline-present".to_string())
+            .spawn(move || {
+                let window = thread_window;
+                let mut held: Option<Box<Gpu>> = None;
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        PresentCmd::Lend(gpu) => held = Some(gpu),
+                        PresentCmd::Frame(job) => {
+                            if let Some(gpu) = held.as_mut() {
+                                let notify = worker_notify_window(&window);
+                                if let Err(e) = present_job(gpu, notify, &job, None) {
+                                    error!("pixels.render: {e}");
+                                }
+                            }
+                            let back = PresentBack::Frame {
+                                frame: job.frame.unwrap_or_default(),
+                                picture: job.picture.map(|picture| picture.fb),
+                            };
+                            if back_tx.send(back).is_err() {
+                                break;
+                            }
+                        }
+                        PresentCmd::Return => {
+                            if back_tx.send(PresentBack::Gpu(held.take())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn present worker");
+        Self {
+            cmd_tx: Some(cmd_tx),
+            back_rx,
+            handle: Some(handle),
+            _window: window,
+            lent: false,
+            in_flight: 0,
+            recycled: Vec::new(),
+            recycled_pictures: Vec::new(),
+        }
+    }
 
-impl ToolWindow {
-    /// Tool-window counterpart of `Render::resize_surface`.
-    fn resize_surface(&mut self, size: PhysicalSize<u32>) -> Result<(), pixels::TextureError> {
-        let (width, height) = (size.width.max(1), size.height.max(1));
-        self.pixels.resize_surface(width, height)?;
-        self.surface_size = (width, height);
-        Ok(())
+    fn lend(&mut self, gpu: Box<Gpu>) -> std::result::Result<(), Box<Gpu>> {
+        let Some(tx) = self.cmd_tx.as_ref() else {
+            return Err(gpu);
+        };
+        match tx.send(PresentCmd::Lend(gpu)) {
+            Ok(()) => {
+                self.lent = true;
+                Ok(())
+            }
+            Err(mpsc::SendError(PresentCmd::Lend(gpu))) => Err(gpu),
+            Err(_) => unreachable!("a lend returns a lend"),
+        }
+    }
+
+    /// Take the GPU side back, waiting out a frame in flight. None when
+    /// the worker never had it, or it is gone with the worker.
+    fn reclaim(&mut self) -> Option<Box<Gpu>> {
+        if !self.lent {
+            return None;
+        }
+        self.lent = false;
+        let sent = self
+            .cmd_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(PresentCmd::Return).is_ok());
+        if !sent {
+            return None;
+        }
+        loop {
+            match self.back_rx.recv() {
+                Ok(PresentBack::Frame { frame, picture }) => self.take_back(frame, picture),
+                Ok(PresentBack::Gpu(gpu)) => return gpu,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn take_back(&mut self, frame: Vec<u8>, picture: Option<Vec<u32>>) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.recycled.push(frame);
+        if let Some(picture) = picture {
+            self.recycled_pictures.push(picture);
+        }
+    }
+
+    /// Collect the buffers of frames presented since the last call.
+    fn collect(&mut self) {
+        while let Ok(back) = self.back_rx.try_recv() {
+            match back {
+                PresentBack::Frame { frame, picture } => self.take_back(frame, picture),
+                PresentBack::Gpu(Some(gpu)) => {
+                    // Only `reclaim` asks for it; put it back to work.
+                    let _ = self.lend(gpu);
+                }
+                PresentBack::Gpu(None) => {}
+            }
+        }
+    }
+
+    /// A buffer of `len` bytes to compose the next frame into, or None
+    /// while the worker still holds every buffer it may.
+    fn frame_buffer(&mut self, len: usize) -> Option<Vec<u8>> {
+        self.collect();
+        if let Some(mut frame) = self.recycled.pop() {
+            frame.resize(len, 0);
+            return Some(frame);
+        }
+        (self.in_flight < PRESENT_FRAMES_IN_FLIGHT).then(|| vec![0u8; len])
+    }
+
+    /// Queue a frame; back on Err when the worker cannot take it now.
+    #[allow(clippy::result_large_err)]
+    fn submit(&mut self, job: PresentJob) -> std::result::Result<(), PresentJob> {
+        let Some(tx) = self.cmd_tx.as_ref() else {
+            return Err(job);
+        };
+        match tx.try_send(PresentCmd::Frame(job)) {
+            Ok(()) => {
+                self.in_flight += 1;
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(PresentCmd::Frame(job)))
+            | Err(mpsc::TrySendError::Disconnected(PresentCmd::Frame(job))) => Err(job),
+            Err(_) => unreachable!("a frame returns a frame"),
+        }
+    }
+
+    fn recycle(&mut self, frame: Vec<u8>, picture: Option<Vec<u32>>) {
+        self.recycled.push(frame);
+        if let Some(picture) = picture {
+            self.recycled_pictures.push(picture);
+        }
+    }
+
+    /// An empty buffer to copy the next picture into.
+    fn picture_buffer(&mut self) -> Vec<u32> {
+        let mut buffer = self.recycled_pictures.pop().unwrap_or_default();
+        buffer.clear();
+        buffer
     }
 }
 
-/// Frame-loop repaints of the tool windows (debugger, frame analyzer) are
-/// paced to this wall-clock interval (20 Hz). Each repaint costs a full
-/// panel raster plus a whole-texture GPU upload on the emulation thread, so
+impl Drop for PresentWorker {
+    fn drop(&mut self) {
+        // The join runs the thread's last drops, its window clone among
+        // them; `self._window` keeps the window alive past the join (see
+        // the field), so that clone never dispatches a drop back to the
+        // thread waiting here. The GPU side is home by now
+        // (`Render::gpu_mut` reclaims it before the worker goes).
+        self.cmd_tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Live inspector snapshots are paced to this wall-clock interval (20 Hz).
+/// Inspection and GPU submission run on the emulation thread, so
 /// repainting at the 50 Hz emulated frame rate can push the loop past its
 /// frame budget and underrun the audio ring. Interactive updates (hover,
 /// clicks, stepping, debug stops) request immediate redraws and are not
@@ -1937,12 +2597,15 @@ impl App {
         screenshot_after: Vec<(f32, PathBuf)>,
         save_state_after: Vec<(f32, PathBuf)>,
         frame_dump: Option<FrameDumpSpec>,
+        gif_after: Vec<GifCaptureSpec>,
+        clip: crate::gifclip::ClipSettings,
         press_after: Vec<KeyPressSpec>,
         click_after: Vec<(f32, MouseButtonKind, u32, u8)>,
         joy_after: Vec<(f32, JoyButtonKind, u32, u8)>,
         mouse_after: Vec<(f32, i32, i32, u8)>,
         mouse_to_after: Vec<(f32, i32, i32, u8)>,
         pot_after: Vec<(f32, u8, u8, u8)>,
+        pen_after: Vec<(f32, i32, i32, Option<u8>)>,
         disk_insert_after: Vec<DiskInsertSpec>,
         cd_insert_after: Vec<(f32, PathBuf)>,
         freeze_after: Vec<f32>,
@@ -1960,6 +2623,7 @@ impl App {
         bezel: BezelStyle,
         bezel_stickers: Option<PathBuf>,
         perf_overlay: bool,
+        vsync: bool,
         tint: crate::config::Tint,
         start_fullscreen: bool,
         hide_status_bar: bool,
@@ -1987,7 +2651,8 @@ impl App {
         let powered_on = power_on
             || !screenshot_after.is_empty()
             || !save_state_after.is_empty()
-            || frame_dump.is_some();
+            || frame_dump.is_some()
+            || !gif_after.is_empty();
         let render_worker = threaded_render_enabled().then(|| {
             info!("threaded render pipeline enabled");
             RenderWorker::new()
@@ -2059,13 +2724,18 @@ impl App {
             present_tv_aperture_rows: Some(TV_PAL_PRESENT_HEIGHT),
             presentation_latch: PresentationLatch::default(),
             present_content_rect: None,
+            present_placement: None,
             last_diag_layout: None,
             autocrop_latch: AutocropLatch::default(),
             present_programmable: false,
             render: None,
-            debugger_tool_window: None,
-            frame_analyzer_tool_window: None,
-            console_tool_window: None,
+            debugger_ui: None,
+            debug_layout_active: false,
+            debug_guest_input: false,
+            debug_snapshot_dirty: std::cell::Cell::new(true),
+            debug_play_geometry: None,
+            egui_selected_tool: ToolPanelKind::Debugger,
+            egui_preferences: None,
             last_tool_redraw: Instant::now(),
             debugger_panel: None,
             frame_analyzer_panel: None,
@@ -2085,6 +2755,11 @@ impl App {
             paused: false,
             auto_shot: Vec::new(),
             pending_auto_shot: screenshot_after,
+            auto_expect: Vec::new(),
+            pending_auto_expect: Vec::new(),
+            verdict: crate::verdict::RunVerdict::default(),
+            run_return_marker: None,
+            guest_exit_requested: false,
             auto_save_state: Vec::new(),
             pending_auto_save_state: save_state_after,
             frame_dump: None,
@@ -2095,8 +2770,10 @@ impl App {
             pending_auto_clicks: click_after,
             auto_joys: Vec::new(),
             pending_auto_joys: joy_after,
-            auto_joy_held: [AutoJoyHeld::default(); 2],
-            auto_joy_engaged: [false; 2],
+            auto_joy_held: [AutoJoyHeld::default(); crate::bus::PORT_COUNT],
+            auto_joy_engaged: [false; crate::bus::PORT_COUNT],
+            auto_pens: Vec::new(),
+            pending_auto_pens: pen_after,
             #[cfg(feature = "control")]
             control: None,
             #[cfg(feature = "gdb")]
@@ -2128,6 +2805,7 @@ impl App {
             panel_held_rawkeys: [false; 128],
             raw_device_held_rawkeys: [false; 128],
             main_window_focused: false,
+            clipboard_next_poll: None,
             window_manually_sized: false,
             snap_request_deadline: None,
             pending_canvas_follow: None,
@@ -2179,11 +2857,13 @@ impl App {
             bezel_last: last_bezel_style(bezel),
             bezel_stickers_path: bezel_stickers,
             perf_overlay,
+            vsync,
             perf: PerfOverlay::default(),
             tint,
             tint_lut: tint_lut(tint),
             start_fullscreen,
             gamepad: crate::gamepad::GamepadReader::new(),
+            gamepad_available: [false; 4],
             gamepad_quit_hold: None,
             tool_window_front: None,
             cal_pad_drives: false,
@@ -2222,7 +2902,9 @@ impl App {
             netplay_keyboard_controller: true,
             netplay_setup: None,
             netplay_disk_picker: None,
+            netplay_catchup_notice: None,
             host_clipboard: None,
+            host_clipboard_unavailable: false,
             run_ahead_frames,
             runahead_machine_block,
             ui: UiState::default(),
@@ -2240,6 +2922,15 @@ impl App {
             recorder: None,
             record_fb: Vec::new(),
             record_scratch_fb: Vec::new(),
+            clip_settings: clip,
+            clip_ring: None,
+            clip_save: None,
+            clip_fb: Vec::new(),
+            present_fb_generation: 0,
+            clip_ring_source: None,
+            picture_scratch: Vec::new(),
+            gif_captures: Vec::new(),
+            pending_gif_captures: gif_after,
         };
         // Attach the sampler now for a directly-booted machine; the config-screen
         // placeholder passes a disabled request and attaches on Run instead.
@@ -2363,7 +3054,7 @@ impl App {
     /// holds a mouse. Otherwise live mouse input is dropped.
     fn mouse_port(&self) -> Option<usize> {
         if let Some(peer) = &self.netplay {
-            let port = peer.player();
+            let port = peer.port()?;
             return self.emu.bus().input.ports[port]
                 .device
                 .is_mouse()
@@ -2377,98 +3068,110 @@ impl App {
             .position(|p| p.device.is_mouse())
     }
 
-    /// Which port each host input source drives this quantum. The host
-    /// mouse claims the lowest-numbered mouse port; the ports left over
-    /// that a host source can drive (joysticks, CD32 pads, and a second
-    /// mouse) are assigned by count:
-    ///
-    /// - One port: the [`JoystickInputMode`] picks its source. `Gamepad`
-    ///   leaves the keyboard passing through to the Amiga -- and cannot
-    ///   drive a second mouse, which is then undriven until the mode is
-    ///   flipped to `Keyboard`.
-    /// - Two ports (a two-controller setup): the gamepad -- backed by the
-    ///   numpad keyboard mapping whenever no physical pad is present --
-    ///   and the cursor-key mapping drive one each, the mode picking
-    ///   which source pair gets the lower-numbered port.
-    ///
-    /// The cursor-key mapping drives whatever device its port carries:
-    /// direction lines on a joystick/pad, pointer motion and buttons on a
-    /// mouse.
+    /// Assign physical controllers to stable player slots, then use the
+    /// cursor and numpad mappings for remaining players. Keyboard mode
+    /// reserves the first player's port for cursor keys. A single joystick
+    /// in Gamepad mode keeps all keyboard keys passing through to the guest.
     fn host_routing(&self) -> HostRouting {
         let input = &self.emu.bus().input;
-        host_routing_for(
+        host_routing_for_gamepads(
             [input.ports[0].device, input.ports[1].device],
+            [input.device(2), input.device(3)],
             self.joystick_input_mode,
+            self.gamepad_available,
         )
     }
 
-    /// Poll the host input sources and drive the emulated port(s). Called
-    /// once per scheduler quantum. Scripted --joy-after state beats the
-    /// keyboard mapping on a shared port and asserts alone on ports no
-    /// host source drives; a present physical pad beats the scripted
-    /// state on its port, as it always has.
+    /// Poll every physical controller once per quantum. The first controller
+    /// also operates the host interface; each player keeps independent input.
     fn pump_joystick_input(&mut self) {
         if self.netplay.is_some() {
             self.pump_netplay_input();
             return;
         }
+        let pads = self.gamepad.poll_all();
+        self.track_gamepad_quit_hold(pads[0].is_some_and(|state| state.quit));
+        self.pad_last = pads[0];
+        self.apply_host_gamepads(pads);
+    }
+
+    fn apply_host_gamepads(&mut self, pads: [Option<crate::gamepad::PadState>; 4]) {
+        self.gamepad_available = pads.map(|p| p.is_some());
         let r = self.host_routing();
-        // Poll the pad whether or not it drives a port: the Quit hotkey
-        // and Menu button are host controls and work regardless of routing.
-        let pad = self.gamepad.poll();
-        self.track_gamepad_quit_hold(pad.is_some_and(|state| state.quit));
-        // Published for the menu bridge, which runs at the about_to_wait
-        // boundary where the event loop is at hand.
-        self.pad_last = pad;
-        // While the menu or an overlay panel is up, the pad walks the UI
-        // rather than the game -- the same arbitration the keyboard gets
-        // from the modal overlay -- so the port lines are released rather
-        // than held mid-move.
+        let pad_ports = [
+            r.gamepad,
+            r.additional_gamepads[0],
+            r.additional_gamepads[1],
+            r.additional_gamepads[2],
+        ];
         let ui_owns_pad = self.modal_ui_active();
-        if let Some(port) = r.gamepad {
-            match pad {
-                Some(state) if !ui_owns_pad => self.apply_joystick_state(port, state.joystick),
-                Some(_) => self.release_joystick_lines(port),
-                // No physical pad but --joy-after scripting has fired: keep
-                // asserting the scripted state so it survives this release
-                // path and drives the upcoming scheduler quantum.
-                None if self.auto_joy_engaged[port] => self.apply_auto_joy_state(port),
-                // No pad in a two-controller setup: the numpad keyboard
-                // mapping stands in for it.
-                None if r.keyboard2 == Some(port) => {
-                    self.apply_joystick_state(port, self.keyboard_joystick_state(1))
+        for port in 0..crate::bus::PORT_COUNT {
+            let pad_slot = pad_ports.iter().position(|&p| p == Some(port));
+            let physical = pad_slot.and_then(|slot| pads[slot]);
+            if let Some(state) = physical {
+                if ui_owns_pad {
+                    self.release_joystick_lines(port);
+                } else {
+                    self.apply_joystick_state(port, state.joystick);
                 }
-                // Pad gone/uncalibrated: release the port so nothing sticks.
-                None => self.release_joystick_lines(port),
-            }
-        }
-        // In Gamepad Mouse mode the pad is spent on the mouse port
-        // instead of a joystick one: the routing has already taken it
-        // off the joysticks, so this is the only place it is heard.
-        if let Some(port) = r.gamepad_mouse {
-            match pad {
-                Some(state) if !ui_owns_pad => self.apply_pad_mouse_state(port, state),
-                // The UI has it, or it has gone: let go of the buttons
-                // rather than leaving one down over the guest.
-                _ => self.release_pad_mouse(port),
-            }
-        }
-        if let Some(port) = r.keyboard {
-            if self.emu.bus().input.device(port).is_mouse() {
+            } else if r.keyboard == Some(port) && self.emu.bus().input.device(port).is_mouse() {
                 self.apply_keyboard_mouse_state(port);
             } else if self.auto_joy_engaged[port] {
                 self.apply_auto_joy_state(port);
-            } else {
+            } else if r.keyboard == Some(port) {
                 self.apply_joystick_state(port, self.keyboard_joystick_state(0));
+            } else if r.keyboard2 == Some(port) {
+                self.apply_joystick_state(port, self.keyboard_joystick_state(1));
+            } else if pad_slot.is_some() {
+                self.release_joystick_lines(port);
             }
         }
-        // Scripted joy state on ports no host source drives asserts
-        // independently.
-        for port in 0..2 {
-            if Some(port) != r.gamepad && Some(port) != r.keyboard && self.auto_joy_engaged[port] {
-                self.apply_auto_joy_state(port);
+        if let Some(port) = r.gamepad_mouse {
+            match pads[0] {
+                Some(state) if !ui_owns_pad => self.apply_pad_mouse_state(port, state),
+                _ => self.release_pad_mouse(port),
             }
         }
+    }
+
+    /// The rendered-field pixel (the `--mouse-to-after` coordinates) that
+    /// logical canvas pixel (`x`, `y`) shows: back through the display
+    /// copy to the presentation buffer, then back through the field
+    /// placement. `None` over chrome, pads, or before a frame has been
+    /// presented.
+    fn canvas_to_field_pixel(&self, x: usize, y: usize) -> Option<(i32, i32)> {
+        let placement = self.present_placement?;
+        let (sx, sy) = canvas_source_point(
+            x,
+            y,
+            self.present_rows,
+            self.present_width,
+            self.overscan,
+            self.tv_centre,
+            self.present_tv_aperture_rows,
+            present_height(),
+        )?;
+        placement.field_point(sx, sy, self.present_rows)
+    }
+
+    /// Hold the light pen where the host pointer is over the display, or
+    /// lift it off when the pointer leaves. `pos` is a logical canvas
+    /// pixel; the pen wants the rendered field's coordinates, so it goes
+    /// back through the presentation the way the pixels came.
+    fn track_light_pen_pointer(&mut self, pos: Option<(i32, i32)>) {
+        if self.emu.bus().input.light_pen_port().is_none() {
+            return;
+        }
+        let field = pos
+            .filter(|p| cursor_in_display(*p))
+            .and_then(|(x, y)| self.canvas_to_field_pixel(x as usize, y as usize));
+        if self.emu.bus().input.light_pen.position == field {
+            return;
+        }
+        self.emu.bus_mut().input.set_light_pen_position(field);
+        // Reverse-debug: note the move so replay can reproduce it.
+        self.emu
+            .tt_note_input(crate::inputsched::ReplayAction::Pen { position: field });
     }
 
     /// Whether the pad has been handed the calibration panel's buttons,
@@ -2908,8 +3611,17 @@ impl App {
         };
         let active = self.keyboard_mapping_active(mapping);
         let was_held = self.keyboard_joy_held[mapping].is_set(code);
-        if !active && !was_held {
+        if (!active || !pressed) && !was_held {
+            // A key pressed before this mapping took ownership still owes
+            // its release to the Amiga keyboard, even after a pad unplug.
             return false;
+        }
+        if pressed && !was_held {
+            // A repeated press can arrive after routing changes. End any
+            // guest key hold before taking it over as a joystick control.
+            if let Some(rawkey) = host_to_amiga_rawkey(code) {
+                self.release_amiga_rawkey_if_held(rawkey);
+            }
         }
         self.keyboard_joy_held[mapping].set(code, pressed);
         if active {
@@ -2920,12 +3632,44 @@ impl App {
         true
     }
 
+    /// Hold the light pen over presented pixel (`x`, `y`) -- or lift it
+    /// off the glass with a negative coordinate -- from `--pen-after` or
+    /// the control protocol. `port` names the port the pen must be in;
+    /// `None` takes whichever port has one.
+    fn apply_scripted_pen_position(&mut self, x: i32, y: i32, port: Option<u8>) {
+        let input = &mut self.emu.bus_mut().input;
+        let pen_port = input.light_pen_port();
+        match (port, pen_port) {
+            (Some(p), Some(pen)) if p as usize != pen => {
+                warn!(
+                    "pen: port {} named but the light pen is in port {}; ignored",
+                    p + 1,
+                    pen + 1
+                );
+                return;
+            }
+            (_, None) => {
+                warn!("pen: no light pen fitted ([input] port1/port2 = \"lightpen\"); ignored");
+                return;
+            }
+            _ => {}
+        }
+        let position = (x >= 0 && y >= 0).then_some((x, y));
+        info!(
+            "auto-pen: {position:?} on port {}",
+            pen_port.unwrap_or(0) + 1
+        );
+        input.set_light_pen_position(position);
+        self.emu
+            .tt_note_input(crate::inputsched::ReplayAction::Pen { position });
+    }
+
     /// Drive a port's emulated joystick/CD32 pad from the --joy-after
     /// held-control set.
     fn apply_auto_joy_state(&mut self, port: usize) {
         let held = self.auto_joy_held[port];
         if let Some(session) = &self.netplay {
-            if port == session.player() {
+            if session.port() == Some(port) {
                 self.netplay_input.held.buttons = [
                     held.up,
                     held.down,
@@ -2970,7 +3714,9 @@ impl App {
             });
     }
 
-    pub fn run(self) -> Result<()> {
+    /// Run the windowed session to its end; the value is the process exit
+    /// status the session concluded on (src/verdict.rs).
+    pub fn run(self) -> Result<i32> {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = self;
@@ -2995,7 +3741,7 @@ impl App {
         event_loop
             .run_app(&mut app)
             .map_err(|e| anyhow!("event loop: {e}"))?;
-        Ok(())
+        Ok(app.exit_status())
     }
 }
 
@@ -3011,11 +3757,22 @@ impl App {
     /// windowed exit. Never touching winit means no display-server
     /// connection is made, so capture runs work over SSH and in sandboxes
     /// without window-server access.
-    pub fn run_headless(mut self) -> Result<()> {
+    pub fn run_headless(mut self) -> Result<i32> {
         self.arm_scheduled_events();
-        if self.auto_shot.is_empty() && self.frame_dump.is_none() {
+        #[cfg(feature = "dap")]
+        let coverage_run = self.emu.coverage_run_armed();
+        #[cfg(not(feature = "dap"))]
+        let coverage_run = false;
+        if self.auto_shot.is_empty()
+            && self.auto_expect.is_empty()
+            && self.frame_dump.is_none()
+            && self.gif_captures.is_empty()
+            && self.run_return_marker.is_none()
+            && !coverage_run
+        {
             return Err(anyhow!(
-                "windowless capture run needs --screenshot-after or --dump-frames"
+                "windowless capture run needs --screenshot-after, --expect-screenshot, \
+                 --dump-frames, --gif-after, --coverage, or --exit-on-return"
             ));
         }
         loop {
@@ -3041,14 +3798,83 @@ impl App {
             self.recover_audio_if_device_lost();
             self.render_emulated_frame_if_needed();
             if self.dump_frame_if_due() {
-                return Ok(());
+                return Ok(self.headless_exit_status());
+            }
+            if self.fire_gif_captures() {
+                return Ok(self.headless_exit_status());
             }
             self.fire_scheduled_events();
             self.fire_auto_save_state();
             if self.fire_auto_shot() {
-                return Ok(());
+                return Ok(self.headless_exit_status());
+            }
+            if self.poll_run_return() || self.note_guest_exit_request() {
+                return Ok(self.headless_exit_status());
+            }
+            // A coverage-only run ends with the program: once its file is
+            // written and no capture is still scheduled, there is nothing
+            // left to wait for.
+            #[cfg(feature = "dap")]
+            if self.emu.coverage_run_written()
+                && self.auto_shot.is_empty()
+                && self.auto_expect.is_empty()
+                && self.frame_dump.is_none()
+                && self.gif_captures.is_empty()
+            {
+                return Ok(self.headless_exit_status());
             }
         }
+    }
+
+    /// `--expect-screenshot` checks to arm alongside the screenshots.
+    pub fn set_expect_screenshots(&mut self, specs: Vec<crate::expect::ExpectShotSpec>) {
+        self.pending_auto_expect = specs;
+    }
+
+    /// `--exit-on-return`: end the run when the `--run` program's return
+    /// code appears in `marker`, and exit with that code.
+    pub fn set_exit_on_return(&mut self, marker: PathBuf) {
+        self.run_return_marker = Some(marker);
+        self.verdict.exit_on_return = true;
+    }
+
+    /// The process exit status the session has concluded on so far.
+    pub fn exit_status(&self) -> i32 {
+        self.verdict.exit_status()
+    }
+
+    /// Poll the `--run` completion marker for the guest's return code.
+    /// Returns true once it is recorded: the run is over. One host `stat`
+    /// per frame, like the warp-launch gate's own marker probe.
+    fn poll_run_return(&mut self) -> bool {
+        let Some(marker) = self.run_return_marker.as_deref() else {
+            return false;
+        };
+        let Some(code) = crate::runprog::read_return_code(marker) else {
+            return false;
+        };
+        info!(
+            "run: program returned {code} at {:.3}s emulated time",
+            self.emu.bus().emulated_seconds()
+        );
+        self.verdict.guest_return = Some(code);
+        self.run_return_marker = None;
+        true
+    }
+
+    /// Take a guest `ExitEmu` request (uaelib function 13). Returns true
+    /// when one was pending: the session ends cleanly.
+    fn note_guest_exit_request(&mut self) -> bool {
+        if !self.emu.take_uaelib_exit_request() {
+            return false;
+        }
+        info!(
+            "uaelib: guest stopped the emulator (ExitEmu) at {:.3}s emulated time",
+            self.emu.bus().emulated_seconds()
+        );
+        self.verdict.guest_exit = true;
+        self.guest_exit_requested = true;
+        true
     }
 
     /// Arm every scheduled capture and input flag: pending (parse-time)
@@ -3070,6 +3896,17 @@ impl App {
         // latest capture however the flags were written. The sort is
         // stable, so captures sharing a deadline keep their given order.
         self.auto_shot.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        for mut spec in std::mem::take(&mut self.pending_auto_expect) {
+            info!(
+                "screenshot expectation armed: will compare with {} after {:.1}s emulated time (tolerance {})",
+                spec.path.display(),
+                spec.secs,
+                spec.tolerance
+            );
+            spec.secs = spec.secs.max(0.0);
+            self.auto_expect.push(spec);
+        }
+        self.auto_expect.sort_by(|a, b| a.secs.total_cmp(&b.secs));
         for (secs, path) in std::mem::take(&mut self.pending_auto_save_state) {
             info!(
                 "auto-save-state armed: will save {} after {:.1}s emulated time",
@@ -3080,6 +3917,20 @@ impl App {
         }
         self.auto_save_state
             .sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        if !self.pending_gif_captures.is_empty() {
+            let fps = self
+                .clip_settings
+                .effective_fps(self.emu.bus().agnus.video_standard());
+            for spec in std::mem::take(&mut self.pending_gif_captures) {
+                info!(
+                    "gif capture armed: will write {} from {:.1}s for {:.1}s at {fps} fps",
+                    spec.path.display(),
+                    spec.start_secs,
+                    spec.seconds
+                );
+                self.gif_captures.push(GifCaptureState::new(spec, fps));
+            }
+        }
         if let Some(spec) = self.pending_frame_dump.take() {
             info!(
                 "frame dump armed: will save {} frames to {} after {:.1}s emulated time",
@@ -3155,6 +4006,15 @@ impl App {
         }
         for (secs, x, y, port) in self.pending_auto_pots.drain(..) {
             self.auto_pots.push((secs.max(0.0) as f64, x, y, port));
+        }
+        for (secs, x, y, port) in self.pending_auto_pens.drain(..) {
+            self.auto_pens.push((secs.max(0.0) as f64, x, y, port));
+        }
+        if !self.auto_pens.is_empty() {
+            info!(
+                "auto-pen armed: {} scheduled positions",
+                self.auto_pens.len()
+            );
         }
         if !self.auto_pots.is_empty() {
             info!(
@@ -3255,10 +4115,10 @@ impl App {
         // Fire any scheduled --joy-after events into the named port's
         // joystick/CD32-pad state, then assert the held sets (input polling
         // re-applies them every quantum while scripting is engaged).
-        let mut joy_changed = [false; 2];
+        let mut joy_changed = [false; crate::bus::PORT_COUNT];
         let held = &mut self.auto_joy_held;
         self.auto_joys.retain_mut(|j| {
-            let port = usize::from(j.port != 0);
+            let port = (j.port as usize).min(crate::bus::PORT_COUNT - 1);
             if !j.pressed && emu_secs >= j.press_at_emulated_secs {
                 info!("auto-joy pressing: {:?} (port {})", j.button, port + 1);
                 held[port].set(j.button, true);
@@ -3273,7 +4133,7 @@ impl App {
             }
             true
         });
-        for port in 0..2 {
+        for port in 0..crate::bus::PORT_COUNT {
             if joy_changed[port] {
                 self.auto_joy_engaged[port] = true;
                 self.apply_auto_joy_state(port);
@@ -3330,6 +4190,20 @@ impl App {
             self.emu.bus_mut().input.set_analogue(port as usize, x, y);
             self.emu
                 .tt_note_input(crate::inputsched::ReplayAction::Pot { port, x, y });
+        }
+        // Fire any scheduled --pen-after light-pen positions (one-shot
+        // each).
+        let mut pen_sets = Vec::new();
+        self.auto_pens.retain(|&(at, x, y, port)| {
+            if emu_secs >= at {
+                pen_sets.push((x, y, port));
+                false
+            } else {
+                true
+            }
+        });
+        for (x, y, port) in pen_sets {
+            self.apply_scripted_pen_position(x, y, port);
         }
         let mut disk_inserts = Vec::new();
         let mut disk_change_available = self.netplay.as_ref().is_none_or(|s| s.can_change_disk());
@@ -3427,7 +4301,7 @@ impl App {
     /// while the target frame is still being rendered, and a run with more
     /// captures still pending keeps going.
     fn fire_auto_shot(&mut self) -> bool {
-        if self.auto_shot.is_empty() {
+        if self.auto_shot.is_empty() && self.auto_expect.is_empty() {
             return false;
         }
         let now = self.emu.bus().emulated_seconds();
@@ -3438,7 +4312,12 @@ impl App {
             .iter()
             .take_while(|(secs, _)| now >= *secs as f64)
             .count();
-        if due == 0 {
+        let due_expect = self
+            .auto_expect
+            .iter()
+            .take_while(|spec| now >= spec.secs as f64)
+            .count();
+        if due == 0 && due_expect == 0 {
             return false;
         }
         let emulated_frame = self.emu.bus().emulated_frames();
@@ -3451,7 +4330,18 @@ impl App {
         for (_, path) in self.auto_shot.drain(..due).collect::<Vec<_>>() {
             self.save_screenshot(&path);
         }
-        if !self.auto_shot.is_empty() {
+        // Expectations read the same frame through the same capture path,
+        // so an image saved by --screenshot-after compares pixel for pixel.
+        for spec in self.auto_expect.drain(..due_expect).collect::<Vec<_>>() {
+            self.check_screenshot_expectation(&spec);
+        }
+        if !self.auto_shot.is_empty() || !self.auto_expect.is_empty() {
+            return false;
+        }
+        // A clip still recording (or a frame dump still running) is
+        // scheduled work of its own: the run ends with the last capture of
+        // any kind, not with the last screenshot.
+        if self.other_capture_work_pending() {
             return false;
         }
         self.emu.report_stats();
@@ -3470,6 +4360,11 @@ impl Drop for App {
     /// recording toggle writes its file when stopped, so by the time the app
     /// drops there is nothing left for it here.
     fn drop(&mut self) {
+        self.save_egui_preferences();
+        // Same rule for a --coverage run: whatever ends the session writes
+        // the counts collected so far.
+        #[cfg(feature = "dap")]
+        self.emu.finish_coverage_run();
         let (Some(rec), Some(path)) = (self.input_recorder.take(), self.record_input_path.take())
         else {
             return;
@@ -3499,8 +4394,9 @@ impl ApplicationHandler for App {
         // create the window hidden: it avoids flashing an empty window on
         // screen and removes the vsync present gate, letting the run
         // advance as fast as the host allows. Emulated state is identical.
-        let headless_capture =
-            !self.pending_auto_shot.is_empty() || self.pending_frame_dump.is_some();
+        let headless_capture = !self.pending_auto_shot.is_empty()
+            || !self.pending_auto_expect.is_empty()
+            || self.pending_frame_dump.is_some();
         // Start fullscreen only for an interactive window ([display] full_screen
         // / --full-screen); a headless capture window stays hidden and windowed.
         let fullscreen =
@@ -3547,7 +4443,7 @@ impl ApplicationHandler for App {
         // Other platforms keep wgpu's default backend set (Metal on macOS,
         // DX12/Vulkan on Windows). cfg!() (not #[cfg]) keeps the Linux branch
         // type-checked on every host.
-        let pixels = match build_pixels_for_window(window.clone(), texture_scale, true) {
+        let pixels = match build_pixels_for_window(window.clone(), texture_scale, self.vsync) {
             Ok(p) => p,
             Err(e) => {
                 error!("pixels init failed: {e}");
@@ -3596,15 +4492,30 @@ impl ApplicationHandler for App {
         if shader_error.is_some() {
             self.crt_shader_kind = crate::config::ShaderKind::None;
         }
+        let present_worker =
+            threaded_present_enabled().then(|| PresentWorker::new(Arc::clone(&window)));
+        info!(
+            "presentation: {}",
+            if present_worker.is_some() {
+                "present worker (COPPERLINE_THREADED_PRESENT=0 presents on the main thread)"
+            } else {
+                "main thread"
+            }
+        );
         self.render = Some(Render {
             window,
-            pixels,
+            gpu: Some(Box::new(Gpu {
+                pixels,
+                presenter: presenter::Presenter::new(),
+                scaler,
+                rtg_texture,
+                crt_shader,
+                bezel_shader,
+                sticker_pass,
+            })),
+            present_worker,
             texture_scale,
-            scaler,
-            rtg_texture,
-            crt_shader,
-            bezel_shader,
-            sticker_pass,
+            debug_viewport: None,
             minimized: false,
             surface_size: (inner.width.max(1), inner.height.max(1)),
         });
@@ -3642,15 +4553,14 @@ impl ApplicationHandler for App {
         if self.netplay_window_event(event_loop, &event) {
             return;
         }
-        if let Some(kind) = self.tool_window_kind(window_id) {
-            self.handle_tool_window_event(event_loop, kind, event);
-            return;
-        }
         if self
             .render
             .as_ref()
             .is_some_and(|render| render.window.id() != window_id)
         {
+            return;
+        }
+        if self.route_debug_workspace_event(&event) {
             return;
         }
         match event {
@@ -3699,7 +4609,7 @@ impl ApplicationHandler for App {
                             && self.modifiers.shift_key() =>
                     {
                         if self.save_states_allowed() {
-                            self.load_state_from_dialog(Some(event_loop))
+                            self.open_states_browser()
                         }
                     }
                     (KeyCode::KeyS, ElementState::Pressed)
@@ -3711,6 +4621,12 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.cycle_disk()
+                    }
+                    (KeyCode::KeyG, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
+                    {
+                        self.save_clip_gif()
                     }
                     (KeyCode::KeyG, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
@@ -3805,6 +4721,12 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.toggle_recording()
+                    }
+                    (KeyCode::KeyV, ElementState::Pressed)
+                        if host_shortcut_modifier_pressed(self.modifiers)
+                            && self.modifiers.shift_key() =>
+                    {
+                        self.paste_as_keystrokes()
                     }
                     (KeyCode::KeyW, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers)
@@ -3957,10 +4879,13 @@ impl ApplicationHandler for App {
                     // While a menu/panel is open, the host cursor is
                     // operating the UI; don't feed its motion to the
                     // emulated mouse underneath.
-                    if self.modal_ui_active() {
+                    if self.modal_ui_active()
+                        || (self.debug_layout_active && !self.debug_guest_input)
+                    {
                         self.last_display_cursor_pos = None;
                     } else {
                         self.track_uncaptured_cursor_motion(pos);
+                        self.track_light_pen_pointer(pos);
                     }
                     // A hand actually moving the mouse takes over from
                     // the keyboard: the marker goes away, though where it
@@ -4019,6 +4944,8 @@ impl ApplicationHandler for App {
                 self.cursor_pos = None;
                 self.last_cursor_phys = None;
                 self.last_display_cursor_pos = None;
+                // The hand holding the pen has left the glass with it.
+                self.track_light_pen_pointer(None);
                 self.volume_dragging = false;
                 self.analyzer_dragging = false;
                 self.menu_hover_arm = None;
@@ -4048,6 +4975,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(focused) => {
                 self.main_window_focused = focused;
+                if !focused && self.debug_layout_active {
+                    self.release_debug_guest_input();
+                }
                 if focused {
                     // A capture a panel borrowed can only be repaid to a
                     // focused window, so a panel that closed while the focus
@@ -4073,6 +5003,21 @@ impl ApplicationHandler for App {
                 let pressed = state == ElementState::Pressed;
                 if pressed {
                     self.log_cursor_diag(button);
+                }
+                // The host pointer is the light pen as well as the mouse.
+                // This runs before the UI's early returns below: a press
+                // over the display that ends over the status bar or a
+                // panel must still release the pen's tip switch, or the
+                // guest sees it held for good. A press only counts where
+                // the pen is actually pointing, over the display.
+                if button == MouseButton::Left && self.netplay.is_none() {
+                    let over_display = self.cursor_pos.is_some_and(cursor_in_display);
+                    if !pressed || over_display {
+                        let input = &mut self.emu.bus_mut().input;
+                        if let Some(port) = input.light_pen_port() {
+                            input.set_mouse_button(port, 0, pressed);
+                        }
+                    }
                 }
                 if button == MouseButton::Left {
                     if pressed {
@@ -4316,6 +5261,8 @@ impl ApplicationHandler for App {
                 if self.render.as_ref().is_some_and(|r| r.minimized) {
                     return;
                 }
+                let inspector_actions = self.prepare_debug_workspace();
+                let debug_layout = self.debug_layout_active && !self.ui.active();
                 // The presentation layout can change under a stationary
                 // pointer -- the autocrop latch adopting a new crop, a menu
                 // suspending it, a toggle -- and every such change requests
@@ -4383,6 +5330,7 @@ impl ApplicationHandler for App {
                 // every frame rather than mirrored from the clicks.
                 let kbd_panel = super::keyboard_panel_shown().then(|| self.keyboard_panel_view());
                 let ui_data = self.build_panel_view_data();
+                let inspector_ui = self.debugger_ui.as_mut().filter(|_| debug_layout);
                 if let Some(r) = self.render.as_mut() {
                     // RTG with a working GPU pipeline presents the native frame
                     // through its own texture in the GPU render pass below.
@@ -4431,313 +5379,320 @@ impl ApplicationHandler for App {
                     // sample.
                     let bezel_active =
                         self.bezel.is_on() && !self.ui.active() && self.rtg_present_dims.is_none();
-                    if let Some((w, h)) = self.rtg_present_dims.filter(|_| rtg_gpu) {
-                        r.rtg_texture.upload(
-                            r.pixels.device(),
-                            r.pixels.queue(),
-                            &self.rtg_fb,
-                            w,
-                            h,
-                        );
-                    }
-                    let frame = r.pixels.frame_mut();
-                    if rtg_gpu {
-                        // The GPU pass overdraws the display region; black it
-                        // out so nothing stale shows at the seams.
-                        let rows = present_height() * r.texture_scale;
-                        let stride = texture_width(r.texture_scale) * 4;
-                        frame[..rows * stride].fill(0);
-                    } else {
-                        copy_window_present_frame(
-                            &self.present_fb,
-                            self.present_rows,
-                            self.present_width,
-                            frame,
-                            r.texture_scale,
-                            self.overscan,
-                            self.tv_centre,
-                            // The TV aperture is a chipset crop rect. An RTG
-                            // frame fills the buffer on its own terms, so
-                            // applying it here would show a sub-rect of the
-                            // board's screen.
-                            self.present_tv_aperture_rows
-                                .filter(|_| self.rtg_present_dims.is_none()),
-                            // A drawn bezel shows the tube aperture. Keyed to
-                            // the style alone, not bezel_active: an open
-                            // overlay suspends the bezel *pass*, and the
-                            // picture must not jump between apertures when a
-                            // panel opens over it.
-                            self.bezel.is_on(),
-                        );
-                        // The tint models the monitor on the Amiga's video
-                        // output, so RTG board scanout stays untinted here
-                        // too, matching the GPU RTG path (which never sees
-                        // this buffer).
-                        if self.rtg_present_dims.is_none() {
-                            if let Some(lut) = &self.tint_lut {
-                                tint_display_rows(frame, r.texture_scale, lut);
+                    let texture_scale = r.texture_scale;
+                    let surface_size = r.surface_size;
+                    // Frames present from the worker unless this one carries
+                    // something only the main thread has: the RTG board's
+                    // texture upload, or the inspector's egui paint.
+                    let threaded = r.present_worker.is_some() && !rtg_gpu && inspector_ui.is_none();
+                    // The display draw samples the presentation buffer on
+                    // the GPU when nothing has to be composed over the
+                    // picture on the CPU: no UI, overlay, badge or tint,
+                    // and no pass that samples the composed texture.
+                    let picture_on_gpu = !rtg_gpu
+                        && !crt_active
+                        && !bezel_active
+                        && !debug_layout
+                        && self.tint_lut.is_none()
+                        && self.rtg_present_dims.is_none()
+                        && !self.ui.active()
+                        && osd.is_none()
+                        && guest_overlay.is_empty()
+                        && !recording
+                        && !self.perf_overlay
+                        && !self.drop_hover
+                        && self.present_width > 0
+                        && self.present_rows > 0
+                        && self.present_fb.len() >= self.present_rows * self.present_width;
+                    let frame_len =
+                        texture_width(texture_scale) * texture_height(texture_scale) * 4;
+                    'present: {
+                        let mut worker_frame = None;
+                        if threaded {
+                            r.lend_gpu();
+                            worker_frame = r
+                                .present_worker
+                                .as_mut()
+                                .and_then(|worker| worker.frame_buffer(frame_len));
+                            if worker_frame.is_none() {
+                                // The worker still holds every buffer it may:
+                                // this redraw waits for the next pass.
+                                self.main_presentation_dirty = true;
+                                break 'present;
                             }
                         }
-                    }
-                    #[cfg(feature = "mt32")]
-                    if let Some(panel) = &mt32_panel {
-                        mt32panel::draw(frame, panel, present_height(), r.texture_scale);
-                    }
-                    #[cfg(feature = "coppersynth")]
-                    if let Some(panel) = &csynth_panel {
-                        csynthpanel::draw(frame, panel, csynth_panel_top(), r.texture_scale);
-                    }
-                    if let Some(panel) = &kbd_panel {
-                        kbdpanel::draw(frame, panel, keyboard_panel_top(), r.texture_scale);
-                    }
-                    if !super::status_bar_hidden() {
-                        // The bar lights its focus the way the
-                        // surfaces light theirs, and knows when the
-                        // marker is up on one of them instead.
-                        statusbar::set_nav_light(nav_bar_target, nav_bar_mix, nav_target.is_some());
-                        draw_status_bar(frame, &view, r.texture_scale);
-                        statusbar::set_nav_light(None, 0.0, false);
-                    }
-                    // The picture loses its corners to a front's aperture
-                    // and to a preset's bowed face; all three overlays live
-                    // in one, so all three come in far enough to clear
-                    // whichever is drawn (nil when the picture is a plain
-                    // rectangle). Worked out before any of them is drawn.
-                    let corner = bezel::corner_inset(
-                        self.bezel,
-                        if crt_active {
-                            crt_shader::face_curvature(self.crt_shader_kind)
+                        let window = r.window.clone();
+                        let layout = main_present_layout(r, display_src);
+                        // A frame the main thread presents itself composes
+                        // straight into the pixels buffer, with the GPU side
+                        // at home; it goes back into `r` at the end.
+                        let mut gpu_home = if worker_frame.is_none() {
+                            r.gpu_mut();
+                            r.gpu.take()
                         } else {
-                            0.0
-                        },
-                        self.shader_strength,
-                        r.texture_scale,
-                    );
-                    // The corner overlays anchor to the display region the
-                    // viewer actually sees: the whole display classically,
-                    // the sub-rect while autocrop or per-axis scaling
-                    // presents one.
-                    let overlay_anchor = display_src.map(|src| src.rect).unwrap_or((
-                        0,
-                        0,
-                        FB_WIDTH,
-                        present_height(),
-                    ));
-                    if !guest_overlay.is_empty() {
-                        // The guest's debug overlay sits directly on the
-                        // picture, under every piece of host chrome, and --
-                        // like everything from here down -- never in a
-                        // capture.
-                        draw_guest_overlay(
-                            frame,
-                            &mut self.guest_overlay_cache,
-                            &guest_overlay,
-                            r.texture_scale,
-                            overlay_anchor,
-                        );
-                    }
-                    if recording {
-                        // Painted into the presentation texture only, so
-                        // the badge never appears in the recorded file.
-                        draw_record_badge(frame, r.texture_scale, corner, overlay_anchor);
-                    }
-                    if self.perf_overlay {
-                        draw_perf_overlay(
-                            frame,
-                            &self.perf.lines,
-                            r.texture_scale,
-                            recording,
-                            corner,
-                            overlay_anchor,
-                        );
-                    }
-                    if let Some((text, warning)) = &osd {
-                        draw_osd(
-                            frame,
-                            text,
-                            *warning,
-                            r.texture_scale,
-                            corner,
-                            overlay_anchor,
-                        );
-                    }
-                    // The focus lights its control the way the pointer
-                    // does, breathing between the two.
-                    ui::set_nav_light(nav_target, nav_mix, nav_is_open, nav_bar_target.is_some());
-                    ui::draw(frame, r.texture_scale, &self.ui, ui_hover, ui_data.as_ref());
-                    ui::set_nav_light(None, 0.0, false, false);
-                    // The drag hint sits on top of everything: the drop will
-                    // land wherever the drag is released, panels or not. The
-                    // launcher refuses drops, so no hint over it.
-                    if self.drop_hover && !matches!(self.ui.panel, Some(Panel::Launcher(_))) {
-                        ui::draw_drop_hint(frame, r.texture_scale);
-                    }
-                    // The scaler pass draws the composited buffer with this
-                    // layout; every overlay pass below keys its viewport off
-                    // the same display rect, and the cursor mapping inverts
-                    // the same layout, so all of them agree by construction.
-                    // The branches that draw over the display (RTG, CRT,
-                    // bezel) only run when the sub-rect modes are
-                    // suspended, so their layout is the classic
-                    // whole-texture letterbox.
-                    let layout = main_present_layout(r, display_src);
-                    // COPPERLINE_DIAG_AUTOCROP: the window half of the
-                    // renderer-side envelope trace -- the exact rects the
-                    // scaler pass draws this frame, logged when they
-                    // change, with the mode spelled out: a classic layout
-                    // must say WHY it is classic (both modes off, or which
-                    // condition suspended them), because the envelope
-                    // line prints whether or not a mode is on and the
-                    // difference is invisible from it alone. The factors
-                    // are the whole-number draw's pixels per canvas
-                    // column and per field line, the shape is the glass
-                    // ratio a per-axis draw aims at, and the scan says
-                    // which window model the envelope came through (a
-                    // programmable scan crops too, at the uniform
-                    // multiple).
-                    if crate::envcfg::flag("COPPERLINE_DIAG_AUTOCROP")
-                        && self.last_diag_layout != Some(layout)
-                    {
-                        let autocrop = crate::video::autocrop();
-                        let per_axis = per_axis_scaling_requested();
-                        let mode = if !autocrop && !per_axis {
-                            "off"
-                        } else if self.rtg_present_dims.is_some() {
-                            "suspended(rtg)"
-                        } else if self.bezel.is_on() {
-                            "suspended(bezel)"
-                        } else if autocrop && per_axis {
-                            "active(autocrop+per-axis)"
-                        } else if per_axis {
-                            "active(per-axis)"
-                        } else {
-                            "active(autocrop)"
+                            None
                         };
-                        info!(
-                            "[DIAG_AUTOCROP] layout mode={} scan={} surface={:?} \
-                             src_canvas={:?} display_dst={:?} chrome_dst={:?} filter={:?} \
-                             factors={:?} shape={:?}",
-                            mode,
-                            if self.present_programmable {
-                                "programmable"
+                        if let (Some((w, h)), Some(gpu)) = (
+                            self.rtg_present_dims.filter(|_| rtg_gpu),
+                            gpu_home.as_deref_mut(),
+                        ) {
+                            gpu.rtg_texture.upload(
+                                gpu.pixels.device(),
+                                gpu.pixels.queue(),
+                                &self.rtg_fb,
+                                w,
+                                h,
+                            );
+                        }
+                        let Some(frame) = worker_frame
+                            .as_deref_mut()
+                            .or_else(|| gpu_home.as_deref_mut().map(|gpu| gpu.pixels.frame_mut()))
+                        else {
+                            r.gpu = gpu_home;
+                            break 'present;
+                        };
+                        if picture_on_gpu {
+                            // The picture reaches the surface from its own
+                            // texture; the frame's display rows go unsampled.
+                        } else if rtg_gpu {
+                            // The GPU pass overdraws the display region; black it
+                            // out so nothing stale shows at the seams.
+                            let rows = present_height() * texture_scale;
+                            let stride = texture_width(texture_scale) * 4;
+                            frame[..rows * stride].fill(0);
+                        } else {
+                            copy_window_present_frame(
+                                &self.present_fb,
+                                self.present_rows,
+                                self.present_width,
+                                frame,
+                                texture_scale,
+                                self.overscan,
+                                self.tv_centre,
+                                // The TV aperture is a chipset crop rect. An RTG
+                                // frame fills the buffer on its own terms, so
+                                // applying it here would show a sub-rect of the
+                                // board's screen.
+                                self.present_tv_aperture_rows
+                                    .filter(|_| self.rtg_present_dims.is_none()),
+                                // A drawn bezel shows the tube aperture. Keyed to
+                                // the style alone, not bezel_active: an open
+                                // overlay suspends the bezel *pass*, and the
+                                // picture must not jump between apertures when a
+                                // panel opens over it.
+                                self.bezel.is_on(),
+                            );
+                            // The tint models the monitor on the Amiga's video
+                            // output, so RTG board scanout stays untinted here
+                            // too, matching the GPU RTG path (which never sees
+                            // this buffer).
+                            if self.rtg_present_dims.is_none() {
+                                if let Some(lut) = &self.tint_lut {
+                                    tint_display_rows(frame, texture_scale, lut);
+                                }
+                            }
+                        }
+                        #[cfg(feature = "mt32")]
+                        if let Some(panel) = &mt32_panel {
+                            mt32panel::draw(frame, panel, present_height(), texture_scale);
+                        }
+                        #[cfg(feature = "coppersynth")]
+                        if let Some(panel) = &csynth_panel {
+                            csynthpanel::draw(frame, panel, csynth_panel_top(), texture_scale);
+                        }
+                        if let Some(panel) = &kbd_panel {
+                            kbdpanel::draw(frame, panel, keyboard_panel_top(), texture_scale);
+                        }
+                        if !super::status_bar_hidden() {
+                            // The bar lights its focus the way the
+                            // surfaces light theirs, and knows when the
+                            // marker is up on one of them instead.
+                            statusbar::set_nav_light(
+                                nav_bar_target,
+                                nav_bar_mix,
+                                nav_target.is_some(),
+                            );
+                            draw_status_bar(frame, &view, texture_scale);
+                            statusbar::set_nav_light(None, 0.0, false);
+                        }
+                        // The picture loses its corners to a front's aperture
+                        // and to a preset's bowed face; all three overlays live
+                        // in one, so all three come in far enough to clear
+                        // whichever is drawn (nil when the picture is a plain
+                        // rectangle). Worked out before any of them is drawn.
+                        let corner = bezel::corner_inset(
+                            self.bezel,
+                            if crt_active {
+                                crt_shader::face_curvature(self.crt_shader_kind)
                             } else {
-                                "standard"
+                                0.0
                             },
-                            r.surface_size,
-                            layout.src_canvas,
-                            layout.display_dst,
-                            layout.chrome_dst,
-                            layout.filter,
-                            layout.factors,
-                            display_src.map(|src| src.par),
+                            self.shader_strength,
+                            texture_scale,
                         );
-                        self.last_diag_layout = Some(layout);
-                    }
-                    let present_clip = layout.display_dst;
-                    let present_draws = layout.draws();
-                    let scaler = &mut r.scaler;
-                    let render_result = if rtg_gpu {
-                        // Draw the UI buffer, then overdraw the display region
-                        // with the native RTG texture (GPU-scaled). The display
-                        // rect is the top present_height fraction of the buffer's
-                        // letterboxed clip rect on the surface.
-                        let rtg = &r.rtg_texture;
-                        // The board frame is drawn straight to the surface,
-                        // so integer scaling applies to it in its own native
-                        // pixels rather than through the canvas texture the
-                        // scaler pass letterboxed above.
-                        let integer_scaling = integer_scaling_requested();
-                        r.pixels.render_with(|encoder, target, ctx| {
-                            scaler.render(
-                                &ctx.device,
-                                &ctx.queue,
-                                &ctx.texture,
-                                encoder,
-                                target,
-                                &present_draws,
-                            );
-                            let (cx, cy, cw, ch) = present_clip;
-                            let disp_h = ch as f32 * present_height() as f32
-                                / window_present_height() as f32;
-                            rtg.render(
-                                &ctx.queue,
-                                encoder,
-                                target,
-                                (cx as f32, cy as f32, cw as f32, disp_h),
-                                integer_scaling,
-                            );
-                            Ok(())
-                        })
-                    } else if crt_active || bezel_active {
-                        // Draw the composited buffer, then re-draw the display
-                        // rect. Bezel alone: one pass draws the frame with the
-                        // picture scaled into its opening. Preset alone: the
-                        // pass covers the display rect. Both: the preset paints
-                        // the picture into the opening first and the bezel
-                        // frames it on top in frame-only mode -- the plastic
-                        // overlaps the tube face, so the frame's rounded
-                        // corners and chamfer clip the preset's square viewport
-                        // rather than being buried under it. One CRT beam pass
-                        // per emulated field line the copy above actually
-                        // shows.
-                        let scanlines = crt_scanline_count(
-                            self.present_rows,
+                        // The corner overlays anchor to the display region the
+                        // viewer actually sees: the whole display classically,
+                        // the sub-rect while autocrop or per-axis scaling
+                        // presents one.
+                        let overlay_anchor = display_src.map(|src| src.rect).unwrap_or((
+                            0,
+                            0,
+                            FB_WIDTH,
                             present_height(),
-                            // The same branch copy_window_present_frame took,
-                            // tube aperture included: the line count follows
-                            // the rows the copy actually put on the glass.
-                            self.present_tv_aperture_rows
-                                .filter(|_| {
-                                    self.overscan == Overscan::Tv
-                                        && self.rtg_present_dims.is_none()
-                                        && self.present_width == FB_WIDTH
-                                })
-                                .map(|rows| {
-                                    if self.bezel.is_on() {
-                                        tube_aperture_rows(rows)
-                                    } else {
-                                        rows
-                                    }
-                                }),
-                        );
-                        let kind = self.crt_shader_kind;
-                        let strength = self.shader_strength;
-                        let bezel_style = self.bezel;
-                        // Under a sub-rect layout the preset re-draws the
-                        // rect into the rect's own viewport -- the same
-                        // sub-rect the scaler pass just drew -- with the
-                        // beam-line count scaled to the rows the rect shows.
-                        // The bezel suspends the sub-rect modes, so this is
-                        // never the bezel case.
-                        let crt_crop = display_src.map(|_| {
-                            (
-                                layout.display_dst,
-                                layout.src_canvas,
-                                scanlines * layout.src_canvas.3 as f32
-                                    / present_height().max(1) as f32,
-                            )
-                        });
-                        // The closure is FnOnce and captures `r`, so the
-                        // shaders have to be split out of it as separate
-                        // borrows rather than reached through `r` inside.
-                        let crt = &mut r.crt_shader;
-                        let bezel_shader = &mut r.bezel_shader;
-                        let sticker_pass = &mut r.sticker_pass;
-                        r.pixels.render_with(|encoder, target, ctx| {
-                            scaler.render(
-                                &ctx.device,
-                                &ctx.queue,
-                                &ctx.texture,
-                                encoder,
-                                target,
-                                &present_draws,
+                        ));
+                        if !guest_overlay.is_empty() {
+                            // The guest's debug overlay sits directly on the
+                            // picture, under every piece of host chrome, and --
+                            // like everything from here down -- never in a
+                            // capture.
+                            draw_guest_overlay(
+                                frame,
+                                &mut self.guest_overlay_cache,
+                                &guest_overlay,
+                                texture_scale,
+                                overlay_anchor,
                             );
-                            let texture_extent =
-                                (ctx.texture_extent.width, ctx.texture_extent.height);
+                        }
+                        if recording {
+                            // Painted into the presentation texture only, so
+                            // the badge never appears in the recorded file.
+                            draw_record_badge(frame, texture_scale, corner, overlay_anchor);
+                        }
+                        if self.perf_overlay {
+                            draw_perf_overlay(
+                                frame,
+                                &self.perf.lines,
+                                texture_scale,
+                                recording,
+                                corner,
+                                overlay_anchor,
+                            );
+                        }
+                        if let Some((text, warning)) = &osd {
+                            draw_osd(frame, text, *warning, texture_scale, corner, overlay_anchor);
+                        }
+                        // The focus lights its control the way the pointer
+                        // does, breathing between the two.
+                        ui::set_nav_light(
+                            nav_target,
+                            nav_mix,
+                            nav_is_open,
+                            nav_bar_target.is_some(),
+                        );
+                        ui::draw(frame, texture_scale, &self.ui, ui_hover, ui_data.as_ref());
+                        ui::set_nav_light(None, 0.0, false, false);
+                        // The drag hint sits on top of everything: the drop will
+                        // land wherever the drag is released, panels or not. The
+                        // launcher refuses drops, so no hint over it.
+                        if self.drop_hover && !matches!(self.ui.panel, Some(Panel::Launcher(_))) {
+                            ui::draw_drop_hint(frame, texture_scale);
+                        }
+                        // The scaler pass draws the composited buffer with this
+                        // layout; every overlay pass below keys its viewport off
+                        // the same display rect, and the cursor mapping inverts
+                        // the same layout, so all of them agree by construction.
+                        // The branches that draw over the display (RTG, CRT,
+                        // bezel) only run when the sub-rect modes are
+                        // suspended, so their layout is the classic
+                        // whole-texture letterbox.
+                        // COPPERLINE_DIAG_AUTOCROP: the window half of the
+                        // renderer-side envelope trace -- the exact rects the
+                        // scaler pass draws this frame, logged when they
+                        // change, with the mode spelled out: a classic layout
+                        // must say WHY it is classic (both modes off, or which
+                        // condition suspended them), because the envelope
+                        // line prints whether or not a mode is on and the
+                        // difference is invisible from it alone. The factors
+                        // are the whole-number draw's pixels per canvas
+                        // column and per field line, the shape is the glass
+                        // ratio a per-axis draw aims at, and the scan says
+                        // which window model the envelope came through (a
+                        // programmable scan crops too, at the uniform
+                        // multiple).
+                        if crate::envcfg::flag("COPPERLINE_DIAG_AUTOCROP")
+                            && self.last_diag_layout != Some(layout)
+                        {
+                            let autocrop = crate::video::autocrop();
+                            let per_axis = per_axis_scaling_requested();
+                            let mode = if !autocrop && !per_axis {
+                                "off"
+                            } else if self.rtg_present_dims.is_some() {
+                                "suspended(rtg)"
+                            } else if self.bezel.is_on() {
+                                "suspended(bezel)"
+                            } else if autocrop && per_axis {
+                                "active(autocrop+per-axis)"
+                            } else if per_axis {
+                                "active(per-axis)"
+                            } else {
+                                "active(autocrop)"
+                            };
+                            info!(
+                                "[DIAG_AUTOCROP] layout mode={} scan={} surface={:?} \
+                                 src_canvas={:?} display_dst={:?} chrome_dst={:?} filter={:?} \
+                                 factors={:?} shape={:?}",
+                                mode,
+                                if self.present_programmable {
+                                    "programmable"
+                                } else {
+                                    "standard"
+                                },
+                                surface_size,
+                                layout.src_canvas,
+                                layout.display_dst,
+                                layout.chrome_dst,
+                                layout.filter,
+                                layout.factors,
+                                display_src.map(|src| src.par),
+                            );
+                            self.last_diag_layout = Some(layout);
+                        }
+                        let present_clip = layout.display_dst;
+                        let texture_extent = (
+                            texture_width(texture_scale) as u32,
+                            texture_height(texture_scale) as u32,
+                        );
+                        let pass = if rtg_gpu {
+                            let (cx, cy, cw, ch) = present_clip;
+                            let disp_h = if debug_layout {
+                                ch as f32
+                            } else {
+                                ch as f32 * present_height() as f32 / window_present_height() as f32
+                            };
+                            PresentPass::Rtg {
+                                rect: (cx as f32, cy as f32, cw as f32, disp_h),
+                                integer_scaling: integer_scaling_requested(),
+                            }
+                        } else if crt_active || bezel_active {
+                            let scanlines = crt_scanline_count(
+                                self.present_rows,
+                                present_height(),
+                                self.present_tv_aperture_rows
+                                    .filter(|_| {
+                                        self.overscan == Overscan::Tv
+                                            && self.rtg_present_dims.is_none()
+                                            && self.present_width == FB_WIDTH
+                                    })
+                                    .map(|rows| {
+                                        if self.bezel.is_on() {
+                                            tube_aperture_rows(rows)
+                                        } else {
+                                            rows
+                                        }
+                                    }),
+                            );
+                            let crt_crop = (display_src.is_some() || debug_layout).then(|| {
+                                (
+                                    layout.display_dst,
+                                    layout.src_canvas,
+                                    scanlines * layout.src_canvas.3 as f32
+                                        / present_height().max(1) as f32,
+                                )
+                            });
                             let (uniforms, viewport) = match crt_crop {
                                 Some((dst, src, crop_scanlines)) => crt_shader::uniforms_for_rect(
-                                    kind,
-                                    strength,
+                                    self.crt_shader_kind,
+                                    self.shader_strength,
                                     dst,
                                     src,
                                     (FB_WIDTH, window_present_height()),
@@ -4745,8 +5700,8 @@ impl ApplicationHandler for App {
                                     crop_scanlines,
                                 ),
                                 None => crt_shader::uniforms_for(
-                                    kind,
-                                    strength,
+                                    self.crt_shader_kind,
+                                    self.shader_strength,
                                     present_clip,
                                     present_height(),
                                     window_present_height(),
@@ -4754,72 +5709,88 @@ impl ApplicationHandler for App {
                                     scanlines,
                                 ),
                             };
-                            if bezel_active {
-                                let opening = bezel::opening_rect(bezel_style, viewport);
-                                if crt_active {
-                                    crt.render(
-                                        &ctx.device,
-                                        &ctx.queue,
-                                        &ctx.texture,
-                                        encoder,
-                                        target,
-                                        opening,
-                                        kind,
-                                        uniforms.with_viewport(opening),
-                                    );
-                                }
-                                bezel_shader.render(
-                                    &ctx.device,
-                                    &ctx.queue,
-                                    &ctx.texture,
-                                    encoder,
-                                    target,
-                                    viewport,
-                                    bezel_style,
-                                    bezel::uniforms_from(&uniforms, viewport, opening, crt_active),
-                                );
-                                // Decals stick to the plastic, so they ride
-                                // the bezel pass: suspended with it, never
-                                // drawn over a bare picture.
-                                sticker_pass.render(
-                                    &ctx.device,
-                                    &ctx.queue,
-                                    encoder,
-                                    target,
-                                    viewport,
-                                    opening,
-                                );
-                            } else {
-                                crt.render(
-                                    &ctx.device,
-                                    &ctx.queue,
-                                    &ctx.texture,
-                                    encoder,
-                                    target,
-                                    viewport,
-                                    kind,
-                                    uniforms,
-                                );
-                            }
-                            Ok(())
-                        })
-                    } else {
-                        r.pixels.render_with(|encoder, target, ctx| {
-                            scaler.render(
-                                &ctx.device,
-                                &ctx.queue,
-                                &ctx.texture,
-                                encoder,
-                                target,
-                                &present_draws,
+                            PresentPass::Crt(CrtPresent {
+                                kind: self.crt_shader_kind,
+                                style: self.bezel,
+                                crt_active,
+                                bezel_active,
+                                uniforms,
+                                viewport,
+                            })
+                        } else {
+                            PresentPass::Plain
+                        };
+                        let mut draws = layout.draws();
+                        let picture = picture_on_gpu.then(|| {
+                            let map = picture_map(
+                                self.present_rows,
+                                self.present_width,
+                                texture_scale,
+                                self.overscan,
+                                self.tv_centre,
+                                self.present_tv_aperture_rows,
+                                self.bezel.is_on(),
                             );
-                            Ok(())
-                        })
-                    };
-                    if let Err(e) = render_result {
-                        error!("pixels.render: {e}");
+                            if let Some(display) = draws.first_mut() {
+                                display.picture = Some(map);
+                            }
+                            let mut fb = match r.present_worker.as_mut() {
+                                Some(worker) if worker_frame.is_some() => worker.picture_buffer(),
+                                _ => std::mem::take(&mut self.picture_scratch),
+                            };
+                            fb.clear();
+                            fb.extend_from_slice(
+                                &self.present_fb[..self.present_rows * self.present_width],
+                            );
+                            PictureFrame {
+                                fb,
+                                width: self.present_width as u32,
+                                rows: self.present_rows as u32,
+                            }
+                        });
+                        let mut job = PresentJob {
+                            frame: worker_frame,
+                            emulated_frame: self.last_rendered_emulated_frame,
+                            draws,
+                            pass,
+                            picture,
+                        };
+                        match gpu_home.as_deref_mut() {
+                            Some(gpu) => {
+                                let mut paint = inspector_ui.map(|ui| {
+                                    move |device: &wgpu::Device,
+                                          queue: &wgpu::Queue,
+                                          encoder: &mut wgpu::CommandEncoder,
+                                          target: &wgpu::TextureView| {
+                                        ui.paint_prepared(device, queue, encoder, target)
+                                    }
+                                });
+                                let after = paint.as_mut().map(|paint| paint as PresentAfter<'_>);
+                                if let Err(e) = present_job(gpu, Some(&window), &job, after) {
+                                    error!("pixels.render: {e}");
+                                }
+                                if let Some(picture) = job.picture.take() {
+                                    self.picture_scratch = picture.fb;
+                                }
+                            }
+                            None => {
+                                if let Some(worker) = r.present_worker.as_mut() {
+                                    if let Err(job) = worker.submit(job) {
+                                        if let Some(frame) = job.frame {
+                                            worker.recycle(
+                                                frame,
+                                                job.picture.map(|picture| picture.fb),
+                                            );
+                                        }
+                                        self.main_presentation_dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        r.gpu = gpu_home;
                     }
                 }
+                self.dispatch_egui_frame(inspector_actions, Ok(()));
             }
             _ => {}
         }
@@ -4870,9 +5841,17 @@ impl ApplicationHandler for App {
         if self.netplay.is_none() {
             self.service_uaelib();
         }
+        // The guest's own ExitEmu, and the --exit-on-return program
+        // return: both end the session on this pass, verdict recorded.
+        if self.guest_exit_requested || self.note_guest_exit_request() || self.poll_run_return() {
+            event_loop.exit();
+            return;
+        }
+        self.service_clipboard();
         if self.render.is_none() {
             return;
         }
+        let host_poll_started = Instant::now();
         // Act on a completed drop before the OSD/control-flow computation
         // below, so a drop-raised OSD keeps the loop awake for its fade.
         if !self.pending_dropped_files.is_empty() {
@@ -4975,6 +5954,7 @@ impl ApplicationHandler for App {
                 ControlFlow::Wait
             },
         );
+        self.schedule_egui_debugger_repaint(event_loop);
         if writing_image && !running {
             // Nothing else paces the loop while the machine is off; check
             // back at a human rate rather than spinning a core on it.
@@ -5053,7 +6033,7 @@ impl ApplicationHandler for App {
             // If the live output device vanished (unplugged), reopen on the
             // current default so sound continues.
             self.recover_audio_if_device_lost();
-            // Presentation is vsync-gated, so emulating exactly one frame per
+            // With vsync enabled, emulating exactly one frame per
             // presented frame would cap warp at the host monitor refresh rate
             // (about 1.2x for 50 Hz PAL on a 60 Hz display). In warp, retire
             // several frames per presented frame (output frame skip): only the
@@ -5247,6 +6227,8 @@ impl ApplicationHandler for App {
             rendered |= self.finish_render_for_current_frame();
         }
         self.capture_recorder_output(rendered);
+        self.capture_clip_frame(rendered);
+        self.poll_clip_save();
         // Skipping request_redraw for headless capture avoids the vsync gate so
         // the run advances as fast as the host allows; emulated state is
         // identical either way. (`headless_capture` was resolved above, before
@@ -5278,11 +6260,35 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        if self.fire_gif_captures() {
+            event_loop.exit();
+            return;
+        }
 
         self.fire_scheduled_events();
         self.fire_auto_save_state();
         if self.fire_auto_shot() {
             event_loop.exit();
+        }
+        // Paused/off animations have no emulation-clock sleep. With vsync
+        // disabled they also lose the swapchain wait, so bound their polling
+        // to a UI frame. Credit any sleeps/work already done above.
+        // Without a vsync wait in the redraw -- vsync off, or frames
+        // presented by the worker -- a polling loop with nothing running
+        // would spin; tick it at a human rate instead.
+        let threaded_present = self
+            .render
+            .as_ref()
+            .is_some_and(|r| r.present_worker.is_some());
+        if (!self.vsync || threaded_present)
+            && !running
+            && event_loop.control_flow() == ControlFlow::Poll
+        {
+            let wait =
+                std::time::Duration::from_millis(16).saturating_sub(host_poll_started.elapsed());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
         }
     }
 }
@@ -5297,14 +6303,17 @@ fn display_file_name(path: &std::path::Path) -> String {
 
 /// What a file dropped on the window should be treated as. Extension-based:
 /// only floppies get content-sniffed (by the insert path itself), and cue
-/// sheets/hard disks/ROMs have no shared magic worth probing here.
+/// sheets/hard disks/ROMs have no shared magic worth probing here. The one
+/// exception is `.chd`, which holds either a CD or a hard disk and says
+/// which in its metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DroppedMediaKind {
     /// Anything the floppy loader may accept (floppy::IMAGE_EXTENSIONS and
     /// unknown extensions): FloppyImage::from_bytes sniffs the content and
     /// rejects what it cannot read, surfacing a clean OSD failure.
     Floppy,
-    /// A CD image (cue sheet, bare ISO, Nero NRG, or CHD) for the CD drive.
+    /// A CD image (cue sheet, bare ISO, Nero NRG, or CD-ROM CHD) for the
+    /// CD drive.
     Cd,
     /// Hard disk images cannot be hot-attached; point at the config screen.
     HardDisk,
@@ -5320,6 +6329,7 @@ fn classify_dropped_media(path: &std::path::Path) -> DroppedMediaKind {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
     match ext.as_deref() {
+        Some("chd") if crate::harddrive::chd::is_hard_disk_chd(path) => DroppedMediaKind::HardDisk,
         Some("cue") | Some("iso") | Some("nrg") | Some("chd") => DroppedMediaKind::Cd,
         Some("hdf") | Some("hdz") | Some("img") => DroppedMediaKind::HardDisk,
         Some("rom") => DroppedMediaKind::Rom,
@@ -5655,10 +6665,8 @@ impl App {
     }
 
     /// Whether main-window UI is claiming the keyboard and pointer: the
-    /// menu, or an overlay panel drawn over the display. The debugger,
-    /// frame analyzer, and console are separate tool windows with their
-    /// own event routing, so they are deliberately not modal here -- while
-    /// one is open (even mid-run), the main window keeps driving the Amiga.
+    /// menu, or an overlay panel drawn over the display. The Debug layout
+    /// routes its own events according to explicit guest/UI input ownership.
     fn modal_ui_active(&self) -> bool {
         self.ui.active()
     }
@@ -5689,6 +6697,7 @@ impl App {
             return;
         };
         let mut raw = crate::config::RawConfig::default();
+        raw.display.vsync = Some(self.vsync);
         raw.display.pixel_aspect =
             Some(super::launcher::pixel_aspect_name(crate::video::pixel_aspect()).to_string());
         raw.display.scaling = Some(
@@ -5737,81 +6746,10 @@ impl App {
         }
     }
 
-    /// Whether any UI surface has a claim on the host cursor: main-window
-    /// UI, or an open tool window. Tool windows are not modal over the
-    /// main window's input, but an automatic grab taken while one is open
-    /// would trap the cursor its controls need, so the auto-capture paths
-    /// wait until the last of them closes. An explicit capture (a display
-    /// click or the shortcut) is always honoured.
+    /// Automatic capture waits while the Debug layout or a modal UI is visible.
+    /// Explicit display clicks can still transfer input to the Amiga.
     fn ui_wants_cursor(&self) -> bool {
-        self.ui.active()
-            || ToolPanelKind::ALL
-                .into_iter()
-                .any(|kind| self.tool_panel_is_open(kind))
-    }
-
-    fn tool_window(&self, kind: ToolPanelKind) -> Option<&ToolWindow> {
-        match kind {
-            ToolPanelKind::Debugger => self.debugger_tool_window.as_ref(),
-            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_tool_window.as_ref(),
-            ToolPanelKind::Console => self.console_tool_window.as_ref(),
-        }
-    }
-
-    fn tool_window_mut(&mut self, kind: ToolPanelKind) -> Option<&mut ToolWindow> {
-        match kind {
-            ToolPanelKind::Debugger => self.debugger_tool_window.as_mut(),
-            ToolPanelKind::FrameAnalyzer => self.frame_analyzer_tool_window.as_mut(),
-            ToolPanelKind::Console => self.console_tool_window.as_mut(),
-        }
-    }
-
-    fn tool_window_slot(&mut self, kind: ToolPanelKind) -> &mut Option<ToolWindow> {
-        match kind {
-            ToolPanelKind::Debugger => &mut self.debugger_tool_window,
-            ToolPanelKind::FrameAnalyzer => &mut self.frame_analyzer_tool_window,
-            ToolPanelKind::Console => &mut self.console_tool_window,
-        }
-    }
-
-    fn tool_panel_for_kind(&self, kind: ToolPanelKind) -> Option<Panel> {
-        match kind {
-            ToolPanelKind::Debugger => self
-                .debugger_panel
-                .as_ref()
-                .map(|panel| Panel::Debugger(panel.clone())),
-            ToolPanelKind::FrameAnalyzer => self
-                .frame_analyzer_panel
-                .as_ref()
-                .map(|panel| Panel::FrameAnalyzer(panel.clone())),
-            ToolPanelKind::Console => self
-                .console_panel
-                .as_ref()
-                .map(|panel| Panel::Console(panel.clone())),
-        }
-    }
-
-    fn tool_panel_control_at(&self, kind: ToolPanelKind, pos: (i32, i32)) -> Option<UiControl> {
-        self.tool_panel_for_kind(kind)
-            .as_ref()
-            .and_then(|panel| ui::panel_control_at(panel, pos))
-    }
-
-    fn tool_hover_changed(
-        &self,
-        kind: ToolPanelKind,
-        previous: Option<(i32, i32)>,
-        current: Option<(i32, i32)>,
-    ) -> bool {
-        previous.and_then(|pos| self.tool_panel_control_at(kind, pos))
-            != current.and_then(|pos| self.tool_panel_control_at(kind, pos))
-    }
-
-    fn tool_window_kind(&self, window_id: WindowId) -> Option<ToolPanelKind> {
-        ToolPanelKind::ALL.into_iter().find(|&kind| {
-            self.tool_window(kind)
-                .is_some_and(|tool| tool.window.id() == window_id)
-        })
+        self.ui.active() || self.debug_layout_active
     }
 
     fn ui_key_accepts_repeat(&self, kind: Option<ToolPanelKind>, code: KeyCode) -> bool {
@@ -6550,6 +7488,12 @@ impl App {
             }
             UiControl::LauncherRun => self.launcher_run(),
             UiControl::DropDrive(drive_idx) => self.drop_chooser_route(drive_idx),
+            UiControl::StateRow(_)
+            | UiControl::StateLoad
+            | UiControl::StateDelete
+            | UiControl::StateBrowse
+            | UiControl::StateConfirmDelete
+            | UiControl::StateCancelDelete => self.states_activate(control, event_loop),
             UiControl::AnalyzerTab(_)
             | UiControl::AnalyzerHeatPreset(_)
             | UiControl::AnalyzerResourceRow(_)
@@ -6570,42 +7514,6 @@ impl App {
         }
         self.request_redraw();
     }
-
-    /// Console keyboard input: printable characters append to the command
-    /// line; editing, history, and scrollback keys do the rest.
-    fn ui_handle_console_key(&mut self, code: KeyCode) -> bool {
-        if self.console_panel.is_none() {
-            return false;
-        }
-        if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
-            self.console_submit();
-            self.request_redraw();
-            return true;
-        }
-        let Some(panel) = self.console_panel.as_mut() else {
-            return false;
-        };
-        if let Some(ch) = entry_char_for_key(code) {
-            panel.push_input_char(ch);
-            self.request_redraw();
-            return true;
-        }
-        match code {
-            KeyCode::Backspace => {
-                panel.input.pop();
-                panel.history_pos = None;
-            }
-            KeyCode::ArrowUp => panel.history_step(-1),
-            KeyCode::ArrowDown => panel.history_step(1),
-            KeyCode::PageUp => {
-                panel.scroll = (panel.scroll + 10).min(ui::CONSOLE_SCROLLBACK_LINES);
-            }
-            KeyCode::PageDown => panel.scroll = panel.scroll.saturating_sub(10),
-            _ => return false,
-        }
-        self.request_redraw();
-        true
-    }
 }
 
 mod app_debugger;
@@ -6616,7 +7524,9 @@ mod app_media;
 mod app_menus;
 mod app_nav;
 mod app_netplay;
+mod app_states;
 use app_nav::{cycle_hold_delay, PadNav};
+mod adapter;
 mod app_panels;
 mod app_session;
 mod bezel;
@@ -6626,13 +7536,16 @@ mod control;
 mod crt_shader;
 #[cfg(feature = "coppersynth")]
 mod csynthpanel;
+mod egui_debugger;
 #[cfg(feature = "gdb")]
 mod gdb;
 mod host_input;
 mod kbdpanel;
 #[cfg(feature = "mt32")]
 mod mt32panel;
+mod native_dialog;
 mod present;
+mod presenter;
 mod rtg_texture;
 mod scaler;
 pub(in crate::video) mod statusbar;

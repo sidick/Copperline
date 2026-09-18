@@ -55,7 +55,18 @@ copperline-ctl --info /tmp/ccp.json continue
 
 # Interactive REPL session
 copperline-ctl --info /tmp/ccp.json --repl
+
+# Describe a save state (no session needed) and write out its thumbnail
+copperline-ctl state-info /tmp/at120.clstate --thumbnail /tmp/at120.png
 ```
+
+## A/B divergence finder
+
+`copperline-ctl diverge` launches two headless sessions (two builds, or one
+build under two configs) and drives them in lockstep over this protocol,
+comparing the frame digest, the CPU registers and a server-side RAM digest
+at every frame, then narrowing the first mismatch to the instruction and,
+for memory, to the byte. See [A/B divergence finder](diverge.md).
 
 ## Debug adapter
 
@@ -244,7 +255,12 @@ events.unsubscribe {"events":["serial"]}
 
 ### Execution control
 - `continue`: Resume execution.
-- `step {"n": 1}`: Single-step CPU instructions.
+- `step {"n": 1}`: Single-step CPU instructions. A CPU parked in `STOP` retires
+  nothing until an interrupt arrives, so a step there carries it to the one that
+  wakes it and retires the handler's first instruction; when no interrupt can
+  reach it (SR mask 7, or nothing enabled in `INTENA`) the step gives up after
+  two video frames and the stop event reports the unchanged
+  `retired_instructions`.
 - `step_over`: Step over subroutine call.
 - `step_out`: Step out of current subroutine.
 - `step_copper`: Step single Copper instruction.
@@ -267,6 +283,16 @@ events.unsubscribe {"events":["serial"]}
 ### State inspection and modification
 - `regs.get` / `regs.set {"reg": "...", "value": ...}`: Read or modify 68k registers. `regs.get` includes exact raw FP0-FP7 plus FPCR/FPSR/FPIAR when an FPU is fitted.
 - `mem.read {"addr": ..., "len": ..., "encoding": "hex"|"base64"}` / `mem.write {"addr": ..., "data": "...", "encoding": "hex"|"base64"}`: Read or modify memory.
+- `mem.digest {"region": "chip"|"all"}` or `mem.digest {"addr": ..., "len": ...}`:
+  FNV-1a digest of RAM computed inside the emulator, for change detection
+  and for comparing two sessions without moving the bytes. `chip` (the
+  default) digests the fitted chip RAM bank, `all` every writable RAM bank
+  (chip, slow, motherboard, accelerator, Zorro boards) one by one; `addr`
+  and `len` digest one span through the CPU map instead (a span that lies
+  inside one bank is hashed in place, anything else is peeked byte by
+  byte, at most 256 MB). The reply carries `digest` over the whole and
+  `regions`, each bank's `base`, `len` and `digest`. Allowed in a resume
+  verb's `collect` list.
 - `disasm {"addr": ..., "count": ...}`: Disassemble instructions at address (default: PC).
   Every line includes `cycles_min` and `cycles_max`, evaluated through the
   selected 68000-family core's generation-specific timing path. These are
@@ -309,6 +335,15 @@ events.unsubscribe {"events":["serial"]}
   the hardware shift/mask/fill pipeline. The path is optional.
 - `display.get`: Query active display parameters, viewport size, and pixel format.
 - `rtc.get` / `rtc.set {"unix": ..., "time": "...", "advance": ..., "frozen": ...}`: Inspect or move real-time clock.
+- `clipboard.get` / `clipboard.set {"text": "..."}`: The host <-> guest
+  clipboard bridge (`[clipboard] share`, `--clipboard`; see
+  [Configuration](../guide/configuration.md#clipboard)). `get` reports
+  whether the unit is fitted and sharing, whether the guest bridge is up,
+  the host and guest text generations, and the newest text the guest
+  copied. `set` stages text for the guest exactly as a windowed session's
+  host clipboard poll would, so a headless run (which never reads the host
+  clipboard itself) can hand the guest text to paste; `replay_unsafe` is
+  set when reverse execution is armed, as for `mem.write`.
 - `cartridge.get`: Query freezer cartridge state (`model`, memory `base`/`size`, monitor `version`, `entered` status, `nmi_pending`, and freeze count).
 - `cartridge.freeze`: Trigger the freezer cartridge NMI (level 7), transferring execution to the monitor.
 - `copper.list {"addr": ..., "resource": ..., "max": ..., "trace": true}`:
@@ -322,8 +357,8 @@ events.unsubscribe {"events":["serial"]}
 ### Windowed UI
 
 - `ui.show {"window": "debugger"|"console"|"analyzer"}`: Open or focus one of
-  Copperline's native tool windows. This is available only from a windowed
-  `--control-gui` session; a headless server returns an unsupported error.
+  the inspectors in the main window's Debug layout. This is available only from
+  a windowed `--control-gui` session; a headless server returns an unsupported error.
 
 ### Diagnostics and profiling
 - `chipset.validate {"enabled": ..., "clear": ...}` / `chipset.report`: Arm or query custom register access validator.
@@ -337,7 +372,7 @@ events.unsubscribe {"events":["serial"]}
 - `debug.idle`: Query guest idle time statistics reported via uaelib idle markers.
 - `trace.start {"path": "...", "max_lines": ...}` / `trace.stop` / `trace.status`: Control instruction execution trace logging.
 - `waveform.start {"path": "...", "trigger": "...", "duration": "...", "signals": "..."}` / `waveform.stop` / `waveform.status`: Control VCD logic analyzer waveform capture.
-- `profile.start {"path": "...", "frames": ..., "slots": ..., "memory": ..., "screenshots": "none"|"every"|"last", "pc_samples": ..., "samples": ..., "registers": ..., "unwind": {"base": ADDR, "table": BASE64}, "relocation_bases": [ADDR, ...], "code_ranges": [{"base": ADDR, "size": N}, ...], "trigger": {"frame": F}|{"busy_cck_over": N}}` / `profile.stop` / `profile.status`: Export per-frame profiling data (DMA ownership, full slot/event records, frame-start custom registers and palette, blit records, CPU chip-bus wait attribution, guest idle time, retired instructions, and stack bounds). `memory` snapshots chip and slow RAM once; because that baseline must align with the first recorded frame, it cannot be combined with a deferred `trigger`. `slots` writes a raw 24-byte-record sidecar per frame. `samples` adds a WinUAE/Bartman-compatible per-instruction binary sidecar; `registers` adds D0-D7/A0-A7/SR, the optional compact unwind table supplies live call stacks, `relocation_bases` preserves every program hunk's runtime base for offline source mapping, and `code_ranges` identifies executable hunks outside the compact hunk-0 table. Data streams to `profile.jsonl` with a `profile.json` summary upon stop; see [](profiling). Arms Frame Analyzer tracing immediately and begins recording only when an optional trigger matches.
+- `profile.start {"path": "...", "frames": ..., "slots": ..., "memory": ..., "screenshots": "none"|"every"|"last", "pc_samples": ..., "samples": ..., "registers": ..., "unwind": {"base": ADDR, "table": BASE64}, "relocation_bases": [ADDR, ...], "code_ranges": [{"base": ADDR, "size": N}, ...], "coverage": ..., "trigger": {"frame": F}|{"busy_cck_over": N}}` / `profile.stop` / `profile.status`: Export per-frame profiling data (DMA ownership, full slot/event records, frame-start custom registers and palette, blit records, CPU chip-bus wait attribution, guest idle time, retired instructions, and stack bounds). `memory` snapshots chip and slow RAM once; because that baseline must align with the first recorded frame, it cannot be combined with a deferred `trigger`. `slots` writes a raw 24-byte-record sidecar per frame. `samples` adds a WinUAE/Bartman-compatible per-instruction binary sidecar; `registers` adds D0-D7/A0-A7/SR, the optional compact unwind table supplies live call stacks, `relocation_bases` preserves every program hunk's runtime base for offline source mapping, and `code_ranges` identifies executable hunks outside the compact hunk-0 table. `coverage` counts every retired instruction over `code_ranges` (every address, bounded, without them) and writes the histogram as `coverage.bin` at stop for `copperline-ctl profile-report --format lcov`; it takes `relocation_bases`/`code_ranges` without `samples` and is refused while a `--coverage` run holds the counters. Data streams to `profile.jsonl` with a `profile.json` summary upon stop; see [](profiling). Arms Frame Analyzer tracing immediately and begins recording only when an optional trigger matches.
 
 ### Breakpoints and traps
 - `break.add`: Add breakpoint (`pc`, `watch`, `reg_watch`, `beam`, `copper`, `catch`, `loadseg`). A memory watch accepts `"access": "write"|"read"|"access"` (default `write`).
@@ -347,12 +382,14 @@ events.unsubscribe {"events":["serial"]}
 
 ### Input injection
 - `input.key {"rawkey": ..., "action": "press"|"release"|"tap", "hold_ms": ..., "at_seconds": ...}`: Inject keyboard events.
+- `input.type {"text": ..., "at_seconds": ...}`: Type `text` on the US Amiga keyboard as raw key press/release pairs (Shift where needed, newline as Return, tab as Tab, escape as Esc), one key every 100 ms of emulated time from `at_seconds` (default now). Text with characters the US keymap cannot type is rejected. The same conversion backs `--type-after` and the window's Paste as Keystrokes.
 - `input.mouse {"dx": ..., "dy": ..., "left": ..., "right": ..., "middle": ..., "port": 1|2, "at_seconds": ...}`: Inject mouse motion/buttons.
 - `input.mouse_to {"x": ..., "y": ..., "port": 1|2, "tolerance": ..., "max_frames": ...}`: Steer pointer to screen pixel coordinates via sprite 0.
-- `input.joy {"up": ..., "down": ..., "left": ..., "right": ..., "red": ..., "blue": ..., "green": ..., "yellow": ..., "play": ..., "rwd": ..., "ffw": ..., "port": 1|2, "at_seconds": ...}`: Inject joystick / CD32 button state.
+- `input.joy {"up": ..., "down": ..., "left": ..., "right": ..., "red": ..., "blue": ..., "green": ..., "yellow": ..., "play": ..., "rwd": ..., "ffw": ..., "port": 1|2|3|4, "at_seconds": ...}`: Inject joystick / CD32 button state. Ports 3 and 4 are the parallel-port four-player adapter's sockets (driving one fits the adapter); on a light pen `red` is the tip switch / trigger.
 - `input.analogue {"x": ..., "y": ..., "port": 1|2, "at_seconds": ...}`: Set analogue paddle/pot position (0-255).
-- `input.set_port {"port": 1|2, "device": "mouse"|"gamepad-mouse"|"joystick"|"cd32"|"analogue"|"none"}`: Change port device.
-- `input.get_ports`: Query active controller port device assignments.
+- `input.pen {"x": ..., "y": ..., "at_seconds": ...}`: Hold the light pen over presented pixel (x, y) (the `input.mouse_to` coordinates); omit or negate to lift it off the glass.
+- `input.set_port {"port": 1|2|3|4, "device": "mouse"|"gamepad-mouse"|"joystick"|"cd32"|"analogue"|"lightpen"|"none"}`: Change port device (ports 3 and 4 take `joystick` or `none`).
+- `input.get_ports`: Query active controller port device assignments (`port1`-`port4`, `parallel_adapter`, and the light pen's `port`, whether it is `wired` to Agnus LP, and its position).
 
 ### Media management
 - `media.floppy.insert {"drive": 0, "path": "...", "write_protected": true}`: Insert floppy disk image.
@@ -360,12 +397,33 @@ events.unsubscribe {"events":["serial"]}
 - `media.floppy.query`: Query connected floppy drives, mounted disk images, and write-protection status.
 - `media.cd.insert {"path": "..."}`: Insert CD image.
 - `media.cd.eject`: Eject CD image.
+- `pcmcia.insert {"card": "cf"|"sram", "path": "...", "size": "2M", "read_only": false}`: Push a card into the A600/A1200 PCMCIA slot -- a CompactFlash card over the hard-disk image at `path` (the default kind), or an SRAM card of `size` bytes optionally mirrored to `path`. Any card already in the slot is ejected first; Gayle latches the card-detect change, so the guest sees a real insertion (INT6 once card.resource has enabled it). Fails on a machine without the slot.
+- `pcmcia.eject`: Pull the card out of the slot (latches the card-detect change the same way).
+- `pcmcia.query`: Report the slot: `slot` (the machine has one), `enabled` (not disabled by the guest or shadowed by Zorro II fast RAM), `shadowed_by_fast_ram`, `inserted`, `card` (`cf`/`sram`), `description`, `path`, Gayle's sampled `pins`, and its pending `change_latches`. The `media` event stream also reports `{"kind": "pcmcia", "action": "inserted"|"ejected", "name": ...}`.
 - `copperhf.attach {"unit": 0, "path": "...", "volume_name": "...", "boot_pri": 0}`: Hot-attach a `copperhf.device` unit's media (opens `path` exactly like a boot-time `[copperhf]` unit, `volume_name`/`boot_pri` optional). Bumps the unit's change counter and sets its `CHF_CHANGED_MASK` bit. Fails if no `[copperhf]` controller is configured.
 - `copperhf.eject {"unit": 0}`: Hot-eject/detach a `copperhf.device` unit's media. The unit stays present (`CHF_UNIT_PRESENT`); only its media bit (`CHF_UNIT_MEDIA`) clears. Bumps the change counter and sets `CHF_CHANGED_MASK`, the same as the guest's own `TD_EJECT`.
 
 ### State snapshot files
-- `state.save {"path": "..."}`: Snapshot machine state to file.
+- `state.save {"path": "..."}`: Snapshot machine state to file. The file
+  carries a metadata chunk (thumbnail of the current frame from the same
+  renderer as `capture.screenshot`, emulated and wall-clock save times,
+  machine summary, media names) ahead of the machine.
 - `state.load {"path": "..."}`: Restore machine state from file.
+- `state.info {"path": "...", "thumbnail": "..."}`: Describe a state file
+  without loading it -- its container `version`, the `machine` it was
+  taken on (summary, model, CPU, chipset, video standard, RAM sizes, ROM
+  fingerprint), and its `meta` (`emulated_seconds`, `emulated_frames`,
+  `saved_at_unix` and readable `saved_at`, `machine` summary, `media`
+  with `floppies` per connected drive, `hard_disks`, and `cd`, and the
+  `thumbnail` size in pixels and bytes), or `meta: null` for a state
+  written before the chunk existed. With `thumbnail`, the PNG is written
+  to that host path and `thumbnail_path` names it. Reads only the file's
+  header; the running session is untouched, so it is allowed while the
+  machine runs.
+
+The same card is printed without a session by
+`copperline-ctl state-info STATE.clstate [--thumbnail FILE.png]`, as
+pretty-printed JSON with the same fields.
 
 ### Framebuffer capture
 - `capture.screenshot {"path": "...", "overlays": ["blits", "overdraw", "sources"]}`:

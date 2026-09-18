@@ -63,11 +63,9 @@ try {
     await page.locator('#boot:enabled').waitFor({ timeout: 30000 });
     if (await page.locator('#netplay-open').count()) await page.locator('#netplay-open').click();
     else await page.locator('#netplay-panel > summary').click();
-    if (relayOnly) {
-      await page.locator('#netplay-advanced > summary').click();
-      await page.locator('#netplay-relay-only').check();
-      await page.locator('#netplay-advanced > summary').click();
-    }
+    await page.locator('#netplay-advanced > summary').click();
+    if (relayOnly) await page.locator('#netplay-relay-only').check();
+    await page.locator('#netplay-advanced > summary').click();
     pages.push(page);
   }
   const [host, guest] = pages;
@@ -81,7 +79,23 @@ try {
   await host.locator('#writable-floppies').check();
   const disk = Buffer.alloc(901120);
   await host.locator('#df0').setInputFiles({ name: 'host-df0.adf', mimeType: 'application/octet-stream', buffer: disk });
-  await host.locator('#df1').setInputFiles({ name: 'host-df1.adf', mimeType: 'application/octet-stream', buffer: disk });
+  // DF1 is inserted only once the host is already waiting for player 2:
+  // its page stays its own until then, and the guest must receive what the
+  // host holds when the connection opens. Every hosted game shows both
+  // invitations, each with a QR code, while it waits.
+  let hostedBefore = false;
+  const whileWaiting = async () => {
+    if (!hostedBefore) {
+      hostedBefore = true;
+      for (const id of ['boot', 'df0', 'df1', 'machine']) {
+        assert.equal(await host.locator(`#${id}`).isEnabled(), true, `${id} stays usable while the host waits`);
+      }
+      await host.locator('#df1').setInputFiles({ name: 'host-df1.adf', mimeType: 'application/octet-stream', buffer: disk });
+    }
+    assert.ok((await host.locator('#netplay-watch-invite').inputValue()).includes('#watch='), 'the spectator invitation is offered at once');
+    assert.equal(await host.locator('#netplay-watch-invitation').isVisible(), true);
+    await host.locator('#netplay-watch-qr svg').waitFor();
+  };
   await guest.locator('#kick').setInputFiles({ name: 'guest-original.rom', mimeType: 'application/octet-stream', buffer: Buffer.alloc(256 * 1024) });
   await guest.waitForFunction(() => document.querySelector('#load-status').textContent.includes('guest-original.rom'));
   const restored = async () => {
@@ -133,6 +147,7 @@ try {
     phase = 'connecting';
     const link = await invitation();
     assert.equal(new URL(link).search, '');
+    await whileWaiting();
     await host.locator('#netplay-qr svg').waitFor();
     await host.locator('#netplay-copy-invite').click();
     assert.equal(await host.evaluate(() => window.__copied), link);
@@ -155,6 +170,10 @@ try {
       throw error;
     });
     phase = 'playing';
+    // Player 2 is in: the spent player invitation gives way to the
+    // spectator one, which stays for the whole game.
+    await host.locator('#netplay-invitation').waitFor({ state: 'hidden' });
+    assert.equal(await host.locator('#netplay-watch-invitation').isVisible(), true);
     return link;
   }
   // Model a disk channel that opens later than input/setup. The game can
@@ -224,6 +243,73 @@ try {
     console.log(`DF${drive} ${value === null ? 'ejection' : 'swap'} at frame ${boundaries[0].frame}; both checked ${checked}`);
   }
   await host.locator('#netplay-panel').screenshot({ path: `${output}/disk-swaps.png` });
+  // A spectator joins the running game through its own invitation, replays
+  // the history including the swaps above, and stays locked out of input
+  // and media; leaving it does not disturb the players.
+  {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block' });
+    await context.route('**/*', route => {
+      const target = new URL(route.request().url());
+      return [url.origin, service.origin].includes(target.origin) ? route.continue() : route.abort();
+    });
+    await context.addInitScript(base => {
+      new MutationObserver(() => {
+        const meta = document.querySelector('meta[name="copperline-netplay-service"]');
+        if (meta && meta.content !== base) meta.content = base;
+      }).observe(document, { childList: true, subtree: true });
+    }, service.origin);
+    const spectator = await context.newPage();
+    spectator.on('pageerror', error => errors.push({ phase: 'spectating', message: error.message }));
+    phase = 'spectating';
+    const watchLink = await host.locator('#netplay-watch-invite').inputValue();
+    assert.ok(watchLink.includes('#watch='), 'the host offers a separate spectator invitation');
+    assert.ok(!watchLink.includes(new URL(link).hash.slice(6)), 'the spectator link carries no player capability');
+    await spectator.goto(watchLink);
+    await spectator.locator('#boot:enabled').waitFor({ timeout: 30000 });
+    await spectator.locator('#netplay-room-watch:visible').waitFor();
+    assert.equal(await spectator.locator('#netplay-room-join').isVisible(), false, 'a spectator link offers Watch, not Join');
+    await spectator.locator('#netplay-room-watch').click();
+    await spectator.waitForFunction(() => { const s = window.__emu?.spectate_status?.(); return s && s[2] < 60 && s[3] >= 120; },
+      null, { timeout: 120000 }).catch(async error => {
+      console.error('Spectator setup:', await spectator.locator('#netplay-status').textContent());
+      throw error;
+    });
+    for (const id of ['boot', 'machine', 'video', 'reset', 'pause', 'df0', 'df1']) {
+      assert.equal(await spectator.locator(`#${id}`).isDisabled(), true, `${id} must stay locked for a spectator`);
+    }
+    assert.equal(await spectator.locator('#netplay-disks').isVisible(), false);
+    assert.deepEqual(await spectator.evaluate(() => [0, 1].map(drive => window.__emu.disk_name(drive))),
+      await host.evaluate(() => [0, 1].map(drive => window.__emu.disk_name(drive))), 'the spectator replayed every swap');
+    await host.waitForFunction(() => /1 watching/.test(document.querySelector('#netplay-status').textContent), null, { timeout: 30000 });
+    await spectator.locator('#netplay-panel').screenshot({ path: `${output}/spectator.png` });
+    // A second spectator arrives through the same invitation, pasted into
+    // the code field rather than opened as a link.
+    const second = await context.newPage();
+    second.on('pageerror', error => errors.push({ phase: 'spectating', message: error.message }));
+    await second.goto(url.href);
+    await second.locator('#boot:enabled').waitFor({ timeout: 30000 });
+    if (await second.locator('#netplay-open').count()) await second.locator('#netplay-open').click();
+    else await second.locator('#netplay-panel > summary').click();
+    await second.locator('#netplay-room-code').fill(watchLink);
+    await second.locator('#netplay-room-watch:visible').waitFor();
+    assert.equal(await second.locator('#netplay-room-join').isVisible(), false, 'a pasted spectator link offers Watch, not Join');
+    await second.locator('#netplay-room-watch').click();
+    await second.waitForFunction(() => { const s = window.__emu?.spectate_status?.(); return s && s[2] < 60 && s[3] >= 120; },
+      null, { timeout: 120000 }).catch(async error => {
+      console.error('Second spectator setup:', await second.locator('#netplay-status').textContent());
+      throw error;
+    });
+    await host.waitForFunction(() => /2 watching/.test(document.querySelector('#netplay-status').textContent), null, { timeout: 30000 });
+    await host.locator('#netplay-panel').screenshot({ path: `${output}/spectators.png` });
+    await second.locator('#netplay-disconnect').click();
+    await second.locator('#netplay-room-host:enabled').waitFor();
+    const before = await Promise.all(pages.map(page => page.evaluate(() => window.__emu.netplay_status()[6])));
+    await spectator.locator('#netplay-disconnect').click();
+    await spectator.locator('#netplay-room-host:enabled').waitFor();
+    await Promise.all(pages.map((page, i) => page.waitForFunction(checked => window.__emu?.netplay_status()[6] > checked,
+      before[i], { timeout: 60000 })));
+    await context.close();
+  }
   phase = 'disconnect';
   await host.locator('#netplay-disconnect').click();
   await Promise.all(pages.map(page => page.locator('#netplay-room-host:enabled').waitFor()));

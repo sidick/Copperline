@@ -5,8 +5,9 @@ does not paint pixels as it runs; instead, every render-relevant event is
 recorded with its beam position, and the renderer replays the completed
 frame's events afterwards. The live emulation and the painting of pixels
 are decoupled in time but exact in beam position. In normal windowed and
-headless runs, replay happens on the default render worker; the CPU,
-custom-chip model, and GPU presentation remain on the main thread.
+headless runs, replay happens on the default render worker, and the
+window's GPU presentation on a present worker; the CPU and custom-chip
+model remain on the main thread.
 
 ## Recording: beam events (`video/beam.rs`)
 
@@ -152,12 +153,19 @@ BPLCON0 mode decode, display-window edges, fetch-origin quantization,
 per-plane scroll delays) is constant and is computed once per run rather
 than per pixel. The per-pixel decisions inside a run are unchanged -- the
 chunking is a host-CPU optimisation, not a model change.
-History-independent colour modes also resolve their complete 256-entry
-Denise/Lisa index table once for each distinct control-and-palette state in
-the frame. HAM -- HAM6 and Lisa's HAM8 alike -- remains on the sequential
-path because every output depends on the preceding colour. Prepared planar rows similarly share a single byte
-lookup when the odd and even BPLCON1 taps have the same delay; the exhaustive
-prepared-pixel/word-sampler comparison covers both that common path and
+History-independent colour modes also cache their complete 256-entry
+Denise/Lisa index tables in up to eight frame-local entries. The cache
+compares the palette, the AGA colour-path selection and
+the complete BPLCON0, BPLCON2, BPLCON3 and BPLCON4 registers. Scroll, fetch,
+DMA, display-window and collision changes reuse that table: they affect
+which sample is drawn or how its output is composed, rather than the
+colour, colour latch and playfield mask resolved for a given sample index.
+HAM -- HAM6 and Lisa's HAM8 alike -- remains on the sequential path because
+every output depends on the preceding colour. An indexed lookup still
+seeds the held colour for a later switch into HAM. Prepared planar rows
+similarly share a single byte lookup when the odd and even BPLCON1 taps
+have the same delay; the exhaustive prepared-pixel/word-sampler comparison
+covers both that common path and
 separate dual-playfield taps.
 
 The horizontal display-window flip-flop is still the same 9-bit Denise
@@ -432,11 +440,54 @@ Denise after painting, but the threaded path treats those bits as diagnostic
 render output and records only the returned render timing on the main
 thread.
 
-wgpu and winit remain main-thread-only: the worker paints CPU buffers, and
-the main thread uploads the newest completed presentation buffer to the
-`pixels` surface. Normal display can be one frame behind emulation; exact
-capture paths call `finish_render_for_current_frame` so screenshots, frame
-dumps, recordings, debugger step, and run-to-PC output use the requested
+The render worker paints CPU buffers only. The main thread composes the
+newest completed presentation buffer into the texture image (the TV
+aperture or full-overscan copy, the tint, the status bar, panels and
+overlays) and hands that image to a second worker, `copperline-present`,
+which owns the GPU side of the window (the `pixels` surface and the
+scaler, CRT, bezel and sticker passes: `Gpu` in `window.rs`). The worker
+uploads the image, draws the passes and presents, so the main thread's
+redraw ends at hand-off rather than at the surface's vsync wait -- on a
+host that falls short of real time, that wait was otherwise a per-frame
+stall of the emulation loop. Up to two frames are in flight; a third
+redraw waits for the next pass. Everything the passes need (scaler
+draws, CRT uniforms, the RTG rect) is resolved on the main thread into
+the `PresentJob`. The worker gives the window's pre-present hint in the
+established order, after the draw and before the present, except on
+macOS, where every winit window method waits on the main thread and the
+hint is a no-op anyway. The GPU side comes home for the operations that
+need the main thread -- surface and texture resizes, present-mode and
+shader changes, and any frame carrying the RTG board's texture upload or
+the inspector's egui paint, which present synchronously as before
+(`Render::gpu_mut` reclaims it, waiting out a frame in flight). The
+worker shares the window with the main thread but never owns the last
+reference to it: on macOS a winit window dropped off the main thread
+dispatches its drop to the main thread and waits, and the main thread
+is the one joining the worker at shutdown, so the worker's clone
+releasing the window inside that join would deadlock the exit. The
+main-thread side keeps a reference past the join.
+`COPPERLINE_THREADED_PRESENT=0` presents every frame from the main thread.
+
+When nothing has to be composed over the picture on the CPU -- no menu,
+panel, OSD, badge or guest overlay, no tint, and no CRT, bezel or RTG pass
+that samples the composed texture -- the display draw of the scaler pass
+samples the presentation buffer itself (`ScalerDraw::picture`,
+`PresentScaler::upload_picture`) instead of a CPU copy of it into the
+texture. The buffer goes up at the canvas's own size, and the shader
+reproduces `copy_window_present_frame` per texel of the texture it stands
+in for: the same row selection and the same 8.8 two-column glass blend in
+the same integer arithmetic (`picture_texel` in `scaler.rs`, from the
+`PictureMap` `present::picture_map` builds from the copy's inputs), then
+the same clamp-to-edge bilinear filter in linear light that the sampler
+applies to the composed texture. Point sampling is bit-identical to the
+CPU path; the sharp filter differs by the sampler's weight precision,
+within two LSBs (`picture_draws_match_the_composed_texture`). The chrome
+band below the picture still comes from the CPU texture, and every case
+above falls back to composing the whole frame on the CPU.
+
+Normal display can be one frame behind emulation; exact capture paths
+call `finish_render_for_current_frame` so screenshots, frame dumps,
+recordings, debugger step, and run-to-PC output use the requested
 emulated frame.
 
 Run-ahead (`[emulation] run_ahead_frames`) sits above this pipeline. A burst
@@ -592,15 +643,30 @@ surface: the field is presented at a TV-like 4:3 aspect plus the
 is fed from `present_fb`, the post-processed presentation buffer produced by
 either the render worker or the synchronous fallback.
 
+Window creation selects its graphics backend before constructing the scaler,
+CRT passes, or egui renderer. On Windows, an automatically selected CPU adapter
+triggers a second `pixels` build restricted to OpenGL. Each renderer is dropped
+before creating another surface for the same native window. A failed or
+software-only GL attempt rebuilds the original backend; an error rebuilding
+it propagates to the window creator. `WGPU_BACKEND` and
+`WGPU_ADAPTER_NAME` opt out of this retry. Other platforms keep their existing
+selection policy, including Linux's Vulkan default.
+
 The emulator window is drawn onto the surface by its own scaling pass
-(`window/scaler.rs`), not the `pixels` crate default renderer (tool windows
-retain the built-in Fill renderer). The custom scaler pass accepts destination
+(`window/scaler.rs`), while the inspectors draw directly with egui. The custom
+scaler pass accepts destination
 rectangles and filter modes directly, allowing integer scaling multipliers beyond
 4x on high-resolution displays. Point sampling remains exact because the present
 copy replicates each canvas pixel into a uniform texel block. Smooth filtering
 uses a sharp bilinear shader with texel snapping. `PresentLayout`
 (`window/present.rs`) is the single source of truth for display geometry, cursor
 coordinates, and overlay positioning.
+
+The scaler draws an opaque black background across the surface before drawing
+the picture and chrome. A render-pass clear alone can leave corrupt colour and
+alpha values in the letterbox bars on Intel Mac Metal presentation surfaces,
+even when the same clear works on an offscreen texture. The background draw
+also covers frames with no display rectangles.
 
 `[display] autocrop` samples the active content sub-rectangle of the canvas each
 frame (`RenderResult::content_rect`), computed from raster lines containing
@@ -739,14 +805,118 @@ sequencer and a plausible CRTC mode whose visible rows fit in VRAM. During
 driver mode changes this makes presentation fall back to the native chipset
 frame instead of exposing stale or out-of-bounds VRAM.
 
-`ui.rs` implements the status bar widgets, the pop-up menu, the smaller
-overlay panels (About, Shortcuts, Calibration), and the shared debugger/tool
-panel drawing used by the native debugger and frame-analyzer windows. The UI
-uses the 8x8 `font.rs` glyphs. `COPPERLINE_UI_PREVIEW=1 cargo test
-panels_render_into_their_rects` renders every panel into
-`target/ui-preview-*.png` -- the screenshots in this documentation come
-from there -- and the `test_app()` fixture drives the debugger window
-against a real emulator instance in the unit tests.
+`ui.rs` implements the status bar widgets, pop-up menu, and smaller overlay
+panels (About, Shortcuts, Calibration), using the 8x8 `font.rs` glyphs. Its
+software inspector drawing helpers remain available for tests and rendering
+comparisons. `COPPERLINE_UI_PREVIEW=1 cargo test panels_render_into_their_rects`
+renders the software panels into `target/ui-preview-*.png`.
+
+The desktop `frontend` feature includes egui. `window/egui_debugger.rs` owns the
+shared debugger/Frame Analyzer/Console layout, text input, and GPU drawing.
+`egui_debugger/workspace.rs` integrates it into the main window: a transparent
+display pane supplies the destination rectangle to `debug_present_layout`,
+and the ordinary scaler, RTG, CRT, and bezel passes render there. Egui loads
+that same surface afterwards and adds the surrounding controls. The display
+never makes a GPU readback or an extra CPU image copy to enter the workspace.
+The same `PresentLayout` maps the picture and host cursor, including crop,
+integer scaling, and physical-pixel offsets.
+
+The main window retains its device, surface, vsync, and minimized-window guards.
+Live inspector snapshots, layout, and tessellation are cached at 20 Hz; input,
+stepping, and repaint deadlines invalidate the cache immediately. The display
+continues at its usual cadence, composing the cached UI between inspector updates.
+Textures retired by egui remain alive while the cached frame can still use
+them. They are released when that frame is replaced, before uploading the
+next frame's texture updates.
+Headless, browser, and libretro builds omit the desktop frontend and egui.
+`egui_debugger/analyzer.rs` supplies the four analyzer views, and
+`egui_debugger/console.rs` supplies the command field and selectable output.
+The inspector context replaces egui's Hack face with the bundled
+`assets/egui/hack-slash/HackSlash-Regular.ttf`. Only the zero outline changes,
+using Source Foundry's forward-slash alternate; character advances, line
+metrics, and the 13-point monospace style remain unchanged. Egui's Unicode
+fallbacks and proportional labels retain their default fonts. The asset's
+README and build script record how to reproduce it; `THIRD_PARTY_FONTS.txt`
+preserves its credits and licences in packaged builds.
+
+The egui versions in Cargo.toml share pixels' wgpu major version; upgrading
+them requires keeping those device and encoder types compatible.
+
+The view builder supplies side-effect-free snapshots, including structured CPU
+registers, disassembly, and memory. Software rendering helpers use fixed-width
+text clipping; egui receives complete lines and scrolls them. UI commands are
+collected during layout and applied through the existing debugger handlers
+after the final egui pass, so a repeated sizing pass cannot execute a command
+twice. Commands still dispatch if presentation fails, because their input has
+already been consumed. UI state and GPU resources belong to the host window
+and never enter save states. Repaint deadlines wake a paused event loop for
+caret blinking and interaction without advancing the machine; minimized windows
+skip presentation.
+
+Audio rows reserve four detail lines and place each scope beside the text.
+Their geometry depends on the viewport and font metrics, so transient pending
+flags and changing status text do not move later rows or mute controls. Detail
+text scrolls horizontally within its column; the tab header does not wrap.
+
+Logical panels stay independent of the visible Play/Debug layout. Selecting an
+inspector opens it lazily and preserves the other panels. Returning to Play
+retains those panels and the current run/pause state; explicitly closing a panel
+runs its existing cleanup, including profile/heat-map capture ownership. The
+last panel closing returns to Play. A native close exits the application.
+
+The workspace starts with input owned by the debugger. A display click transfers
+ownership to the guest; the capture shortcut releases it. While the debugger
+owns input, text events and raw device qualifiers are kept out of the Amiga.
+Transferring input back releases held host keys and buttons, so a swallowed
+key-up cannot leave an Amiga qualifier held. Physical gamepads keep their
+existing routing. Modal main-window overlays temporarily cover the workspace.
+
+Analyzer address links dispatch host navigation actions: they open the debugger,
+select CPU/Memory/Copper, pin the address, and reset the destination scroll.
+The captured frame is retained; the destination reads the current machine.
+The Console stores its input, output, and history in the existing panel model.
+Text edits stay in the panel, and submission becomes a single post-layout
+command batch, so paste and repeated sizing passes cannot execute commands.
+A `CLOSE` stops that batch. Hidden Console panels still receive guest output.
+
+`egui_debugger/preferences.rs` stores a small TOML file in the host data directory:
+Debug layout size, display divider, CPU divider sizes, and tab names. It is loaded
+lazily and saved atomically on returning to Play, closing an inspector, or exiting.
+The Play window size and position are kept in host memory while Debug is visible;
+position restoration checks that the title bar remains on a connected monitor.
+Invalid preferences fall back to defaults and sizes are bounded. Legacy inspector
+files retain their pane/tab settings. No egui internals or guest state are stored.
+Tests use temporary files; ordinary test App instances never read or write the
+user's preferences.
+
+The beam image uses the same pure `AnalyzerTraceView::raster_pixel` sampler as
+the software renderer for owner colours, CPU waits, picture blending, and beam
+scrub. Egui draws the display/DIW/DDF bounds, markers, and selections above that
+texture. Image picks map through the existing 0..1023 beam coordinates and
+256x256 memory grid. Diagram sizes come from the visible scroll viewport so
+window resizing keeps input and imagery aligned.
+
+The inspector tests run with the ordinary desktop unit suite on macOS, Linux,
+and Windows. The macOS **Inspector UI tests** step reuses the default build's
+library test binary and fails if the suite is missing. These tests exercise all
+tabs, input, navigation, shared lifecycle, and saved layouts without a GPU or
+native window, and compare serialized machine state before and after inspection.
+The `test_app()` fixture supplies a real emulator instance. For visual review
+on a host with a GPU:
+
+```sh
+cargo test --release --locked --lib render_debugger_previews -- --ignored --nocapture
+cargo test --release --locked --lib render_analyzer_previews -- --ignored --nocapture
+cargo test --release --locked --lib render_console_preview -- --ignored --nocapture
+```
+
+These write the nine debugger, four analyzer, and Console images to
+`target/egui-debugger/`. The similarly invoked
+`benchmark_debugger_repaint` test measures alternating, warmed CPU-tab repaints:
+legacy software drawing plus texture upload against egui layout, tessellation,
+and GPU submission. It excludes machine-data collection, GPU completion waits,
+window presentation/vsync, and emulation; its timings describe repaint CPU
+cost, not overall emulator performance.
 
 The configuration panel lives in `ui/configuration.rs`, with row drawing and
 hit-testing together in `configuration/rows.rs`, library artwork and entries in
@@ -876,3 +1046,42 @@ so a nominal "50 fps" label never drifts against PAL's true field rate and
 warp-speed captures play back at normal speed. The REC badge, status bar, OSD,
 and menus are drawn into the presentation texture after capture, so they never
 appear in the file.
+
+## GIF clips (`gifclip.rs`)
+
+The window's Save Clip as GIF and the headless `--gif-after` capture share
+one module. Presented frames are offered with their emulated timestamp at
+the same point the video recorder taps (after the presentation buffer is
+applied, before the status bar, OSD and menus are drawn) and pass through
+`present_capture_frame`, the picture builder `save_present_frame` uses for
+screenshots and frame dumps, so a clip has the same crop, TV aperture,
+centring and aspect as a screenshot of the same moment (an RTG frame is
+taken at its own row count, as the screenshot path does).
+
+A `FrameSelector` thins the field rate to `[recording] clip_fps` on the
+emulated timeline: a frame is taken once its timestamp reaches the next
+clip slot, and slots a gap skipped (a warp burst that presented nothing)
+are dropped rather than back-filled. Frames are stored as `ClipFrame`s:
+an exact first-seen-order palette plus 8-bit indices when the picture
+has 256 colours or fewer, the RGBA pixels otherwise. The interactive
+`ClipRing` keeps the last `clip_seconds` of those, stores a picture once
+however long it stays on screen (the next stored frame ends it), keeps
+the frame that was showing when the window opens with its time clamped to
+the window's start, and evicts the oldest frames past a 256 MiB byte
+budget; a timestamp that moves backwards (state load, reset) restarts it.
+
+`GifWriter` streams frames through the `gif` crate as a looping GIF89a
+with a local colour table per frame; a frame kept as RGBA is reduced with
+`color_quant`'s NeuQuant (trained on the frame, mapped through a colour
+cache) only when it is written. Delays are centiseconds computed as the
+difference of the cumulative rounded timestamps from the clip's origin,
+so 3.33 cs frames at 30 fps come out as 3, 4, 3 and the clip's length
+stays within half a centisecond of the emulated interval; the last frame
+runs to the clip's end (the ring's newest frame plus one period, or the
+`--gif-after` window's end). The interactive save clones the ring and
+encodes on a background thread, flashing the file name on the OSD when
+the write lands; the headless capture writes frames as they are taken,
+waiting for the renderer's exact frame like a frame dump, and finishes
+when emulated time passes its window. Every step is a pure function of
+the frames and their timestamps, so the same run yields a byte-identical
+file.

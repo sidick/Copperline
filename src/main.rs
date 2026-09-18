@@ -27,7 +27,7 @@ use copperline::emulator::Emulator;
 use copperline::floppy::FloppyController;
 use copperline::memory::Memory;
 use copperline::serial::StdoutSink;
-use copperline::video::window::{App, DiskInsertSpec};
+use copperline::video::window::{App, DiskInsertSpec, GifCaptureSpec};
 use copperline::video::HOST_SHORTCUT_MODIFIER_LABEL;
 
 mod cli;
@@ -85,6 +85,16 @@ fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
             "--benchmark-until cannot be combined with --screenshot-after"
         ));
     }
+    if !cli.expect_screenshot.is_empty() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --expect-screenshot"
+        ));
+    }
+    if cli.exit_on_return {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --exit-on-return"
+        ));
+    }
     if !cli.save_state_after.is_empty() {
         return Err(anyhow!(
             "--benchmark-until cannot be combined with --save-state-after"
@@ -93,6 +103,11 @@ fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
     if cli.frame_dump.is_some() {
         return Err(anyhow!(
             "--benchmark-until cannot be combined with --dump-frames"
+        ));
+    }
+    if !cli.gif_after.is_empty() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --gif-after"
         ));
     }
     if cli.live_audio_profile_secs.is_some() {
@@ -106,6 +121,7 @@ fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
         || !cli.mouse_after.is_empty()
         || !cli.mouse_to_after.is_empty()
         || !cli.pot_after.is_empty()
+        || !cli.pen_after.is_empty()
         || !cli.freeze_after.is_empty()
     {
         return Err(anyhow!(
@@ -136,6 +152,24 @@ fn validate_run_args(cli: &CliArgs) -> Result<()> {
         return Err(anyhow!(
             "--run and --whdload are mutually exclusive: each stages its own boot volume"
         ));
+    }
+    if (cli.coverage.is_some() || !cli.coverage_source_map.is_empty()) && cli.run.is_none() {
+        return Err(anyhow!(
+            "--coverage and --coverage-source-map need --run: coverage is counted from \
+             the program's LoadSeg to its exit"
+        ));
+    }
+    if cli.coverage.is_none() && !cli.coverage_source_map.is_empty() {
+        return Err(anyhow!("--coverage-source-map needs --coverage FILE"));
+    }
+    #[cfg(not(feature = "dap"))]
+    if cli.coverage.is_some() {
+        return Err(anyhow!(
+            "--coverage needs the debug-information reader; this build has no `dap` feature"
+        ));
+    }
+    if cli.coverage.is_some() && cli.netplay.is_some() {
+        return Err(anyhow!("--coverage cannot combine with netplay"));
     }
     Ok(())
 }
@@ -169,11 +203,17 @@ fn validate_gdb_args(cli: &CliArgs) -> Result<()> {
     if !cli.screenshot_after.is_empty() {
         return Err(anyhow!("--gdb cannot be combined with --screenshot-after"));
     }
+    if !cli.expect_screenshot.is_empty() {
+        return Err(anyhow!("--gdb cannot be combined with --expect-screenshot"));
+    }
     if !cli.save_state_after.is_empty() {
         return Err(anyhow!("--gdb cannot be combined with --save-state-after"));
     }
     if cli.frame_dump.is_some() {
         return Err(anyhow!("--gdb cannot be combined with --dump-frames"));
+    }
+    if !cli.gif_after.is_empty() {
+        return Err(anyhow!("--gdb cannot be combined with --gif-after"));
     }
     if cli.live_audio_profile_secs.is_some() {
         return Err(anyhow!(
@@ -186,6 +226,7 @@ fn validate_gdb_args(cli: &CliArgs) -> Result<()> {
         || !cli.mouse_after.is_empty()
         || !cli.mouse_to_after.is_empty()
         || !cli.pot_after.is_empty()
+        || !cli.pen_after.is_empty()
         || !cli.freeze_after.is_empty()
     {
         return Err(anyhow!(
@@ -244,6 +285,9 @@ fn validate_control_args(cli: &CliArgs) -> Result<()> {
     if cli.frame_dump.is_some() {
         return Err(anyhow!("--control cannot be combined with --dump-frames"));
     }
+    if !cli.gif_after.is_empty() {
+        return Err(anyhow!("--control cannot be combined with --gif-after"));
+    }
     if cli.live_audio_profile_secs.is_some() {
         return Err(anyhow!(
             "--control cannot be combined with --profile-live-audio"
@@ -255,6 +299,7 @@ fn validate_control_args(cli: &CliArgs) -> Result<()> {
         || !cli.mouse_after.is_empty()
         || !cli.mouse_to_after.is_empty()
         || !cli.pot_after.is_empty()
+        || !cli.pen_after.is_empty()
         || !cli.freeze_after.is_empty()
     {
         return Err(anyhow!(
@@ -664,7 +709,31 @@ fn list_midi_endpoints() -> Result<()> {
     Ok(())
 }
 
+/// `--list-serial-ports`: the host serial ports `[serial] device` /
+/// `--serial-device` take, as the paths to spell them by.
+fn list_serial_ports() -> Result<()> {
+    if !cfg!(feature = "host-serial") {
+        println!(
+            "This build has no host serial port support; rebuild with --features host-serial."
+        );
+        return Ok(());
+    }
+    let ports = copperline::serial::device::available_host_ports();
+    println!("Serial ports (for --serial-device):");
+    if ports.is_empty() {
+        println!("  (none)");
+    }
+    for port in &ports {
+        println!("  {port}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // Before the logger, which is the first thing that would write to a
+    // console this is about to take away (see winconsole).
+    copperline::winconsole::detach_desktop_console();
+
     let mut log_builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     // Copperline resolves gamepads through gilrs's bundled SDL controller
@@ -718,6 +787,9 @@ fn main() -> Result<()> {
     }
     if cli.list_midi {
         return list_midi_endpoints();
+    }
+    if cli.list_serial_ports {
+        return list_serial_ports();
     }
     if cli.list_audio_devices {
         return print_audio_output_devices();
@@ -788,10 +860,12 @@ fn main() -> Result<()> {
         )?);
     }
 
+    // Guests and spectators receive the host's machine; their own
+    // configuration is only a placeholder with local preferences.
     let netplay_guest = cli
         .netplay
         .as_ref()
-        .is_some_and(|options| options.settings().player == 1);
+        .is_some_and(|options| options.role() != copperline::netplay::Role::Host);
     let (cfg, mut raw_cfg) = if netplay_guest {
         let raw = load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
         (copperline::netplay::guest_config(&raw)?, raw)
@@ -868,6 +942,19 @@ fn main() -> Result<()> {
     // configuration and CLI flags say.
     let mut run_prog_name: Option<String> = None;
     let mut run_warp: Option<copperline::runprog::WarpLaunch> = None;
+    // --exit-on-return watches the same completion marker the warp gate
+    // does, for the whole run rather than the launch phase.
+    let mut run_done_marker: Option<std::path::PathBuf> = None;
+    if cli.exit_on_return && cli.run.is_none() {
+        return Err(anyhow!(
+            "--exit-on-return needs a --run program whose return code to report"
+        ));
+    }
+    // --run PROG --coverage FILE: the run's debug information is read
+    // before the machine boots, so a missing or unreadable executable
+    // fails here rather than after a full boot.
+    #[cfg(feature = "dap")]
+    let mut coverage_run: Option<copperline::profile::lcov::CoverageRun> = None;
     if let Some(program) = cli.run.as_ref().filter(|_| !netplay_guest) {
         let prepared = copperline::runprog::prepare_with_options(
             program,
@@ -887,10 +974,26 @@ fn main() -> Result<()> {
             prepared.prog_dir.display(),
             copperline::runprog::PROG_VOLUME
         );
+        let done_marker = prepared.boot_dir.join(copperline::runprog::DONE_MARKER);
         run_warp = Some(copperline::runprog::WarpLaunch::new(
             prepared.prog_name.clone(),
-            Some(prepared.boot_dir.join(copperline::runprog::DONE_MARKER)),
+            Some(done_marker.clone()),
         ));
+        run_done_marker = cli.exit_on_return.then_some(done_marker);
+        #[cfg(feature = "dap")]
+        if let Some(out) = cli.coverage.as_ref() {
+            coverage_run = Some(
+                copperline::profile::lcov::CoverageRun::prepare(
+                    program,
+                    None,
+                    prepared.prog_name.clone(),
+                    prepared.boot_dir.join(copperline::runprog::DONE_MARKER),
+                    out.clone(),
+                    cli.coverage_source_map.clone(),
+                )
+                .map_err(|e| anyhow!("--coverage: {e}"))?,
+            );
+        }
         run_prog_name = Some(prepared.prog_name);
     }
     // Only the gdb and control dispatches read the program name; without
@@ -1010,11 +1113,19 @@ fn main() -> Result<()> {
     // Headless capture runs (screenshot / frame dump) advance the
     // deterministic core unthrottled; the interactive window paces to
     // wall-clock time. The emulated result is identical either way.
+    // A --coverage run without an interactive server attached is a capture
+    // run too: it ends by itself when the program exits. With
+    // --control-gui/--gdb-gui it rides along the windowed session instead.
+    let coverage_capture =
+        cli.coverage.is_some() && cli.control_gui.is_none() && cli.gdb_gui.is_none();
     let headless_capture = !cli.screenshot_after.is_empty()
+        || !cli.expect_screenshot.is_empty()
         || cli.frame_dump.is_some()
+        || !cli.gif_after.is_empty()
         || cli.benchmark_until.is_some()
         || cli.gdb.is_some()
-        || cli.control.is_some();
+        || cli.control.is_some()
+        || coverage_capture;
     // A real drive on a bridge is the exception: its platter turns in
     // wall-clock time and cannot be hurried. Left unthrottled, the emulated
     // machine outruns it -- spinning the motor up and down faster than it can
@@ -1027,6 +1138,9 @@ fn main() -> Result<()> {
         info!("emulation timing: paced to wall-clock because a physical floppy drive is attached");
     }
     info!("emulation timing: deterministic core, paced={paced}");
+    // Host clipboard sharing is off unless the configuration asked for it,
+    // windowed or headless, and off under netplay either way.
+    cfg.resolve_clipboard_share(cli.netplay.is_some() || netplay_guest);
     let mut emu = emulator::build_machine(
         &cfg,
         audio,
@@ -1035,6 +1149,10 @@ fn main() -> Result<()> {
     )?;
     if let Some(uss) = &uss {
         uss.load(&mut emu)?;
+    }
+    #[cfg(feature = "dap")]
+    if let Some(run) = coverage_run.take() {
+        emu.arm_coverage_run(run);
     }
     if let Some(path) = &cli.load_state {
         let outcome = emu.load_state(path)?;
@@ -1117,6 +1235,7 @@ fn main() -> Result<()> {
     });
     video::set_pixel_aspect(config::resolve_pixel_aspect(cfg.pixel_aspect));
     video::set_display_scaling(cfg.scaling);
+    video::set_hidpi_texture(cfg.hidpi_texture);
     video::set_autocrop(cfg.autocrop);
     video::set_menu_scale(cfg.menu_scale);
     // A fascia belongs to a machine that carries the instrument: with the
@@ -1142,7 +1261,11 @@ fn main() -> Result<()> {
     // window-server access), and a capture run must work anywhere.
     // --control-gui keeps the windowed path: it explicitly asks for an
     // interactive session.
-    let windowless_capture = (!cli.screenshot_after.is_empty() || cli.frame_dump.is_some())
+    let windowless_capture = (!cli.screenshot_after.is_empty()
+        || !cli.expect_screenshot.is_empty()
+        || cli.frame_dump.is_some()
+        || !cli.gif_after.is_empty()
+        || coverage_capture)
         && cli.control_gui.is_none()
         && cli.gdb_gui.is_none();
     // The warp-launch gate belongs to interactive sessions only: a capture
@@ -1178,40 +1301,82 @@ fn main() -> Result<()> {
         }
         let session = copperline::netplay::Session::new(options, &mut emu, &cfg)?;
         #[cfg(feature = "netplay-internet")]
-        if let Some(path) = &cli.netplay_invitation_out {
-            if let copperline::netplay::ConnectionOptions::Internet(options) = session.options() {
+        if let copperline::netplay::ConnectionOptions::Internet(options) = session.options() {
+            fn write_invitation(path: &std::path::Path, code: &str) -> Result<()> {
                 let parent = path
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let mut file = tempfile::NamedTempFile::new_in(parent)?;
-                std::io::Write::write_all(&mut file, options.invitation.encode()?.as_bytes())?;
+                std::io::Write::write_all(&mut file, code.as_bytes())?;
                 file.persist(path)
                     .map_err(|error| anyhow!("Writing netplay invitation: {}", error.error))?;
+                Ok(())
+            }
+            if let Some(path) = &cli.netplay_invitation_out {
+                write_invitation(path, &options.invitation.encode()?)?;
                 log::info!(
                     "netplay: invitation written to {}; waiting for guest",
                     path.display()
                 );
             }
+            if let (Some(path), Some(invitation)) = (
+                &cli.netplay_spectator_invitation_out,
+                options.spectator_invitation(),
+            ) {
+                write_invitation(path, &invitation.encode()?)?;
+                log::info!(
+                    "netplay: spectator invitation written to {}; up to {} may watch",
+                    path.display(),
+                    options.spectators
+                );
+            }
         }
         #[cfg(not(feature = "netplay-internet"))]
-        let _ = &cli.netplay_invitation_out;
+        let _ = (
+            &cli.netplay_invitation_out,
+            &cli.netplay_spectator_invitation_out,
+        );
         Some(session)
     } else {
         None
     };
+    // Each --gif-after clip covers --gif-seconds, defaulting to the
+    // configured ring length; a ring switched off has no length to lend.
+    let gif_seconds = match cli.gif_seconds {
+        Some(secs) => secs,
+        None if cli.gif_after.is_empty() => 0.0,
+        None if cfg.recording.clip_seconds > 0 => cfg.recording.clip_seconds as f32,
+        None => {
+            return Err(anyhow!(
+                "--gif-after needs --gif-seconds N: [recording] clip_seconds is 0"
+            ))
+        }
+    };
+    let gif_after: Vec<GifCaptureSpec> = cli
+        .gif_after
+        .into_iter()
+        .map(|(start_secs, path)| GifCaptureSpec {
+            start_secs,
+            seconds: gif_seconds,
+            path,
+        })
+        .collect();
     let mut app = App::new(
         emu,
         cfg.emulation.power_on,
         cli.screenshot_after,
         cli.save_state_after,
         cli.frame_dump,
+        gif_after,
+        cfg.recording.clip_settings(),
         cli.press_after,
         cli.click_after,
         cli.joy_after,
         cli.mouse_after,
         cli.mouse_to_after,
         cli.pot_after,
+        cli.pen_after,
         disk_insert_after,
         cli.cd_insert_after,
         cli.freeze_after,
@@ -1229,6 +1394,7 @@ fn main() -> Result<()> {
         config::resolve_bezel(cfg.bezel),
         config::resolve_bezel_stickers(cfg.bezel_stickers.clone()),
         config::resolve_perf_overlay(cfg.perf_overlay),
+        cfg.vsync,
         config::resolve_tint(cfg.tint),
         cfg.full_screen,
         !cfg.status_bar,
@@ -1246,6 +1412,10 @@ fn main() -> Result<()> {
         live_audio,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
+    app.set_expect_screenshots(cli.expect_screenshot);
+    if let Some(marker) = run_done_marker {
+        app.set_exit_on_return(marker);
+    }
     if let Some(session) = netplay {
         app.attach_netplay(session);
     }
@@ -1285,12 +1455,24 @@ fn main() -> Result<()> {
     }
     if windowless_capture {
         info!("headless capture: running without a window (no display connection)");
-        return app.run_headless();
+        return finish_with(app.run_headless()?);
     }
     info!(
         "entering event loop. {HOST_SHORTCUT_MODIFIER_LABEL}+Q to quit, {HOST_SHORTCUT_MODIFIER_LABEL}+S to screenshot, {HOST_SHORTCUT_MODIFIER_LABEL}+G to capture/release mouse."
     );
-    app.run()
+    finish_with(app.run()?)
+}
+
+/// End the process with the session's verdict (src/verdict.rs): a plain
+/// return for the usual 0, otherwise the status the run concluded on. The
+/// App has already been dropped by then (its recording flushed), so the
+/// immediate exit loses nothing.
+fn finish_with(status: i32) -> Result<()> {
+    if status != 0 {
+        info!("exiting with status {status}");
+        std::process::exit(status);
+    }
+    Ok(())
 }
 
 /// Build the minimal placeholder machine that hosts the configuration screen
@@ -1349,6 +1531,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
     // the default aspect and scaling; the machine it starts applies its own
     // (see start_configured_machine).
     video::set_display_scaling(config::DisplayScaling::Smooth);
+    video::set_hidpi_texture(true);
     video::set_autocrop(false);
     // The launcher opens before a machine config is built, so the menu size
     // comes straight off the raw file.
@@ -1362,6 +1545,9 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         Vec::new(),
         Vec::new(),
         None,
+        Vec::new(),
+        copperline::gifclip::ClipSettings::default(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -1385,6 +1571,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         config::resolve_bezel(config::BezelStyle::None),
         config::resolve_bezel_stickers(None),
         config::resolve_perf_overlay(false),
+        true,
         config::resolve_tint(config::Tint::None),
         // The config-screen placeholder is always a normal windowed UI.
         false,
@@ -1407,7 +1594,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
     // `[emulation] auto_launch` in the configuration the launcher opened
     // showing: straight to the machine, no configuration screen first.
     app.auto_launch_if_asked();
-    app.run()
+    finish_with(app.run()?)
 }
 
 /// Whether to show the configuration screen instead of booting: only on a bare
@@ -1429,8 +1616,11 @@ fn launcher_requested(cli: &CliArgs) -> bool {
         && cli.overrides.is_empty()
         && !Path::new("copperline.toml").exists()
         && cli.screenshot_after.is_empty()
+        && cli.expect_screenshot.is_empty()
+        && !cli.exit_on_return
         && cli.save_state_after.is_empty()
         && cli.frame_dump.is_none()
+        && cli.gif_after.is_empty()
         && cli.benchmark_until.is_none()
         && cli.gdb.is_none()
         && cli.gdb_gui.is_none()
@@ -1444,6 +1634,7 @@ fn launcher_requested(cli: &CliArgs) -> bool {
         && cli.mouse_after.is_empty()
         && cli.mouse_to_after.is_empty()
         && cli.pot_after.is_empty()
+        && cli.pen_after.is_empty()
         && cli.freeze_after.is_empty()
         && cli.disk_insert_after.is_empty()
         && cli.record_input.is_none()
@@ -1777,12 +1968,85 @@ mod tests {
             .to_string()
             .contains("--run"));
 
+        // --coverage counts the --run program, so it needs one; its
+        // source map needs the file.
+        let covered = parse(&[
+            "--run",
+            "hello",
+            "--coverage",
+            "out/cov.info",
+            "--coverage-source-map",
+            "/build=/src",
+        ])
+        .unwrap();
+        assert_eq!(covered.coverage.as_deref(), Some(Path::new("out/cov.info")));
+        assert_eq!(
+            covered.coverage_source_map,
+            vec![("/build".to_string(), "/src".to_string())]
+        );
+        assert!(validate_run_args(&covered).is_ok());
+        let orphan = parse(&["--coverage", "out/cov.info"]).unwrap();
+        assert!(validate_run_args(&orphan)
+            .unwrap_err()
+            .to_string()
+            .contains("--run"));
+        let mapless = parse(&["--run", "hello", "--coverage-source-map", "a=b"]).unwrap();
+        assert!(validate_run_args(&mapless)
+            .unwrap_err()
+            .to_string()
+            .contains("--coverage FILE"));
+        assert!(parse(&["--run", "hello", "--coverage-source-map", "nope"]).is_err());
+
         // --run and --whdload each stage their own boot volume.
         let both = parse(&["--run", "hello", "--whdload", "game.lha"]).unwrap();
         assert!(validate_run_args(&both)
             .unwrap_err()
             .to_string()
             .contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn gif_flags_parse_and_validate() {
+        let args = parse(&[
+            "--gif-after",
+            "24",
+            "intro.gif",
+            "--gif-after",
+            "40",
+            "boss.gif",
+            "--gif-seconds",
+            "5",
+        ])
+        .unwrap();
+        let clips: Vec<_> = args
+            .gif_after
+            .iter()
+            .map(|(secs, path)| (*secs, path.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            clips,
+            vec![
+                (24.0, "intro.gif".to_owned()),
+                (40.0, "boss.gif".to_owned())
+            ]
+        );
+        assert_eq!(args.gif_seconds, Some(5.0));
+        // The length defaults to [recording] clip_seconds when omitted.
+        let args = parse(&["--gif-after", "24", "intro.gif"]).unwrap();
+        assert_eq!(args.gif_seconds, None);
+
+        let err = parse(&["--gif-seconds", "5"]).unwrap_err();
+        assert!(err.to_string().contains("--gif-after"), "{err:#}");
+        assert!(parse(&["--gif-after", "1"]).is_err());
+        assert!(parse(&["--gif-after", "soon", "x.gif"]).is_err());
+        assert!(parse(&["--gif-after", "1", "x.gif", "--gif-seconds", "0"]).is_err());
+        assert!(parse(&["--gif-after", "1", "x.gif", "--gif-seconds", "500"]).is_err());
+
+        // Like every capture flag, it cannot share the machine with the
+        // benchmark runner.
+        let args = parse(&["--gif-after", "1", "x.gif", "--benchmark-until", "5"]).unwrap();
+        let err = validate_benchmark_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--gif-after"), "{err:#}");
     }
 
     #[test]
@@ -1911,6 +2175,51 @@ mod tests {
     }
 
     #[test]
+    fn joy_after_reaches_the_adapter_sockets_and_pen_after_positions_the_pen() -> Result<()> {
+        let args = parse(&[
+            "--joy-after",
+            "4",
+            "red",
+            "100",
+            "3",
+            "--joy-after",
+            "5",
+            "up",
+            "100",
+            "4",
+            "--pen-after",
+            "3",
+            "320",
+            "128",
+            "--pen-after",
+            "6",
+            "-1",
+            "-1",
+            "2",
+            "--noaudio",
+        ])?;
+        assert_eq!(
+            args.joy_after,
+            vec![
+                (4.0, JoyButtonKind::Red, 100, 2),
+                (5.0, JoyButtonKind::Up, 100, 3)
+            ]
+        );
+        assert_eq!(
+            args.pen_after,
+            vec![(3.0, 320, 128, None), (6.0, -1, -1, Some(1))]
+        );
+        assert!(!args.audio_live);
+        // The same directives inside a script.
+        let path = temp_script("pen", "pen-after 4.5 100 40 1\njoy-after 1 fire 50 4\n");
+        let args = parse(&["--script", &path.display().to_string()])?;
+        assert_eq!(args.pen_after, vec![(4.5, 100, 40, Some(0))]);
+        assert_eq!(args.joy_after, vec![(1.0, JoyButtonKind::Red, 50, 3)]);
+        std::fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    #[test]
     fn port_token_lookahead_does_not_eat_a_following_flag() -> Result<()> {
         // No trailing port: the next flag must survive as a flag, and the
         // defaults are click/mouse -> port 1, joy/pot -> port 2 (0-based
@@ -1963,6 +2272,130 @@ mod tests {
             })]
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn type_after_expands_to_spaced_key_presses() -> Result<()> {
+        use copperline::typing::{
+            RAWKEY_LSHIFT, TYPE_KEY_HOLD_MS, TYPE_KEY_PITCH_MS, TYPE_SHIFT_HOLD_MS,
+            TYPE_SHIFT_LEAD_MS,
+        };
+        let args = parse(&["--type-after", "5", "Di\\n"])?;
+        let keys: Vec<(f32, u8, u32)> = args
+            .press_after
+            .iter()
+            .map(|k| (k.secs, k.rawkey, k.hold_ms))
+            .collect();
+        let pitch = TYPE_KEY_PITCH_MS as f32 / 1000.0;
+        let lead = TYPE_SHIFT_LEAD_MS as f32 / 1000.0;
+        assert_eq!(
+            keys,
+            vec![
+                (5.0, RAWKEY_LSHIFT, TYPE_SHIFT_HOLD_MS),
+                (5.0 + lead, 0x22, TYPE_KEY_HOLD_MS),
+                (5.0 + pitch, 0x17, TYPE_KEY_HOLD_MS),
+                (5.0 + 2.0 * pitch, 0x44, TYPE_KEY_HOLD_MS),
+            ]
+        );
+        // Typed text and explicit presses share one queue, in flag order.
+        let args = parse(&["--press-after", "1", "esc", "--type-after", "2", "a"])?;
+        assert_eq!(args.press_after.len(), 2);
+        assert_eq!(args.press_after[0].rawkey, 0x45);
+        assert_eq!(args.press_after[1].rawkey, 0x20);
+        // Untypable text is an error naming the characters, not silence.
+        let err = parse(&["--type-after", "1", "caf\u{e9}"]).unwrap_err();
+        assert!(err.to_string().contains("\u{e9}"), "{err}");
+        assert!(parse(&["--type-after", "1"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn script_type_directive_is_type_after() -> Result<()> {
+        let path = temp_script("type", "type 3.5 \"dir df0:\\n\"\ntype-after 4 x\n");
+        let args = parse(&["--script", path.to_str().unwrap()])?;
+        // "dir df0:" + Return: 9 keys plus one Shift (for the colon), then x.
+        assert_eq!(args.press_after.len(), 11);
+        assert_eq!(args.press_after[0].secs, 3.5);
+        assert_eq!(args.press_after[0].rawkey, 0x22);
+        assert_eq!(args.press_after[10].secs, 4.0);
+        assert_eq!(args.press_after[10].rawkey, 0x32);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn expect_screenshot_takes_an_optional_tolerance() -> Result<()> {
+        use copperline::expect::Tolerance;
+        let args = parse(&[
+            "--expect-screenshot",
+            "10",
+            "a.png",
+            "--expect-screenshot",
+            "20",
+            "b.png",
+            "0.001",
+            "--expect-screenshot",
+            "30",
+            "c.png",
+            "250",
+            "KICK13.ROM",
+        ])?;
+        let got: Vec<_> = args
+            .expect_screenshot
+            .iter()
+            .map(|e| (e.secs, e.path.to_string_lossy().into_owned(), e.tolerance))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (10.0, "a.png".to_owned(), Tolerance::Exact),
+                (20.0, "b.png".to_owned(), Tolerance::Fraction(0.001)),
+                (30.0, "c.png".to_owned(), Tolerance::Pixels(250)),
+            ]
+        );
+        // A positional ROM path after the flag is not mistaken for a tolerance.
+        assert_eq!(args.rom_path.as_deref(), Some(Path::new("KICK13.ROM")));
+        let args = parse(&["--expect-screenshot", "1", "x.png", "--noaudio"])?;
+        assert_eq!(args.expect_screenshot[0].tolerance, Tolerance::Exact);
+        assert!(!args.audio_live);
+        assert!(parse(&["--expect-screenshot", "1"]).is_err());
+
+        // The script directive spells the same flag.
+        let path = temp_script("expect", "expect-screenshot 2 \"/tmp/a b.png\" 3\n");
+        let args = parse(&["--script", path.to_str().unwrap()])?;
+        assert_eq!(
+            args.expect_screenshot[0].path,
+            PathBuf::from("/tmp/a b.png")
+        );
+        assert_eq!(args.expect_screenshot[0].tolerance, Tolerance::Pixels(3));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn exit_on_return_is_a_flag_and_excluded_from_benchmarks() -> Result<()> {
+        assert!(!parse(&[])?.exit_on_return);
+        let args = parse(&["--run", "prog", "--exit-on-return"])?;
+        assert!(args.exit_on_return);
+        let err = validate_benchmark_args(&parse(&[
+            "--benchmark-until",
+            "5",
+            "--run",
+            "prog",
+            "--exit-on-return",
+        ])?)
+        .unwrap_err();
+        assert!(err.to_string().contains("--exit-on-return"), "{err}");
+        let err = validate_benchmark_args(&parse(&[
+            "--benchmark-until",
+            "5",
+            "--expect-screenshot",
+            "1",
+            "x.png",
+        ])?)
+        .unwrap_err();
+        assert!(err.to_string().contains("--expect-screenshot"), "{err}");
         Ok(())
     }
 
@@ -2597,7 +3030,7 @@ mod netplay_cli_tests {
             "df0",
             "game.adf",
         ])?;
-        let options = cli.netplay.as_ref().unwrap().settings();
+        let options = cli.netplay.as_ref().unwrap().settings().unwrap();
         assert_eq!(options.player, 0);
         assert_eq!(options.input_delay, 2);
         assert_eq!(options.rollback_frames, 8);
@@ -2607,6 +3040,7 @@ mod netplay_cli_tests {
                 .netplay
                 .unwrap()
                 .settings()
+                .unwrap()
                 .input_delay,
             0
         );
@@ -2685,8 +3119,16 @@ mod internet_netplay_cli_tests {
         assert_eq!(options.settings().player, 0);
         let code = options.invitation.encode()?;
         let join = parse(&["--netplay-join", &code])?;
-        assert_eq!(join.netplay.as_ref().unwrap().settings().player, 1);
-        assert_eq!(join.netplay.as_ref().unwrap().settings().input_delay, 4);
+        assert_eq!(join.netplay.as_ref().unwrap().settings().unwrap().player, 1);
+        assert_eq!(
+            join.netplay
+                .as_ref()
+                .unwrap()
+                .settings()
+                .unwrap()
+                .input_delay,
+            4
+        );
         for args in [
             vec![
                 "--netplay-host",
@@ -2714,6 +3156,167 @@ mod internet_netplay_cli_tests {
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod spectator_cli_tests {
+    use super::*;
+    use copperline::netplay::{ConnectionOptions, Role};
+
+    const SESSION: &str = "0123456789abcdef0123456789abcdef";
+
+    fn parse(args: &[&str]) -> Result<CliArgs> {
+        parse_args_from(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn direct_hosts_admit_spectators_and_watchers_take_no_input() -> Result<()> {
+        let host = [
+            "--netplay-bind",
+            "0.0.0.0:19732",
+            "--netplay-peer",
+            "192.168.1.11:19732",
+            "--netplay-player",
+            "1",
+            "--netplay-session",
+            SESSION,
+        ];
+        let mut with_spectators = host.to_vec();
+        with_spectators.extend(["--netplay-spectators", "3"]);
+        let options = parse(&with_spectators)?.netplay.unwrap();
+        assert_eq!(options.role(), Role::Host);
+        assert_eq!(options.spectators(), 3);
+        assert_eq!(parse(&host)?.netplay.unwrap().spectators(), 0);
+        let mut guest = host.to_vec();
+        guest[5] = "2";
+        guest.extend(["--netplay-spectators", "1"]);
+        assert!(parse(&guest).is_err(), "only player 1 admits spectators");
+        let mut too_many = host.to_vec();
+        too_many.extend(["--netplay-spectators", "9"]);
+        assert!(parse(&too_many).is_err());
+        let mut invite = host.to_vec();
+        invite.extend(["--netplay-spectator-invite", "/tmp/s.txt"]);
+        assert!(
+            parse(&invite).is_err(),
+            "invitation files are an Internet host's"
+        );
+
+        let watch = [
+            "--netplay-watch",
+            "192.168.1.10:19732",
+            "--netplay-session",
+            SESSION,
+        ];
+        let options = parse(&watch)?.netplay.unwrap();
+        assert_eq!(options.role(), Role::Spectator);
+        assert!(options.settings().is_none());
+        let ConnectionOptions::Watch(direct) = options else {
+            panic!("expected direct watch options");
+        };
+        assert_eq!(direct.host.port(), 19732);
+        assert!(direct.bind.ip().is_unspecified() && direct.bind.port() == 0);
+        let ConnectionOptions::Watch(v6) = parse(&[
+            "--netplay-watch",
+            "[2001:db8::2]:19732",
+            "--netplay-session",
+            SESSION,
+        ])?
+        .netplay
+        .unwrap() else {
+            panic!("expected direct watch options");
+        };
+        assert!(v6.bind.is_ipv6());
+        assert!(parse(&watch[..2]).is_err(), "the session code is required");
+        for extra in [
+            &["--netplay-player", "1"][..],
+            &["--netplay-peer", "192.168.1.11:19732"],
+            &["--netplay-delay", "1"],
+            &["--netplay-spectators", "1"],
+            &["--joy-after", "1", "red", "100", "1"],
+            &["--press-after", "1", "f1"],
+            &["--type-after", "1", "hello"],
+            &["--insert-disk-after", "1", "df0", "x.adf"],
+        ] {
+            let mut args = watch.to_vec();
+            args.extend(extra);
+            assert!(parse(&args).is_err(), "{extra:?}");
+        }
+        let mut capture = watch.to_vec();
+        capture.extend(["--screenshot-after", "10", "/tmp/x.png", "--noaudio"]);
+        assert!(parse(&capture).is_ok());
+        Ok(())
+    }
+
+    #[cfg(feature = "netplay-internet")]
+    #[test]
+    fn internet_hosts_write_a_separate_spectator_code_that_only_watches() -> Result<()> {
+        assert!(
+            parse(&["--netplay-host", "/tmp/i.txt", "--netplay-spectators", "2"]).is_err(),
+            "spectators need somewhere to write their code"
+        );
+        let host = parse(&[
+            "--netplay-host",
+            "/tmp/i.txt",
+            "--netplay-spectators",
+            "2",
+            "--netplay-spectator-invite",
+            "/tmp/s.txt",
+        ])?;
+        assert_eq!(
+            host.netplay_spectator_invitation_out.as_deref(),
+            Some(std::path::Path::new("/tmp/s.txt"))
+        );
+        let ConnectionOptions::Internet(options) = host.netplay.unwrap() else {
+            panic!("expected Internet options");
+        };
+        assert_eq!(options.spectators, 2);
+        let code = options.spectator_invitation().unwrap().encode()?;
+        let player = options.invitation.encode()?;
+        let watch = parse(&["--netplay-watch", &code, "--netplay-relay-only"])?;
+        let ConnectionOptions::WatchInternet(watching) = watch.netplay.unwrap() else {
+            panic!("expected Internet watch options");
+        };
+        assert!(watching.relay_only);
+        assert_eq!(
+            watching.invitation.capability,
+            options.spectator_capability.unwrap()
+        );
+        assert!(parse(&["--netplay-watch", &code, "--netplay-delay", "1"]).is_err());
+        assert!(parse(&["--netplay-watch", &code, "--netplay-session", SESSION]).is_err());
+        assert!(parse(&[
+            "--netplay-watch",
+            &code,
+            "--joy-after",
+            "1",
+            "red",
+            "100",
+            "1"
+        ])
+        .is_err());
+        assert!(
+            parse(&["--netplay-join", &code]).is_err(),
+            "a spectator code admits no player"
+        );
+        assert!(
+            parse(&["--netplay-watch", &player]).is_err(),
+            "a player invitation admits no spectator"
+        );
+        assert!(parse(&["--netplay-join", &player, "--netplay-spectators", "1"]).is_err());
+        assert!(parse(&[
+            "--netplay-join",
+            &player,
+            "--netplay-spectator-invite",
+            "/tmp/s.txt"
+        ])
+        .is_err());
+        let plain = parse(&["--netplay-host", "/tmp/i.txt"])?;
+        assert!(plain.netplay_spectator_invitation_out.is_none());
+        let ConnectionOptions::Internet(options) = plain.netplay.unwrap() else {
+            panic!("expected Internet options");
+        };
+        assert!(options.spectator_invitation().is_none());
         Ok(())
     }
 }

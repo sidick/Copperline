@@ -1,6 +1,6 @@
 [package]
 name = "copperline"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.95"
 license = "GPL-3.0-or-later"
@@ -36,6 +36,7 @@ default = [
     "gdb",
     "dap",
     "netplay-internet",
+    "host-serial",
 ]
 # Native NAT traversal and encrypted relay fallback. The portable/WASM core
 # keeps using its frontend-provided transport.
@@ -97,7 +98,7 @@ internal-diagnostics = []
 # get a stub. See src/midi/.
 midi = []
 # The interactive desktop frontend: the winit/pixels window and launcher,
-# host audio output, gamepads, file dialogs, and the debugger console's
+# shared egui inspectors, host audio output, gamepads, file dialogs, and
 # clipboard paste. Off, the crate is the portable headless core (the surface
 # a wasm32 browser frontend builds against); the `copperline` binary
 # requires it.
@@ -109,6 +110,9 @@ frontend = [
     "dep:rfd",
     "dep:arboard",
     "dep:env_logger",
+    "dep:egui",
+    "dep:egui-winit",
+    "dep:egui-wgpu",
 ]
 # The wasmtime host for functional Zorro boards (src/wasmboard.rs). Separate
 # from `frontend` because it is a core-machine feature, but Cranelift cannot
@@ -163,15 +167,27 @@ dap = ["control", "dep:gimli", "dep:object"]
 # in the build. Off, none of it is built, which is what browser builds
 # (--no-default-features) want.
 fluxbridge = ["dep:fluxbridge"]
+# A real host serial port on Paula's UART (`[serial] mode = "device"`,
+# src/serial/device.rs): the same pure-Rust `serialport` crate FluxBridge
+# talks to a Greaseweazle through. Native-only by construction (threads and
+# tty ioctls), so browser builds (--no-default-features) compile it out and
+# the mode reports itself as unavailable there.
+host-serial = ["dep:serialport"]
 
 [dependencies]
-m68k = { version = "0.12", features = ["serde"] }
+m68k = { version = "0.13", features = ["serde"] }
 # The MT-32 synthesiser engine: our own port of Munt, pinned by revision.
 mt32-rs = { git = "https://github.com/CopperlineHQ/mt32-rs", rev = "ac00f818629a549a2712747660091e4f84d55599", optional = true }
 # The General MIDI synthesiser (Coppersynth), pinned by revision.
 coppersynth = { git = "https://github.com/CopperlineHQ/Coppersynth", rev = "38873e283aa9f2e6d2574d6c71e9a2cf9d0b42a2", optional = true }
 pixels = { version = "0.17", optional = true }
 winit = { version = "0.30", optional = true }
+# egui 0.35 shares pixels 0.17's wgpu 29 device and command encoder.
+# Upgrade pixels and all egui adapters together: egui 0.36 uses wgpu 30.
+# Dependabot keeps this stack on compatible patch updates until that migration.
+egui = { version = "0.35", optional = true }
+egui-winit = { version = "0.35", optional = true, default-features = false, features = ["clipboard", "wayland", "x11"] }
+egui-wgpu = { version = "0.35", optional = true, default-features = false }
 anyhow = "1"
 log = "0.4"
 env_logger = { version = "0.11", optional = true }
@@ -216,13 +232,20 @@ symphonia-core = { version = "0.6.1", default-features = false, optional = true 
 # serde feature snapshots prediction frames and partial bitstream state rather
 # than retaining and replaying the compressed stream on every save-state load.
 plmpeg = { git = "https://github.com/CopperlineHQ/plmpeg-rs", rev = "d020ba1015b48c0c646d32b16a27157623fff915", features = ["serde"], optional = true }
-# Save-state and snapshot serialization (src/savestate.rs and friends).
-# Held on the 1.x serde API on purpose: bincode 2 replaces the API and its
-# defaults use a different wire format, while bincode 3 is an intentionally
-# non-functional tombstone release. Moving serializers would invalidate every
-# existing .clstate for no functional gain. Migrate only as part of a planned
-# savestate::STATE_VERSION bump with an explicit compatibility story.
+# In-process snapshots (reverse debugging, run-ahead, netplay rollback):
+# positional bincode, written and read by the same build only, so its wire
+# format is never a compatibility concern. Held on the 1.x serde API on
+# purpose: bincode 2 replaces the API and its defaults use a different wire
+# format, while bincode 3 is an intentionally non-functional tombstone
+# release. .clstate files do not use it (see rmp-serde below).
 bincode = "1"
+# Save-state files (src/savestate/chunk.rs): self-describing MessagePack
+# chunk payloads, so a struct can gain or lose fields between releases
+# without invalidating old states; rmpv carries the value tree that chunk
+# migrations rewrite.
+rmp = "0.8"
+rmp-serde = "1.3"
+rmpv = { version = "1.3", features = ["with-serde"] }
 toml = "1.1"
 png = "0.18"
 flate2 = "1"
@@ -242,7 +265,8 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # or wat parsing in the shipped binary (kept deterministic; see the determinism
 # Config in wasmboard.rs). Pin the version: save-state replay of a plugin's
 # linear-memory snapshot is only guaranteed within one wasmtime build, so
-# changing this is a savestate::STATE_VERSION bump, not a routine update.
+# changing this means bumping the ZORR chunk version in src/savestate/chunk.rs
+# (with a migration or a documented refusal), not a routine update.
 # Track an LTS line (24.x, 36.x, 48.x, ...): those keep receiving security
 # backports, which the line this was previously pinned to (27.x) did not.
 wasmtime = { version = "=36.0.14", default-features = false, features = ["cranelift", "runtime"], optional = true }
@@ -275,11 +299,18 @@ zerocopy = { version = "0.8", features = ["derive"] }
 # line: adding a driver Copperline supports means adding its feature, nothing
 # else.
 fluxbridge = { git = "https://github.com/CopperlineHQ/FluxBridge", branch = "main", default-features = false, features = ["greaseweazle"], optional = true }
+# Host serial ports for `[serial] mode = "device"`. The version FluxBridge
+# already pins, with the same `default-features = false`: the default
+# `libudev` feature would link a C library on Linux for richer USB port
+# descriptions, and the sysfs fallback lists the same ports without it.
+serialport = { version = "4.9", default-features = false, optional = true }
 # CHD (MAME "Compressed Hunks of Data") CD images (src/cdrom/chd.rs). Pure
 # Rust, so it builds for wasm32 browser targets like the rest of the core.
 chd = "0.3"
 delharc = "0.8"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+gif = "0.14"
+color_quant = "2.0"
 
 # macOS dock icon: winit's with_window_icon is a no-op on macOS, so the dock
 # icon must be set at runtime via NSApplication. These objc2 versions match the
@@ -338,9 +369,20 @@ libloading = { version = "0.9", optional = true }
 # Win32_System_IO is DeviceIoControl, which src/diskimage.rs uses to ask
 # NTFS for a sparse file: setting a file's length commits the space there,
 # where on Unix it leaves a hole.
+# Win32_Foundation/Graphics_Gdi/UI_WindowsAndMessaging drive the message pump
+# that keeps the window serviced while a native file picker runs on a thread of
+# its own (src/video/window/native_dialog.rs), and Storage_FileSystem/Security/
+# System_Console put away the console window a desktop launch is given
+# (src/winconsole.rs).
 windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Optional realtime-priority feature: cross-platform thread scheduling control.
@@ -356,6 +398,13 @@ thread-priority = "3.1"
 # See src/timebase.rs -- native targets re-export std::time unchanged.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 web-time = "1"
+
+# Links the emulator's own icon into copperline.exe, so it carries it in
+# Explorer, the taskbar and the Start menu rather than the generic default.
+# Only ever called for a Windows *target* (see build.rs), but kept off the
+# host-specific table so a cross-compiled Windows build gets the icon too.
+[build-dependencies]
+embed-resource = "3.0"
 
 [[bin]]
 name = "copperline"

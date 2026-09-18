@@ -217,7 +217,8 @@ const CONSOLE_HELP: &[&str] = &[
     "os:         tasks  task [ADDR|NAME]  execbase  memlist  segments",
     "            libs  devs  resources  ports  who ADDR  guru [CODE]",
     "hunt:       hunt start [B|W]  hunt eq/ne/lt/gt VAL  hunt same|diff  hunt list",
-    "modify:     poke ADDR VAL   setreg REG VAL   trace start [PATH]|stop",
+    "modify:     poke[.b|.w|.l] ADDR VAL [VAL ...]   setreg REG VAL",
+    "            trace start [PATH]|stop",
     "waveform:   wave start [PATH] [TRIGGER] [DURATION] [SIGNALS]   wave stop   wave",
     "            TRIGGER: now  pc=ADDR  beam=V[:H]  reg=OFF  time=SECS",
     "console:    help  clear  close",
@@ -261,66 +262,6 @@ impl App {
         }
     }
 
-    /// Host text input for the console window: the paste shortcut
-    /// (Cmd+V on macOS, Ctrl+V anywhere) and layout-aware typed text.
-    /// Returns false for everything else so editing and command keys
-    /// reach the keycode handler.
-    pub(super) fn console_handle_text_input(&mut self, code: KeyCode, text: Option<&str>) -> bool {
-        if code == KeyCode::KeyV
-            && (host_shortcut_modifier_pressed(self.modifiers) || self.modifiers.control_key())
-        {
-            self.console_paste();
-            return true;
-        }
-        // Text typed with a command modifier held is a shortcut, not input.
-        if host_shortcut_modifier_pressed(self.modifiers) || self.modifiers.control_key() {
-            return false;
-        }
-        let Some(text) = text else {
-            return false;
-        };
-        let printable: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
-        if printable.is_empty() {
-            return false;
-        }
-        self.console_insert_text(&printable);
-        true
-    }
-
-    /// Insert text into the console prompt, executing the line for every
-    /// newline: a multi-line paste runs as a script, and the trailing
-    /// fragment stays in the prompt for editing.
-    pub(super) fn console_insert_text(&mut self, text: &str) {
-        for ch in text.chars() {
-            if ch == '\n' {
-                self.console_submit();
-                continue;
-            }
-            if let Some(panel) = self.console_panel.as_mut() {
-                panel.push_input_char(ch);
-            }
-        }
-        self.request_redraw();
-    }
-
-    /// Paste the host clipboard into the prompt.
-    fn console_paste(&mut self) {
-        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => {
-                // Normalize CRLF so a Windows-clipboard script does not
-                // submit a blank line per line.
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.console_insert_text(&text);
-            }
-            Err(e) => {
-                if let Some(panel) = self.console_panel.as_mut() {
-                    panel.push_output(format!("!clipboard unavailable: {e}"));
-                }
-                self.request_redraw();
-            }
-        }
-    }
-
     /// Dispatch one command line. Never touches `console_panel`; the
     /// caller applies the outcome so borrows stay simple. Arguments keep
     /// their case (file paths); every parser is case-insensitive.
@@ -348,12 +289,14 @@ impl App {
             "RUN" | "GO" | "CONTINUE" | "C" => {
                 self.paused = false;
                 self.paused_before_console = false;
+                self.egui_remember_run_state();
                 self.sync_live_audio_suspension();
                 ConsoleOutcome::one("running (PAUSE stops; breakpoints report here or on stop)")
             }
             "PAUSE" => {
                 self.paused = true;
                 self.paused_before_console = true;
+                self.egui_remember_run_state();
                 self.sync_live_audio_suspension();
                 let mut lines = vec!["paused".to_string()];
                 lines.extend(self.console_status_lines());
@@ -424,6 +367,7 @@ impl App {
                 use crate::timetravel::ReverseOutcome;
                 self.paused = true;
                 self.paused_before_console = true;
+                self.egui_remember_run_state();
                 self.sync_live_audio_suspension();
                 self.last_debug_stop = None;
                 let mut lines = Vec::new();
@@ -995,22 +939,78 @@ impl App {
                 }
                 ConsoleOutcome::lines(lines)
             }
-            "POKE" => {
-                let (Some(addr), Some(value)) = (
-                    args.first().and_then(|t| hex32(t)),
-                    args.get(1).and_then(|t| hex32(t)),
-                ) else {
-                    return ConsoleOutcome::error("usage: POKE ADDR VALUE (hex word)");
+            "POKE" | "POKE.B" | "POKE.W" | "POKE.L" => {
+                const USAGE: &str =
+                    "usage: POKE[.B|.W|.L] ADDR VAL [VAL ...] (hex; POKE ADDR VAL is a word, \
+                     POKE ADDR VAL VAL ... is a byte sequence)";
+                let width = match cmd.as_str() {
+                    "POKE.B" => Some(1usize),
+                    "POKE.W" => Some(2),
+                    "POKE.L" => Some(4),
+                    _ => None,
                 };
-                let addr = addr & !1;
-                let written = self
-                    .emu
-                    .machine
-                    .debug_write_memory(addr, &(value as u16).to_be_bytes());
-                if written == 2 {
-                    ConsoleOutcome::one(format!("poked ${:04X} -> ${addr:06X}", value as u16))
-                } else {
+                let (Some(addr), Some(values)) =
+                    (args.first().and_then(|t| hex32(t)), args.get(1..))
+                else {
+                    return ConsoleOutcome::error(USAGE);
+                };
+                if values.is_empty() {
+                    return ConsoleOutcome::error(USAGE);
+                }
+                let (addr, bytes) =
+                    match width {
+                        // The original form: one word at an even address.
+                        None if values.len() == 1 => {
+                            let token = values[0].trim_start_matches('$');
+                            match hex32(token) {
+                                Some(value) if token.len() <= 4 => {
+                                    (addr & !1, (value as u16).to_be_bytes().to_vec())
+                                }
+                                _ => {
+                                    return ConsoleOutcome::error(format!(
+                                        "{} is not a hex word; use POKE.L or byte pairs",
+                                        values[0]
+                                    ))
+                                }
+                            }
+                        }
+                        // Several values without a suffix: hex byte pairs, as FIND takes.
+                        None => match parse_hex_pattern(values) {
+                            Some(bytes) => (addr, bytes),
+                            None => return ConsoleOutcome::error(
+                                "a byte sequence takes hex byte pairs (e.g. POKE 60000 12 34 56)",
+                            ),
+                        },
+                        Some(width) => {
+                            let mut bytes = Vec::with_capacity(values.len() * width);
+                            for token in values {
+                                let digits = token.trim_start_matches('$');
+                                match hex32(digits) {
+                                    Some(value) if digits.len() <= width * 2 => {
+                                        bytes.extend_from_slice(&value.to_be_bytes()[4 - width..]);
+                                    }
+                                    _ => {
+                                        return ConsoleOutcome::error(format!(
+                                            "{token} does not fit {}",
+                                            ["a byte", "a word", "", "a long"][width - 1]
+                                        ))
+                                    }
+                                }
+                            }
+                            (if width == 1 { addr } else { addr & !1 }, bytes)
+                        }
+                    };
+                let written = self.debug_poke_bytes(addr, &bytes);
+                let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+                if written == bytes.len() {
+                    ConsoleOutcome::one(format!("poked {} -> ${addr:06X}", hex.join(" ")))
+                } else if written == 0 {
                     ConsoleOutcome::error(format!("${addr:06X} is not writable RAM"))
+                } else {
+                    ConsoleOutcome::error(format!(
+                        "wrote {written} of {} bytes from ${addr:06X}; the rest is not writable RAM",
+                        bytes.len()
+                    ))
                 }
             }
             "SETREG" => {
@@ -1279,6 +1279,7 @@ impl App {
     ) -> ConsoleOutcome {
         self.paused = true;
         self.paused_before_console = true;
+        self.egui_remember_run_state();
         self.sync_live_audio_suspension();
         self.last_debug_stop = None;
         let note = match op(self) {
@@ -1321,6 +1322,7 @@ impl App {
         use crate::timetravel::ReverseOutcome;
         self.paused = true;
         self.paused_before_console = true;
+        self.egui_remember_run_state();
         self.sync_live_audio_suspension();
         self.last_debug_stop = None;
         let outcome = match op(self) {
