@@ -50,9 +50,8 @@
 //!
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
-//! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`,
-//! `BLEND_EQUATION`/`BLEND_FUNC_SEPARATE`, fog, polygon offset,
-//! line/point primitives
+//! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`, fog,
+//! polygon offset, line/point primitives
 //! (only `TRIANGLES`-family and `POINTS`/`LINES`-as-degenerate-triangles
 //! are not special-cased -- see [`triangulate`]). Every one of these
 //! returns [`RenderError::Unimplemented`] rather than panicking.
@@ -90,8 +89,8 @@
 use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
-    self, BlendFactor, CompareFunc, Face, FrontFace, PrimitiveType, ShadeModel, State, Surface,
-    SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexWrap,
+    self, BlendEquation, BlendFactor, CompareFunc, Face, FrontFace, PrimitiveType, ShadeModel,
+    State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -742,6 +741,9 @@ pub struct PipelineKey {
     pub blend: bool,
     pub blend_src: BlendFactorKey,
     pub blend_dst: BlendFactorKey,
+    pub blend_src_alpha: BlendFactorKey,
+    pub blend_dst_alpha: BlendFactorKey,
+    pub blend_equation: BlendEquationKey,
     pub cull: Option<FaceKey>,
     pub front_face_ccw: bool,
     pub color_write: (bool, bool, bool, bool),
@@ -857,6 +859,37 @@ impl BlendFactorKey {
             Self::DstColor => wgpu::BlendFactor::Dst,
             Self::OneMinusDstColor => wgpu::BlendFactor::OneMinusDst,
             Self::SrcAlphaSaturate => wgpu::BlendFactor::SrcAlphaSaturated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlendEquationKey {
+    FuncAdd,
+    Min,
+    Max,
+    FuncSubtract,
+    FuncReverseSubtract,
+}
+impl From<BlendEquation> for BlendEquationKey {
+    fn from(e: BlendEquation) -> Self {
+        match e {
+            BlendEquation::FuncAdd => Self::FuncAdd,
+            BlendEquation::Min => Self::Min,
+            BlendEquation::Max => Self::Max,
+            BlendEquation::FuncSubtract => Self::FuncSubtract,
+            BlendEquation::FuncReverseSubtract => Self::FuncReverseSubtract,
+        }
+    }
+}
+impl BlendEquationKey {
+    fn to_wgpu(self) -> wgpu::BlendOperation {
+        match self {
+            Self::FuncAdd => wgpu::BlendOperation::Add,
+            Self::Min => wgpu::BlendOperation::Min,
+            Self::Max => wgpu::BlendOperation::Max,
+            Self::FuncSubtract => wgpu::BlendOperation::Subtract,
+            Self::FuncReverseSubtract => wgpu::BlendOperation::ReverseSubtract,
         }
     }
 }
@@ -1454,16 +1487,17 @@ impl Renderer {
             mask
         };
         let blend = if key.blend {
+            let operation = key.blend_equation.to_wgpu();
             Some(wgpu::BlendState {
                 color: wgpu::BlendComponent {
                     src_factor: key.blend_src.to_wgpu(),
                     dst_factor: key.blend_dst.to_wgpu(),
-                    operation: wgpu::BlendOperation::Add,
+                    operation,
                 },
                 alpha: wgpu::BlendComponent {
-                    src_factor: key.blend_src.to_wgpu(),
-                    dst_factor: key.blend_dst.to_wgpu(),
-                    operation: wgpu::BlendOperation::Add,
+                    src_factor: key.blend_src_alpha.to_wgpu(),
+                    dst_factor: key.blend_dst_alpha.to_wgpu(),
+                    operation,
                 },
             })
         } else {
@@ -1648,6 +1682,9 @@ impl Renderer {
             blend: state.is_enabled(state::Capability::Blend),
             blend_src: raster.blend_src_rgb.into(),
             blend_dst: raster.blend_dst_rgb.into(),
+            blend_src_alpha: raster.blend_src_alpha.into(),
+            blend_dst_alpha: raster.blend_dst_alpha.into(),
+            blend_equation: raster.blend_equation.into(),
             cull,
             front_face_ccw: raster.front_face == FrontFace::Ccw,
             color_write: (
@@ -3652,6 +3689,134 @@ mod tests {
         assert_eq!(
             back, 0,
             "a back-facing (CW in y-down window space) triangle was drawn"
+        );
+    }
+
+    /// Draws a single fully-covering opaque-red triangle over a cleared
+    /// surface with `Blend` enabled, and returns the RGBA8 bytes at a
+    /// pixel known to be inside it. Shared by the two `BLEND_FUNC_SEPARATE`/
+    /// `BLEND_EQUATION` tests below, which only differ in the blend state
+    /// they set before drawing.
+    fn draw_blended_covering_triangle(
+        clear_color: (f32, f32, f32, f32),
+        current_color: (f32, f32, f32, f32),
+        set_blend_state: impl FnOnce(&mut State),
+    ) -> Option<[u8; 4]> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        let (cr, cg, cb, ca) = clear_color;
+        state.set_clear_color(cr, cg, cb, ca);
+        let (vr, vg, vb, va) = current_color;
+        state.set_current_color(vr, vg, vb, va);
+        state.enable(state::Capability::Blend);
+        set_blend_state(&mut state);
+
+        // A large triangle fully covering the whole 16x16 surface.
+        let tri = [(-16.0f32, -16.0f32), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+        }
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format: VertexFormat(0),
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(8 * 16 + 8) * 4..][..4];
+        Some([px[0], px[1], px[2], px[3]])
+    }
+
+    /// `BLEND_FUNC_SEPARATE` must apply its RGB factors to colour and its
+    /// alpha factors to alpha independently -- not share one factor pair
+    /// across both, which is what the pipeline did before this test
+    /// existed. Colour uses (One, Zero) so it comes through unchanged from
+    /// the fragment; alpha uses (Zero, One) so it comes through unchanged
+    /// from the destination instead -- a shared-factor implementation
+    /// would give alpha the fragment's value (1.0) rather than the
+    /// destination's (0.4).
+    #[test]
+    fn blend_func_separate_applies_independent_rgb_and_alpha_factors() {
+        let Some(px) =
+            draw_blended_covering_triangle((0.0, 0.0, 0.0, 0.4), (1.0, 0.0, 0.0, 1.0), |s| {
+                s.set_blend_func_separate(
+                    BlendFactor::One,
+                    BlendFactor::Zero,
+                    BlendFactor::Zero,
+                    BlendFactor::One,
+                );
+            })
+        else {
+            return; // no adapter
+        };
+        assert_eq!(
+            &px[..3],
+            &[255, 0, 0],
+            "colour factors (One, Zero) should pass the fragment's RGB through unchanged: {px:?}"
+        );
+        assert!(
+            (px[3] as i32 - 102).abs() <= 2,
+            "alpha factors (Zero, One) should pass the destination's alpha (0.4 ~= 102) through, not the fragment's: {px:?}"
+        );
+    }
+
+    /// `BLEND_EQUATION` must select the combine operation, not just the
+    /// factors -- `FuncSubtract` with (One, One) computes `src - dst`
+    /// rather than the default `FuncAdd`'s `src + dst`.
+    #[test]
+    fn blend_equation_selects_the_combine_operation() {
+        let Some(px) = draw_blended_covering_triangle(
+            (50.0 / 255.0, 0.0, 0.0, 1.0),
+            (200.0 / 255.0, 0.0, 0.0, 1.0),
+            |s| {
+                s.set_blend_func_separate(
+                    BlendFactor::One,
+                    BlendFactor::One,
+                    BlendFactor::One,
+                    BlendFactor::One,
+                );
+                s.set_blend_equation(BlendEquation::FuncSubtract);
+            },
+        ) else {
+            return; // no adapter
+        };
+        assert!(
+            (px[0] as i32 - 150).abs() <= 2,
+            "FuncSubtract with (One, One) should compute src(200) - dst(50) = 150: {px:?}"
         );
     }
 }
