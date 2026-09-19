@@ -7910,6 +7910,60 @@ impl Bus {
         Some(position_cck)
     }
 
+    /// Drains every board's [`ZorroDevice::take_pending_dma_writes`] and
+    /// applies each queued write, resolving the destination the same way
+    /// any other bus-master DMA is resolved. Called once per timed-device
+    /// tick, after every board has ticked (see the call site's own
+    /// comment) so that every `take_pending_dma_writes` call in this pass
+    /// is a plain, sequential, single-index borrow of `self.devices` --
+    /// never two at once, so this needs no `split_at_mut` or unsafe code.
+    /// A write that resolves to another device-backed board's window is
+    /// applied through the same [`ZorroDevice::write`] a CPU access would
+    /// use, so from the target board's point of view it is
+    /// indistinguishable from a register write -- exactly what real
+    /// bus-master DMA is; a write that resolves to ordinary RAM goes
+    /// through the shared [`crate::zorro_device::dma_write_byte`] decode
+    /// instead, exactly as the A2091/CDTV's own DMA already does.
+    fn drain_cross_board_dma(&mut self) {
+        for slot in 0..self.devices.len() {
+            let writes =
+                crate::zorro_device::ZorroDevice::take_pending_dma_writes(&mut self.devices[slot]);
+            for w in writes {
+                for (i, byte) in w.bytes.iter().enumerate() {
+                    let addr = w.addr.wrapping_add(i as u32);
+                    if let Some((crate::zorro::BoardBacking::Device(target_slot), off)) =
+                        self.mem.zorro.device_region_at(addr, 1)
+                    {
+                        // A board writing into its own window this way
+                        // would be a design error (it should just write
+                        // its own state directly); skip rather than
+                        // reenter to be safe regardless.
+                        if target_slot != slot {
+                            let mut host = crate::zorro_device::DeviceHost::for_slot(
+                                &mut self.mem,
+                                target_slot,
+                            );
+                            crate::zorro_device::ZorroDevice::write(
+                                &mut self.devices[target_slot],
+                                off,
+                                1,
+                                *byte as u32,
+                                &mut host,
+                            );
+                        }
+                    } else {
+                        // Not a device-backed board: ordinary RAM (or
+                        // unmapped, in which case this drops the byte,
+                        // exactly as any other bus-master write does).
+                        if crate::zorro_device::dma_write_byte(&mut self.mem, addr, *byte) {
+                            self.devices_wrote_memory = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn tick_timed_devices(
         &mut self,
         cck: u32,
@@ -8089,6 +8143,8 @@ impl Bus {
                 }
             }
         }
+
+        self.drain_cross_board_dma();
 
         let cia_remainder = self.device_clock.cia_tick_remainder_cck;
         let ticks = self.device_clock.cia_ticks_for_cck(cck);

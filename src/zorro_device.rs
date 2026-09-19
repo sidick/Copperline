@@ -148,6 +148,17 @@ pub(crate) fn dma_write_byte(mem: &mut Memory, addr: u32, b: u8) -> bool {
     false
 }
 
+/// One board's queued write into a guest address, destined for another
+/// device-backed board's window (or, rarely, ordinary RAM, which the
+/// board could have written directly but chose to route through the same
+/// queue anyway) -- see [`ZorroDevice::take_pending_dma_writes`].
+#[derive(Debug, Clone)]
+pub struct PendingDmaWrite {
+    /// The guest address the bytes are destined for.
+    pub addr: u32,
+    pub bytes: Vec<u8>,
+}
+
 /// The host-services view handed to a [`ZorroDevice`] on every call. Wraps the
 /// guest [`Memory`] so a board can DMA, and is the place capability hooks are
 /// added (CD audio injection, networking) as the boards that need them land.
@@ -401,6 +412,32 @@ pub trait ZorroDevice {
         false
     }
 
+    /// Bytes this board queued for a guest address during this tick or
+    /// the doorbell/register write that preceded it, drained by the bus
+    /// once every board has ticked (`Bus`'s "Cross-board DMA" pass, right
+    /// after the "Functional Zorro-chain boards" tick loop). A board
+    /// cannot simply reach into a sibling board's window from inside its
+    /// own `write`/`tick`: that would need this board's own `&mut self`
+    /// call to also mutably borrow another element of the same
+    /// `Bus::devices` vector at the same time, which Rust's aliasing
+    /// rules refuse (there is no `own_window_offset`-style trick for
+    /// *another* board's window the way there is for a board's own). The
+    /// bus, which is not inside any single board's borrow at the point it
+    /// drains this, can freely index a second board and apply the write
+    /// there through the ordinary [`ZorroDevice::write`] path -- from the
+    /// target board's point of view this is indistinguishable from an
+    /// register access, exactly as a real DMA write would be.
+    ///
+    /// The target address may resolve to ordinary RAM, another
+    /// device-backed board, or nothing at all; the bus resolves it the
+    /// same way any other bus master's DMA is resolved
+    /// ([`dma_write_byte`] for RAM, [`ZorroChain::device_region_at`] for
+    /// a device). A board that never needs this (almost all of them)
+    /// need not override it; the default is the empty queue.
+    fn take_pending_dma_writes(&mut self) -> Vec<PendingDmaWrite> {
+        Vec::new()
+    }
+
     /// Return the board to its power-on state (keeps attached media/ROM).
     fn reset(&mut self);
 
@@ -584,6 +621,31 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Sf2000Sd(d) => ZorroDevice::take_activity(d),
             #[cfg(feature = "c3d")]
             BoardDevice::C3d(d) => ZorroDevice::take_activity(d.as_mut()),
+        }
+    }
+
+    fn take_pending_dma_writes(&mut self) -> Vec<PendingDmaWrite> {
+        match self {
+            BoardDevice::A2091(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::A4091(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::A2065(d) => ZorroDevice::take_pending_dma_writes(d),
+            #[cfg(feature = "wasm-boards")]
+            BoardDevice::Wasm(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::Filesys(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::Z3660(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::Picasso2(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            BoardDevice::IdeZorro(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::GraffityZ2(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            BoardDevice::GraffityZ3(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            BoardDevice::Toccata(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            #[cfg(feature = "mhi")]
+            BoardDevice::Mhi(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            #[cfg(feature = "cd32-fmv")]
+            BoardDevice::Cd32Fmv(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
+            BoardDevice::Copperhf(d) => ZorroDevice::take_pending_dma_writes(d),
+            BoardDevice::Sf2000Sd(d) => ZorroDevice::take_pending_dma_writes(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::take_pending_dma_writes(d.as_mut()),
         }
     }
 

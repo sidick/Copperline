@@ -91,7 +91,7 @@ pub const RING_SIZE_LIMIT: u32 = 0x0004_0000; // 256 KiB
 /// Copperline's fitted `CAPS0` for this milestone -- see the module doc
 /// comment's "Milestone scope" for why `CAP_TRANSFORM` and friends are
 /// not here yet.
-pub const CAPS0: u32 = proto::CAP_IRQ | proto::CAP_REF_SYNC;
+pub const CAPS0: u32 = proto::CAP_IRQ | proto::CAP_REF_SYNC | proto::CAP_SURFACE_GUESTADDR;
 
 // ---------------------------------------------------------------------
 // Global register offsets (`docs/internals/c3d.md`, "Global registers")
@@ -168,6 +168,22 @@ struct ContextSlot {
     alloc: bool,
     enable: bool,
     fence_irq_target: u32,
+
+    /// A fence this context reached whose completion is held back because
+    /// a `CAP_SURFACE_GUESTADDR` readback in the same doorbell queued
+    /// bytes for the bus's cross-board DMA pass (see
+    /// `C3dBoard::take_pending_dma_writes`) rather than landing
+    /// immediately. Two-stage, not simply "pending": `deferred_fence` is
+    /// this doorbell's own queued write, not yet even handed to the bus;
+    /// `deferred_fence_ready` is last call's, now safe to complete
+    /// because the bus has had one whole tick to apply it (draining
+    /// happens synchronously, right after `take_pending_dma_writes`
+    /// returns, in the same tick invocation). Neither is meaningful
+    /// outside one doorbell/tick cycle, so both are transient.
+    #[serde(skip)]
+    deferred_fence: Option<u32>,
+    #[serde(skip)]
+    deferred_fence_ready: Option<u32>,
 }
 
 impl Default for ContextSlot {
@@ -177,6 +193,8 @@ impl Default for ContextSlot {
             alloc: false,
             enable: false,
             fence_irq_target: 0,
+            deferred_fence: None,
+            deferred_fence_ready: None,
         }
     }
 }
@@ -193,6 +211,15 @@ pub struct C3dBoard {
     irq_enable: u32,
     contexts: Vec<ContextSlot>,
     activity: bool,
+
+    /// Bytes queued this tick for the bus's cross-board DMA pass; see
+    /// `take_pending_dma_writes`. Transient -- drained every tick, so a
+    /// save state never needs to carry it (the worst a save/restore mid
+    /// doorbell can do is lose one tick's not-yet-applied readback,
+    /// which happens before the doorbell's fence would ever complete
+    /// anyway, so nothing guest-visible depends on it surviving).
+    #[serde(skip)]
+    pending_dma: Vec<crate::zorro_device::PendingDmaWrite>,
 
     /// Lazily created on the first doorbell that needs it -- board
     /// construction must not require a GPU adapter, since `[c3d] enabled
@@ -228,6 +255,7 @@ impl C3dBoard {
             irq_enable: 0,
             contexts,
             activity: false,
+            pending_dma: Vec::new(),
             renderer: None,
             renderer_failed: false,
         }
@@ -343,6 +371,7 @@ impl C3dBoard {
         self.control = CONTROL_ENABLE;
         self.renderer = None;
         self.renderer_failed = false;
+        self.pending_dma.clear();
     }
 
     fn read_context(&self, n: usize, off: u32) -> u32 {
@@ -445,21 +474,45 @@ impl C3dBoard {
             .submit(&ring_bytes, new_tail, &config, &mut ops);
 
         if !ops.is_empty() {
+            let queued_before = self.pending_dma.len();
             if let Some(renderer) =
                 Self::ensure_renderer(&mut self.renderer, &mut self.renderer_failed)
             {
                 let state = &self.contexts[n].ctx.state;
                 let mut mem = ApertureMemory {
                     aperture: &mut self.aperture,
+                    pending_dma: &mut self.pending_dma,
                 };
                 let errors = renderer.execute(&ops, state, &mut mem);
                 for e in &errors {
                     log::warn!("c3d: context {n}: render error: {e}");
                 }
             }
-            for op in &ops {
-                if let RenderOp::Fence { id } = op {
-                    self.contexts[n].ctx.complete_fence(*id);
+            // If this submission queued a guest-address write (a
+            // CAP_SURFACE_GUESTADDR readback into another board's
+            // window), the bus has not applied it yet, so no fence this
+            // submission reaches has actually taken effect -- defer the
+            // last one to `deferred_fence` instead of completing any of
+            // them now. Only the last one matters: fence IDs are
+            // monotonic and everything is synchronous within one
+            // doorbell, so the guest can never observe an intermediate
+            // value before the final one supersedes it. Otherwise (the
+            // common case: aperture-backed surfaces only) complete every
+            // fence immediately, exactly as before this milestone.
+            let deferred = self.pending_dma.len() > queued_before;
+            let last_fence = ops.iter().rev().find_map(|op| match op {
+                RenderOp::Fence { id } => Some(*id),
+                _ => None,
+            });
+            if deferred {
+                if let Some(id) = last_fence {
+                    self.contexts[n].deferred_fence = Some(id);
+                }
+            } else {
+                for op in &ops {
+                    if let RenderOp::Fence { id } = op {
+                        self.contexts[n].ctx.complete_fence(*id);
+                    }
                 }
             }
         }
@@ -517,6 +570,13 @@ impl C3dBoard {
 /// backed (`CAP_SURFACE_GUESTADDR` is likewise clear).
 struct ApertureMemory<'a> {
     aperture: &'a mut Vec<u8>,
+    /// Where a [`MemLoc::Guest`] write is queued -- see
+    /// `C3dBoard::take_pending_dma_writes`'s doc comment for why this
+    /// board cannot apply such a write itself. `None` would mean "this
+    /// milestone does not support guest-address surfaces at all"; M3
+    /// always supplies one, since `CAPS0`'s `CAP_SURFACE_GUESTADDR` bit
+    /// promises exactly this.
+    pending_dma: &'a mut Vec<crate::zorro_device::PendingDmaWrite>,
 }
 
 impl ApertureMemory<'_> {
@@ -534,6 +594,13 @@ impl Memory for ApertureMemory<'_> {
                 let r = self.range(addr, len)?;
                 Some(&self.aperture[r])
             }
+            // Not supported by this milestone: CAP_GUESTMEM is clear
+            // (see the module doc comment's "Milestone scope"), so the
+            // ring decoder never produces a guest-space ref for TEX_IMAGE
+            // and friends to resolve through here in the first place.
+            // Only SURFACE_DEFINE's own guest-address *destination*
+            // (CAP_SURFACE_GUESTADDR, written to, never read from) is
+            // supported, in `write` below.
             MemLoc::Guest(_) => None,
         }
     }
@@ -547,7 +614,18 @@ impl Memory for ApertureMemory<'_> {
                 }
                 None => false,
             },
-            MemLoc::Guest(_) => false,
+            // Queued for the bus to apply after this tick -- see
+            // `ZorroDevice::take_pending_dma_writes`'s doc comment.
+            // Accepted unconditionally (never `false`): whether `addr`
+            // is actually reachable is the bus's question to answer when
+            // it resolves the address, not this board's.
+            MemLoc::Guest(addr) => {
+                self.pending_dma.push(crate::zorro_device::PendingDmaWrite {
+                    addr,
+                    bytes: data.to_vec(),
+                });
+                true
+            }
         }
     }
 }
@@ -625,6 +703,25 @@ impl ZorroDevice for C3dBoard {
 
     fn take_activity(&mut self) -> bool {
         std::mem::take(&mut self.activity)
+    }
+
+    fn take_pending_dma_writes(&mut self) -> Vec<crate::zorro_device::PendingDmaWrite> {
+        // Two-stage drain -- see ContextSlot's own doc comment on
+        // `deferred_fence`/`deferred_fence_ready`. This call happens once
+        // per bus tick, immediately followed (same tick, same call to
+        // `Bus`'s cross-board DMA pass) by the bus actually applying the
+        // batch this returns, so "ready" entries left over from the
+        // *previous* call are now safe to complete, and this call's own
+        // newly-queued writes become "ready" for the *next* call.
+        for slot in &mut self.contexts {
+            if let Some(id) = slot.deferred_fence_ready.take() {
+                slot.ctx.complete_fence(id);
+            }
+        }
+        for slot in &mut self.contexts {
+            slot.deferred_fence_ready = slot.deferred_fence.take();
+        }
+        std::mem::take(&mut self.pending_dma)
     }
 
     fn reset(&mut self) {
