@@ -18,7 +18,7 @@
 //! | Code | Cause |
 //! |---|---|
 //! | `E_BAD_LENGTH`, `E_RING_OVERRUN` | framing |
-//! | `E_BAD_OPCODE` | unknown opcode, or a known opcode of a tier `DeviceConfig` lacks |
+//! | `E_BAD_OPCODE` | unknown opcode, a known opcode of a tier `DeviceConfig` lacks, or `TEX_PALETTE` without `TEXFMT_SUPPORTED` bit 9 (`I8_INDEXED`) |
 //! | `E_BAD_ARG` | length/count/format mismatch, a non-zero reserved field, a capability-less feature flag, `NORMAL` in a window-space draw, `stride_bytes` short of the row |
 //! | `E_BAD_REF` | a ref outside the aperture/reachable space, misaligned, in space 1 without `CAP_GUESTMEM`, or an aperture-backed `SURFACE_DEFINE` extent outside the aperture |
 //! | `E_BAD_ID` | a texture/surface ID of 0 (where 0 isn't the documented "none") or above the configured limit |
@@ -63,6 +63,10 @@
 //! exactly like an opcode outside the map -- both are skipped by trusting
 //! the `length` word already validated by the framing check, per the
 //! spec's "Unknown opcodes ... `length` is trusted" line.
+//!
+//! `TEX_PALETTE` gets the same "opcode doesn't exist" treatment, but keyed
+//! off `TEXFMT_SUPPORTED` bit 9 (`I8_INDEXED`) instead of `transform`: the
+//! spec makes the opcode itself optional, separately from any tier.
 //!
 //! ## GL enumerant legality stays out of this module
 //!
@@ -377,6 +381,18 @@ impl<'a> RingCursor<'a> {
     /// command's payload words, i.e. `ring[start+4 .. start+length*4]`.
     fn decode_body(&mut self, opcode: u16, start: u32, length_words: u32) -> Step<'a> {
         if !self.config.transform && Self::opcode_needs_transform(opcode) {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        // TEX_PALETTE is spec-optional, gated by its own TEXFMT_SUPPORTED
+        // bit rather than by tier: "a device reports it with
+        // TEXFMT_SUPPORTED bit 9 (I8_INDEXED); without it TEX_PALETTE is
+        // E_BAD_OPCODE" -- not E_UNSUPPORTED_FORMAT, which is for a format
+        // value the opcode's own payload names (TEX_PALETTE's never does;
+        // it only ever binds a palette, it doesn't select an image
+        // format).
+        if opcode == proto::OP_TEX_PALETTE
+            && (self.config.texfmt_supported >> proto::TextureFormat::I8Indexed as u32) & 1 == 0
+        {
             return self.raise(ErrorCode::BadOpcode, start);
         }
 
@@ -2052,18 +2068,58 @@ mod tests {
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
     }
 
+    fn config_with_tex_palette_supported() -> DeviceConfig {
+        DeviceConfig {
+            texfmt_supported: DeviceConfig::default().texfmt_supported
+                | (1 << proto::TextureFormat::I8Indexed as u32),
+            ..DeviceConfig::default()
+        }
+    }
+
     #[test]
     fn tex_palette_rejects_more_than_256_entries() {
         let words = [
-            header(OP_TEX_PALETTE, 4),
+            header(OP_TEX_PALETTE, 5),
             1,   // id
             257, // entries
             0x0010_0000,
             0,
         ];
         let ring = ring_with(4096, 0, &words);
-        let step = decode_one(&ring, 0, 16);
+        let step = decode_one_with(&ring, 0, 20, config_with_tex_palette_supported());
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn tex_palette_is_bad_opcode_without_texfmt_supported_bit_9() {
+        // Otherwise entirely well-formed -- Copperline's own default
+        // config (TEXFMT_SUPPORTED bits 0-7 only) doesn't set I8_INDEXED,
+        // so the opcode itself doesn't exist per the spec, exactly like
+        // an unknown opcode or a missing-tier one.
+        let words = [
+            header(OP_TEX_PALETTE, 5),
+            1,   // id
+            256, // entries
+            0x0010_0000,
+            1024, // ref length: 256 RGBA8 entries
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 20);
+        assert_eq!(step, err(ErrorCode::BadOpcode, 0, false));
+    }
+
+    #[test]
+    fn tex_palette_decodes_normally_when_texfmt_supported_bit_9_is_set() {
+        let words = [
+            header(OP_TEX_PALETTE, 5),
+            1,   // id
+            256, // entries
+            0x0010_0000,
+            1024, // ref length: 256 RGBA8 entries
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 20, config_with_tex_palette_supported());
+        assert!(matches!(step, Step::Command(Command::TexPalette { .. })));
     }
 
     #[test]
