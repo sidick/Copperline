@@ -51,7 +51,7 @@
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
 //! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`, fog,
-//! polygon offset, line/point primitives
+//! line/point primitives
 //! (only `TRIANGLES`-family and `POINTS`/`LINES`-as-degenerate-triangles
 //! are not special-cased -- see [`triangulate`]). Every one of these
 //! returns [`RenderError::Unimplemented`] rather than panicking.
@@ -748,6 +748,7 @@ pub struct PipelineKey {
     pub front_face_ccw: bool,
     pub color_write: (bool, bool, bool, bool),
     pub surface_format: TextureFormatKey,
+    pub polygon_offset: Option<PolygonOffsetKey>,
 }
 
 // wgpu's own enums don't implement `Hash`/`Eq` in a way this module wants
@@ -890,6 +891,36 @@ impl BlendEquationKey {
             Self::Max => wgpu::BlendOperation::Max,
             Self::FuncSubtract => wgpu::BlendOperation::Subtract,
             Self::FuncReverseSubtract => wgpu::BlendOperation::ReverseSubtract,
+        }
+    }
+}
+
+/// `POLYGON_OFFSET`'s (factor, units), stored as bit patterns so the key
+/// stays `Eq`/`Hash` without pulling in an ordered-float dependency --
+/// these values are only ever compared for exact pipeline-cache identity,
+/// never ordered or arithmetic-compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PolygonOffsetKey {
+    factor_bits: u32,
+    units_bits: u32,
+}
+impl PolygonOffsetKey {
+    fn new(factor: f32, units: f32) -> Self {
+        Self {
+            factor_bits: factor.to_bits(),
+            units_bits: units.to_bits(),
+        }
+    }
+    /// The direct GL -> wgpu mapping every GL-on-Vulkan/D3D layer uses:
+    /// `factor` becomes the slope-scaled term, `units` becomes the
+    /// constant term in depth-format basic units. GL leaves the constant
+    /// term's absolute scale implementation-defined, so this is a
+    /// reasonable rendering of the spec's intent, not an exact formula.
+    fn to_wgpu(self) -> wgpu::DepthBiasState {
+        wgpu::DepthBiasState {
+            constant: f32::from_bits(self.units_bits).round() as i32,
+            slope_scale: f32::from_bits(self.factor_bits),
+            clamp: 0.0,
         }
     }
 }
@@ -1539,7 +1570,10 @@ impl Renderer {
                             .unwrap_or(wgpu::CompareFunction::Always),
                     ),
                     stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
+                    bias: key
+                        .polygon_offset
+                        .map(PolygonOffsetKey::to_wgpu)
+                        .unwrap_or_default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
@@ -1694,6 +1728,14 @@ impl Renderer {
                 raster.color_mask.a,
             ),
             surface_format: surface_format.into(),
+            polygon_offset: if state.is_enabled(state::Capability::PolygonOffsetFill) {
+                Some(PolygonOffsetKey::new(
+                    raster.polygon_offset_factor,
+                    raster.polygon_offset_units,
+                ))
+            } else {
+                None
+            },
         }
     }
 
@@ -3525,6 +3567,113 @@ mod tests {
                 "expected roughly {expected}, got {value}"
             );
         }
+    }
+
+    /// Draws a single fully-covering triangle at a fixed window-space
+    /// depth of 0.5 onto a freshly-cleared depth buffer, then reads that
+    /// depth back at a pixel known to be inside it. `set_extra_state` sets
+    /// up `POLYGON_OFFSET`/`Capability::PolygonOffsetFill` (or leaves them
+    /// at their default-off state, for the baseline run).
+    fn drawn_depth_at_center(set_extra_state: impl FnOnce(&mut State)) -> Option<u32> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_depth(0.0);
+        set_extra_state(&mut state);
+
+        // A large triangle fully covering the whole 16x16 surface, at
+        // window-space z = 0.5.
+        let tri = [(-16.0f32, -16.0f32), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+        }
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_DEPTH,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format: VertexFormat(0),
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let dest = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 4,
+        };
+        let errs = renderer.execute(
+            &[RenderOp::ReadPixels {
+                x: 8,
+                y: 8,
+                w: 1,
+                h: 1,
+                format: WireSurfaceFormat::Depth,
+                row_bytes: 4,
+                flags: 0,
+                dest,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        Some(u32::from_be_bytes(mem.aperture[0..4].try_into().unwrap()))
+    }
+
+    /// `POLYGON_OFFSET` must actually reach the pipeline's depth bias --
+    /// before this test, `set_polygon_offset`'s state was decoded but
+    /// `build_pipeline` always used `DepthBiasState::default()`, so no
+    /// amount of offset changed a thing. The exact GL-to-hardware scale
+    /// for `units` is implementation-defined (the spec itself leaves it
+    /// that way), so this only checks that a large offset moves the
+    /// written depth by something far larger than ordinary f32 rounding
+    /// noise -- not a specific formula.
+    #[test]
+    fn polygon_offset_shifts_the_written_depth_value() {
+        let Some(baseline) = drawn_depth_at_center(|_| {}) else {
+            return; // no adapter
+        };
+        let Some(offset) = drawn_depth_at_center(|s| {
+            s.enable(state::Capability::PolygonOffsetFill);
+            s.set_polygon_offset(0.0, 100_000.0);
+        }) else {
+            return; // no adapter
+        };
+        assert!(
+            (offset as i64 - baseline as i64).abs() > 1_000_000,
+            "a large POLYGON_OFFSET units value should shift the written \
+             depth well past f32 rounding noise: baseline={baseline}, offset={offset}"
+        );
     }
 
     /// `QUERY` needs no GPU work at all -- `dispatch::Context` has
