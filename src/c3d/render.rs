@@ -80,7 +80,7 @@
 //! [`Renderer::for_testing`] and skips cleanly with no adapter, per
 //! `tests/README.md`'s asset-gated pattern.
 
-use super::dispatch::{DrawVertices, RenderOp};
+use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
     self, BlendFactor, CompareFunc, Face, FrontFace, PrimitiveType, ShadeModel, State, Surface,
@@ -1640,7 +1640,7 @@ impl Renderer {
             }
             RenderOp::TexPalette { .. } => Err(RenderError::Unimplemented("TEX_PALETTE (M3)")),
             RenderOp::ReadPixels { .. } => Err(RenderError::Unimplemented("READ_PIXELS (M3)")),
-            RenderOp::Query { .. } => Err(RenderError::Unimplemented("QUERY (M3)")),
+            RenderOp::Query { dest, result } => self.op_query(*dest, *result, mem),
         }
     }
 
@@ -2218,6 +2218,30 @@ impl Renderer {
             return Err(RenderError::BadMemory(format!(
                 "SURFACE_READBACK write to {loc:?}"
             )));
+        }
+        Ok(())
+    }
+
+    /// `QUERY`: the spec's whole contract is "write `result` to `dest`,
+    /// as big-endian `f32`s, matrices in column-major order" -- `dispatch`
+    /// has already resolved *which* state `what` meant (`resolve_query`),
+    /// so there is no GL semantics left to apply here, only the guest
+    /// memory write, the same big-endian convention every other
+    /// guest-visible value on this wire uses (`docs/internals/c3d.md`'s
+    /// "IEEE-754 single precision, big-endian").
+    fn op_query(
+        &mut self,
+        dest: Ref,
+        result: QueryResult,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let bytes: Vec<u8> = result.values[..result.count as usize]
+            .iter()
+            .flat_map(|f| f.to_be_bytes())
+            .collect();
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &bytes) {
+            return Err(RenderError::BadMemory(format!("QUERY write to {loc:?}")));
         }
         Ok(())
     }
@@ -2836,6 +2860,88 @@ mod tests {
                 "red should have cleared to 0; green/blue/alpha must stay untouched at 255"
             );
         }
+    }
+
+    /// `QUERY` needs no GPU work at all -- `dispatch::Context` has
+    /// already resolved the state into a `QueryResult`, so this checks
+    /// only that `op_query` writes the right bytes, in the wire's
+    /// big-endian convention, to the right place. A `Renderer` is still
+    /// needed to call `execute` on (device creation itself may skip with
+    /// no adapter, even though this op never touches it).
+    #[test]
+    fn a_query_writes_its_result_as_big_endian_f32s_to_the_dest_ref() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(256);
+
+        // A vec4-shaped result (as CURRENT_COLOR/VIEWPORT/etc. all are),
+        // written to aperture offset 16 so a non-zero base offset is
+        // exercised too.
+        let result = QueryResult {
+            values: [
+                1.5, -2.25, 3.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            count: 4,
+        };
+        let dest = Ref {
+            address: 16,
+            space: RefSpace::Aperture,
+            length: 16,
+        };
+
+        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &state, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let written = mem.aperture[16..32].to_vec();
+        let expected: Vec<u8> = [1.5f32, -2.25, 3.0, 0.5]
+            .iter()
+            .flat_map(|f| f.to_be_bytes())
+            .collect();
+        assert_eq!(
+            written, expected,
+            "QUERY must write big-endian f32s, matching every other guest-visible value on this wire"
+        );
+    }
+
+    /// A `count` shorter than 16 (a vec4/vec2 result, not a matrix) must
+    /// write only that many floats -- nothing past the result's own
+    /// length, so a small destination buffer is never over-run and a
+    /// caller reading exactly `count` floats back sees nothing stray
+    /// after them.
+    #[test]
+    fn a_query_writes_exactly_count_floats_not_the_full_16_word_buffer() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(256);
+
+        let result = QueryResult {
+            values: [9.0; 16],
+            count: 2, // e.g. CURRENT_TEXTURE_COORDS (s, t)
+        };
+        let dest = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 8,
+        };
+        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &state, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert_eq!(mem.aperture[0..8].to_vec(), 9.0f32.to_be_bytes().repeat(2));
     }
 
     /// Culling is the one piece of window-space rasterisation whose
