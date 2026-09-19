@@ -40,6 +40,10 @@
 //!   [`RenderOp::SurfaceUpload`], its mirror -- both row by row, each row
 //!   at its own `address + (y + row) * stride_bytes + x * bpp` offset in
 //!   backing memory, never the rectangle's own tightly-packed offset.
+//! - [`RenderOp::ReadPixels`], including the `Depth` format
+//!   `SurfaceReadback`/`encode_pixel` do not accept, scaled from wgpu's
+//!   own `[0, 1]` depth range to the spec's 32-bit unsigned one, and
+//!   `ROWS_BOTTOM_UP`.
 //! - Depth test and mask, blend func (not yet separate/equation), alpha
 //!   test, cull face and front face, scissor, viewport (window-space draws
 //!   ignore it, per the spec -- viewport is transform-tier), colour mask.
@@ -47,8 +51,8 @@
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
 //! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`,
-//! `ReadPixels`, `BLEND_EQUATION`/
-//! `BLEND_FUNC_SEPARATE`, fog, polygon offset, line/point primitives
+//! `BLEND_EQUATION`/`BLEND_FUNC_SEPARATE`, fog, polygon offset,
+//! line/point primitives
 //! (only `TRIANGLES`-family and `POINTS`/`LINES`-as-degenerate-triangles
 //! are not special-cased -- see [`triangulate`]). Every one of these
 //! returns [`RenderError::Unimplemented`] rather than panicking.
@@ -182,6 +186,18 @@ fn offset_backing(b: state::Backing, extra: u32) -> MemLoc {
     match b {
         state::Backing::Aperture(a) => MemLoc::Aperture(a + extra),
         state::Backing::Guest(a) => MemLoc::Guest(a + extra),
+    }
+}
+
+/// The same shift as [`offset_backing`], for a [`Ref`] destination
+/// instead of a surface's own backing -- [`RenderOp::ReadPixels`]'s
+/// `dest` (an arbitrary caller-chosen buffer, not the surface itself),
+/// written one row at a time at its own caller-specified `row_bytes`
+/// stride.
+fn offset_ref(r: Ref, extra: u32) -> MemLoc {
+    match r.space {
+        RefSpace::Aperture => MemLoc::Aperture(r.address + extra),
+        RefSpace::Guest => MemLoc::Guest(r.address + extra),
     }
 }
 
@@ -1308,7 +1324,10 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: INTERNAL_DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // COPY_SRC: READ_PIXELS(DEPTH) reads this back via
+                // copy_texture_to_cpu, exactly like the colour texture's
+                // own COPY_SRC above.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1727,7 +1746,18 @@ impl Renderer {
                 Err(RenderError::Unimplemented("TEX_COPY_SUBIMAGE (M3)"))
             }
             RenderOp::TexPalette { .. } => Err(RenderError::Unimplemented("TEX_PALETTE (M3)")),
-            RenderOp::ReadPixels { .. } => Err(RenderError::Unimplemented("READ_PIXELS (M3)")),
+            RenderOp::ReadPixels {
+                x,
+                y,
+                w,
+                h,
+                format,
+                row_bytes,
+                flags,
+                dest,
+            } => self.op_read_pixels(
+                *x, *y, *w, *h, *format, *row_bytes, *flags, *dest, state, mem,
+            ),
             RenderOp::Query { dest, result } => self.op_query(*dest, *result, mem),
         }
     }
@@ -2320,6 +2350,99 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
+    }
+
+    /// `READ_PIXELS`: like [`Self::op_surface_readback`], reads the draw
+    /// surface's rectangle back to the CPU, but into an arbitrary `dest`
+    /// ref at the caller's own `row_bytes` stride rather than the
+    /// surface's own backing memory and its own `stride_bytes` --
+    /// `SurfaceReadback` and `ReadPixels` differ in *where* the pixels
+    /// land and, for `ReadPixels`, that `Depth` is a legal target format;
+    /// the row-by-row addressing the fix to `SurfaceReadback`/
+    /// `SurfaceUpload` already established applies identically to the
+    /// destination side here, just keyed by `row_bytes` instead of
+    /// `stride_bytes`. `flags` bit 0 (`ROWS_BOTTOM_UP`) reverses which
+    /// *output* row a source row lands at -- row values are unchanged,
+    /// only their order -- so a client with a bottom-left image origin
+    /// (`glReadPixels`) needs no row-reversal of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn op_read_pixels(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        format: WireSurfaceFormat,
+        row_bytes: u32,
+        flags: u32,
+        dest: Ref,
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let id = state.draw_surface();
+        let def = *state
+            .surface(id)
+            .ok_or(RenderError::UnknownObject("surface", id))?;
+        let gpu = self
+            .surfaces
+            .get(&id)
+            .ok_or(RenderError::UnknownObject("surface", id))?;
+
+        // Both branches produce one f32-per-channel-or-depth value per
+        // source texel, straight from `copy_texture_to_cpu`'s raw bytes
+        // (4 bytes/texel either way: RGBA8 four channel bytes, or one
+        // little-endian f32 for Depth32Float -- a raw GPU-to-CPU memory
+        // copy, not a serialised value, so it is read back in the same
+        // little-endian convention every other GPU buffer in this module
+        // uses, e.g. `gpu_vertices_to_bytes`).
+        let bpp = if format == WireSurfaceFormat::Depth {
+            4
+        } else {
+            surface_format_bytes_per_pixel(format)
+        };
+        let encode_at = |raw: &[u8], sx: u32, sy: u32| -> Result<Vec<u8>, RenderError> {
+            let at = ((sy * def.width + sx) * 4) as usize;
+            if format == WireSurfaceFormat::Depth {
+                let depth = f32::from_le_bytes(
+                    *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
+                );
+                let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
+                Ok(scaled.to_be_bytes().to_vec())
+            } else {
+                let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
+                encode_pixel(format, pixel)
+            }
+        };
+        let raw = if format == WireSurfaceFormat::Depth {
+            let depth = gpu.depth.clone();
+            self.copy_texture_to_cpu(&depth, def.width, def.height)?
+        } else {
+            let color = gpu.color.clone();
+            self.copy_texture_to_cpu(&color, def.width, def.height)?
+        };
+
+        let bottom_up = flags & proto::READ_PIXELS_FLAG_ROWS_BOTTOM_UP != 0;
+        for out_row in 0..h {
+            let src_row = if bottom_up { h - 1 - out_row } else { out_row };
+            let sy = y + src_row;
+            let mut row_out = vec![0u8; (w * bpp) as usize];
+            for col in 0..w {
+                let sx = x + col;
+                if sx >= def.width || sy >= def.height {
+                    continue;
+                }
+                let encoded = encode_at(&raw, sx, sy)?;
+                let at = (col * bpp) as usize;
+                row_out[at..at + encoded.len()].copy_from_slice(&encoded);
+            }
+            let loc = offset_ref(dest, out_row * row_bytes);
+            if !mem.write(loc, &row_out) {
+                return Err(RenderError::BadMemory(format!(
+                    "READ_PIXELS write to {loc:?} (row {out_row})"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -3201,6 +3324,169 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A colour `READ_PIXELS` with `ROWS_BOTTOM_UP` set must land the
+    /// surface's own top row *last* in the destination -- the row
+    /// *values* are unchanged, only which output row each lands at, so a
+    /// two-colour surface (top red, bottom green) proves the flip
+    /// unambiguously in a way a uniform colour never could.
+    #[test]
+    fn read_pixels_with_rows_bottom_up_reverses_output_row_order_not_values() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 2,
+                height: 2,
+                stride_bytes: 8,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+
+        let mut mem = TestMemory::new(64);
+        // Top row (y=0) red via a scissored clear, bottom row (y=1) green.
+        state.set_clear_color(1.0, 0.0, 0.0, 1.0);
+        state.enable(state::Capability::ScissorTest);
+        state.set_scissor(0, 0, 2, 1);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        state.set_clear_color(0.0, 1.0, 0.0, 1.0);
+        state.set_scissor(0, 1, 2, 1);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let dest = Ref {
+            address: 32,
+            space: RefSpace::Aperture,
+            length: 16,
+        };
+        let errs = renderer.execute(
+            &[RenderOp::ReadPixels {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+                format: WireSurfaceFormat::A8r8g8b8,
+                row_bytes: 8,
+                flags: proto::READ_PIXELS_FLAG_ROWS_BOTTOM_UP,
+                dest,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // A R G B. Bottom-up: output row 0 = source row 1 (green), output
+        // row 1 = source row 0 (red) -- the reverse of plain top-down.
+        let green = [0xFFu8, 0x00, 0xFF, 0x00];
+        let red = [0xFFu8, 0xFF, 0x00, 0x00];
+        assert_eq!(
+            &mem.aperture[32..36],
+            &green,
+            "output row 0 must be the source's bottom row"
+        );
+        assert_eq!(
+            &mem.aperture[40..44],
+            &red,
+            "output row 1 must be the source's top row"
+        );
+    }
+
+    /// `READ_PIXELS` with `format = Depth` reads the depth buffer, not
+    /// the colour one, as a 32-bit unsigned value scaled from wgpu's own
+    /// `[0, 1]` depth range -- `0` at the near plane, `0xFFFFFFFF` at the
+    /// far plane, per the spec. A `CLEAR_DEPTH` to a known value is the
+    /// simplest way to put a known depth in the buffer without a real
+    /// draw.
+    #[test]
+    fn read_pixels_of_depth_reads_the_depth_buffer_as_a_scaled_u32() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 2,
+                height: 2,
+                stride_bytes: 8,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_depth(0.5);
+        let mut mem = TestMemory::new(64);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_DEPTH,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let dest = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 16,
+        };
+        let errs = renderer.execute(
+            &[RenderOp::ReadPixels {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+                format: WireSurfaceFormat::Depth,
+                row_bytes: 8,
+                flags: 0,
+                dest,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let expected = ((0.5f64) * u32::MAX as f64).round() as u32;
+        for chunk in mem.aperture[0..16].chunks_exact(4) {
+            let value = u32::from_be_bytes(chunk.try_into().unwrap());
+            // Within 1 of the expected scaled value: acceptable f32
+            // rounding either side of the exact midpoint.
+            assert!(
+                (value as i64 - expected as i64).abs() <= 1,
+                "expected roughly {expected}, got {value}"
+            );
         }
     }
 
