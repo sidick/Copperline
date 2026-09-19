@@ -692,6 +692,7 @@ makes the real ROMulus flash-ROM board. The product numbers under it are:
 | 6 | HostSocket bsdsocket.library board (`[hostsocket]`; `hostsocket.rs`) |
 | 7 | MHI virtual MPEG audio decoder board (`[mhi]`; `mhi.rs`) |
 | 8 | copperhf virtual hardfile controller (`[copperhf]`; `copperhf.rs`) |
+| 9 | C3D virtual 3D accelerator board (`[c3d]`; `c3d/board.rs`) |
 
 (The bundled [zz9k crypto board](#crypto-the-bundled-zz9k-board) is the one
 exception: it autoconfigs under MNT's manufacturer ID 0x6D6E with the

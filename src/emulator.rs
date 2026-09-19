@@ -4077,6 +4077,25 @@ fn build_machine_inner(
     if cfg.mhi {
         log::warn!("[mhi] enabled = true needs a build with --features mhi; no board is fitted");
     }
+    // C3D virtual 3D accelerator board (`[c3d] enabled`): see
+    // crate::c3d::board and docs/internals/c3d.md.
+    #[cfg(feature = "c3d")]
+    if cfg.c3d {
+        // The whole Zorro III window; not yet a `[c3d]` config knob (see
+        // crate::c3d::board's module doc comment). A legal Zorro III size
+        // -- BoardSpec::validate checks this the same as any other board.
+        const WINDOW_BYTES: u32 = 0x0200_0000; // 32 MiB
+        let slot = devices.len();
+        zorro.add_board(crate::zorro::BoardSpec::c3d(slot, WINDOW_BYTES as usize))?;
+        info!("c3d: 3D accelerator board on the Zorro chain (slot {slot})");
+        devices.push(crate::zorro_device::BoardDevice::C3d(Box::new(
+            crate::c3d::board::C3dBoard::new(WINDOW_BYTES),
+        )));
+    }
+    #[cfg(not(feature = "c3d"))]
+    if cfg.c3d {
+        log::warn!("[c3d] enabled = true needs a build with --features c3d; no board is fitted");
+    }
     // RTG board (`[rtg] card`): the Z3660.card P96 driver drives RTG screens
     // through its register file and framebuffer; see crate::z3660.
     if cfg.rtg == crate::config::RtgCard::Z3660 {

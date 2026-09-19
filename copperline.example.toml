@@ -421,6 +421,13 @@ slow = "512K"
 # [mhi]
 # enabled = true
 
+# C3D: a virtual fixed-function 3D accelerator board, targeted by a guest
+# OpenGL 1.x library. Needs a build with the c3d feature (off by
+# default -- the only board that creates a GPU device of its own). No
+# other options exist yet; see docs/internals/c3d.md.
+# [c3d]
+# enabled = true
+
 
 # zz9k: a ZZ9000 SDK v2 crypto accelerator (the MNT ZZ9000's CORE + MEMORY
 # + CRYPTO services, register-compatible, crypto computed host-side). The

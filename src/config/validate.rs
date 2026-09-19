@@ -923,6 +923,7 @@ impl TryFrom<RawConfig> for Config {
             }
         };
         let mhi = raw.mhi.enabled.unwrap_or(defaults.mhi);
+        let c3d = raw.c3d.enabled.unwrap_or(defaults.c3d);
 
         // `[recording]`: the clip ring is bounded in time (and by a byte
         // budget in gifclip.rs); the rate caps at the field rate.
@@ -1435,6 +1436,7 @@ impl TryFrom<RawConfig> for Config {
             cartridge,
             recording,
             mhi,
+            c3d,
             hostsocket_net,
             hostsocket_transport,
             rtg,

@@ -2593,6 +2593,28 @@ byte-for-byte reproducible, like `--audio-wav` captures of the rest of
 Copperline's audio path. See [](../zorro) and [](../internals/mhi)
 for the register model.
 
+## `[c3d]` -- virtual 3D accelerator board
+
+```toml
+[c3d]
+enabled = true
+```
+
+Fits a virtual fixed-function 3D accelerator board on the Zorro chain,
+targeted by a guest OpenGL 1.x library. Omit the section (or `enabled =
+false`) for no board. Needs a build with the `c3d` feature (**off by
+default**, unlike `mhi`: this is the only board that creates a GPU device
+of its own, so a build that does not want 3D pays nothing for it). It
+prefers a hardware adapter and falls back to a software one; if neither is
+available the board still autoconfigs and answers registers, but every
+doorbell's rendering work is silently dropped (a warning is logged once).
+Board size, context count, capability mask, timing preset and trace
+capture are not yet configuration knobs -- Copperline fits one fixed
+32 MiB Zorro III window with 4 contexts. The device specification is
+published separately from Copperline's own docs; see [](../internals/c3d)
+for Copperline's implementation notes and where to find it, and
+[](../zorro) for the autoconfig identity.
+
 ## `[hostsocket]` -- bsdsocket.library without a guest TCP/IP stack
 
 ```toml

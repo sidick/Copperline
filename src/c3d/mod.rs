@@ -35,3 +35,9 @@ pub mod trace;
 /// everywhere the core does.
 #[cfg(feature = "c3d")]
 pub mod render;
+
+/// The board itself -- autoconfig, register decode, the doorbell path --
+/// gated with `render` since it is meaningless without a renderer to
+/// drive.
+#[cfg(feature = "c3d")]
+pub mod board;

@@ -103,6 +103,8 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) mhi: RawMhi,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) c3d: RawC3d,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) hostsocket: RawHostSocket,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) zz9k: RawZz9k,
@@ -1039,6 +1041,17 @@ pub(crate) struct RawRecording {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawMhi {
     /// Fit the board. Absent/false means no MHI board is on the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enabled: Option<bool>,
+}
+
+/// `[c3d]` C3D virtual 3D accelerator board.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawC3d {
+    /// Fit the board. Absent/false means no C3D board is on the chain.
+    /// Needs a build with the `c3d` feature (off by default); see
+    /// `docs/internals/c3d.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) enabled: Option<bool>,
 }

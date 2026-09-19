@@ -76,6 +76,13 @@ const PRODUCT_MHI: u8 = 0x07;
 /// `COPPERHF-DEVICE-PLAN.md`.
 const PRODUCT_COPPERHF: u8 = 0x08;
 
+/// The C3D virtual 3D accelerator board (`crate::c3d::board`, `[c3d]`); see
+/// `docs/internals/c3d.md` and the protocol specification it points at.
+/// Gated like its only consumer, [`BoardSpec::c3d`], so a non-`c3d` build
+/// stays warning-free.
+#[cfg(feature = "c3d")]
+const PRODUCT_C3D: u8 = 0x09;
+
 /// MNT Research's registered expansion manufacturer ID, carried by the
 /// bundled ZZ9000 SDK crypto board (`crate::zz9k`, `[zz9k]`): the SDK's
 /// Amiga-side transport detects the board by this identity, so the
@@ -561,6 +568,34 @@ impl BoardSpec {
             product: crate::z3660::Z3660_PRODUCT,
             serial: 0,
             size_bytes: crate::z3660::Z3660_WINDOW_BYTES,
+            backing: BoardBacking::Device(slot),
+            memlist: false,
+            memory_space: false,
+            chained: false,
+            no_shutup: false,
+            window: 0,
+            diag_vec: None,
+        }
+    }
+
+    /// The C3D virtual 3D accelerator board: one Zorro III autoconfig
+    /// window (manufacturer [`COPPERLINE_MANUFACTURER_ID`], product
+    /// [`PRODUCT_C3D`]) holding the global and per-context registers and
+    /// the data aperture, per the protocol specification's "Zorro
+    /// identity" and "Window layout". `window_bytes` is the whole window
+    /// (a legal Zorro III size, a power of two) as [`crate::c3d::board`]
+    /// computes it from `[c3d]`'s configured aperture size; no autoboot
+    /// ROM, not in the free-memory list -- the board's window belongs to
+    /// whichever guest library claims it, not to Kickstart.
+    #[cfg(feature = "c3d")]
+    pub fn c3d(slot: usize, window_bytes: usize) -> Self {
+        Self {
+            name: "C3D 3D accelerator".into(),
+            version: ZorroVersion::III,
+            manufacturer: COPPERLINE_MANUFACTURER_ID,
+            product: PRODUCT_C3D,
+            serial: 0,
+            size_bytes: window_bytes,
             backing: BoardBacking::Device(slot),
             memlist: false,
             memory_space: false,

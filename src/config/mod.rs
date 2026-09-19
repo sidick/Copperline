@@ -316,6 +316,11 @@ pub struct Config {
     /// with the `mhi` feature (on by default; off only for the wasm32
     /// browser core, which builds `default-features = false`).
     pub mhi: bool,
+    /// The C3D virtual 3D accelerator board (`[c3d] enabled = true`):
+    /// when true, a C3D board autoconfigs on the Zorro chain. Needs a
+    /// build with the `c3d` feature (off by default; see
+    /// `docs/internals/c3d.md`).
+    pub c3d: bool,
     /// HostSocket board backend (`[hostsocket] net`): when set, the bundled
     /// bsdsocket.library plugin board is fitted with this backend. The board
     /// itself travels in [`Config::wasm_boards`]; this field records the
@@ -2686,6 +2691,7 @@ impl Default for Config {
             cartridge: CartridgeConfig::default(),
             recording: RecordingConfig::default(),
             mhi: false,
+            c3d: false,
             hostsocket_net: None,
             hostsocket_transport: None,
             rtg: RtgCard::None,

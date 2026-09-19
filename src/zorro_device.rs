@@ -432,6 +432,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::read(d.as_mut(), off, size, host),
             BoardDevice::Copperhf(d) => ZorroDevice::read(d, off, size, host),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::read(d, off, size, host),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::read(d.as_mut(), off, size, host),
         }
     }
 
@@ -455,6 +457,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::write(d.as_mut(), off, size, value, host),
             BoardDevice::Copperhf(d) => ZorroDevice::write(d, off, size, value, host),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::write(d, off, size, value, host),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::write(d.as_mut(), off, size, value, host),
         }
     }
 
@@ -478,6 +482,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::peek_word(d.as_ref(), off),
             BoardDevice::Copperhf(d) => ZorroDevice::peek_word(d, off),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::peek_word(d, off),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::peek_word(d.as_ref(), off),
         }
     }
 
@@ -501,6 +507,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::tick(d.as_mut(), cck, host),
             BoardDevice::Copperhf(d) => ZorroDevice::tick(d, cck, host),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::tick(d, cck, host),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::tick(d.as_mut(), cck, host),
         }
     }
 
@@ -524,6 +532,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::int2_line(d.as_ref()),
             BoardDevice::Copperhf(d) => ZorroDevice::int2_line(d),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::int2_line(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::int2_line(d.as_ref()),
         }
     }
 
@@ -547,6 +557,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::int6_line(d.as_ref()),
             BoardDevice::Copperhf(d) => ZorroDevice::int6_line(d),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::int6_line(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::int6_line(d.as_ref()),
         }
     }
 
@@ -570,6 +582,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::take_activity(d.as_mut()),
             BoardDevice::Copperhf(d) => ZorroDevice::take_activity(d),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::take_activity(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::take_activity(d.as_mut()),
         }
     }
 
@@ -593,6 +607,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::reset(d.as_mut()),
             BoardDevice::Copperhf(d) => ZorroDevice::reset(d),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::reset(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::reset(d.as_mut()),
         }
     }
 
@@ -616,6 +632,8 @@ impl ZorroDevice for BoardDevice {
             BoardDevice::Cd32Fmv(d) => ZorroDevice::kind(d.as_ref()),
             BoardDevice::Copperhf(d) => ZorroDevice::kind(d),
             BoardDevice::Sf2000Sd(d) => ZorroDevice::kind(d),
+            #[cfg(feature = "c3d")]
+            BoardDevice::C3d(d) => ZorroDevice::kind(d.as_ref()),
         }
     }
 }
