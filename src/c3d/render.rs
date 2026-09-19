@@ -20,7 +20,11 @@
 //! end, not the full fixed-function feature set (that is M3). Implemented:
 //!
 //! - [`RenderOp::Clear`] honouring `CLEAR_COLOR`/`CLEAR_DEPTH`, the colour
-//!   mask and the scissor.
+//!   mask and the scissor -- a full-rect, full-mask clear uses `wgpu`'s
+//!   own `LoadOp::Clear`; a scissored or partial-colour-mask clear falls
+//!   back to a degenerate scissored draw instead
+//!   ([`ClearRectPipelineKey`]), since neither restriction is something
+//!   `LoadOp::Clear` alone can express.
 //! - [`RenderOp::Draw`] for the **window-space** draw shapes
 //!   (`DRAW_INLINE_WIN` only; `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` and
 //!   every GL-space shape are deferred -- see [`RenderError::Unimplemented`]),
@@ -956,8 +960,12 @@ pub struct Renderer {
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     bind_group_layout_textured: wgpu::BindGroupLayout,
     bind_group_layout_textured_alpha: wgpu::BindGroupLayout,
+    /// One uniform (the clear colour + depth) -- see
+    /// [`ClearRectPipelineKey`] and [`Renderer::op_clear`].
+    bind_group_layout_clear_rect: wgpu::BindGroupLayout,
     surfaces: HashMap<u32, GpuSurface>,
     textures: HashMap<u32, GpuTexture>,
+    clear_rect_pipelines: HashMap<ClearRectPipelineKey, wgpu::RenderPipeline>,
 }
 
 /// Ranks a [`wgpu::AdapterInfo`]'s device type for adapter selection:
@@ -972,6 +980,72 @@ fn adapter_rank(info: &wgpu::AdapterInfo) -> u8 {
         wgpu::DeviceType::Cpu => 4,
     }
 }
+
+/// A scissored/partial-colour-mask `CLEAR` is done as a degenerate draw
+/// (a full-viewport triangle, clipped by the render pass's own scissor
+/// rect) rather than `wgpu`'s pass-wide `LoadOp::Clear`, which always
+/// covers the whole attachment and cannot be masked per channel either.
+/// This is a separate, much smaller pipeline family from [`PipelineKey`]'s
+/// -- no texturing, no vertex buffer, no blending, a fixed depth compare
+/// -- specialised only over what a clear actually varies: which colour
+/// channels land, whether depth is written, and the surface's format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClearRectPipelineKey {
+    color_write: (bool, bool, bool, bool),
+    depth_write: bool,
+    surface_format: TextureFormatKey,
+}
+
+/// Uniform bytes for the clear-rect shader: the clear colour and the
+/// clear depth, packed to a 16-byte-aligned 32-byte struct matching
+/// `CLEAR_RECT_SHADER`'s `ClearUniforms` exactly (`vec4<f32>` colour,
+/// `f32` depth, 12 bytes of tail padding -- a uniform buffer's total size
+/// must be a multiple of its largest member's alignment, 16 here).
+fn clear_rect_uniform_bytes(color: [f32; 4], depth: f32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, c) in color.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&c.to_le_bytes());
+    }
+    out[16..20].copy_from_slice(&depth.to_le_bytes());
+    out
+}
+
+/// A full-viewport triangle from `@builtin(vertex_index)` alone (no
+/// vertex buffer needed), the same construction
+/// `src/video/window/rtg_texture.rs`'s own fullscreen pass uses. The
+/// render pass's scissor rect (set by the caller to either the whole
+/// surface or the active `SCISSOR` rectangle) is what actually restricts
+/// which pixels this touches; the triangle itself always covers the
+/// whole clip-space square. `u.depth` is written as clip-space `z` with
+/// `w = 1`, so it lands unchanged as the fragment's depth -- this shader
+/// works entirely in wgpu's own `[0, 1]` depth convention, unlike the
+/// GL-space (M3 transform tier) path, which has an extra `[-1, 1]` fixup
+/// to do first (see [`gl_clip_z_to_wgpu`]).
+const CLEAR_RECT_SHADER: &str = r#"
+struct ClearUniforms {
+    color: vec4<f32>,
+    depth: f32,
+};
+@group(0) @binding(0) var<uniform> u: ClearUniforms;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VOut {
+    let tc = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VOut;
+    let ndc = tc * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    out.pos = vec4<f32>(ndc, u.depth, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return u.color;
+}
+"#;
 
 impl Renderer {
     /// Creates a headless renderer: no window, no surface. Prefers a
@@ -1062,6 +1136,21 @@ impl Renderer {
                 ],
             });
 
+        let bind_group_layout_clear_rect =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d clear-rect bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
         Ok(Renderer {
             _instance: instance,
             adapter_info,
@@ -1071,8 +1160,10 @@ impl Renderer {
             pipelines: HashMap::new(),
             bind_group_layout_textured,
             bind_group_layout_textured_alpha,
+            bind_group_layout_clear_rect,
             surfaces: HashMap::new(),
             textures: HashMap::new(),
+            clear_rect_pipelines: HashMap::new(),
         })
     }
 
@@ -1325,6 +1416,94 @@ impl Renderer {
             })
     }
 
+    fn clear_rect_pipeline_for(&mut self, key: &ClearRectPipelineKey) -> &wgpu::RenderPipeline {
+        if !self.clear_rect_pipelines.contains_key(key) {
+            let pipeline = self.build_clear_rect_pipeline(key);
+            self.clear_rect_pipelines.insert(*key, pipeline);
+        }
+        self.clear_rect_pipelines.get(key).expect("just inserted")
+    }
+
+    fn build_clear_rect_pipeline(&self, key: &ClearRectPipelineKey) -> wgpu::RenderPipeline {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("c3d clear-rect shader"),
+                source: wgpu::ShaderSource::Wgsl(CLEAR_RECT_SHADER.into()),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("c3d clear-rect pipeline layout"),
+                bind_group_layouts: &[Some(&self.bind_group_layout_clear_rect)],
+                immediate_size: 0,
+            });
+
+        let color_write = {
+            let (r, g, b, a) = key.color_write;
+            let mut mask = wgpu::ColorWrites::empty();
+            if r {
+                mask |= wgpu::ColorWrites::RED;
+            }
+            if g {
+                mask |= wgpu::ColorWrites::GREEN;
+            }
+            if b {
+                mask |= wgpu::ColorWrites::BLUE;
+            }
+            if a {
+                mask |= wgpu::ColorWrites::ALPHA;
+            }
+            mask
+        };
+        let surface_format = wgpu::TextureFormat::Rgba8Unorm; // internal target format
+        let _ = key.surface_format; // reserved, matches PipelineKey's own note
+
+        self.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("c3d clear-rect pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[], // no vertex buffer -- see CLEAR_RECT_SHADER's doc comment
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: INTERNAL_DEPTH_FORMAT,
+                    depth_write_enabled: Some(key.depth_write),
+                    // Always: a clear unconditionally overwrites whatever
+                    // depth is already there within the scissor rect,
+                    // never depth-tested against it.
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: color_write,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+    }
+
     fn pipeline_key_from_state(
         &self,
         state: &State,
@@ -1474,8 +1653,31 @@ impl Renderer {
         let color_view = gpu.color_view.clone();
         let depth_view = gpu.depth_view.clone();
 
+        let mask_full = state.raster.color_mask.r
+            && state.raster.color_mask.g
+            && state.raster.color_mask.b
+            && state.raster.color_mask.a;
+        // Real GL only lets SCISSOR restrict a clear when GL_SCISSOR_TEST
+        // is enabled, and only within the surface's own bounds --
+        // `clamped_scissor_rect` returns `None` for exactly the cases
+        // that need no restriction (test off, or a rect that already
+        // covers everything -- `set_draw_surface` resets scissor to the
+        // whole surface, so an untouched scissor is "full" too).
+        let scissor_rect = Self::clamped_scissor_rect(state, def.width, def.height);
+
+        // `wgpu::LoadOp::Clear` covers the whole attachment and cannot be
+        // masked per colour channel, so anything a scissor or a partial
+        // colour mask would need to *not* touch is instead handled by a
+        // second, scissored draw pass below (`ClearRectPipelineKey`) --
+        // colour and depth independently, since a scissor without a
+        // colour mask still wants the cheap whole-attachment depth clear
+        // whenever there is no scissor to restrict it by.
+        let color_needs_draw =
+            mask & proto::CLEAR_MASK_COLOR != 0 && (scissor_rect.is_some() || !mask_full);
+        let depth_needs_draw = mask & proto::CLEAR_MASK_DEPTH != 0 && scissor_rect.is_some();
+
         let [r, g, b, a] = state.raster.clear_color;
-        let load_color = if mask & proto::CLEAR_MASK_COLOR != 0 {
+        let load_color = if mask & proto::CLEAR_MASK_COLOR != 0 && !color_needs_draw {
             wgpu::LoadOp::Clear(wgpu::Color {
                 r: r as f64,
                 g: g as f64,
@@ -1485,85 +1687,153 @@ impl Renderer {
         } else {
             wgpu::LoadOp::Load
         };
-        let load_depth = if mask & proto::CLEAR_MASK_DEPTH != 0 {
+        let load_depth = if mask & proto::CLEAR_MASK_DEPTH != 0 && !depth_needs_draw {
             wgpu::LoadOp::Clear(state.raster.clear_depth)
         } else {
             wgpu::LoadOp::Load
         };
 
-        // The scissor and colour mask apply to CLEAR per the spec; a
-        // scissored clear is done as a degenerate full-screen "draw" pass
-        // whose load op is Load and which restricts the viewport/scissor
-        // rect, rather than wgpu's pass-wide LoadOp::Clear (which always
-        // covers the whole attachment). When there is no scissor and the
-        // colour mask is all-on, the cheap LoadOp::Clear path is used.
-        // Real GL only lets SCISSOR restrict a clear when GL_SCISSOR_TEST
-        // is enabled (a set-but-disabled scissor rect never narrows a
-        // clear); the spec's "Honours the scissor" note is read the same
-        // way here, matching GL 1.x. `set_draw_surface` also resets
-        // scissor/viewport to the whole surface, so a scissor rect that
-        // merely equals the surface's own bounds counts as "full" too.
-        let scissor = state.raster.scissor;
-        let full_rect = !state.is_enabled(state::Capability::ScissorTest)
-            || (scissor.x <= 0
-                && scissor.y <= 0
-                && scissor.w >= def.width
-                && scissor.h >= def.height);
-        let mask_full = state.raster.color_mask.r
-            && state.raster.color_mask.g
-            && state.raster.color_mask.b
-            && state.raster.color_mask.a;
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("c3d clear"),
-            });
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("c3d clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if full_rect || mask & proto::CLEAR_MASK_COLOR == 0 {
-                            load_color
-                        } else {
-                            // Partial-rect colour clears are deferred; the
-                            // M1 traces clear the whole surface.
-                            wgpu::LoadOp::Load
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("c3d clear"),
+                });
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("c3d clear pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: load_color,
+                            store: wgpu::StoreOp::Store,
                         },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: load_depth,
-                        store: wgpu::StoreOp::Store,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: load_depth,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            self.queue.submit(Some(encoder.finish()));
         }
-        self.queue.submit(Some(encoder.finish()));
 
-        if !full_rect && mask & proto::CLEAR_MASK_COLOR != 0 {
-            return Err(RenderError::Unimplemented("scissored CLEAR rectangle"));
+        if color_needs_draw || depth_needs_draw {
+            let key = ClearRectPipelineKey {
+                color_write: if color_needs_draw {
+                    (
+                        state.raster.color_mask.r,
+                        state.raster.color_mask.g,
+                        state.raster.color_mask.b,
+                        state.raster.color_mask.a,
+                    )
+                } else {
+                    (false, false, false, false)
+                },
+                depth_write: depth_needs_draw,
+                surface_format: wgpu::TextureFormat::Rgba8Unorm.into(),
+            };
+            self.clear_rect_pipeline_for(&key);
+            let pipeline = self.clear_rect_pipelines.get(&key).expect("just ensured");
+
+            let uniform_bytes = clear_rect_uniform_bytes(
+                [r, g, b, a],
+                if depth_needs_draw {
+                    state.raster.clear_depth
+                } else {
+                    0.0
+                },
+            );
+            let uniform_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("c3d clear-rect uniforms"),
+                        contents: &uniform_bytes,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("c3d clear-rect bind group"),
+                layout: &self.bind_group_layout_clear_rect,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("c3d clear-rect"),
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("c3d clear-rect pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                if let Some((x, y, sw, sh)) = scissor_rect {
+                    pass.set_scissor_rect(x, y, sw, sh);
+                }
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.queue.submit(Some(encoder.finish()));
         }
-        if !mask_full {
-            return Err(RenderError::Unimplemented(
-                "CLEAR with a partial colour mask",
-            ));
-        }
+
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The active `SCISSOR` rect, clamped to the surface and to
+    /// non-negative device coordinates, or `None` when `SCISSOR_TEST` is
+    /// off or the rect is empty -- in either case nothing should be
+    /// scissored, i.e. the caller draws (or clears) unrestricted. Shared
+    /// by ordinary scissor-tested draws and [`Renderer::op_clear`]'s
+    /// scissored-clear path, so the two can never clamp differently.
+    fn clamped_scissor_rect(
+        state: &State,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let scissor = state.raster.scissor;
+        if scissor.w == 0 || scissor.h == 0 || !state.is_enabled(state::Capability::ScissorTest) {
+            return None;
+        }
+        let x = scissor.x.max(0) as u32;
+        let y = scissor.y.max(0) as u32;
+        let sw = scissor.w.min(width.saturating_sub(x));
+        let sh = scissor.h.min(height.saturating_sub(y));
+        (sw > 0 && sh > 0).then_some((x, y, sw, sh))
+    }
+
     fn op_draw_inline_win(
         &mut self,
         prim: PrimitiveType,
@@ -1741,15 +2011,8 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(pipeline);
-            let scissor = state.raster.scissor;
-            if scissor.w > 0 && scissor.h > 0 && state.is_enabled(state::Capability::ScissorTest) {
-                let x = scissor.x.max(0) as u32;
-                let y = scissor.y.max(0) as u32;
-                let sw = scissor.w.min(def.width.saturating_sub(x));
-                let sh = scissor.h.min(def.height.saturating_sub(y));
-                if sw > 0 && sh > 0 {
-                    pass.set_scissor_rect(x, y, sw, sh);
-                }
+            if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, def.width, def.height) {
+                pass.set_scissor_rect(x, y, sw, sh);
             }
             if let Some(bg) = &bind_group {
                 pass.set_bind_group(0, bg, &[]);
@@ -2430,6 +2693,148 @@ mod tests {
         assert_eq!((w, h), (8, 8));
         for px in pixels.chunks(4) {
             assert_eq!(px, [0, 255, 0, 255]);
+        }
+    }
+
+    /// A scissored `CLEAR` must touch only the rectangle inside
+    /// `SCISSOR`, leaving everything outside it exactly as it was --
+    /// this is the case `wgpu::LoadOp::Clear` alone cannot express
+    /// (see `Renderer::op_clear`'s doc comment), so it is the one worth
+    /// checking pixel-by-pixel rather than trusting "no error".
+    #[test]
+    fn a_scissored_clear_touches_only_the_scissor_rectangle() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 8,
+                height: 8,
+                stride_bytes: 32,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+
+        let mut mem = TestMemory::new(4096);
+        // First, an ordinary full clear to a known background (blue), so
+        // "untouched" has an unambiguous value to check against.
+        state.set_clear_color(0.0, 0.0, 1.0, 1.0);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // Then a scissored clear to red, restricted to the top-left 3x2
+        // rectangle only.
+        state.set_clear_color(1.0, 0.0, 0.0, 1.0);
+        state.enable(state::Capability::ScissorTest);
+        state.set_scissor(0, 0, 3, 2);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let at = ((y * 8 + x) * 4) as usize;
+                let px = &pixels[at..at + 4];
+                if x < 3 && y < 2 {
+                    assert_eq!(
+                        px,
+                        [255, 0, 0, 255],
+                        "({x}, {y}) should be red (inside scissor)"
+                    );
+                } else {
+                    assert_eq!(
+                        px,
+                        [0, 0, 255, 255],
+                        "({x}, {y}) should still be blue (outside scissor)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `CLEAR` with a partial colour mask must leave the masked-off
+    /// channels exactly as they were, even for a full-surface clear with
+    /// no scissor -- the same `wgpu::LoadOp::Clear` limitation as the
+    /// scissored case, for a different reason (per-channel masking
+    /// rather than a sub-rectangle).
+    #[test]
+    fn a_clear_with_a_partial_colour_mask_leaves_the_masked_channels_alone() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        let mut mem = TestMemory::new(4096);
+
+        // Background: opaque white, so every channel starts at 255 and a
+        // masked-off channel staying at 255 is unambiguous.
+        state.set_clear_color(1.0, 1.0, 1.0, 1.0);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // Clear to black with only the red channel writable.
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.set_color_mask(true, false, false, false);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for px in pixels.chunks(4) {
+            assert_eq!(
+                px,
+                [0, 255, 255, 255],
+                "red should have cleared to 0; green/blue/alpha must stay untouched at 255"
+            );
         }
     }
 
