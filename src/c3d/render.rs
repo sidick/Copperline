@@ -36,7 +36,10 @@
 //!   wrap modes (`CLAMP` behaving as `CLAMP_TO_EDGE`, never a border
 //!   colour), `TEXCOORD_SPACE` normalised (texel space is deferred).
 //! - [`RenderOp::SurfaceReadback`] resolving the rendered surface into a
-//!   CPU buffer in the surface's own pixel format.
+//!   CPU buffer in the surface's own pixel format, and
+//!   [`RenderOp::SurfaceUpload`], its mirror -- both row by row, each row
+//!   at its own `address + (y + row) * stride_bytes + x * bpp` offset in
+//!   backing memory, never the rectangle's own tightly-packed offset.
 //! - Depth test and mask, blend func (not yet separate/equation), alpha
 //!   test, cull face and front face, scissor, viewport (window-space draws
 //!   ignore it, per the spec -- viewport is transform-tier), colour mask.
@@ -44,7 +47,7 @@
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
 //! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`,
-//! `SurfaceUpload`, `ReadPixels`, `Query`, `BLEND_EQUATION`/
+//! `ReadPixels`, `BLEND_EQUATION`/
 //! `BLEND_FUNC_SEPARATE`, fog, polygon offset, line/point primitives
 //! (only `TRIANGLES`-family and `POINTS`/`LINES`-as-degenerate-triangles
 //! are not special-cased -- see [`triangulate`]). Every one of these
@@ -168,6 +171,17 @@ impl MemLoc {
             state::Backing::Aperture(a) => MemLoc::Aperture(a),
             state::Backing::Guest(a) => MemLoc::Guest(a),
         }
+    }
+}
+
+/// A surface's backing location, offset by `extra` bytes -- one row of a
+/// [`RenderOp::SurfaceReadback`] or [`RenderOp::SurfaceUpload`] rectangle
+/// that does not start at the surface's own first row/column, per
+/// `def.stride_bytes` and the rectangle's own `x`/`y`.
+fn offset_backing(b: state::Backing, extra: u32) -> MemLoc {
+    match b {
+        state::Backing::Aperture(a) => MemLoc::Aperture(a + extra),
+        state::Backing::Guest(a) => MemLoc::Guest(a + extra),
     }
 }
 
@@ -309,6 +323,80 @@ fn pack555(r: u8, g: u8, b: u8, a: u8) -> u16 {
     let b5 = (b as u16 * 31 + 127) / 255;
     let a1 = if a >= 128 { 1u16 } else { 0 };
     (r5 << 10) | (g5 << 5) | b5 | a1
+}
+
+fn unpack565(v: u16) -> (u8, u8, u8) {
+    let r5 = (v >> 11) & 0x1F;
+    let g6 = (v >> 5) & 0x3F;
+    let b5 = v & 0x1F;
+    let r = ((r5 << 3) | (r5 >> 2)) as u8;
+    let g = ((g6 << 2) | (g6 >> 4)) as u8;
+    let b = ((b5 << 3) | (b5 >> 2)) as u8;
+    (r, g, b)
+}
+
+fn unpack555(v: u16) -> (u8, u8, u8, u8) {
+    let r5 = (v >> 10) & 0x1F;
+    let g5 = (v >> 5) & 0x1F;
+    let b5 = v & 0x1F;
+    let a1 = v & 0x1;
+    let r = ((r5 << 3) | (r5 >> 2)) as u8;
+    let g = ((g5 << 3) | (g5 >> 2)) as u8;
+    let b = ((b5 << 3) | (b5 >> 2)) as u8;
+    let a = if a1 != 0 { 255u8 } else { 0u8 };
+    (r, g, b, a)
+}
+
+/// The exact inverse of [`encode_pixel`], for [`RenderOp::SurfaceUpload`]:
+/// converts one pixel of `fmt` at `src` back to a straight RGBA8 pixel.
+/// `None` if `src` is too short for one pixel of `fmt`, or for `Depth`,
+/// which is not a colour format `SURFACE_UPLOAD` ever targets (surfaces
+/// are colour render targets; `Depth` only ever appears as a
+/// `READ_PIXELS` output format).
+pub fn decode_pixel(fmt: WireSurfaceFormat, src: &[u8]) -> Option<[u8; 4]> {
+    Some(match fmt {
+        WireSurfaceFormat::A8r8g8b8 => {
+            let [a, r, g, b] = *<&[u8; 4]>::try_from(src.get(..4)?).ok()?;
+            [r, g, b, a]
+        }
+        WireSurfaceFormat::B8g8r8a8 => {
+            let [b, g, r, a] = *<&[u8; 4]>::try_from(src.get(..4)?).ok()?;
+            [r, g, b, a]
+        }
+        WireSurfaceFormat::R8g8b8a8 => {
+            let [r, g, b, a] = *<&[u8; 4]>::try_from(src.get(..4)?).ok()?;
+            [r, g, b, a]
+        }
+        WireSurfaceFormat::R8g8b8 => {
+            let [r, g, b] = *<&[u8; 3]>::try_from(src.get(..3)?).ok()?;
+            [r, g, b, 255]
+        }
+        WireSurfaceFormat::B8g8r8 => {
+            let [b, g, r] = *<&[u8; 3]>::try_from(src.get(..3)?).ok()?;
+            [r, g, b, 255]
+        }
+        WireSurfaceFormat::R5g6b5 => {
+            let v = u16::from_be_bytes(*<&[u8; 2]>::try_from(src.get(..2)?).ok()?);
+            let (r, g, b) = unpack565(v);
+            [r, g, b, 255]
+        }
+        WireSurfaceFormat::R5g6b5Le => {
+            let v = u16::from_le_bytes(*<&[u8; 2]>::try_from(src.get(..2)?).ok()?);
+            let (r, g, b) = unpack565(v);
+            [r, g, b, 255]
+        }
+        WireSurfaceFormat::R5g5b5 => {
+            let v = u16::from_be_bytes(*<&[u8; 2]>::try_from(src.get(..2)?).ok()?);
+            let (r, g, b, a) = unpack555(v);
+            [r, g, b, a]
+        }
+        WireSurfaceFormat::R5g5b5Le => {
+            let v = u16::from_le_bytes(*<&[u8; 2]>::try_from(src.get(..2)?).ok()?);
+            let (r, g, b, a) = unpack555(v);
+            [r, g, b, a]
+        }
+        WireSurfaceFormat::Depth => return None,
+    })
 }
 
 /// Converts a texel of `fmt` at `src` into a straight RGBA8 pixel, for
@@ -1631,8 +1719,8 @@ impl Renderer {
             RenderOp::SurfaceReadback { x, y, w, h } => {
                 self.op_surface_readback(*x, *y, *w, *h, state, mem)
             }
-            RenderOp::SurfaceUpload { .. } => {
-                Err(RenderError::Unimplemented("SURFACE_UPLOAD (M3)"))
+            RenderOp::SurfaceUpload { x, y, w, h } => {
+                self.op_surface_upload(*x, *y, *w, *h, state, mem)
             }
             RenderOp::TexCopyImage { .. } => Err(RenderError::Unimplemented("TEX_COPY_IMAGE (M3)")),
             RenderOp::TexCopySubImage { .. } => {
@@ -2171,6 +2259,70 @@ impl Renderer {
         Ok(())
     }
 
+    /// `SURFACE_UPLOAD`: the mirror of [`Self::op_surface_readback`] --
+    /// reads the rectangle from the surface's own backing memory (the
+    /// guest has drawn 2D into the bitmap and wants 3D composited over
+    /// it) and uploads it into the render target, one row at a time for
+    /// exactly the same reason the readback direction needs it: a row's
+    /// position in backing memory is `address + (y + row) * stride_bytes +
+    /// x * bpp`, never simply the rectangle's own tightly-packed offset.
+    fn op_surface_upload(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let id = state.draw_surface();
+        let def = *state
+            .surface(id)
+            .ok_or(RenderError::UnknownObject("surface", id))?;
+        let color = self.ensure_surface(id, &def)?.color.clone();
+
+        let bpp = surface_format_bytes_per_pixel(def.format);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for row in 0..h {
+            let row_offset = (y + row) * def.stride_bytes + x * bpp;
+            let loc = offset_backing(def.backing, row_offset);
+            let needed = (w * bpp) as usize;
+            let src = mem.read(loc, needed).ok_or_else(|| {
+                RenderError::BadMemory(format!("SURFACE_UPLOAD read from {loc:?} (row {row})"))
+            })?;
+            for col in 0..w {
+                let texel_at = (col * bpp) as usize;
+                let pixel = src
+                    .get(texel_at..)
+                    .and_then(|s| decode_pixel(def.format, s))
+                    .ok_or(RenderError::ShortPayload("SURFACE_UPLOAD pixel"))?;
+                let out_at = ((row * w + col) * 4) as usize;
+                rgba[out_at..out_at + 4].copy_from_slice(&pixel);
+            }
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
     fn op_surface_readback(
         &mut self,
         x: u32,
@@ -2192,8 +2344,16 @@ impl Renderer {
         let rgba = self.copy_texture_to_cpu(&gpu.color, def.width, def.height)?;
 
         let bpp = surface_format_bytes_per_pixel(def.format);
-        let mut out = vec![0u8; (w * bpp) as usize * h as usize];
+        // Each row lands at its own offset inside the surface's backing
+        // memory -- address + (y + row) * stride_bytes + x * bpp -- one
+        // `mem.write` per row, not the whole rectangle packed at the
+        // surface's own base address regardless of x/y. A rectangle away
+        // from the origin, or a surface whose stride_bytes carries
+        // padding past width * bpp, both need this: the rect's own w * bpp
+        // packing is only ever the row *length*, never where the row
+        // starts.
         for row in 0..h {
+            let mut out_row = vec![0u8; (w * bpp) as usize];
             for col in 0..w {
                 let sx = x + col;
                 let sy = y + row;
@@ -2208,16 +2368,16 @@ impl Renderer {
                     rgba[src_at + 3],
                 ];
                 let encoded = encode_pixel(def.format, pixel)?;
-                let dst_at = (row * w * bpp + col * bpp) as usize;
-                out[dst_at..dst_at + encoded.len()].copy_from_slice(&encoded);
+                let dst_at = (col * bpp) as usize;
+                out_row[dst_at..dst_at + encoded.len()].copy_from_slice(&encoded);
             }
-        }
-
-        let loc = MemLoc::from_backing(def.backing);
-        if !mem.write(loc, &out) {
-            return Err(RenderError::BadMemory(format!(
-                "SURFACE_READBACK write to {loc:?}"
-            )));
+            let row_offset = (y + row) * def.stride_bytes + x * bpp;
+            let loc = offset_backing(def.backing, row_offset);
+            if !mem.write(loc, &out_row) {
+                return Err(RenderError::BadMemory(format!(
+                    "SURFACE_READBACK write to {loc:?} (row {row})"
+                )));
+            }
         }
         Ok(())
     }
@@ -2859,6 +3019,188 @@ mod tests {
                 [0, 255, 255, 255],
                 "red should have cleared to 0; green/blue/alpha must stay untouched at 255"
             );
+        }
+    }
+
+    /// The bug `SURFACE_UPLOAD`'s own implementation would otherwise have
+    /// repeated: a rectangle away from the surface's origin, and a
+    /// surface whose `stride_bytes` carries padding past `width * bpp`,
+    /// both need each row placed at `address + (y + row) * stride_bytes
+    /// + x * bpp` in backing memory -- never the readback rectangle's own
+    /// tightly-packed offset, which is only ever a row's *length*. This
+    /// clears a padded, wider-than-tall surface to a known colour, reads
+    /// back a 2x2 rectangle away from the origin, and checks the bytes
+    /// landed at the correct strided offset -- with the padding bytes
+    /// (and everything outside the rectangle) left exactly as they
+    /// started, proving this does not merely "work" by writing more than
+    /// it should.
+    #[test]
+    fn a_surface_readback_of_a_subrectangle_lands_at_the_correct_strided_offset() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const WIDTH: u32 = 8;
+        const HEIGHT: u32 = 8;
+        const BPP: u32 = 4; // A8R8G8B8
+        const STRIDE: u32 = WIDTH * BPP + 16; // deliberate padding past width * bpp
+        const BACKING_LEN: usize = (STRIDE * HEIGHT) as usize;
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: WIDTH,
+                height: HEIGHT,
+                stride_bytes: STRIDE,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 1.0, 0.0, 1.0); // opaque green
+
+        let mut mem = TestMemory::new(BACKING_LEN);
+        // Mark the whole backing buffer with a sentinel first, so
+        // "untouched" is unambiguous -- a real readback bug that writes
+        // zeros where it shouldn't would otherwise be indistinguishable
+        // from a freshly zeroed test buffer.
+        mem.aperture.fill(0xAA);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::SurfaceReadback {
+                    x: 3,
+                    y: 2,
+                    w: 2,
+                    h: 2,
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // A R G B for opaque green.
+        let green = [0xFFu8, 0x00, 0xFF, 0x00];
+        for row in 0..HEIGHT {
+            for col in 0..WIDTH {
+                let at = (row * STRIDE + col * BPP) as usize;
+                let in_rect = (3..5).contains(&col) && (2..4).contains(&row);
+                if in_rect {
+                    assert_eq!(
+                        &mem.aperture[at..at + 4],
+                        &green,
+                        "({col}, {row}) is inside the rectangle and should be green"
+                    );
+                } else {
+                    assert_eq!(
+                        &mem.aperture[at..at + 4],
+                        &[0xAA, 0xAA, 0xAA, 0xAA],
+                        "({col}, {row}) is outside the rectangle and must be untouched"
+                    );
+                }
+            }
+            // Stride padding for this row must also be untouched.
+            let pad_at = (row * STRIDE + WIDTH * BPP) as usize;
+            assert_eq!(
+                &mem.aperture[pad_at..pad_at + 16],
+                &[0xAAu8; 16][..],
+                "row {row}'s stride padding must be untouched"
+            );
+        }
+    }
+
+    /// The mirror of the readback test above, same surface shape: an
+    /// upload from backing memory must read each row from its own
+    /// strided offset too, not the rectangle's tightly-packed offset.
+    #[test]
+    fn a_surface_upload_reads_a_subrectangle_from_the_correct_strided_offset() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const WIDTH: u32 = 8;
+        const HEIGHT: u32 = 8;
+        const BPP: u32 = 4;
+        const STRIDE: u32 = WIDTH * BPP + 16;
+        const BACKING_LEN: usize = (STRIDE * HEIGHT) as usize;
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: WIDTH,
+                height: HEIGHT,
+                stride_bytes: STRIDE,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0); // black background
+
+        let mut mem = TestMemory::new(BACKING_LEN);
+        // Paint just the 2x2 rectangle at (3, 2) opaque blue (A R G B) in
+        // backing memory, at its correct strided position; everything
+        // else stays the zeroed TestMemory default.
+        let blue = [0xFFu8, 0x00, 0x00, 0xFF];
+        for row in 2..4u32 {
+            for col in 3..5u32 {
+                let at = (row * STRIDE + col * BPP) as usize;
+                mem.aperture[at..at + 4].copy_from_slice(&blue);
+            }
+        }
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::SurfaceUpload {
+                    x: 3,
+                    y: 2,
+                    w: 2,
+                    h: 2,
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for row in 0..HEIGHT {
+            for col in 0..WIDTH {
+                let at = ((row * WIDTH + col) * 4) as usize;
+                let in_rect = (3..5).contains(&col) && (2..4).contains(&row);
+                if in_rect {
+                    assert_eq!(
+                        &pixels[at..at + 4],
+                        &[0, 0, 255, 255],
+                        "({col}, {row}) should be blue (uploaded)"
+                    );
+                } else {
+                    assert_eq!(
+                        &pixels[at..at + 4],
+                        &[0, 0, 0, 255],
+                        "({col}, {row}) should still be black (never uploaded)"
+                    );
+                }
+            }
         }
     }
 
