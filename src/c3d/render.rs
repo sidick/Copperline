@@ -44,17 +44,17 @@
 //!   `SurfaceReadback`/`encode_pixel` do not accept, scaled from wgpu's
 //!   own `[0, 1]` depth range to the spec's 32-bit unsigned one, and
 //!   `ROWS_BOTTOM_UP`.
-//! - Depth test and mask, blend func (not yet separate/equation), alpha
-//!   test, cull face and front face, scissor, viewport (window-space draws
-//!   ignore it, per the spec -- viewport is transform-tier), colour mask.
+//! - Depth test and mask, blend func/func-separate/equation, polygon
+//!   offset, alpha test, cull face and front face (POINTS/LINES-family
+//!   primitives are never culled, per GL), scissor, viewport (window-space
+//!   draws ignore it, per the spec -- viewport is transform-tier), colour
+//!   mask.
 //!
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
-//! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`, fog,
-//! line/point primitives
-//! (only `TRIANGLES`-family and `POINTS`/`LINES`-as-degenerate-triangles
-//! are not special-cased -- see [`triangulate`]). Every one of these
-//! returns [`RenderError::Unimplemented`] rather than panicking.
+//! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`, fog.
+//! Every one of these returns [`RenderError::Unimplemented`] rather than
+//! panicking.
 //!
 //! ## Two traps the spec calls out
 //!
@@ -642,9 +642,9 @@ pub type Triangle = [usize; 3];
 /// table exactly, including the quad/quad-strip/polygon decomposition
 /// order the spec calls **normative**. `POINTS`/`LINES`/`LINE_LOOP`/
 /// `LINE_STRIP` have no triangle form and return
-/// `Err(RenderError::Unimplemented)` -- M1's traces are triangle/quad
-/// shaped, and point/line rasterisation is deferred, per the module doc
-/// comment.
+/// `Err(RenderError::Unimplemented)` -- assembling those primitives is
+/// [`primitive_index_order`]'s job, which never calls this function for
+/// them.
 pub fn triangulate(prim: PrimitiveType, vertex_count: usize) -> Result<Vec<Triangle>, RenderError> {
     let n = vertex_count;
     match prim {
@@ -723,6 +723,65 @@ pub fn triangulate(prim: PrimitiveType, vertex_count: usize) -> Result<Vec<Trian
     }
 }
 
+/// Top-level primitive assembly: dispatches `TRIANGLES`-family primitives
+/// to [`triangulate`], and expands `POINTS`/`LINES`/`LINE_LOOP`/
+/// `LINE_STRIP` into the flat, already-duplicated vertex-index order the
+/// chosen `wgpu` *List* topology draws directly -- no primitive-restart
+/// index buffer, matching [`PrimTopologyKey`]'s doc comment. `LINE_STRIP`/
+/// `LINE_LOOP` decompose into `LineList` segments the same normative way
+/// `triangulate` decomposes quads/fans (`LINE_LOOP` additionally closes
+/// with a segment back to vertex 0); `POINTS` maps to `PointList`
+/// one-for-one. Each line segment's two indices are emitted **second
+/// vertex first**, so `wgpu`/WGSL's `@interpolate(flat)` (which always
+/// takes the primitive's first vertex) lines up with GL's provoking-
+/// vertex rule for line primitives (the second vertex of each segment) --
+/// the same reasoning [`Triangle`]'s own doc comment gives for triangles.
+/// A count that does not complete the last primitive drops the
+/// incomplete one, per GL (matching `triangulate`'s own rule).
+pub fn primitive_index_order(
+    prim: PrimitiveType,
+    vertex_count: usize,
+) -> Result<(PrimTopologyKey, Vec<usize>), RenderError> {
+    let n = vertex_count;
+    match prim {
+        PrimitiveType::Points => Ok((PrimTopologyKey::Points, (0..n).collect())),
+        PrimitiveType::Lines => {
+            let mut idx = Vec::new();
+            let mut i = 0;
+            while i + 2 <= n {
+                idx.push(i + 1);
+                idx.push(i);
+                i += 2;
+            }
+            Ok((PrimTopologyKey::Lines, idx))
+        }
+        PrimitiveType::LineStrip => {
+            let mut idx = Vec::new();
+            for i in 0..n.saturating_sub(1) {
+                idx.push(i + 1);
+                idx.push(i);
+            }
+            Ok((PrimTopologyKey::Lines, idx))
+        }
+        PrimitiveType::LineLoop => {
+            let mut idx = Vec::new();
+            for i in 0..n.saturating_sub(1) {
+                idx.push(i + 1);
+                idx.push(i);
+            }
+            if n >= 2 {
+                idx.push(0);
+                idx.push(n - 1);
+            }
+            Ok((PrimTopologyKey::Lines, idx))
+        }
+        _ => Ok((
+            PrimTopologyKey::Triangles,
+            triangulate(prim, n)?.into_iter().flatten().collect(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Pipeline specialisation
 // ---------------------------------------------------------------------
@@ -749,6 +808,7 @@ pub struct PipelineKey {
     pub color_write: (bool, bool, bool, bool),
     pub surface_format: TextureFormatKey,
     pub polygon_offset: Option<PolygonOffsetKey>,
+    pub topology: PrimTopologyKey,
 }
 
 // wgpu's own enums don't implement `Hash`/`Eq` in a way this module wants
@@ -921,6 +981,28 @@ impl PolygonOffsetKey {
             constant: f32::from_bits(self.units_bits).round() as i32,
             slope_scale: f32::from_bits(self.factor_bits),
             clamp: 0.0,
+        }
+    }
+}
+
+/// The three `wgpu` "list" topologies this module ever draws with --
+/// strip/loop primitives are decomposed to one of these (the same
+/// normative-decomposition approach [`triangulate`] already takes for
+/// quads/fans) rather than using `wgpu`'s native strip topologies, so no
+/// primitive-restart index buffer is ever needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PrimTopologyKey {
+    #[default]
+    Triangles,
+    Lines,
+    Points,
+}
+impl PrimTopologyKey {
+    fn to_wgpu(self) -> wgpu::PrimitiveTopology {
+        match self {
+            Self::Triangles => wgpu::PrimitiveTopology::TriangleList,
+            Self::Lines => wgpu::PrimitiveTopology::LineList,
+            Self::Points => wgpu::PrimitiveTopology::PointList,
         }
     }
 }
@@ -1549,14 +1631,21 @@ impl Renderer {
                     buffers: &[vertex_layout],
                 },
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    topology: key.topology.to_wgpu(),
                     strip_index_format: None,
                     front_face: front_face_to_wgpu(if key.front_face_ccw {
                         FrontFace::Ccw
                     } else {
                         FrontFace::Cw
                     }),
-                    cull_mode: cull_to_wgpu(key.cull),
+                    // GL only culls polygons: face culling never applies
+                    // to POINTS/LINES-family primitives, whose two (or
+                    // one) vertices don't have a meaningful winding.
+                    cull_mode: if key.topology == PrimTopologyKey::Triangles {
+                        cull_to_wgpu(key.cull)
+                    } else {
+                        None
+                    },
                     unclipped_depth: false,
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
@@ -1684,6 +1773,7 @@ impl Renderer {
         state: &State,
         unit0_bound: bool,
         surface_format: wgpu::TextureFormat,
+        topology: PrimTopologyKey,
     ) -> PipelineKey {
         let raster = &state.raster;
         let alpha_test = if state.is_enabled(state::Capability::AlphaTest) {
@@ -1736,6 +1826,7 @@ impl Renderer {
             } else {
                 None
             },
+            topology,
         }
     }
 
@@ -2045,8 +2136,8 @@ impl Renderer {
             .ok_or(RenderError::UnknownObject("surface", id))?;
 
         let verts = parse_window_vertices(bytes, format, count, &state.current)?;
-        let tris = triangulate(prim, verts.len())?;
-        if tris.is_empty() {
+        let (topology, order) = primitive_index_order(prim, verts.len())?;
+        if order.is_empty() {
             return Ok(());
         }
 
@@ -2064,23 +2155,21 @@ impl Renderer {
             }
         };
 
-        let mut vbuf: Vec<GpuVertex> = Vec::with_capacity(tris.len() * 3);
-        for tri in &tris {
-            for &idx in tri {
-                let Some(v) = verts.get(idx) else {
-                    return Err(RenderError::ShortPayload("triangulated vertex index"));
-                };
-                vbuf.push(to_gpu(v));
-            }
+        let mut vbuf: Vec<GpuVertex> = Vec::with_capacity(order.len());
+        for idx in order {
+            let Some(v) = verts.get(idx) else {
+                return Err(RenderError::ShortPayload("primitive vertex index"));
+            };
+            vbuf.push(to_gpu(v));
         }
 
         let unit0 = state.texture_units.first();
         let bound_tex = unit0.map(|u| u.bound_texture).unwrap_or(0);
         let unit0_bound = bound_tex != 0 && self.textures.contains_key(&bound_tex);
         let surface_format = INTERNAL_COLOR_FORMAT;
-        let key = self.pipeline_key_from_state(state, unit0_bound, surface_format);
+        let key = self.pipeline_key_from_state(state, unit0_bound, surface_format, topology);
 
-        if key.cull == Some(FaceKey::FrontAndBack) {
+        if topology == PrimTopologyKey::Triangles && key.cull == Some(FaceKey::FrontAndBack) {
             return Ok(()); // culls every triangle: nothing to draw
         }
 
@@ -2930,6 +3019,52 @@ mod tests {
             triangulate(PrimitiveType::Lines, 4),
             Err(RenderError::Unimplemented(_))
         ));
+    }
+
+    #[test]
+    fn primitive_index_order_maps_points_one_to_one() {
+        let (topology, idx) = primitive_index_order(PrimitiveType::Points, 3).unwrap();
+        assert_eq!(topology, PrimTopologyKey::Points);
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn primitive_index_order_pairs_lines_with_the_provoking_vertex_first() {
+        // LINES (v0 v1 v2 v3) -> segments (v0 v1), (v2 v3); GL's
+        // provoking vertex is each segment's second, emitted first to
+        // line up with wgpu/WGSL's first-vertex flat interpolation.
+        let (topology, idx) = primitive_index_order(PrimitiveType::Lines, 4).unwrap();
+        assert_eq!(topology, PrimTopologyKey::Lines);
+        assert_eq!(idx, vec![1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn primitive_index_order_drops_an_incomplete_trailing_line() {
+        let (_, idx) = primitive_index_order(PrimitiveType::Lines, 3).unwrap();
+        assert_eq!(idx, vec![1, 0]);
+    }
+
+    #[test]
+    fn primitive_index_order_decomposes_line_strip_into_segments() {
+        // LINE_STRIP (v0 v1 v2) -> (v0 v1), (v1 v2).
+        let (topology, idx) = primitive_index_order(PrimitiveType::LineStrip, 3).unwrap();
+        assert_eq!(topology, PrimTopologyKey::Lines);
+        assert_eq!(idx, vec![1, 0, 2, 1]);
+    }
+
+    #[test]
+    fn primitive_index_order_closes_line_loop_back_to_the_first_vertex() {
+        // LINE_LOOP (v0 v1 v2) -> (v0 v1), (v1 v2), (v2 v0).
+        let (topology, idx) = primitive_index_order(PrimitiveType::LineLoop, 3).unwrap();
+        assert_eq!(topology, PrimTopologyKey::Lines);
+        assert_eq!(idx, vec![1, 0, 2, 1, 0, 2]);
+    }
+
+    #[test]
+    fn primitive_index_order_still_delegates_triangle_family_to_triangulate() {
+        let (topology, idx) = primitive_index_order(PrimitiveType::Triangles, 3).unwrap();
+        assert_eq!(topology, PrimTopologyKey::Triangles);
+        assert_eq!(idx, vec![2, 0, 1]);
     }
 
     // -- format conversion ---------------------------------------------
@@ -3838,6 +3973,78 @@ mod tests {
         assert_eq!(
             back, 0,
             "a back-facing (CW in y-down window space) triangle was drawn"
+        );
+    }
+
+    /// GL applies `CullFace` to polygons only -- a `LINES` draw must land
+    /// pixels even with `Face::FrontAndBack` enabled (which discards every
+    /// triangle unconditionally). Before `op_draw_inline_win`'s own
+    /// "cull == FrontAndBack -> nothing to draw" short-circuit was made
+    /// topology-aware, it fired for every primitive type, silently
+    /// dropping every line/point draw whenever a client legitimately left
+    /// FrontAndBack culling enabled between polygon and line draws.
+    #[test]
+    fn cull_face_front_and_back_never_discards_a_line_draw() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.set_current_color(1.0, 1.0, 1.0, 1.0);
+        state.enable(state::Capability::CullFace);
+        state.set_cull_face(Face::FrontAndBack);
+
+        // A horizontal line straight through the pixel this test samples
+        // -- 8.5, not 8.0, to sit on row 8's pixel *center* rather than
+        // the ambiguous boundary between rows 7 and 8.
+        let line = [(2.0f32, 8.5f32), (14.0, 8.5)];
+        let mut verts = Vec::new();
+        for (x, y) in line {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+        }
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Lines,
+                    format: VertexFormat(0),
+                    count: 2,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            &px[..3],
+            &[255, 255, 255],
+            "the line should have lit this pixel regardless of FrontAndBack culling: {px:?}"
         );
     }
 
