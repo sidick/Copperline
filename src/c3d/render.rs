@@ -44,6 +44,10 @@
 //!   `SurfaceReadback`/`encode_pixel` do not accept, scaled from wgpu's
 //!   own `[0, 1]` depth range to the spec's 32-bit unsigned one, and
 //!   `ROWS_BOTTOM_UP`.
+//! - [`RenderOp::TexCopyImage`]/[`RenderOp::TexCopySubImage`] as a
+//!   GPU-side texture-to-texture copy from the draw surface -- no CPU
+//!   round trip, since the surface's internal colour format already
+//!   matches every texture object's.
 //! - Depth test and mask, blend func/func-separate/equation, polygon
 //!   offset, alpha test, cull face and front face (POINTS/LINES-family
 //!   primitives are never culled, per GL), scissor, viewport (window-space
@@ -52,9 +56,11 @@
 //!
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
-//! coordinates, `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`/`TEX_PALETTE`, fog.
-//! Every one of these returns [`RenderError::Unimplemented`] rather than
-//! panicking.
+//! coordinates, fog. Every one of these returns
+//! [`RenderError::Unimplemented`] rather than panicking. (`TEX_PALETTE` is
+//! not in this list: it's spec-optional and Copperline correctly never
+//! advertises it, so `ring.rs` rejects it as `E_BAD_OPCODE` before it
+//! ever reaches this module -- see `ring.rs`'s own doc comment.)
 //!
 //! ## Two traps the spec calls out
 //!
@@ -1911,9 +1917,26 @@ impl Renderer {
             RenderOp::SurfaceUpload { x, y, w, h } => {
                 self.op_surface_upload(*x, *y, *w, *h, state, mem)
             }
-            RenderOp::TexCopyImage { .. } => Err(RenderError::Unimplemented("TEX_COPY_IMAGE (M3)")),
-            RenderOp::TexCopySubImage { .. } => {
-                Err(RenderError::Unimplemented("TEX_COPY_SUBIMAGE (M3)"))
+            RenderOp::TexCopyImage {
+                id,
+                level,
+                format: _,
+                x,
+                y,
+                width,
+                height,
+            } => self.op_tex_copy_image(*id, *level, *x, *y, *width, *height, state),
+            RenderOp::TexCopySubImage {
+                id,
+                level,
+                xoff,
+                yoff,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                self.op_tex_copy_subimage(*id, *level, *xoff, *yoff, *x, *y, *width, *height, state)
             }
             RenderOp::TexPalette { .. } => Err(RenderError::Unimplemented("TEX_PALETTE (M3)")),
             RenderOp::ReadPixels {
@@ -2454,6 +2477,162 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
+    }
+
+    /// `TEX_COPY_IMAGE` (`glCopyTexImage2D`): defines a fresh level 0 from
+    /// the draw surface's rectangle with a GPU-side texture-to-texture
+    /// copy -- no guest round trip, no CPU readback. The draw surface's
+    /// internal colour format is already [`INTERNAL_COLOR_FORMAT`], the
+    /// same format every texture object is stored in, so this is a
+    /// straight copy with no conversion step; `format` names only the
+    /// *wire* layout `TEX_IMAGE`/`TEX_SUBIMAGE` would decode from guest
+    /// bytes; it has no guest bytes to decode here, so it goes unused
+    /// (the spec permits a device to store at higher precision than a
+    /// requested format -- "Texture formats" -- which is what every
+    /// texture object already does).
+    fn op_tex_copy_image(
+        &mut self,
+        id: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        if level != 0 {
+            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
+        }
+        let surface_id = state.draw_surface();
+        let def = *state
+            .surface(surface_id)
+            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
+        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("c3d texture (TEX_COPY_IMAGE)"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: INTERNAL_COLOR_FORMAT,
+            // COPY_SRC alongside the usual TEXTURE_BINDING|COPY_DST: a
+            // render-to-texture result is a natural source for a later
+            // `TEX_COPY_SUBIMAGE`-into-another-texture or mip-generation
+            // step, unlike a `TEX_IMAGE` upload from guest bytes.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d tex-copy-image encoder"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            size,
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.textures.insert(
+            id,
+            GpuTexture {
+                texture,
+                view,
+                width,
+                height,
+            },
+        );
+        Ok(())
+    }
+
+    /// `TEX_COPY_SUBIMAGE` (`glCopyTexSubImage2D`): the in-place mirror of
+    /// [`Self::op_tex_copy_image`] -- same GPU-side copy, but into an
+    /// existing level's `(xoff, yoff)` rather than creating a new texture.
+    /// The destination rectangle is checked against the *existing* level's
+    /// own dimensions here, exactly as [`Self::op_tex_subimage`] already
+    /// does for `TEX_SUBIMAGE`, since dispatch only ever validated the
+    /// *source* rectangle against the live draw surface.
+    #[allow(clippy::too_many_arguments)]
+    fn op_tex_copy_subimage(
+        &mut self,
+        id: u32,
+        level: u32,
+        xoff: u32,
+        yoff: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        if level != 0 {
+            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
+        }
+        let Some(existing) = self.textures.get(&id) else {
+            return Err(RenderError::UnknownObject("texture", id));
+        };
+        if xoff + width > existing.width || yoff + height > existing.height {
+            return Err(RenderError::ShortPayload("TEX_COPY_SUBIMAGE rectangle"));
+        }
+
+        let surface_id = state.draw_surface();
+        let def = *state
+            .surface(surface_id)
+            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
+        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        let dest = &self.textures[&id].texture;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d tex-copy-subimage encoder"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dest,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: xoff,
+                    y: yoff,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
@@ -3809,6 +3988,186 @@ mod tests {
             "a large POLYGON_OFFSET units value should shift the written \
              depth well past f32 rounding noise: baseline={baseline}, offset={offset}"
         );
+    }
+
+    /// Clears `surface` id `1` (16x16) to `top` for rows `0..8` and
+    /// `bottom` for rows `8..16`, via a plain clear plus one scissored
+    /// clear -- shared by the two `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE`
+    /// tests below, which need a surface whose two halves are
+    /// distinguishable so a copy's `(x, y)` origin is actually load-
+    /// bearing, not just "some colour landed in the texture".
+    fn two_tone_surface(
+        renderer: &mut Renderer,
+        state: &mut State,
+        top: [f32; 4],
+        bottom: [f32; 4],
+    ) {
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        let mut mem = TestMemory::new(65536);
+        state.set_clear_color(bottom[0], bottom[1], bottom[2], bottom[3]);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        state.set_clear_color(top[0], top[1], top[2], top[3]);
+        state.enable(state::Capability::ScissorTest);
+        state.set_scissor(0, 0, 16, 8);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR,
+            }],
+            state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        state.disable(state::Capability::ScissorTest);
+    }
+
+    /// `TEX_COPY_IMAGE` must capture the draw surface's *rectangle*, not
+    /// just some pixels from it -- copies the bottom (blue) half of a
+    /// two-tone surface and checks every texel came out blue, not the top
+    /// half's red. A wrong `origin` on the GPU-side
+    /// `copy_texture_to_texture` call (the easy mistake: it takes a
+    /// separate origin per side, source and destination) would silently
+    /// copy from the wrong place without erroring.
+    #[test]
+    fn tex_copy_image_captures_the_draw_surfaces_rectangle() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut state = State::new(state::Limits::default());
+        two_tone_surface(
+            &mut renderer,
+            &mut state,
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[RenderOp::TexCopyImage {
+                id: 1,
+                level: 0,
+                format: TexFormat::Rgba8,
+                x: 0,
+                y: 8,
+                width: 16,
+                height: 8,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer
+            .textures
+            .get(&1)
+            .expect("TEX_COPY_IMAGE created it");
+        assert_eq!((tex.width, tex.height), (16, 8));
+        let pixels = renderer
+            .copy_texture_to_cpu(&tex.texture, tex.width, tex.height)
+            .unwrap();
+        for (i, px) in pixels.chunks(4).enumerate() {
+            assert_eq!(
+                px,
+                [0, 0, 255, 255],
+                "texel {i} should be the bottom half's blue, not the top half's red"
+            );
+        }
+    }
+
+    /// `TEX_COPY_SUBIMAGE` overwrites an existing level *in place* --
+    /// captures the top (red) half with `TEX_COPY_IMAGE`, then replaces
+    /// the whole thing with the bottom (blue) half via
+    /// `TEX_COPY_SUBIMAGE`, and checks the texture actually changed.
+    #[test]
+    fn tex_copy_subimage_overwrites_the_existing_level_in_place() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut state = State::new(state::Limits::default());
+        two_tone_surface(
+            &mut renderer,
+            &mut state,
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[RenderOp::TexCopyImage {
+                id: 1,
+                level: 0,
+                format: TexFormat::Rgba8,
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 8,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let tex = renderer.textures.get(&1).unwrap();
+        let before = renderer
+            .copy_texture_to_cpu(&tex.texture, tex.width, tex.height)
+            .unwrap();
+        assert_eq!(
+            &before[..4],
+            [255, 0, 0, 255],
+            "sanity: captured the red top half first"
+        );
+
+        let errs = renderer.execute(
+            &[RenderOp::TexCopySubImage {
+                id: 1,
+                level: 0,
+                xoff: 0,
+                yoff: 0,
+                x: 0,
+                y: 8,
+                width: 16,
+                height: 8,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let tex = renderer.textures.get(&1).unwrap();
+        let after = renderer
+            .copy_texture_to_cpu(&tex.texture, tex.width, tex.height)
+            .unwrap();
+        for (i, px) in after.chunks(4).enumerate() {
+            assert_eq!(
+                px,
+                [0, 0, 255, 255],
+                "texel {i} should now be the bottom half's blue after TEX_COPY_SUBIMAGE"
+            );
+        }
     }
 
     /// `QUERY` needs no GPU work at all -- `dispatch::Context` has
