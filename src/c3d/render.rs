@@ -52,11 +52,12 @@
 //!   offset, alpha test, cull face and front face (POINTS/LINES-family
 //!   primitives are never culled, per GL), scissor, viewport (window-space
 //!   draws ignore it, per the spec -- viewport is transform-tier), colour
-//!   mask.
+//!   mask, fog (linear/exp/exp2; per-vertex `FOGCOORD` when the format
+//!   carries it, else derived from `1 / rhw`, per the window-space rule).
 //!
 //! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
 //! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
-//! coordinates, fog. Every one of these returns
+//! coordinates. Every one of these returns
 //! [`RenderError::Unimplemented`] rather than panicking. (`TEX_PALETTE` is
 //! not in this list: it's spec-optional and Copperline correctly never
 //! advertises it, so `ring.rs` rejects it as `E_BAD_OPCODE` before it
@@ -95,8 +96,9 @@
 use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
-    self, BlendEquation, BlendFactor, CompareFunc, Face, FrontFace, PrimitiveType, ShadeModel,
-    State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexWrap,
+    self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, PrimitiveType,
+    ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter,
+    TexFormat, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -533,6 +535,14 @@ pub struct WinVertex {
     pub pos: [f32; 4], // x, y, z, rhw
     pub color: [f32; 4],
     pub texcoord0: [f32; 2],
+    /// `FOGCOORD` if the format carries it, else `CURRENT_FOGCOORD` --
+    /// the ordinary "omitted component takes the current value" rule.
+    /// Whether this or `1 / rhw` is what actually drives the fog
+    /// equation is decided by the caller, per the spec's window-space
+    /// rule ("fog distance is `FOGCOORD` if present, else derived from
+    /// `rhw`") -- a *format-level* decision, not a per-vertex one, so it
+    /// isn't made here.
+    pub fogcoord: f32,
 }
 
 fn read_f32(bytes: &[u8], at: usize) -> Option<f32> {
@@ -549,9 +559,9 @@ fn read_u32_be(bytes: &[u8], at: usize) -> Option<u32> {
 /// interleaved, exactly as `DRAW_INLINE_WIN` lays them out
 /// (`docs/internals/c3d.md`'s "Vertex format"). Every optional component
 /// in the format is walked and its words consumed -- including ones this
-/// milestone doesn't render (`NORMAL`, `TEXCOORD1`-`3`, `FOGCOORD`) -- so
-/// a later vertex in the same command parses at the right offset even
-/// though this milestone only *uses* `COLOR`/`COLOR_PACKED`/`TEXCOORD0`.
+/// milestone doesn't render (`NORMAL`, `TEXCOORD1`-`3`) -- so a later
+/// vertex in the same command parses at the right offset even though this
+/// milestone only *uses* `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`FOGCOORD`.
 /// `current` supplies the value for any component the format omits.
 /// `Err` if `data` runs out before `count` vertices are read.
 pub fn parse_window_vertices(
@@ -617,17 +627,17 @@ pub fn parse_window_vertices(
                 }
             }
         }
+        let mut fogcoord = current.fogcoord;
         if format.has(VertexFormat::FOGCOORD) {
+            fogcoord = read_f32(data, at).ok_or_else(bad)?;
             at += 4;
-            if at > data.len() {
-                return Err(bad());
-            }
         }
 
         out.push(WinVertex {
             pos,
             color,
             texcoord0: [texcoord0.0, texcoord0.1],
+            fogcoord,
         });
     }
     Ok(out)
@@ -815,6 +825,7 @@ pub struct PipelineKey {
     pub surface_format: TextureFormatKey,
     pub polygon_offset: Option<PolygonOffsetKey>,
     pub topology: PrimTopologyKey,
+    pub fog: Option<FogKey>,
 }
 
 // wgpu's own enums don't implement `Hash`/`Eq` in a way this module wants
@@ -991,6 +1002,46 @@ impl PolygonOffsetKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FogModeKey {
+    Linear,
+    Exp,
+    Exp2,
+}
+impl From<FogMode> for FogModeKey {
+    fn from(m: FogMode) -> Self {
+        match m {
+            FogMode::Linear => Self::Linear,
+            FogMode::Exp => Self::Exp,
+            FogMode::Exp2 => Self::Exp2,
+        }
+    }
+}
+
+/// `FOG_MODE`/`FOG_PARAMS`/`FOG_COLOR`, baked as WGSL literals (see
+/// [`VERTEX_SHADER`]'s doc comment for why) -- every field is stored as a
+/// bit pattern purely so this stays `Eq`/`Hash` for the pipeline cache
+/// key, the same reason [`PolygonOffsetKey`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FogKey {
+    mode: FogModeKey,
+    density_bits: u32,
+    start_bits: u32,
+    end_bits: u32,
+    color_bits: [u32; 3], // r, g, b only -- fog never touches alpha
+}
+impl FogKey {
+    fn new(mode: FogModeKey, density: f32, start: f32, end: f32, color: [f32; 4]) -> Self {
+        Self {
+            mode,
+            density_bits: density.to_bits(),
+            start_bits: start.to_bits(),
+            end_bits: end.to_bits(),
+            color_bits: [color[0].to_bits(), color[1].to_bits(), color[2].to_bits()],
+        }
+    }
+}
+
 /// The three `wgpu` "list" topologies this module ever draws with --
 /// strip/loop primitives are decomposed to one of these (the same
 /// normative-decomposition approach [`triangulate`] already takes for
@@ -1085,20 +1136,28 @@ fn cull_to_wgpu(face: Option<FaceKey>) -> Option<wgpu::Face> {
 
 /// The shared shader source every [`PipelineKey`] specialises via string
 /// substitution of `__FLAT__` (either empty or `@interpolate(flat)`) and
-/// `__FRAGMENT_BODY__` (the texenv/alpha-test combination). M1's
-/// fixed-function content is deliberately thin (no lighting, no fog --
-/// see the module doc comment); the specialisation mechanism is what
-/// carries forward to M3, not the amount of WGSL below it.
+/// `__FRAGMENT_BODY__` (the texenv/alpha-test/fog combination). M1's
+/// fixed-function content is deliberately thin (no lighting -- see the
+/// module doc comment); the specialisation mechanism is what carries
+/// forward to M3, not the amount of WGSL below it. Fog's own parameters
+/// (mode, density, start, end, colour) are baked as WGSL literals per
+/// [`FogKey`] rather than passed through a uniform, the same way
+/// `alpha_test`'s comparison *operator* is baked while only its
+/// threshold value gets a uniform -- unlike the threshold, a guest
+/// changing fog parameters mid-scene is rare enough that the resulting
+/// pipeline-cache churn is an acceptable simplification for now.
 const VERTEX_SHADER: &str = r#"
 struct VsIn {
     @location(0) clip_pos: vec4<f32>,
     @location(1) color: vec4<f32>,
     @location(2) texcoord0: vec2<f32>,
+    @location(3) fog_distance: f32,
 };
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     __FLAT__ @location(0) color: vec4<f32>,
     @location(1) texcoord0: vec2<f32>,
+    @location(2) fog_distance: f32,
 };
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -1106,6 +1165,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.position = in.clip_pos;
     out.color = in.color;
     out.texcoord0 = in.texcoord0;
+    out.fog_distance = in.fog_distance;
     return out;
 }
 "#;
@@ -1115,6 +1175,7 @@ struct VsOut {
     @builtin(position) position: vec4<f32>,
     __FLAT__ @location(0) color: vec4<f32>,
     @location(1) texcoord0: vec2<f32>,
+    @location(2) fog_distance: f32,
 };
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -1168,6 +1229,31 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
     } else {
         ""
     };
+    // GL's real fixed-function order (texturing, then alpha test, then
+    // fog) is followed here too, though it's only a correctness
+    // difference for a discarded fragment -- fog never touches alpha, so
+    // it can't change the alpha test's own outcome either way.
+    let fog = match key.fog {
+        None => String::new(),
+        Some(fk) => {
+            let density = f32::from_bits(fk.density_bits);
+            let start = f32::from_bits(fk.start_bits);
+            let end = f32::from_bits(fk.end_bits);
+            let [r, g, b] = fk.color_bits.map(f32::from_bits);
+            let factor = match fk.mode {
+                FogModeKey::Linear => {
+                    format!("clamp(({end:?} - dist) / ({end:?} - {start:?}), 0.0, 1.0)")
+                }
+                FogModeKey::Exp => format!("clamp(exp(-{density:?} * dist), 0.0, 1.0)"),
+                FogModeKey::Exp2 => {
+                    format!("clamp(exp(-pow({density:?} * dist, 2.0)), 0.0, 1.0)")
+                }
+            };
+            format!(
+                "let dist = in.fog_distance;\n    let fog_f = {factor};\n    outc = vec4<f32>(mix(vec3<f32>({r:?}, {g:?}, {b:?}), outc.rgb, fog_f), outc.a);\n"
+            )
+        }
+    };
     let flat = if key.flat_shading {
         "@interpolate(flat)"
     } else {
@@ -1175,7 +1261,7 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
     };
     let header = FRAGMENT_SHADER_HEADER.replace("__FLAT__", flat);
     format!(
-        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {sample}\n    {combine}\n    {alpha_test}    return outc;\n}}\n",
+        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {sample}\n    {combine}\n    {alpha_test}    {fog}    return outc;\n}}\n",
     )
 }
 
@@ -1585,6 +1671,11 @@ impl Renderer {
                     offset: 32,
                     shader_location: 2,
                 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 40,
+                    shader_location: 3,
+                },
             ],
         };
 
@@ -1833,6 +1924,17 @@ impl Renderer {
                 None
             },
             topology,
+            fog: if state.is_enabled(state::Capability::Fog) {
+                Some(FogKey::new(
+                    raster.fog_mode.into(),
+                    raster.fog_density,
+                    raster.fog_start,
+                    raster.fog_end,
+                    raster.fog_color,
+                ))
+            } else {
+                None
+            },
         }
     }
 
@@ -2165,6 +2267,17 @@ impl Renderer {
         }
 
         let (w, h) = (def.width as f32, def.height as f32);
+        // Fog distance is a format-wide decision, not a per-vertex one
+        // (the format bits are the same for every vertex in a draw): the
+        // spec's window-space rule is "FOGCOORD if present, else derived
+        // from rhw" -- CURRENT_FOGCOORD's own "omitted takes the current
+        // value" fallback (already resolved into `v.fogcoord` by
+        // `parse_window_vertices`) only actually applies to fog distance
+        // when the format DOES carry FOGCOORD (an omitted vertex within
+        // such a draw still gets `current.fogcoord`, per that rule); an
+        // entirely FOGCOORD-less draw ignores it altogether and always
+        // derives distance from `1 / rhw` instead.
+        let has_fogcoord = format.has(VertexFormat::FOGCOORD);
         let to_gpu = |v: &WinVertex| -> GpuVertex {
             let rhw = if v.pos[3].abs() < 1e-8 { 1.0 } else { v.pos[3] };
             let clip_w = 1.0 / rhw;
@@ -2175,6 +2288,7 @@ impl Renderer {
                 clip_pos: [ndc_x * clip_w, ndc_y * clip_w, ndc_z * clip_w, clip_w],
                 color: v.color,
                 texcoord0: v.texcoord0,
+                fog_distance: if has_fogcoord { v.fogcoord } else { clip_w },
             }
         };
 
@@ -2967,17 +3081,21 @@ impl Renderer {
 }
 
 /// The GPU-side vertex layout: `clip_pos` is already fully perspective-
-/// ready clip-space `(x*w, y*w, z*w, w)`, `color`/`texcoord0` are the
-/// undivided attribute values the spec describes -- the hardware's own
-/// perspective-correct interpolation (driven by `clip_pos.w`) does exactly
-/// the "interpolate `attr * rhw`, recover `attr` per fragment" the spec
-/// asks for, with no per-fragment division written by this module.
+/// ready clip-space `(x*w, y*w, z*w, w)`, `color`/`texcoord0`/
+/// `fog_distance` are the undivided attribute values the spec describes --
+/// the hardware's own perspective-correct interpolation (driven by
+/// `clip_pos.w`) does exactly the "interpolate `attr * rhw`, recover
+/// `attr` per fragment" the spec asks for, with no per-fragment division
+/// written by this module. `fog_distance` is carried unconditionally
+/// (like `texcoord0` for an untextured draw) even on a pipeline with fog
+/// disabled, where the fragment shader simply never reads it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuVertex {
     clip_pos: [f32; 4],
     color: [f32; 4],
     texcoord0: [f32; 2],
+    fog_distance: f32,
 }
 
 /// Serialises a vertex list to the plain little-endian bytes a wgpu vertex
@@ -2996,6 +3114,7 @@ fn gpu_vertices_to_bytes(vertices: &[GpuVertex]) -> Vec<u8> {
         for f in v.texcoord0 {
             out.extend_from_slice(&f.to_le_bytes());
         }
+        out.extend_from_slice(&v.fog_distance.to_le_bytes());
     }
     out
 }
@@ -3111,20 +3230,32 @@ mod tests {
     }
 
     #[test]
-    fn skips_unused_components_words_correctly_to_reach_the_next_vertex() {
-        // Two POS-only vertices with FOGCOORD in between to skip.
+    fn skips_unused_components_words_correctly_to_reach_the_next_vertex_and_reads_fogcoord() {
+        // Two POS-only vertices, each with its own FOGCOORD word.
         let format = VertexFormat(1 << VertexFormat::POS_COUNT_SHIFT | VertexFormat::FOGCOORD);
         let mut bytes = Vec::new();
         for vertex in [[1.0f32, 2.0, 0.0], [3.0, 4.0, 0.0]] {
             for v in vertex {
                 bytes.extend_from_slice(&f32be(v));
             }
-            bytes.extend_from_slice(&f32be(9.0)); // fogcoord, unused by this parser
+            bytes.extend_from_slice(&f32be(9.0)); // fogcoord
         }
         let verts = parse_window_vertices(&bytes, format, 2, &current()).unwrap();
         assert_eq!(verts.len(), 2);
         assert_eq!(verts[0].pos[0..2], [1.0, 2.0]);
         assert_eq!(verts[1].pos[0..2], [3.0, 4.0]);
+        assert_eq!(verts[0].fogcoord, 9.0);
+        assert_eq!(verts[1].fogcoord, 9.0);
+    }
+
+    #[test]
+    fn an_omitted_fogcoord_takes_the_current_value() {
+        let format = VertexFormat(1 << VertexFormat::POS_COUNT_SHIFT); // no FOGCOORD bit
+        let bytes = [f32be(1.0), f32be(2.0), f32be(0.0)].concat();
+        let mut cur = current();
+        cur.fogcoord = 4.5;
+        let verts = parse_window_vertices(&bytes, format, 1, &cur).unwrap();
+        assert_eq!(verts[0].fogcoord, 4.5);
     }
 
     // -- triangulation ------------------------------------------------
@@ -4168,6 +4299,183 @@ mod tests {
                 "texel {i} should now be the bottom half's blue after TEX_COPY_SUBIMAGE"
             );
         }
+    }
+
+    /// Draws a single fully-covering triangle at window-space `rhw` (so
+    /// fog distance -- `1 / rhw` when the format carries no `FOGCOORD` --
+    /// is under the caller's control) with `Capability::Fog` enabled, and
+    /// returns the RGBA8 bytes at a pixel known to be inside it.
+    fn draw_fogged_covering_triangle(
+        rhw: f32,
+        current_color: [f32; 4],
+        set_fog_state: impl FnOnce(&mut State),
+    ) -> Option<[u8; 4]> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        let [r, g, b, a] = current_color;
+        state.set_current_color(r, g, b, a);
+        state.enable(state::Capability::Fog);
+        set_fog_state(&mut state);
+
+        let tri = [(-16.0f32, -16.0f32), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, rhw] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+        }
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format: VertexFormat(0),
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(8 * 16 + 8) * 4..][..4];
+        Some([px[0], px[1], px[2], px[3]])
+    }
+
+    /// `FOG` must actually reach the fragment shader -- picks `rhw` so
+    /// `1 / rhw` (the fog distance a `FOGCOORD`-less format derives, per
+    /// the window-space rule) lands exactly on `fog_start` in one draw and
+    /// exactly on `fog_end` in another, giving `LINEAR` fog factors of
+    /// exactly `1.0` and `0.0` -- clean byte-exact endpoints with no
+    /// rounding tolerance needed, unlike an arbitrary mid-fog distance.
+    #[test]
+    fn linear_fog_blends_toward_the_fog_colour_based_on_distance_from_1_over_rhw() {
+        let sample = |rhw: f32| {
+            draw_fogged_covering_triangle(rhw, [1.0, 1.0, 1.0, 1.0], |s| {
+                s.set_fog_mode(FogMode::Linear);
+                s.set_fog_params(0.0, 1.0, 5.0); // density unused by LINEAR
+                s.set_fog_color(0.0, 0.0, 0.0, 1.0);
+            })
+        };
+
+        let Some(at_start) = sample(1.0) else {
+            return; // no adapter; distance = 1/1.0 = fog_start
+        };
+        assert_eq!(
+            at_start,
+            [255, 255, 255, 255],
+            "at fog_start, colour should pass through completely unfogged: {at_start:?}"
+        );
+
+        let Some(at_end) = sample(0.2) else {
+            return; // distance = 1/0.2 = fog_end
+        };
+        assert_eq!(
+            at_end,
+            [0, 0, 0, 255],
+            "at fog_end, colour should be fully replaced by the fog colour: {at_end:?}"
+        );
+    }
+
+    /// `FOGCOORD`, when the vertex format carries it, must override the
+    /// `1 / rhw` default entirely -- an `rhw` that alone would land
+    /// exactly on `fog_start` (no fog) still ends up fully fogged once an
+    /// explicit per-vertex `FOGCOORD` names `fog_end` instead.
+    #[test]
+    fn an_explicit_fogcoord_overrides_the_rhw_derived_distance() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.enable(state::Capability::Fog);
+        state.set_fog_mode(FogMode::Linear);
+        state.set_fog_params(0.0, 1.0, 5.0);
+        state.set_fog_color(0.0, 0.0, 0.0, 1.0);
+
+        // rhw = 1.0 (distance would be fog_start, i.e. unfogged) but every
+        // vertex carries an explicit FOGCOORD of fog_end instead.
+        // POS(4) + COLOR(4) + FOGCOORD(1) per vertex.
+        let tri = [(-16.0f32, -16.0f32), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+            for c in [1.0f32, 1.0, 1.0, 1.0] {
+                verts.extend_from_slice(&c.to_bits().to_be_bytes());
+            }
+            verts.extend_from_slice(&5.0f32.to_bits().to_be_bytes()); // FOGCOORD = fog_end
+        }
+
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format: VertexFormat(VertexFormat::COLOR | VertexFormat::FOGCOORD),
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            &px[..3],
+            &[0, 0, 0],
+            "an explicit FOGCOORD of fog_end should fully fog the pixel \
+             even though 1/rhw alone would have meant no fog at all: {px:?}"
+        );
     }
 
     /// `QUERY` needs no GPU work at all -- `dispatch::Context` has
