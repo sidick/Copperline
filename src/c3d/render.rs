@@ -26,11 +26,20 @@
 //!   ([`ClearRectPipelineKey`]), since neither restriction is something
 //!   `LoadOp::Clear` alone can express.
 //! - [`RenderOp::Draw`] for the **window-space** draw shapes
-//!   (`DRAW_INLINE_WIN` only; `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` and
-//!   every GL-space shape are deferred -- see [`RenderError::Unimplemented`]),
-//!   `POS_COUNT` 4/3/2, `COLOR`, `COLOR_PACKED` and `TEXCOORD0`, correct
-//!   `rhw` handling, every primitive type with the spec's normative quad/
-//!   polygon triangulation and provoking vertex, flat and smooth shading.
+//!   (`DRAW_INLINE_WIN` only; `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` are
+//!   deferred -- see [`RenderError::Unimplemented`]), `POS_COUNT` 4/3/2,
+//!   `COLOR`, `COLOR_PACKED` and `TEXCOORD0`, correct `rhw` handling,
+//!   every primitive type with the spec's normative quad/polygon
+//!   triangulation and provoking vertex, flat and smooth shading -- and
+//!   `DRAW_INLINE` (**GL-space**, `CAP_TRANSFORM`), **position transform
+//!   only**: object-space `(x, y, z, w)` transformed by `modelview` then
+//!   `projection` ([`Renderer::op_draw_inline_gl`]), then `VIEWPORT` and
+//!   `DEPTH_RANGE`, per GL 1.1's fixed-function pipeline exactly as the
+//!   spec requires. Colour and `TEXCOORD0` pass through unlit and
+//!   untexgen'd, same as the window-space path; `NORMAL` is parsed (legal
+//!   here, unlike window-space) but not yet used. `DRAW_ARRAYS`/
+//!   `DRAW_ELEMENTS` (GL-space), lighting, texgen and `CLIP_PLANE` remain
+//!   deferred -- see the updated list below.
 //! - [`RenderOp::TexImage`]/[`RenderOp::TexSubImage`] for the conforming
 //!   minimum texture formats, `TEXTURE_2D` sampling with the filter and
 //!   wrap modes (`CLAMP` behaving as `CLAMP_TO_EDGE`, never a border
@@ -55,22 +64,26 @@
 //!   mask, fog (linear/exp/exp2; per-vertex `FOGCOORD` when the format
 //!   carries it, else derived from `1 / rhw`, per the window-space rule).
 //!
-//! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
-//! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
-//! coordinates. Every one of these returns
-//! [`RenderError::Unimplemented`] rather than panicking. (`TEX_PALETTE` is
-//! not in this list: it's spec-optional and Copperline correctly never
-//! advertises it, so `ring.rs` rejects it as `E_BAD_OPCODE` before it
-//! ever reaches this module -- see `ring.rs`'s own doc comment.)
+//! Deferred to M3: `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space; the window-
+//! space array/indexed equivalents are a separate, parallel effort),
+//! lighting (`LIGHT`/`LIGHT_MODEL`/`MATERIAL`/`COLOR_MATERIAL`), texgen
+//! (`TEXGEN`/`TEXGEN_PLANE`), `CLIP_PLANE` user clipping, multitexture
+//! (`TEXCOORD1`-`3`), texel-space texture coordinates. Every one of these
+//! returns [`RenderError::Unimplemented`] rather than panicking.
+//! (`TEX_PALETTE` is not in this list: it's spec-optional and Copperline
+//! correctly never advertises it, so `ring.rs` rejects it as
+//! `E_BAD_OPCODE` before it ever reaches this module -- see `ring.rs`'s
+//! own doc comment.)
 //!
 //! ## Two traps the spec calls out
 //!
 //! - **Clip-space depth convention.** GL's clip space is `z in [-1, 1]`;
 //!   wgpu's is `z in [0, 1]`. Window-space vertices already carry final
 //!   `[0, 1]` surface depth (the spec: "`z` is depth in `0..1`"), so no
-//!   fixup is needed on the path this milestone renders. The fixup a
-//!   GL-space (M3) vertex pipeline will need is [`gl_clip_z_to_wgpu`],
-//!   implemented and unit-tested here now so M3 has it ready.
+//!   fixup is needed on that path. [`gl_clip_z_to_wgpu`] is the fixup
+//!   [`Renderer::op_draw_inline_gl`] needs (generalised to an arbitrary
+//!   `DEPTH_RANGE` right there, rather than adding a second helper --
+//!   see that function's own doc comment).
 //! - **`CLAMP` has no border colour.** [`tex_wrap_to_address_mode`] maps
 //!   both `CLAMP` and `CLAMP_TO_EDGE` to `wgpu::AddressMode::ClampToEdge`
 //!   and never to `ClampToBorder`, via [`state::TexWrap::effective`].
@@ -96,9 +109,9 @@
 use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
-    self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, PrimitiveType,
-    ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter,
-    TexFormat, TexWrap,
+    self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
+    PrimitiveType, ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode,
+    TexFilter, TexFormat, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -555,27 +568,49 @@ fn read_u32_be(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(w))
 }
 
-/// Parses `count` window-space vertices out of `data`, `format`-
-/// interleaved, exactly as `DRAW_INLINE_WIN` lays them out
-/// (`docs/internals/c3d.md`'s "Vertex format"). Every optional component
-/// in the format is walked and its words consumed -- including ones this
-/// milestone doesn't render (`NORMAL`, `TEXCOORD1`-`3`) -- so a later
-/// vertex in the same command parses at the right offset even though this
-/// milestone only *uses* `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`FOGCOORD`.
-/// `current` supplies the value for any component the format omits.
-/// `Err` if `data` runs out before `count` vertices are read.
-pub fn parse_window_vertices(
+/// The byte layout `DRAW_INLINE` (GL-space) and `DRAW_INLINE_WIN`
+/// (window-space) share exactly, per `docs/internals/c3d.md`'s "Vertex
+/// format" table: only `POS`'s four components' *semantics* differ
+/// between the two opcodes (object-space to be transformed vs. window
+/// pixels + `rhw`), which is entirely a matter of how a caller
+/// interprets `pos`, not how the bytes are walked. [`parse_window_vertices`]
+/// and [`parse_gl_vertices`] are both thin wrappers over this shared
+/// walk, returning [`WinVertex`]/[`GlVertex`] respectively -- the two
+/// structs are structurally identical, but kept distinct types so a
+/// caller can never accidentally feed one draw kind's vertices into the
+/// other's transform path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawVertex {
+    pos: [f32; 4],
+    color: [f32; 4],
+    texcoord0: [f32; 2],
+    fogcoord: f32,
+}
+
+/// Parses `count` vertices out of `data`, `format`-interleaved, exactly
+/// as `DRAW_INLINE`/`DRAW_INLINE_WIN` lay them out. Every optional
+/// component in the format is walked and its words consumed --
+/// including ones this milestone doesn't render (`NORMAL`, `TEXCOORD1`-
+/// `3`) -- so a later vertex in the same command parses at the right
+/// offset even though this milestone only *uses*
+/// `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`FOGCOORD`. `NORMAL`'s "illegal in
+/// a window-space draw" rule is enforced at the dispatch/decode layer
+/// (`ring.rs`'s `check_window_space_format`), not here: both draw kinds
+/// must still walk its bytes to keep later components at the right
+/// offset. `current` supplies the value for any component the format
+/// omits. `Err` if `data` runs out before `count` vertices are read.
+fn parse_vertices_raw(
     data: &[u8],
     format: VertexFormat,
     count: u32,
     current: &state::CurrentVertex,
-) -> Result<Vec<WinVertex>, RenderError> {
+) -> Result<Vec<RawVertex>, RenderError> {
     let Some(pos_words) = format.pos_words() else {
         return Err(RenderError::ShortPayload("POS_COUNT"));
     };
     let mut out = Vec::with_capacity(count as usize);
     let mut at = 0usize;
-    let bad = || RenderError::ShortPayload("window-space vertex");
+    let bad = || RenderError::ShortPayload("vertex");
 
     for _ in 0..count {
         let mut pos = [0.0f32, 0.0, 0.0, 1.0];
@@ -633,7 +668,7 @@ pub fn parse_window_vertices(
             at += 4;
         }
 
-        out.push(WinVertex {
+        out.push(RawVertex {
             pos,
             color,
             texcoord0: [texcoord0.0, texcoord0.1],
@@ -641,6 +676,66 @@ pub fn parse_window_vertices(
         });
     }
     Ok(out)
+}
+
+/// Parses `count` window-space vertices out of `data`, `format`-
+/// interleaved, exactly as `DRAW_INLINE_WIN` lays them out -- see
+/// [`parse_vertices_raw`], which this wraps.
+pub fn parse_window_vertices(
+    data: &[u8],
+    format: VertexFormat,
+    count: u32,
+    current: &state::CurrentVertex,
+) -> Result<Vec<WinVertex>, RenderError> {
+    Ok(parse_vertices_raw(data, format, count, current)?
+        .into_iter()
+        .map(|r| WinVertex {
+            pos: r.pos,
+            color: r.color,
+            texcoord0: r.texcoord0,
+            fogcoord: r.fogcoord,
+        })
+        .collect())
+}
+
+/// One parsed GL-space (object-space, `CAP_TRANSFORM`) vertex: `pos` is
+/// `(x, y, z, w)` in object space, to be transformed by the current
+/// modelview and projection matrices, then mapped through `VIEWPORT` and
+/// `DEPTH_RANGE` -- unlike [`WinVertex::pos`], which already carries
+/// final window pixels and `rhw`. `color`/`texcoord0`/`fogcoord` are the
+/// same wire semantics as [`WinVertex`]'s (this milestone applies no
+/// lighting or texgen, so they pass through exactly as parsed, same as
+/// the window-space path).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlVertex {
+    pub pos: [f32; 4], // object-space x, y, z, w
+    pub color: [f32; 4],
+    pub texcoord0: [f32; 2],
+    pub fogcoord: f32,
+}
+
+/// Parses `count` GL-space vertices out of `data`, `format`-interleaved,
+/// exactly as `DRAW_INLINE` lays them out -- see [`parse_vertices_raw`],
+/// which this wraps. `NORMAL` is legal in this format (unlike
+/// [`parse_window_vertices`]'s draw kind) but is not yet used: no
+/// lighting is implemented this milestone, so its words are walked (to
+/// keep later components at the right offset) and discarded, exactly
+/// like `TEXCOORD1`-`3` already are.
+pub fn parse_gl_vertices(
+    data: &[u8],
+    format: VertexFormat,
+    count: u32,
+    current: &state::CurrentVertex,
+) -> Result<Vec<GlVertex>, RenderError> {
+    Ok(parse_vertices_raw(data, format, count, current)?
+        .into_iter()
+        .map(|r| GlVertex {
+            pos: r.pos,
+            color: r.color,
+            texcoord0: r.texcoord0,
+            fogcoord: r.fogcoord,
+        })
+        .collect())
 }
 
 /// One triangle's three vertex indices into the vertex list a draw
@@ -1977,17 +2072,16 @@ impl Renderer {
                 count,
                 vertices,
             } => {
-                if !*window_space {
-                    return Err(RenderError::Unimplemented(
-                        "GL-space draws (CAP_TRANSFORM, M3)",
-                    ));
-                }
                 let DrawVertices::Inline(bytes) = vertices else {
                     return Err(RenderError::Unimplemented(
-                        "DRAW_ARRAYS_WIN/DRAW_ELEMENTS_WIN (M3)",
+                        "DRAW_ARRAYS(_WIN)/DRAW_ELEMENTS(_WIN) (M3)",
                     ));
                 };
-                self.op_draw_inline_win(*prim, *format, *count, bytes, state)
+                if *window_space {
+                    self.op_draw_inline_win(*prim, *format, *count, bytes, state)
+                } else {
+                    self.op_draw_inline_gl(*prim, *format, *count, bytes, state)
+                }
             }
             RenderOp::TexImage {
                 id,
@@ -2300,6 +2394,149 @@ impl Renderer {
             vbuf.push(to_gpu(v));
         }
 
+        self.submit_draw(state, id, def, topology, vbuf)
+    }
+
+    /// The GL-space (object-space, `CAP_TRANSFORM`) counterpart of
+    /// [`Self::op_draw_inline_win`]: **position transform only** this
+    /// milestone -- no lighting, texgen or user clipping (see the module
+    /// doc comment's M3 scope). Each vertex's `(x, y, z, w)` object-space
+    /// position is transformed by `modelview` then `projection`
+    /// (`docs/internals/c3d.md`: "follow the OpenGL 1.1 specification's
+    /// fixed-function pipeline exactly, including the `[-1, 1]` clip-space
+    /// depth range mapped through `DEPTH_RANGE`"), then mapped through
+    /// `VIEWPORT` and `DEPTH_RANGE` -- both spec-mandated transform-tier
+    /// steps a window-space draw skips entirely (window-space vertices
+    /// already carry final surface pixels and `[0, 1]` depth, and
+    /// deliberately ignore `VIEWPORT`, per the module doc comment).
+    /// Colour and `TEXCOORD0` pass through exactly as parsed (or the
+    /// current-state fallback), same as the window-space path -- no
+    /// lighting or texgen is applied to them here.
+    fn op_draw_inline_gl(
+        &mut self,
+        prim: PrimitiveType,
+        format: VertexFormat,
+        count: u32,
+        bytes: &[u8],
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let id = state.draw_surface();
+        let def = *state
+            .surface(id)
+            .ok_or(RenderError::UnknownObject("surface", id))?;
+
+        let verts = parse_gl_vertices(bytes, format, count, &state.current)?;
+        let (topology, order) = primitive_index_order(prim, verts.len())?;
+        if order.is_empty() {
+            return Ok(());
+        }
+
+        // `top_matrix` always returns `Some` for `Modelview`/`Projection`
+        // (only a `Texture` stack past `MAX_TEXTURES` can be `None`; see
+        // `state.rs`'s `stack`), but the fallback keeps this total rather
+        // than relying on that invariant never changing.
+        let modelview = state
+            .top_matrix(MatrixMode::Modelview)
+            .unwrap_or_else(Mat4::identity);
+        let projection = state
+            .top_matrix(MatrixMode::Projection)
+            .unwrap_or_else(Mat4::identity);
+        // `VIEWPORT`/`DEPTH_RANGE`: both transform-tier-only raster state
+        // (`docs/internals/c3d.md`'s raster-state table), origin top-left
+        // like every other rectangle this spec defines (`state.rs`'s
+        // `Rect` doc comment). A window-space draw skips this whole step
+        // (see the module doc comment: "window-space draws ignore
+        // [VIEWPORT], per the spec"); `set_draw_surface` resets it to the
+        // full surface, so an untouched viewport still covers everything.
+        let vp = state.raster.viewport;
+        let (near, far) = state.raster.depth_range;
+        let (w, h) = (def.width as f32, def.height as f32);
+
+        // Fog distance: the spec's "`FOGCOORD` if present, else derived
+        // from `rhw`" rule is stated only for the window-space vertex
+        // format, which has no `w` in the GL-space sense at all. For a
+        // GL-space vertex without `FOGCOORD`, this falls back to GL 1.1's
+        // own fixed-function default fog coordinate: the eye-space
+        // distance `-eye.z` (positive in front of the viewer), computed
+        // from the modelview-only transform before projection.
+        let has_fogcoord = format.has(VertexFormat::FOGCOORD);
+        let to_gpu = |v: &GlVertex| -> GpuVertex {
+            let eye = modelview.transform_point(v.pos);
+            let clip = projection.transform_point(eye);
+            let clip_w = clip[3];
+            // A vertex behind the eye at exactly `w == 0` is GL-undefined
+            // (it doesn't correspond to any real point); guarded the same
+            // way the window-space path guards a zero `rhw`, so this
+            // never divides by zero.
+            let safe_w = if clip_w.abs() < 1e-8 { 1e-8 } else { clip_w };
+            let ndc_x = clip[0] / safe_w;
+            let ndc_y = clip[1] / safe_w;
+
+            // GL's viewport transform (origin top-left in this device's
+            // window space, unlike native GL's bottom-left -- see this
+            // function's doc comment) maps NDC into the `VIEWPORT` sub-
+            // rectangle of the surface; wgpu's own implicit viewport
+            // always covers the *whole* surface (nothing here ever calls
+            // `set_viewport`, matching the window-space path), so that
+            // sub-rectangle mapping is folded into a second remap back to
+            // "as if the whole surface were the viewport" -- the same NDC
+            // convention `op_draw_inline_win` produces from raw pixels.
+            let device_x = vp.x as f32 + (ndc_x * 0.5 + 0.5) * vp.w as f32;
+            let device_y = vp.y as f32 + (1.0 - (ndc_y * 0.5 + 0.5)) * vp.h as f32;
+            let final_ndc_x = (device_x / w) * 2.0 - 1.0;
+            let final_ndc_y = 1.0 - (device_y / h) * 2.0;
+
+            // `DEPTH_RANGE`: GL maps clip-space `z` (after divide, in
+            // `[-1, 1]`) to `[near, far]`. `gl_clip_z_to_wgpu` already
+            // computes the `near = 0, far = 1` case
+            // (`(clip_z_gl + clip_w) / 2`, i.e. `clip_w * (ndc_z + 1) /
+            // 2`); scaling that by `(far - near)` and adding `near *
+            // clip_w` generalises it to an arbitrary `DEPTH_RANGE` while
+            // keeping the same undivided-clip-space convention
+            // `clip_pos.z` needs (the fixture this helper was written and
+            // unit-tested for -- see the module doc comment's "two
+            // traps").
+            let depth_clip_z = near * clip_w + (far - near) * gl_clip_z_to_wgpu(clip[2], clip_w);
+
+            GpuVertex {
+                clip_pos: [
+                    final_ndc_x * clip_w,
+                    final_ndc_y * clip_w,
+                    depth_clip_z,
+                    clip_w,
+                ],
+                color: v.color,
+                texcoord0: v.texcoord0,
+                fog_distance: if has_fogcoord { v.fogcoord } else { -eye[2] },
+            }
+        };
+
+        let mut vbuf: Vec<GpuVertex> = Vec::with_capacity(order.len());
+        for idx in order {
+            let Some(v) = verts.get(idx) else {
+                return Err(RenderError::ShortPayload("primitive vertex index"));
+            };
+            vbuf.push(to_gpu(v));
+        }
+
+        self.submit_draw(state, id, def, topology, vbuf)
+    }
+
+    /// The shared tail of [`Self::op_draw_inline_win`]/
+    /// [`Self::op_draw_inline_gl`]: given an already fully-transformed
+    /// [`GpuVertex`] list (in the primitive's [`primitive_index_order`]),
+    /// builds/looks up the pipeline, binds the texture (if any), and
+    /// submits the draw. Neither caller's vertex-transform math belongs
+    /// here -- this only knows about the GPU-side shape both draw kinds
+    /// converge on.
+    fn submit_draw(
+        &mut self,
+        state: &State,
+        id: u32,
+        def: Surface,
+        topology: PrimTopologyKey,
+        vbuf: Vec<GpuVertex>,
+    ) -> Result<(), RenderError> {
         let unit0 = state.texture_units.first();
         let bound_tex = unit0.map(|u| u.bound_texture).unwrap_or(0);
         let unit0_bound = bound_tex != 0 && self.textures.contains_key(&bound_tex);
@@ -4476,6 +4713,311 @@ mod tests {
             "an explicit FOGCOORD of fog_end should fully fog the pixel \
              even though 1/rhw alone would have meant no fog at all: {px:?}"
         );
+    }
+
+    // -- DRAW_INLINE (GL-space, CAP_TRANSFORM, position transform only) --
+
+    /// Builds and executes a `RenderOp::Draw { window_space: false, .. }`
+    /// against a fresh 16x16 surface cleared to black, drawing `verts`
+    /// (already-encoded GL-space vertex bytes, `POS(4) + COLOR(4)`) as one
+    /// `TRIANGLES` primitive, and returns the rendered RGBA8 pixels (or
+    /// `None` if no adapter is available, the usual skip-cleanly path).
+    fn draw_gl_space_triangle(
+        set_extra_state: impl FnOnce(&mut State),
+        verts: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        set_extra_state(&mut state);
+
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format: VertexFormat(VertexFormat::COLOR),
+                    count: 3,
+                    window_space: false,
+                    vertices: DrawVertices::Inline(verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        Some(pixels)
+    }
+
+    fn encode_gl_vertex(pos: [f32; 4], color: [f32; 4], out: &mut Vec<u8>) {
+        for w in pos {
+            out.extend_from_slice(&w.to_bits().to_be_bytes());
+        }
+        for c in color {
+            out.extend_from_slice(&c.to_bits().to_be_bytes());
+        }
+    }
+
+    /// Proves `DRAW_INLINE` transforms object-space positions by
+    /// `modelview` *then* `projection` -- not the other order, and not
+    /// both folded into one matrix -- by putting a rotation on the
+    /// `MODELVIEW` stack and a translation on the (separate) `PROJECTION`
+    /// stack. `ROTATE(90, 0, 0, 1)` and `TRANSLATE(1, 0, 0)` do not
+    /// commute, so applying them in the wrong order sends the triangle
+    /// somewhere else entirely, not just to a slightly different pixel --
+    /// a test that folded both onto one stack (or used two commuting
+    /// operations) would only re-check `state.rs`'s own within-stack
+    /// `MULT_MATRIX` ordering (already covered by
+    /// `mult_matrix_post_multiplies` there), not this module's
+    /// modelview-before-projection composition.
+    ///
+    /// The triangle's object-space anchor `(0, 1, 0)` is chosen so the
+    /// *correct* order (`eye = modelview.transform_point(obj)`, `clip =
+    /// projection.transform_point(eye)`, i.e. `clip = TRANSLATE(ROTATE(obj))`)
+    /// lands exactly on NDC `(0, 0)` -- the surface's centre pixel, `(8,
+    /// 8)` on a 16x16 surface -- while the wrong order (`ROTATE(TRANSLATE(obj))`)
+    /// lands near NDC `(-0.7, 0.7)` to `(-1.3, 1.0)`, nowhere near the
+    /// centre. Radius `0.3` keeps the triangle comfortably larger than a
+    /// pixel (a rotation and a translation are both isometries in `x`/
+    /// `y`, so nothing here shrinks it), avoiding the subpixel-coverage
+    /// ambiguity a scaled-down test triangle would risk.
+    ///
+    /// Verified per this session's practice: temporarily swapping the two
+    /// `transform_point` calls in `op_draw_inline_gl` (applying
+    /// `projection` before `modelview`) was confirmed to fail this
+    /// assertion (the centre pixel stayed the clear colour) before this
+    /// fix was restored.
+    #[test]
+    fn draw_inline_transforms_by_modelview_then_projection() {
+        let anchor = (0.0f32, 1.0f32);
+        let tri = [
+            (anchor.0 - 0.3, anchor.1 - 0.3),
+            (anchor.0 + 0.3, anchor.1 - 0.3),
+            (anchor.0, anchor.1 + 0.3),
+        ];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            encode_gl_vertex([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+        }
+
+        let Some(pixels) = draw_gl_space_triangle(
+            |s| {
+                s.set_matrix_mode(MatrixMode::Modelview);
+                s.rotate(90.0, 0.0, 0.0, 1.0);
+                s.set_matrix_mode(MatrixMode::Projection);
+                s.translate(1.0, 0.0, 0.0);
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        let center = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            &center[..3],
+            &[255, 255, 255],
+            "the correctly-ordered modelview*projection transform should \
+             land the triangle's centre on the surface's centre pixel: {center:?}"
+        );
+    }
+
+    /// `VIEWPORT` (transform-tier-only, unlike `DRAW_INLINE_WIN` which
+    /// ignores it per the spec) must be folded into the NDC mapping: a
+    /// full-NDC-covering triangle (`(-1,-1)`, `(3,-1)`, `(-1,3)`, which
+    /// over-covers `[-1, 1]^2` the same way `drawn_depth_at_center`'s
+    /// window-space triangle over-covers its surface) restricted to
+    /// `VIEWPORT(4, 4, 8, 8)` on a 16x16 surface should colour only that
+    /// 8x8 sub-rectangle, leaving every pixel outside it at the clear
+    /// colour.
+    #[test]
+    fn draw_inline_folds_viewport_into_the_full_surface_ndc_mapping() {
+        let tri = [(-1.0f32, -1.0), (3.0, -1.0), (-1.0, 3.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            encode_gl_vertex([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+        }
+
+        let Some(pixels) = draw_gl_space_triangle(
+            |s| {
+                s.set_viewport(4, 4, 8, 8);
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        // Inside the viewport: coloured white.
+        let inside = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            &inside[..3],
+            &[255, 255, 255],
+            "(8, 8) is inside VIEWPORT(4, 4, 8, 8) and should be coloured: {inside:?}"
+        );
+        // Outside the viewport (top-left corner): still the clear colour.
+        let outside = &pixels[(1 * 16 + 1) * 4..][..4];
+        assert_eq!(
+            &outside[..3],
+            &[0, 0, 0],
+            "(1, 1) is outside VIEWPORT(4, 4, 8, 8) and must stay the clear colour: {outside:?}"
+        );
+    }
+
+    /// `DEPTH_RANGE(near, far)` maps GL clip-space `z` (post-divide, `[-1,
+    /// 1]`) onto `[near, far]`, per the spec's "OpenGL 1.1 ... including
+    /// the `[-1, 1]` clip-space depth range mapped through `DEPTH_RANGE`".
+    /// With identity modelview/projection, an object-space `z` of exactly
+    /// `-1.0`/`1.0` *is* the post-divide clip `z` (`w = 1`), so the
+    /// written device depth should land exactly on `near`/`far` -- clean
+    /// endpoints, avoiding the float-rounding ambiguity a mid-range value
+    /// would risk (the same reasoning `POLYGON_OFFSET`'s and the LINEAR
+    /// fog test's endpoint choices followed this session).
+    #[test]
+    fn draw_inline_maps_depth_range_onto_near_and_far() {
+        let sample = |z: f32| -> Option<u32> {
+            let mut renderer = match Renderer::new() {
+                Ok(r) => r,
+                Err(RenderError::NoAdapter) => {
+                    eprintln!("skipping: no wgpu adapter available");
+                    return None;
+                }
+                Err(e) => panic!("unexpected renderer error: {e}"),
+            };
+            let mut state = State::new(state::Limits::default());
+            state.surface_define(
+                1,
+                Surface {
+                    width: 16,
+                    height: 16,
+                    stride_bytes: 64,
+                    format: WireSurfaceFormat::A8r8g8b8,
+                    backing: state::Backing::Aperture(0),
+                },
+            );
+            state.set_draw_surface(1);
+            state.set_clear_depth(0.0);
+            state.set_depth_range(0.25, 0.75);
+
+            let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+            let mut verts = Vec::new();
+            for (x, y) in tri {
+                encode_gl_vertex([x, y, z, 1.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+            }
+
+            let mut mem = TestMemory::new(65536);
+            let errs = renderer.execute(
+                &[
+                    RenderOp::Clear {
+                        mask: proto::CLEAR_MASK_DEPTH,
+                    },
+                    RenderOp::Draw {
+                        prim: PrimitiveType::Triangles,
+                        format: VertexFormat(VertexFormat::COLOR),
+                        count: 3,
+                        window_space: false,
+                        vertices: DrawVertices::Inline(&verts),
+                    },
+                ],
+                &state,
+                &mut mem,
+            );
+            assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+            let dest = Ref {
+                address: 0,
+                space: RefSpace::Aperture,
+                length: 4,
+            };
+            let errs = renderer.execute(
+                &[RenderOp::ReadPixels {
+                    x: 8,
+                    y: 8,
+                    w: 1,
+                    h: 1,
+                    format: WireSurfaceFormat::Depth,
+                    row_bytes: 4,
+                    flags: 0,
+                    dest,
+                }],
+                &state,
+                &mut mem,
+            );
+            assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+            Some(u32::from_be_bytes(mem.aperture[0..4].try_into().unwrap()))
+        };
+
+        let Some(at_near) = sample(-1.0) else {
+            return; // no adapter
+        };
+        let expected_near = (0.25f64 * u32::MAX as f64).round() as u32;
+        assert!(
+            (at_near as i64 - expected_near as i64).abs() <= 1,
+            "object z = -1.0 should map to DEPTH_RANGE's near (0.25): expected ~{expected_near}, got {at_near}"
+        );
+
+        let Some(at_far) = sample(1.0) else {
+            return; // no adapter
+        };
+        let expected_far = (0.75f64 * u32::MAX as f64).round() as u32;
+        assert!(
+            (at_far as i64 - expected_far as i64).abs() <= 1,
+            "object z = 1.0 should map to DEPTH_RANGE's far (0.75): expected ~{expected_far}, got {at_far}"
+        );
+    }
+
+    /// `parse_gl_vertices` must accept `NORMAL` (illegal only in a
+    /// window-space draw, per `ring.rs`'s `check_window_space_format`) and
+    /// still walk its three words so a following component lands at the
+    /// right offset -- mirroring `parse_window_vertices`'s existing
+    /// coverage of `NORMAL` as an "unused but consumed" component.
+    #[test]
+    fn parse_gl_vertices_accepts_and_skips_normal() {
+        let format = VertexFormat(
+            (1 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::NORMAL | VertexFormat::COLOR,
+        );
+        let mut bytes = Vec::new();
+        for w in [1.0f32, 2.0, 3.0] {
+            // POS (3 words: POS_COUNT = 1)
+            bytes.extend_from_slice(&w.to_bits().to_be_bytes());
+        }
+        // The wire's fixed component order is POS, then bit order (COLOR
+        // is bit 0, NORMAL is bit 1), so COLOR precedes NORMAL here --
+        // not the format table's row order, which merely lists bits.
+        for w in [0.5f32, 0.25, 0.75, 1.0] {
+            // COLOR
+            bytes.extend_from_slice(&w.to_bits().to_be_bytes());
+        }
+        for w in [0.0f32, 0.0, 1.0] {
+            // NORMAL (skipped)
+            bytes.extend_from_slice(&w.to_bits().to_be_bytes());
+        }
+
+        let verts = parse_gl_vertices(&bytes, format, 1, &current()).unwrap();
+        assert_eq!(verts.len(), 1);
+        assert_eq!(verts[0].pos, [1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(verts[0].color, [0.5, 0.25, 0.75, 1.0]);
     }
 
     /// `QUERY` needs no GPU work at all -- `dispatch::Context` has
