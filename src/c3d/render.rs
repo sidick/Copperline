@@ -25,9 +25,9 @@
 //!   back to a degenerate scissored draw instead
 //!   ([`ClearRectPipelineKey`]), since neither restriction is something
 //!   `LoadOp::Clear` alone can express.
-//! - [`RenderOp::Draw`] for the **window-space** draw shapes
-//!   (`DRAW_INLINE_WIN` only; `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` and
-//!   every GL-space shape are deferred -- see [`RenderError::Unimplemented`]),
+//! - [`RenderOp::Draw`] for every **window-space** draw shape
+//!   (`DRAW_INLINE_WIN`, `DRAW_ARRAYS_WIN`, `DRAW_ELEMENTS_WIN`; every
+//!   GL-space shape is deferred -- see [`RenderError::Unimplemented`]),
 //!   `POS_COUNT` 4/3/2, `COLOR`, `COLOR_PACKED` and `TEXCOORD0`, correct
 //!   `rhw` handling, every primitive type with the spec's normative quad/
 //!   polygon triangulation and provoking vertex, flat and smooth shading.
@@ -55,8 +55,9 @@
 //!   mask, fog (linear/exp/exp2; per-vertex `FOGCOORD` when the format
 //!   carries it, else derived from `1 / rhw`, per the window-space rule).
 //!
-//! Deferred to M3: GL-space transform/lighting draws, `DRAW_ARRAYS*`/
-//! `DRAW_ELEMENTS*`, multitexture (`TEXCOORD1`-`3`), texel-space texture
+//! Deferred to M3: GL-space transform/lighting draws (`DRAW_ARRAYS`/
+//! `DRAW_ELEMENTS` themselves, not their `_WIN` counterparts, which are
+//! implemented), multitexture (`TEXCOORD1`-`3`), texel-space texture
 //! coordinates. Every one of these returns
 //! [`RenderError::Unimplemented`] rather than panicking. (`TEX_PALETTE` is
 //! not in this list: it's spec-optional and Copperline correctly never
@@ -639,6 +640,332 @@ pub fn parse_window_vertices(
             texcoord0: [texcoord0.0, texcoord0.1],
             fogcoord,
         });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// DRAW_ARRAYS_WIN / DRAW_ELEMENTS_WIN vertex fetch
+// ---------------------------------------------------------------------
+//
+// Unlike `parse_window_vertices`'s single interleaved byte run, each array
+// descriptor names its *own* base address and stride, independent of every
+// other descriptor's -- so, unlike the inline path, there is no running
+// "at" offset to keep in step across attributes: a vertex's position and
+// colour (say) may not even share a buffer. That independence is what
+// makes a direct per-index fetch (rather than batch-materialising a whole
+// array range up front) both correct and simple, and is also why
+// `DRAW_ELEMENTS_WIN`'s `min_index`/`max_index` -- including the spec's
+// `0xFFFF_FFFF`/`0xFFFF_FFFF` "device scans the indices itself" sentinel --
+// are never consulted below: they exist so a device that *does* batch
+// (typically a `CAP_TRANSFORM` device amortising the transform/lighting
+// cost per unique vertex) knows the working set's size in advance. A
+// baseline window-space fetch has no transform to amortise, so it simply
+// dereferences whatever index the guest supplies, one vertex at a time,
+// which handles every value of `min_index`/`max_index` -- sentinel
+// included -- without special-casing any of them.
+
+// GL 1.1 array element type enumerants (`c3d-cmd-draw`'s "Array `type` is
+// a GL enumerant" clause: `FLOAT`, `SHORT`, `UNSIGNED_BYTE`, `INT`; the
+// same four values double as `DRAW_ELEMENTS*`'s `index_type`, restricted
+// to the unsigned ones).
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_SHORT: u32 = 0x1402;
+const GL_UNSIGNED_SHORT: u32 = 0x1403;
+const GL_INT: u32 = 0x1404;
+const GL_UNSIGNED_INT: u32 = 0x1405;
+const GL_FLOAT: u32 = 0x1406;
+
+/// Byte size of one array-element component of `elem_type`. `None` for any
+/// value outside the spec's accepted four.
+fn array_elem_size(elem_type: u32) -> Option<usize> {
+    match elem_type {
+        GL_UNSIGNED_BYTE => Some(1),
+        GL_SHORT => Some(2),
+        GL_INT | GL_FLOAT => Some(4),
+        _ => None,
+    }
+}
+
+/// Byte size of one `DRAW_ELEMENTS*` index of `index_type`. `None` for
+/// anything but the spec's three unsigned types.
+fn index_elem_size(index_type: u32) -> Option<usize> {
+    match index_type {
+        GL_UNSIGNED_BYTE => Some(1),
+        GL_UNSIGNED_SHORT => Some(2),
+        GL_UNSIGNED_INT => Some(4),
+        _ => None,
+    }
+}
+
+/// Reads one array index of `index_type` at byte offset `at`, per
+/// `DRAW_ELEMENTS*`'s tightly-packed (no stride field) index buffer.
+fn read_index(bytes: &[u8], at: usize, index_type: u32) -> Option<u32> {
+    match index_type {
+        GL_UNSIGNED_BYTE => bytes.get(at).map(|b| *b as u32),
+        GL_UNSIGNED_SHORT => {
+            let w: [u8; 2] = bytes.get(at..at + 2)?.try_into().ok()?;
+            Some(u16::from_be_bytes(w) as u32)
+        }
+        GL_UNSIGNED_INT => {
+            let w: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+            Some(u32::from_be_bytes(w))
+        }
+        _ => None,
+    }
+}
+
+/// Reads one array component at byte offset `at`, applying the spec's GL
+/// array conversion rules: `FLOAT` straight through, `SHORT`/`INT` as
+/// plain (unnormalised) integer values ("`SHORT` positions and texcoords
+/// as integers"), `UNSIGNED_BYTE` normalised `0..1` ("`UNSIGNED_BYTE`
+/// colours normalised to `0..1`" -- applied uniformly here since the wire
+/// format gives no other signal for a non-colour attribute using it).
+fn read_array_scalar(bytes: &[u8], at: usize, elem_type: u32) -> Option<f32> {
+    match elem_type {
+        GL_FLOAT => read_f32(bytes, at),
+        GL_SHORT => {
+            let w: [u8; 2] = bytes.get(at..at + 2)?.try_into().ok()?;
+            Some(i16::from_be_bytes(w) as f32)
+        }
+        GL_INT => {
+            let w: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+            Some(i32::from_be_bytes(w) as f32)
+        }
+        GL_UNSIGNED_BYTE => bytes.get(at).map(|b| *b as f32 / 255.0),
+        _ => None,
+    }
+}
+
+/// An array descriptor's actual component count: the wire's bits `31:28`
+/// override the vertex-format table's default ("`0` meaning the table's
+/// default"), per `c3d-cmd-draw`'s "positions may be `2`, `3` or `4`
+/// components" clause -- generalised here to every attribute, matching
+/// real GL's per-pointer `size` parameter (`glColorPointer`'s `3`/`4`,
+/// `glTexCoordPointer`'s `1`-`4`). `Err` if the result isn't a legal
+/// component count (`1..=4`).
+fn descriptor_component_count(array_type: u32, table_default: u32) -> Result<u32, RenderError> {
+    let n = (array_type >> 28) & 0xF;
+    let n = if n == 0 { table_default } else { n };
+    if (1..=4).contains(&n) {
+        Ok(n)
+    } else {
+        Err(RenderError::ShortPayload("array component count"))
+    }
+}
+
+/// Reads `ncomp` components of one vertex's worth of `desc`'s array at
+/// `index`, resolving `desc`'s own `ref` (base address) and `stride_bytes`
+/// (`0` meaning tightly packed: `ncomp * element size`). Padded to `[f32;
+/// 4]`; only the first `ncomp` entries are meaningful.
+fn read_array_attribute(
+    desc: &proto::ArrayDescriptor,
+    ncomp: u32,
+    index: u32,
+    mem: &mut dyn Memory,
+) -> Result<[f32; 4], RenderError> {
+    let elem_type = desc.array_type & 0xFFFF;
+    let elem_size =
+        array_elem_size(elem_type).ok_or(RenderError::ShortPayload("array element type"))?;
+    let stride = if desc.stride_bytes == 0 {
+        ncomp * elem_size as u32
+    } else {
+        desc.stride_bytes
+    };
+    let extra = u32::try_from(u64::from(index) * u64::from(stride))
+        .map_err(|_| RenderError::BadMemory("array offset overflowed 32-bit addressing".into()))?;
+    let loc = offset_ref(desc.data, extra);
+    let need = ncomp as usize * elem_size;
+    let bytes = mem
+        .read(loc, need)
+        .ok_or_else(|| RenderError::BadMemory(format!("array data at {loc:?}")))?;
+    let mut out = [0.0f32; 4];
+    for (i, slot) in out.iter_mut().enumerate().take(ncomp as usize) {
+        *slot = read_array_scalar(bytes, i * elem_size, elem_type)
+            .ok_or(RenderError::ShortPayload("array component"))?;
+    }
+    Ok(out)
+}
+
+/// `COLOR_PACKED`'s array form: one `0xRRGGBBAA` word per vertex (never
+/// GL-type-converted, unlike every other attribute -- it is always exactly
+/// one packed word, per the vertex-format table's fixed 1-word contribution
+/// for this bit).
+fn read_packed_color(
+    desc: &proto::ArrayDescriptor,
+    index: u32,
+    mem: &mut dyn Memory,
+) -> Result<[f32; 4], RenderError> {
+    let stride = if desc.stride_bytes == 0 {
+        4
+    } else {
+        desc.stride_bytes
+    };
+    let extra = u32::try_from(u64::from(index) * u64::from(stride))
+        .map_err(|_| RenderError::BadMemory("array offset overflowed 32-bit addressing".into()))?;
+    let loc = offset_ref(desc.data, extra);
+    let bytes = mem
+        .read(loc, 4)
+        .ok_or_else(|| RenderError::BadMemory(format!("array data at {loc:?}")))?;
+    let word = read_u32_be(bytes, 0).ok_or(RenderError::ShortPayload("packed color"))?;
+    Ok(unpack_color(word))
+}
+
+/// Decodes `descriptors` into one [`proto::ArrayDescriptor`] per set
+/// `format` bit -- the position descriptor (tagged `None`) always first,
+/// then each optional bit in [`VertexFormat::OPTIONAL_BITS`] order --
+/// exactly the layout `DrawVertices::Arrays`'s doc comment describes and
+/// `ring.rs` has already confirmed the byte count for (via
+/// `format.descriptor_count()`); this rechecks the slice actually handed
+/// to this call, since that length check lives one layer up.
+fn decode_array_descriptors(
+    format: VertexFormat,
+    descriptors: &[u8],
+) -> Option<Vec<(Option<u32>, proto::ArrayDescriptor)>> {
+    fn read_one(descriptors: &[u8], at: usize) -> Option<proto::ArrayDescriptor> {
+        let bytes: &[u8; 16] = descriptors.get(at..at + 16)?.try_into().ok()?;
+        Some(proto::ArrayDescriptor::decode(bytes))
+    }
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    out.push((None, read_one(descriptors, at)?));
+    at += 16;
+    for bit in VertexFormat::OPTIONAL_BITS {
+        if format.has(bit) {
+            out.push((Some(bit), read_one(descriptors, at)?));
+            at += 16;
+        }
+    }
+    Some(out)
+}
+
+/// Fetches one window-space vertex (`index`) from `descriptors`, the
+/// [`decode_array_descriptors`] output for a `DRAW_ARRAYS_WIN`/
+/// `DRAW_ELEMENTS_WIN` command. Only the components this milestone renders
+/// (`POS`, `COLOR`/`COLOR_PACKED`, `TEXCOORD0`, `FOGCOORD`) are actually
+/// read from memory; `NORMAL` (illegal here, rejected upstream) and
+/// `TEXCOORD1`-`3` (multitexture, out of scope) are present in
+/// `descriptors` -- needed so later descriptors in the same command decode
+/// at the right byte offset -- but are never dereferenced, matching
+/// `parse_window_vertices`'s "consumed, unused" treatment of the same
+/// components on the inline path.
+fn fetch_array_vertex(
+    descriptors: &[(Option<u32>, proto::ArrayDescriptor)],
+    pos_words: u32,
+    index: u32,
+    current: &state::CurrentVertex,
+    mem: &mut dyn Memory,
+) -> Result<WinVertex, RenderError> {
+    let mut pos = [0.0f32, 0.0, 0.0, 1.0];
+    let mut color = current.color;
+    let mut texcoord0 = current.texcoord.first().copied().unwrap_or((0.0, 0.0));
+    let mut fogcoord = current.fogcoord;
+
+    for (bit, desc) in descriptors {
+        match *bit {
+            None => {
+                let ncomp = descriptor_component_count(desc.array_type, pos_words)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                pos[..ncomp as usize].copy_from_slice(&v[..ncomp as usize]);
+            }
+            Some(b) if b == VertexFormat::COLOR => {
+                let ncomp = descriptor_component_count(desc.array_type, 4)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                color = [v[0], v[1], v[2], if ncomp >= 4 { v[3] } else { 1.0 }];
+            }
+            Some(b) if b == VertexFormat::COLOR_PACKED => {
+                color = read_packed_color(desc, index, mem)?;
+            }
+            Some(b) if b == VertexFormat::TEXCOORD0 => {
+                let ncomp = descriptor_component_count(desc.array_type, 2)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                texcoord0 = (v[0], if ncomp >= 2 { v[1] } else { 0.0 });
+            }
+            Some(b) if b == VertexFormat::FOGCOORD => {
+                let ncomp = descriptor_component_count(desc.array_type, 1)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                fogcoord = v[0];
+            }
+            _ => {} // NORMAL / TEXCOORD1-3: see this function's doc comment
+        }
+    }
+
+    Ok(WinVertex {
+        pos,
+        color,
+        texcoord0: [texcoord0.0, texcoord0.1],
+        fogcoord,
+    })
+}
+
+/// `DRAW_ARRAYS_WIN`: fetches `count` window-space vertices, one per array
+/// index `0..count`, per [`fetch_array_vertex`].
+pub fn parse_array_window_vertices(
+    format: VertexFormat,
+    count: u32,
+    descriptors_bytes: &[u8],
+    current: &state::CurrentVertex,
+    mem: &mut dyn Memory,
+) -> Result<Vec<WinVertex>, RenderError> {
+    let pos_words = format
+        .pos_words()
+        .ok_or(RenderError::ShortPayload("POS_COUNT"))?;
+    let descriptors = decode_array_descriptors(format, descriptors_bytes)
+        .ok_or(RenderError::ShortPayload("array descriptors"))?;
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        out.push(fetch_array_vertex(
+            &descriptors,
+            pos_words,
+            index,
+            current,
+            mem,
+        )?);
+    }
+    Ok(out)
+}
+
+/// `DRAW_ELEMENTS_WIN`: reads `count` indices of `index_type` from
+/// `index_ref`, then fetches one window-space vertex per index, per
+/// [`fetch_array_vertex`]. `min_index`/`max_index` are deliberately not
+/// parameters here -- see this section's module doc comment on why a
+/// direct per-index fetch never needs them, sentinel included.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_elements_window_vertices(
+    format: VertexFormat,
+    count: u32,
+    index_type: u32,
+    index_ref: Ref,
+    descriptors_bytes: &[u8],
+    current: &state::CurrentVertex,
+    mem: &mut dyn Memory,
+) -> Result<Vec<WinVertex>, RenderError> {
+    let pos_words = format
+        .pos_words()
+        .ok_or(RenderError::ShortPayload("POS_COUNT"))?;
+    let descriptors = decode_array_descriptors(format, descriptors_bytes)
+        .ok_or(RenderError::ShortPayload("array descriptors"))?;
+    let elem_size = index_elem_size(index_type).ok_or(RenderError::ShortPayload("index type"))?;
+    let need = elem_size * count as usize;
+    let loc = MemLoc::from_ref(index_ref);
+    // Copied out (not borrowed) so the loop below is free to reborrow
+    // `mem` mutably for each vertex's own array reads without this slice's
+    // lifetime standing in the way.
+    let index_bytes = mem
+        .read(loc, need)
+        .ok_or_else(|| RenderError::BadMemory(format!("index buffer at {loc:?}")))?
+        .to_vec();
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let index = read_index(&index_bytes, i * elem_size, index_type)
+            .ok_or(RenderError::ShortPayload("index"))?;
+        out.push(fetch_array_vertex(
+            &descriptors,
+            pos_words,
+            index,
+            current,
+            mem,
+        )?);
     }
     Ok(out)
 }
@@ -1982,12 +2309,30 @@ impl Renderer {
                         "GL-space draws (CAP_TRANSFORM, M3)",
                     ));
                 }
-                let DrawVertices::Inline(bytes) = vertices else {
-                    return Err(RenderError::Unimplemented(
-                        "DRAW_ARRAYS_WIN/DRAW_ELEMENTS_WIN (M3)",
-                    ));
-                };
-                self.op_draw_inline_win(*prim, *format, *count, bytes, state)
+                match vertices {
+                    DrawVertices::Inline(bytes) => {
+                        self.op_draw_inline_win(*prim, *format, *count, bytes, state)
+                    }
+                    DrawVertices::Arrays(descriptors) => {
+                        self.op_draw_arrays_win(*prim, *format, *count, descriptors, state, mem)
+                    }
+                    DrawVertices::Elements {
+                        index_type,
+                        min_index: _,
+                        max_index: _,
+                        index_ref,
+                        descriptors,
+                    } => self.op_draw_elements_win(
+                        *prim,
+                        *format,
+                        *count,
+                        *index_type,
+                        *index_ref,
+                        descriptors,
+                        state,
+                        mem,
+                    ),
+                }
             }
             RenderOp::TexImage {
                 id,
@@ -2247,6 +2592,9 @@ impl Renderer {
         (sw > 0 && sh > 0).then_some((x, y, sw, sh))
     }
 
+    /// `DRAW_INLINE_WIN`: parses `bytes` per `format` into a `Vec<WinVertex>`
+    /// and hands it to [`Self::op_draw_win`], the shared post-parse
+    /// pipeline `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` also use.
     fn op_draw_inline_win(
         &mut self,
         prim: PrimitiveType,
@@ -2255,12 +2603,69 @@ impl Renderer {
         bytes: &[u8],
         state: &State,
     ) -> Result<(), RenderError> {
+        let verts = parse_window_vertices(bytes, format, count, &state.current)?;
+        self.op_draw_win(prim, format, verts, state)
+    }
+
+    /// `DRAW_ARRAYS_WIN`: fetches `count` vertices from `descriptors`'s
+    /// array data (see [`parse_array_window_vertices`]) and hands them to
+    /// the same [`Self::op_draw_win`] pipeline `DRAW_INLINE_WIN` uses.
+    fn op_draw_arrays_win(
+        &mut self,
+        prim: PrimitiveType,
+        format: VertexFormat,
+        count: u32,
+        descriptors: &[u8],
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let verts = parse_array_window_vertices(format, count, descriptors, &state.current, mem)?;
+        self.op_draw_win(prim, format, verts, state)
+    }
+
+    /// `DRAW_ELEMENTS_WIN`: fetches `count` indexed vertices (see
+    /// [`parse_elements_window_vertices`]) and hands them to the same
+    /// [`Self::op_draw_win`] pipeline `DRAW_INLINE_WIN` uses.
+    #[allow(clippy::too_many_arguments)]
+    fn op_draw_elements_win(
+        &mut self,
+        prim: PrimitiveType,
+        format: VertexFormat,
+        count: u32,
+        index_type: u32,
+        index_ref: Ref,
+        descriptors: &[u8],
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let verts = parse_elements_window_vertices(
+            format,
+            count,
+            index_type,
+            index_ref,
+            descriptors,
+            &state.current,
+            mem,
+        )?;
+        self.op_draw_win(prim, format, verts, state)
+    }
+
+    /// The post-parse draw pipeline shared by `DRAW_INLINE_WIN`,
+    /// `DRAW_ARRAYS_WIN` and `DRAW_ELEMENTS_WIN` -- everything from
+    /// triangulation/primitive assembly onward, identical regardless of
+    /// where `verts` came from.
+    fn op_draw_win(
+        &mut self,
+        prim: PrimitiveType,
+        format: VertexFormat,
+        verts: Vec<WinVertex>,
+        state: &State,
+    ) -> Result<(), RenderError> {
         let id = state.draw_surface();
         let def = *state
             .surface(id)
             .ok_or(RenderError::UnknownObject("surface", id))?;
 
-        let verts = parse_window_vertices(bytes, format, count, &state.current)?;
         let (topology, order) = primitive_index_order(prim, verts.len())?;
         if order.is_empty() {
             return Ok(());
@@ -3256,6 +3661,262 @@ mod tests {
         cur.fogcoord = 4.5;
         let verts = parse_window_vertices(&bytes, format, 1, &cur).unwrap();
         assert_eq!(verts[0].fogcoord, 4.5);
+    }
+
+    // -- DRAW_ARRAYS_WIN / DRAW_ELEMENTS_WIN vertex fetch ------------------
+
+    /// Builds one 16-byte array descriptor (`type, stride_bytes, ref`),
+    /// always naming an aperture ref (space bit clear), matching
+    /// [`proto::ArrayDescriptor::decode`]'s layout.
+    fn descriptor_bytes(array_type: u32, stride_bytes: u32, addr: u32, len: u32) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&array_type.to_be_bytes());
+        b[4..8].copy_from_slice(&stride_bytes.to_be_bytes());
+        b[8..12].copy_from_slice(&addr.to_be_bytes());
+        b[12..16].copy_from_slice(&len.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn parse_array_window_vertices_reads_position_and_color_from_independent_buffers() {
+        // POS_COUNT=2 (x, y only) plus COLOR, each array living at a
+        // completely different aperture address with its own stride --
+        // proving the array path addresses each attribute independently,
+        // unlike the inline path's single interleaved run.
+        let format = VertexFormat((2 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::COLOR);
+
+        let mut mem_bytes = vec![0u8; 4096];
+        // Position array at 0x0000, tightly packed (stride 0), 2 vertices.
+        let pos = [(1.0f32, 2.0f32), (3.0, 4.0)];
+        let mut at = 0usize;
+        for (x, y) in pos {
+            mem_bytes[at..at + 4].copy_from_slice(&f32be(x));
+            mem_bytes[at + 4..at + 8].copy_from_slice(&f32be(y));
+            at += 8;
+        }
+        // Colour array far away at 0x0800, tightly packed, 2 vertices.
+        let colors = [(0.25f32, 0.5, 0.75, 1.0), (0.1, 0.2, 0.3, 0.4)];
+        let color_base = 0x0800usize;
+        at = color_base;
+        for (r, g, b, a) in colors {
+            for c in [r, g, b, a] {
+                mem_bytes[at..at + 4].copy_from_slice(&f32be(c));
+                at += 4;
+            }
+        }
+
+        let mut descriptors = Vec::new();
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 0, 0, 8 * 2));
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 0, color_base as u32, 16 * 2));
+
+        let mut mem = TestMemory {
+            aperture: mem_bytes,
+        };
+
+        let verts =
+            parse_array_window_vertices(format, 2, &descriptors, &current(), &mut mem).unwrap();
+        assert_eq!(verts.len(), 2);
+        assert_eq!(verts[0].pos, [1.0, 2.0, 0.0, 1.0]); // z/w default
+        assert_eq!(verts[1].pos, [3.0, 4.0, 0.0, 1.0]);
+        assert_eq!(verts[0].color, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(verts[1].color, [0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn parse_array_window_vertices_converts_short_positions_as_plain_integers() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let mut bytes = vec![0u8; 8];
+        bytes[0..2].copy_from_slice(&100i16.to_be_bytes());
+        bytes[2..4].copy_from_slice(&(-200i16).to_be_bytes());
+        bytes[4..6].copy_from_slice(&5i16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&6i16.to_be_bytes());
+        let descriptors = descriptor_bytes(GL_SHORT, 0, 0, 8);
+        let mut mem = TestMemory { aperture: bytes };
+        let verts =
+            parse_array_window_vertices(format, 2, &descriptors, &current(), &mut mem).unwrap();
+        assert_eq!(verts[0].pos[0..2], [100.0, -200.0]);
+        assert_eq!(verts[1].pos[0..2], [5.0, 6.0]);
+    }
+
+    #[test]
+    fn parse_array_window_vertices_normalises_unsigned_byte_colours() {
+        let format = VertexFormat((2 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::COLOR);
+        let mut bytes = vec![0u8; 32];
+        bytes[0..8].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // two pos vertices
+        bytes[8..12].copy_from_slice(&[0, 128, 255, 64]); // colour, vertex 0
+        bytes[12..16].copy_from_slice(&[255, 255, 255, 255]); // colour, vertex 1
+        let mut descriptors = Vec::new();
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 0, 0, 8));
+        descriptors.extend_from_slice(&descriptor_bytes(GL_UNSIGNED_BYTE, 0, 8, 8));
+        let mut mem = TestMemory { aperture: bytes };
+        let verts =
+            parse_array_window_vertices(format, 2, &descriptors, &current(), &mut mem).unwrap();
+        assert_eq!(verts[0].color, [0.0, 128.0 / 255.0, 1.0, 64.0 / 255.0]);
+        assert_eq!(verts[1].color, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn parse_array_window_vertices_honors_a_stride_and_a_component_count_override() {
+        // TEXCOORD0's array_type overrides the table's default 2
+        // components down to 1 (`glTexCoordPointer(size=1, ...)`): only
+        // `s` is read, `t` stays the default 0.0. The position array is
+        // interleaved with a 4-byte padding gap `stride_bytes` must
+        // account for.
+        let format = VertexFormat((2 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::TEXCOORD0);
+        // pos vertex 0: x=1,y=2, PAD(4 bytes), pos vertex 1: x=3,y=4, PAD
+        let mut pos_bytes = Vec::new();
+        for (x, y) in [(1.0f32, 2.0f32), (3.0, 4.0)] {
+            pos_bytes.extend_from_slice(&f32be(x));
+            pos_bytes.extend_from_slice(&f32be(y));
+            pos_bytes.extend_from_slice(&[0xAA; 4]); // padding, must be skipped
+        }
+        let texcoord_base = 0x1000u32;
+        let mut mem_bytes = pos_bytes;
+        mem_bytes.resize(texcoord_base as usize, 0);
+        mem_bytes.extend_from_slice(&f32be(0.75)); // s for vertex 0
+        mem_bytes.extend_from_slice(&f32be(0.25)); // s for vertex 1
+
+        let ncomp_override_1: u32 = 1 << 28;
+        let mut descriptors = Vec::new();
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 12, 0, 12 * 2));
+        descriptors.extend_from_slice(&descriptor_bytes(
+            ncomp_override_1 | GL_FLOAT,
+            0,
+            texcoord_base,
+            8,
+        ));
+
+        let mut mem = TestMemory {
+            aperture: mem_bytes,
+        };
+        let verts =
+            parse_array_window_vertices(format, 2, &descriptors, &current(), &mut mem).unwrap();
+        assert_eq!(verts[0].pos[0..2], [1.0, 2.0]);
+        assert_eq!(verts[1].pos[0..2], [3.0, 4.0]);
+        assert_eq!(verts[0].texcoord0, [0.75, 0.0]); // t defaults, size override honored
+        assert_eq!(verts[1].texcoord0, [0.25, 0.0]);
+    }
+
+    #[test]
+    fn parse_elements_window_vertices_fetches_indices_non_contiguously() {
+        // Three distinct positions in the array; the index buffer visits
+        // them out of order and repeats one -- proving DRAW_ELEMENTS_WIN
+        // is a real indirection, not just "same as DRAW_ARRAYS_WIN".
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let positions = [(0.0f32, 0.0f32), (10.0, 10.0), (20.0, 20.0)];
+        let mut pos_bytes = Vec::new();
+        for (x, y) in positions {
+            pos_bytes.extend_from_slice(&f32be(x));
+            pos_bytes.extend_from_slice(&f32be(y));
+        }
+        let index_base = 0x2000usize;
+        let mut mem_bytes = pos_bytes;
+        mem_bytes.resize(index_base, 0);
+        // Indices (UNSIGNED_SHORT): 2, 0, 1, 2 -- revisits vertex 2.
+        for idx in [2u16, 0, 1, 2] {
+            mem_bytes.extend_from_slice(&idx.to_be_bytes());
+        }
+
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8 * 3);
+        let index_ref = Ref {
+            address: index_base as u32,
+            space: RefSpace::Aperture,
+            length: 8,
+        };
+        let mut mem = TestMemory {
+            aperture: mem_bytes,
+        };
+        // min_index/max_index deliberately the spec's self-scan sentinel
+        // (both 0xFFFF_FFFF) -- proving they are never consulted.
+        let verts = parse_elements_window_vertices(
+            format,
+            4,
+            GL_UNSIGNED_SHORT,
+            index_ref,
+            &descriptors,
+            &current(),
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(verts.len(), 4);
+        assert_eq!(verts[0].pos[0..2], [20.0, 20.0]); // index 2
+        assert_eq!(verts[1].pos[0..2], [0.0, 0.0]); // index 0
+        assert_eq!(verts[2].pos[0..2], [10.0, 10.0]); // index 1
+        assert_eq!(verts[3].pos[0..2], [20.0, 20.0]); // index 2 again
+    }
+
+    #[test]
+    fn parse_elements_window_vertices_reads_unsigned_byte_indices() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let positions = [(1.0f32, 1.0f32), (2.0, 2.0)];
+        let mut pos_bytes = Vec::new();
+        for (x, y) in positions {
+            pos_bytes.extend_from_slice(&f32be(x));
+            pos_bytes.extend_from_slice(&f32be(y));
+        }
+        let index_base = 0x100usize;
+        let mut mem_bytes = pos_bytes;
+        mem_bytes.resize(index_base, 0);
+        mem_bytes.extend_from_slice(&[1u8, 0]);
+
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8 * 2);
+        let index_ref = Ref {
+            address: index_base as u32,
+            space: RefSpace::Aperture,
+            length: 2,
+        };
+        let mut mem = TestMemory {
+            aperture: mem_bytes,
+        };
+        let verts = parse_elements_window_vertices(
+            format,
+            2,
+            GL_UNSIGNED_BYTE,
+            index_ref,
+            &descriptors,
+            &current(),
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(verts[0].pos[0..2], [2.0, 2.0]);
+        assert_eq!(verts[1].pos[0..2], [1.0, 1.0]);
+    }
+
+    #[test]
+    fn array_element_type_outside_the_documented_four_is_an_error() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let descriptors = descriptor_bytes(0x9999, 0, 0, 8);
+        let mut mem = TestMemory {
+            aperture: vec![0u8; 16],
+        };
+        let err =
+            parse_array_window_vertices(format, 1, &descriptors, &current(), &mut mem).unwrap_err();
+        assert!(matches!(err, RenderError::ShortPayload(_)));
+    }
+
+    #[test]
+    fn index_type_outside_the_documented_three_is_an_error() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8);
+        let index_ref = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 4,
+        };
+        let mut mem = TestMemory {
+            aperture: vec![0u8; 16],
+        };
+        let err = parse_elements_window_vertices(
+            format,
+            1,
+            0x9999,
+            index_ref,
+            &descriptors,
+            &current(),
+            &mut mem,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RenderError::ShortPayload(_)));
     }
 
     // -- triangulation ------------------------------------------------
@@ -4840,6 +5501,200 @@ mod tests {
         assert!(
             (px[0] as i32 - 150).abs() <= 2,
             "FuncSubtract with (One, One) should compute src(200) - dst(50) = 150: {px:?}"
+        );
+    }
+
+    // -- DRAW_ARRAYS_WIN / DRAW_ELEMENTS_WIN: pixel-level ------------------
+
+    /// `DRAW_ARRAYS_WIN` must read position and colour from their own
+    /// independently-addressed arrays and actually rasterise the result --
+    /// not just decode without error. An oversized triangle (far outside
+    /// the surface on two sides) covers the whole 4x4 surface regardless
+    /// of exact winding; the colour comes from a `COLOR` array living at a
+    /// different aperture address than the position array.
+    #[test]
+    fn draw_arrays_win_paints_the_surface_from_independent_position_and_color_arrays() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        // Position array at 0x0000: an oversized covering triangle,
+        // tightly packed FLOAT x,y pairs.
+        let mut aperture = vec![0u8; 4096];
+        let mut at = 0usize;
+        for (x, y) in [(-10.0f32, -10.0f32), (20.0, -10.0), (-10.0, 20.0)] {
+            aperture[at..at + 4].copy_from_slice(&x.to_be_bytes());
+            aperture[at + 4..at + 8].copy_from_slice(&y.to_be_bytes());
+            at += 8;
+        }
+        // Colour array at 0x0800: green for every vertex, far from the
+        // position array's own address.
+        let color_base = 0x0800usize;
+        at = color_base;
+        for _ in 0..3 {
+            for c in [0.0f32, 1.0, 0.0, 1.0] {
+                aperture[at..at + 4].copy_from_slice(&c.to_be_bytes());
+                at += 4;
+            }
+        }
+
+        let mut descriptors = Vec::new();
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 0, 0, 8 * 3));
+        descriptors.extend_from_slice(&descriptor_bytes(GL_FLOAT, 0, color_base as u32, 16 * 3));
+
+        let format = VertexFormat((2 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::COLOR);
+        let mut mem = TestMemory { aperture };
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                },
+                RenderOp::Draw {
+                    window_space: true,
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    vertices: DrawVertices::Arrays(&descriptors),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for px in pixels.chunks(4) {
+            assert_eq!(
+                px,
+                [0, 255, 0, 255],
+                "expected every pixel green: {pixels:?}"
+            );
+        }
+    }
+
+    /// `DRAW_ELEMENTS_WIN` must fetch vertices through the index buffer's
+    /// indirection, not sequentially: the array holds four positions in
+    /// array order `v0, v1, v2, v3`, but only indices `2, 0, 1` are drawn
+    /// (`v3` is a decoy the correct implementation never touches). Reading
+    /// the wrong slot -- e.g. an off-by-one in the index/array-offset
+    /// arithmetic -- substitutes the decoy for one of the real vertices
+    /// and shrinks the triangle enough to uncover the checked pixel, which
+    /// is what this test's break-and-restore check (see the commit
+    /// message) exercises.
+    #[test]
+    fn draw_elements_win_indexes_into_the_array_not_sequentially() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        // v0, v1, v2: an oversized triangle covering the whole surface.
+        // v3: the decoy -- a point that only reaches partway down the
+        // surface, so substituting it for v2 leaves the bottom rows
+        // uncovered.
+        let positions = [
+            (-10.0f32, -10.0f32),
+            (20.0, -10.0),
+            (-10.0, 20.0),
+            (1.0, 1.0),
+        ];
+        let mut aperture = vec![0u8; 4096];
+        let mut at = 0usize;
+        for (x, y) in positions {
+            aperture[at..at + 4].copy_from_slice(&x.to_be_bytes());
+            aperture[at + 4..at + 8].copy_from_slice(&y.to_be_bytes());
+            at += 8;
+        }
+        let index_base = 0x0800usize;
+        at = index_base;
+        for idx in [2u16, 0, 1] {
+            aperture[at..at + 2].copy_from_slice(&idx.to_be_bytes());
+            at += 2;
+        }
+
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8 * 4);
+        let index_ref = Ref {
+            address: index_base as u32,
+            space: RefSpace::Aperture,
+            length: 6,
+        };
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT); // no COLOR: current (white)
+        let mut mem = TestMemory { aperture };
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                },
+                RenderOp::Draw {
+                    window_space: true,
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    vertices: DrawVertices::Elements {
+                        index_type: GL_UNSIGNED_SHORT,
+                        // Deliberately the spec's self-scan sentinel:
+                        // never consulted by this milestone's direct
+                        // per-index fetch (see this section's module doc
+                        // comment).
+                        min_index: 0xFFFF_FFFF,
+                        max_index: 0xFFFF_FFFF,
+                        index_ref,
+                        descriptors: &descriptors,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (w, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        // Bottom-left pixel (row 3, col 0): covered by the real triangle
+        // (v2, v0, v1), NOT by the decoy-substituted one (v3, v0, v1).
+        let row = 3usize;
+        let col = 0usize;
+        let idx = (row * w as usize + col) * 4;
+        assert_eq!(
+            &pixels[idx..idx + 4],
+            &[255, 255, 255, 255],
+            "bottom-left pixel should be covered by the indexed triangle: {pixels:?}"
         );
     }
 }

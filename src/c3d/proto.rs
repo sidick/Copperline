@@ -484,8 +484,11 @@ impl VertexFormat {
     /// Every optional per-vertex component bit that adds a fixed number of
     /// words, in format-table order. `COLOR` and `COLOR_PACKED` are
     /// mutually exclusive (checked separately) rather than both appearing
-    /// here.
-    const OPTIONAL_BITS: [u32; 8] = [
+    /// here. `pub(crate)` (not private) so `render.rs`'s `DRAW_ARRAYS*`/
+    /// `DRAW_ELEMENTS*` array-descriptor walk can share this exact order
+    /// with `vertex_words`/`descriptor_count` rather than duplicating it
+    /// and risking the two falling out of sync.
+    pub(crate) const OPTIONAL_BITS: [u32; 8] = [
         Self::COLOR,
         Self::NORMAL,
         Self::TEXCOORD0,
