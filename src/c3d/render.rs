@@ -2463,12 +2463,19 @@ impl Renderer {
         let to_gpu = |v: &GlVertex| -> GpuVertex {
             let eye = modelview.transform_point(v.pos);
             let clip = projection.transform_point(eye);
-            let clip_w = clip[3];
             // A vertex behind the eye at exactly `w == 0` is GL-undefined
-            // (it doesn't correspond to any real point); guarded the same
-            // way the window-space path guards a zero `rhw`, so this
-            // never divides by zero.
-            let safe_w = if clip_w.abs() < 1e-8 { 1e-8 } else { clip_w };
+            // (it doesn't correspond to any real point, and the wire
+            // format legally allows an explicit `w = 0`); guarded the
+            // same way the window-space path guards a zero `rhw` --
+            // `safe_w`, not the raw `clip[3]`, is used for *every* use of
+            // `w` below, including the one written into `clip_pos.w`
+            // itself. (An earlier version of this guard only protected
+            // the `ndc_x`/`ndc_y` division here and left the unguarded
+            // `clip_w` in `clip_pos.w`/`depth_clip_z`, which still let
+            // wgpu's own GPU-side perspective divide hit a real `0.0`
+            // there -- `0/0 = NaN`. `draw_inline_survives_a_zero_clip_w`
+            // pins this down.)
+            let safe_w = if clip[3].abs() < 1e-8 { 1e-8 } else { clip[3] };
             let ndc_x = clip[0] / safe_w;
             let ndc_y = clip[1] / safe_w;
 
@@ -2496,14 +2503,14 @@ impl Renderer {
             // `clip_pos.z` needs (the fixture this helper was written and
             // unit-tested for -- see the module doc comment's "two
             // traps").
-            let depth_clip_z = near * clip_w + (far - near) * gl_clip_z_to_wgpu(clip[2], clip_w);
+            let depth_clip_z = near * safe_w + (far - near) * gl_clip_z_to_wgpu(clip[2], safe_w);
 
             GpuVertex {
                 clip_pos: [
-                    final_ndc_x * clip_w,
-                    final_ndc_y * clip_w,
+                    final_ndc_x * safe_w,
+                    final_ndc_y * safe_w,
                     depth_clip_z,
-                    clip_w,
+                    safe_w,
                 ],
                 color: v.color,
                 texcoord0: v.texcoord0,
@@ -4984,6 +4991,58 @@ mod tests {
         assert!(
             (at_far as i64 - expected_far as i64).abs() <= 1,
             "object z = 1.0 should map to DEPTH_RANGE's far (0.75): expected ~{expected_far}, got {at_far}"
+        );
+    }
+
+    /// A vertex whose clip-space `w` is exactly `0.0` -- legal on the
+    /// wire (an explicit `POS` `w` of `0.0`, or, under a real `FRUSTUM`/
+    /// `PERSPECTIVE` projection, any object point with eye-space `z ==
+    /// 0`) -- must not turn into a GPU-side `NaN`. `clip_pos.w` is what
+    /// wgpu's own hardware perspective divide (`clip_pos.xyz /
+    /// clip_pos.w`) uses to recover NDC; if the *raw* (unguarded)
+    /// `clip[3]` is written there while `clip_pos.xyz` was built from a
+    /// `safe_w`-divided NDC and then re-multiplied by that same raw,
+    /// zero `clip_w`, the result is `clip_pos = [0, 0, z, 0]` and the
+    /// GPU computes `0 / 0 = NaN` -- silently, with no `RenderError` at
+    /// all, since nothing on the Rust side ever divides by the raw zero.
+    ///
+    /// This constructs the same over-sized covering triangle
+    /// `drawn_depth_at_center`/`draw_inline_maps_depth_range_onto_near_and_far`
+    /// use, but gives its third vertex an explicit `w = 0.0` (identity
+    /// modelview/projection, so `clip == obj` exactly and this vertex's
+    /// `clip[3]` really is `0.0`, not just close to it). With the fix
+    /// (`safe_w` used consistently for every occurrence of `w` in
+    /// `clip_pos`, including the last component), this vertex becomes an
+    /// enormous but finite point in the same direction its `w = 1.0`
+    /// self would have been, and the triangle -- built from two ordinary
+    /// vertices plus this one -- still covers the surface's centre pixel.
+    ///
+    /// Verified per this session's practice: reverting the fix (using
+    /// the raw `clip[3]`/`clip_w` for `clip_pos`'s `x`/`y`/`z`/`w`
+    /// components, as the first version of this function did) was
+    /// confirmed to fail this assertion (the centre pixel stayed the
+    /// clear colour -- the degenerate `NaN` vertex collapses the
+    /// triangle instead of rendering it) before the fix was restored.
+    #[test]
+    fn draw_inline_survives_a_zero_clip_w() {
+        let mut verts = Vec::new();
+        for (x, y) in [(-16.0f32, -16.0), (-16.0, 48.0)] {
+            encode_gl_vertex([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+        }
+        // The third vertex: same direction as an ordinary covering
+        // triangle's corner, but with an explicit w = 0.0.
+        encode_gl_vertex([48.0, -16.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+
+        let Some(pixels) = draw_gl_space_triangle(|_| {}, &verts) else {
+            return; // no adapter
+        };
+
+        let center = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            &center[..3],
+            &[255, 255, 255],
+            "a vertex with clip w = 0.0 must not collapse the triangle to \
+             nothing via a GPU-side NaN divide; centre pixel: {center:?}"
         );
     }
 
