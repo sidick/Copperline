@@ -132,6 +132,16 @@ pub enum RenderError {
     /// A vertex or texel payload was shorter than its format/dimensions
     /// require.
     ShortPayload(&'static str),
+    /// A guest-controlled count/size this renderer was asked to honour
+    /// exceeds a sane internal bound this milestone enforces -- distinct
+    /// from [`RenderError::ShortPayload`] (too little data) and from the
+    /// spec's own `E_LIMIT` (a *decode-time* protocol error `ring.rs`
+    /// raises when it can check a value against a reported limit; some
+    /// values, like `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN`'s `count`,
+    /// cannot be checked until this module tries to act on them). Exists
+    /// so an absurd guest-supplied count (e.g. `count = 0xFFFF_FFFF`)
+    /// becomes an ordinary `Err` instead of an allocator abort.
+    LimitExceeded(&'static str),
     /// A GPU-side operation (texture/buffer creation, mapping) failed.
     Gpu(String),
 }
@@ -147,6 +157,7 @@ impl fmt::Display for RenderError {
             RenderError::BadMemory(e) => write!(f, "memory access failed: {e}"),
             RenderError::UnknownObject(kind, id) => write!(f, "unknown {kind} id {id}"),
             RenderError::ShortPayload(what) => write!(f, "payload too short for {what}"),
+            RenderError::LimitExceeded(what) => write!(f, "exceeds an internal limit: {what}"),
             RenderError::Gpu(e) => write!(f, "GPU error: {e}"),
         }
     }
@@ -201,12 +212,19 @@ fn offset_backing(b: state::Backing, extra: u32) -> MemLoc {
 /// instead of a surface's own backing -- [`RenderOp::ReadPixels`]'s
 /// `dest` (an arbitrary caller-chosen buffer, not the surface itself),
 /// written one row at a time at its own caller-specified `row_bytes`
-/// stride.
-fn offset_ref(r: Ref, extra: u32) -> MemLoc {
-    match r.space {
-        RefSpace::Aperture => MemLoc::Aperture(r.address + extra),
-        RefSpace::Guest => MemLoc::Guest(r.address + extra),
-    }
+/// stride, and `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN`'s per-vertex
+/// array reads, where `extra` is `index * stride_bytes` for a
+/// guest-chosen `index` of potentially large magnitude. `None` if
+/// `r.address + extra` would overflow `u32` -- a `checked_add` rather
+/// than a plain `+` specifically because those array-read callers are the
+/// first to feed this helper an `extra` whose size is guest-controlled
+/// rather than bounded by an already-validated rectangle/row count.
+fn offset_ref(r: Ref, extra: u32) -> Option<MemLoc> {
+    let address = r.address.checked_add(extra)?;
+    Some(match r.space {
+        RefSpace::Aperture => MemLoc::Aperture(address),
+        RefSpace::Guest => MemLoc::Guest(address),
+    })
 }
 
 /// The renderer's view of guest-visible memory: read for texture/array
@@ -737,13 +755,13 @@ fn read_array_scalar(bytes: &[u8], at: usize, elem_type: u32) -> Option<f32> {
     }
 }
 
-/// An array descriptor's actual component count: the wire's bits `31:28`
-/// override the vertex-format table's default ("`0` meaning the table's
-/// default"), per `c3d-cmd-draw`'s "positions may be `2`, `3` or `4`
-/// components" clause -- generalised here to every attribute, matching
-/// real GL's per-pointer `size` parameter (`glColorPointer`'s `3`/`4`,
-/// `glTexCoordPointer`'s `1`-`4`). `Err` if the result isn't a legal
-/// component count (`1..=4`).
+/// A non-position array descriptor's actual component count: the wire's
+/// bits `31:28` override the vertex-format table's default ("`0` meaning
+/// the table's default"), matching real GL's per-pointer `size` parameter
+/// (`glColorPointer`'s `3`/`4`, `glTexCoordPointer`'s `1`-`4`). `Err` if
+/// the result isn't a legal component count (`1..=4`). **Not** for `POS`
+/// -- see [`pos_component_count`], which the spec restricts to a
+/// narrower range.
 fn descriptor_component_count(array_type: u32, table_default: u32) -> Result<u32, RenderError> {
     let n = (array_type >> 28) & 0xF;
     let n = if n == 0 { table_default } else { n };
@@ -751,6 +769,21 @@ fn descriptor_component_count(array_type: u32, table_default: u32) -> Result<u32
         Ok(n)
     } else {
         Err(RenderError::ShortPayload("array component count"))
+    }
+}
+
+/// The position array descriptor's component count -- same override rule
+/// as [`descriptor_component_count`], but validated against the spec's own
+/// narrower range for `POS` specifically: `c3d-cmd-draw`'s "positions may
+/// be `2`, `3` or `4` components" (unlike every other attribute, `1` is
+/// not a legal position component count -- there is no `glVertex1f`).
+fn pos_component_count(array_type: u32, table_default: u32) -> Result<u32, RenderError> {
+    let n = (array_type >> 28) & 0xF;
+    let n = if n == 0 { table_default } else { n };
+    if (2..=4).contains(&n) {
+        Ok(n)
+    } else {
+        Err(RenderError::ShortPayload("position array component count"))
     }
 }
 
@@ -774,7 +807,8 @@ fn read_array_attribute(
     };
     let extra = u32::try_from(u64::from(index) * u64::from(stride))
         .map_err(|_| RenderError::BadMemory("array offset overflowed 32-bit addressing".into()))?;
-    let loc = offset_ref(desc.data, extra);
+    let loc = offset_ref(desc.data, extra)
+        .ok_or_else(|| RenderError::BadMemory("array ref address overflowed 32 bits".into()))?;
     let need = ncomp as usize * elem_size;
     let bytes = mem
         .read(loc, need)
@@ -803,7 +837,8 @@ fn read_packed_color(
     };
     let extra = u32::try_from(u64::from(index) * u64::from(stride))
         .map_err(|_| RenderError::BadMemory("array offset overflowed 32-bit addressing".into()))?;
-    let loc = offset_ref(desc.data, extra);
+    let loc = offset_ref(desc.data, extra)
+        .ok_or_else(|| RenderError::BadMemory("array ref address overflowed 32 bits".into()))?;
     let bytes = mem
         .read(loc, 4)
         .ok_or_else(|| RenderError::BadMemory(format!("array data at {loc:?}")))?;
@@ -864,7 +899,7 @@ fn fetch_array_vertex(
     for (bit, desc) in descriptors {
         match *bit {
             None => {
-                let ncomp = descriptor_component_count(desc.array_type, pos_words)?;
+                let ncomp = pos_component_count(desc.array_type, pos_words)?;
                 let v = read_array_attribute(desc, ncomp, index, mem)?;
                 pos[..ncomp as usize].copy_from_slice(&v[..ncomp as usize]);
             }
@@ -898,6 +933,40 @@ fn fetch_array_vertex(
     })
 }
 
+/// A generous but finite cap on `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN`'s
+/// `count`, checked before any count-sized allocation or arithmetic.
+/// Unlike `DRAW_INLINE_WIN` (where `ring.rs` ties `length_words` to
+/// `count * vertex_words`, so a huge `count` implies a ring submission at
+/// least as huge -- itself bounded by `RING_SIZE_LIMIT` -- before it can
+/// ever reach this module), an array/indexed-array draw's ring command is
+/// a small, `count`-independent fixed size (just the array descriptors,
+/// which reference memory rather than carrying it): `count` alone says
+/// nothing about how much ring space the guest actually spent, so nothing
+/// upstream bounds it. Without this check, an ordinary (not necessarily
+/// adversarial -- an uninitialised or miscomputed `count` is enough)
+/// guest could set `count = 0xFFFF_FFFF` and drive `Vec::with_capacity`
+/// to request roughly 189 GB (`size_of::<WinVertex>()` is 44 bytes);
+/// Rust's global allocator aborts the *whole process* on an allocation
+/// failure that large (`handle_alloc_error`), not a catchable panic, so
+/// this must be rejected as an ordinary `Err` before any such allocation
+/// is attempted. One million vertices is already far beyond anything a
+/// `CAP_TRANSFORM`-less baseline device is a plausible target for.
+const MAX_ARRAY_DRAW_VERTICES: u32 = 1_000_000;
+
+/// Rejects a `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` `count` above
+/// [`MAX_ARRAY_DRAW_VERTICES`] -- see that constant's doc comment. Called
+/// before any allocation or `count`-scaled arithmetic in both
+/// [`parse_array_window_vertices`] and [`parse_elements_window_vertices`].
+fn check_draw_vertex_count(count: u32) -> Result<(), RenderError> {
+    if count > MAX_ARRAY_DRAW_VERTICES {
+        Err(RenderError::LimitExceeded(
+            "DRAW_ARRAYS_WIN/DRAW_ELEMENTS_WIN vertex count",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// `DRAW_ARRAYS_WIN`: fetches `count` window-space vertices, one per array
 /// index `0..count`, per [`fetch_array_vertex`].
 pub fn parse_array_window_vertices(
@@ -907,6 +976,7 @@ pub fn parse_array_window_vertices(
     current: &state::CurrentVertex,
     mem: &mut dyn Memory,
 ) -> Result<Vec<WinVertex>, RenderError> {
+    check_draw_vertex_count(count)?;
     let pos_words = format
         .pos_words()
         .ok_or(RenderError::ShortPayload("POS_COUNT"))?;
@@ -940,6 +1010,7 @@ pub fn parse_elements_window_vertices(
     current: &state::CurrentVertex,
     mem: &mut dyn Memory,
 ) -> Result<Vec<WinVertex>, RenderError> {
+    check_draw_vertex_count(count)?;
     let pos_words = format
         .pos_words()
         .ok_or(RenderError::ShortPayload("POS_COUNT"))?;
@@ -3302,7 +3373,11 @@ impl Renderer {
                 let at = (col * bpp) as usize;
                 row_out[at..at + encoded.len()].copy_from_slice(&encoded);
             }
-            let loc = offset_ref(dest, out_row * row_bytes);
+            let loc = offset_ref(dest, out_row * row_bytes).ok_or_else(|| {
+                RenderError::BadMemory(format!(
+                    "READ_PIXELS dest address overflowed 32 bits (row {out_row})"
+                ))
+            })?;
             if !mem.write(loc, &row_out) {
                 return Err(RenderError::BadMemory(format!(
                     "READ_PIXELS write to {loc:?} (row {out_row})"
@@ -3916,6 +3991,73 @@ mod tests {
             &mut mem,
         )
         .unwrap_err();
+        assert!(matches!(err, RenderError::ShortPayload(_)));
+    }
+
+    /// A `count` far beyond any plausible draw must become an ordinary
+    /// `Err` *before* `Vec::with_capacity` is ever called -- not an
+    /// allocator abort. `0xFFFF_FFFF` vertices of `WinVertex` (44 bytes)
+    /// would ask for roughly 189 GB; if this test ever starts actually
+    /// allocating instead of erroring, it will abort the whole test
+    /// process rather than fail cleanly, which is exactly the bug this
+    /// guards against.
+    #[test]
+    fn a_huge_array_draw_count_is_rejected_before_any_allocation() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8);
+        let mut mem = TestMemory {
+            aperture: vec![0u8; 16],
+        };
+        let err = parse_array_window_vertices(format, u32::MAX, &descriptors, &current(), &mut mem)
+            .unwrap_err();
+        assert!(matches!(err, RenderError::LimitExceeded(_)));
+    }
+
+    /// Same guard, `DRAW_ELEMENTS_WIN` side: even though its own `count`
+    /// is less directly dangerous (the index-buffer `mem.read` against it
+    /// fails first for a `count` this large against a tiny backing store),
+    /// it must still be rejected explicitly rather than relying on that
+    /// happening to be bounded -- see `check_draw_vertex_count`'s doc
+    /// comment.
+    #[test]
+    fn a_huge_elements_draw_count_is_rejected_before_any_allocation() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let descriptors = descriptor_bytes(GL_FLOAT, 0, 0, 8);
+        let index_ref = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 4,
+        };
+        let mut mem = TestMemory {
+            aperture: vec![0u8; 16],
+        };
+        let err = parse_elements_window_vertices(
+            format,
+            u32::MAX,
+            GL_UNSIGNED_BYTE,
+            index_ref,
+            &descriptors,
+            &current(),
+            &mut mem,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RenderError::LimitExceeded(_)));
+    }
+
+    /// The spec's own words: "positions may be `2`, `3` or `4`
+    /// components" -- `1` is illegal specifically for `POS` (unlike every
+    /// other attribute, which real GL's own per-pointer `size` convention
+    /// does allow down to `1` for texture coordinates).
+    #[test]
+    fn a_position_component_count_of_one_is_rejected() {
+        let format = VertexFormat(2 << VertexFormat::POS_COUNT_SHIFT);
+        let override_count_1: u32 = 1 << 28;
+        let descriptors = descriptor_bytes(override_count_1 | GL_FLOAT, 0, 0, 4);
+        let mut mem = TestMemory {
+            aperture: vec![0u8; 16],
+        };
+        let err =
+            parse_array_window_vertices(format, 1, &descriptors, &current(), &mut mem).unwrap_err();
         assert!(matches!(err, RenderError::ShortPayload(_)));
     }
 
