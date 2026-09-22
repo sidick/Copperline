@@ -153,7 +153,13 @@ project's spec-first loop exists to surface.
   `ring.rs`'s `validate_ref` explicitly punts guest-memory reachability
   checking to "a higher layer" that does not exist yet, so `dma_read`
   simply returns the bus's open-bus filler for a hole in the guest
-  address map, and the device never notices.
+  address map, and the device never notices. As of spec draft 0.13 this
+  is a *should-where-detectable*, not a requirement (a hardware bus
+  master has no reachability oracle -- it sees open bus, exactly what
+  this board mimics today), so Copperline is conformant as-is; an
+  emulator *can* detect, though, and implementing the check remains
+  planned as the quality-of-implementation debugging aid the spec's
+  draft-history entry describes.
 - **Implementation order.** The first intended client is an OpenGL 1.x
   subset of the Quake-engine shape: immediate mode, matrices, textures
   with texenv, blend/alpha/depth/fog/scissor, vertex arrays with
