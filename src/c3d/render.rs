@@ -263,8 +263,15 @@ fn offset_ref(r: Ref, extra: u32) -> Option<MemLoc> {
 
 /// The renderer's view of guest-visible memory: read for texture/array
 /// data, write for a surface readback landing back in backing memory.
+///
+/// `read` takes `&mut self`, not `&self`: a [`MemLoc::Guest`] read
+/// (`CAP_GUESTMEM`) has no borrowed home to lend a slice from the way an
+/// aperture read does -- the implementation must copy guest bytes into a
+/// scratch buffer it owns, which needs `&mut` to fill. Every caller in
+/// this module already holds `&mut dyn Memory`, so this costs nothing at
+/// the call sites.
 pub trait Memory {
-    fn read(&self, loc: MemLoc, len: usize) -> Option<&[u8]>;
+    fn read(&mut self, loc: MemLoc, len: usize) -> Option<&[u8]>;
     fn write(&mut self, loc: MemLoc, data: &[u8]) -> bool;
 }
 
@@ -5451,7 +5458,7 @@ mod tests {
         }
     }
     impl Memory for TestMemory {
-        fn read(&self, loc: MemLoc, len: usize) -> Option<&[u8]> {
+        fn read(&mut self, loc: MemLoc, len: usize) -> Option<&[u8]> {
             match loc {
                 MemLoc::Aperture(addr) => {
                     let start = addr as usize;
