@@ -12,20 +12,67 @@
 //! [`CAP_REF_SYNC`](super::proto::CAP_REF_SYNC),
 //! [`CAP_SURFACE_GUESTADDR`](super::proto::CAP_SURFACE_GUESTADDR)
 //! (surfaces backed by another board's VRAM via the cross-board DMA
-//! hook), and -- since the transform-tier MVP landed in
-//! [`super::render`] -- [`CAP_TRANSFORM`](super::proto::CAP_TRANSFORM)
-//! and [`CAP_MULTITEXTURE`](super::proto::CAP_MULTITEXTURE): GL-space
-//! draws in all three shapes (`DRAW_INLINE`/`DRAW_ARRAYS`/
-//! `DRAW_ELEMENTS`), viewport/depth-range, two-unit multitexture and
-//! texgen are all real. The transform-tier *state* the renderer does
-//! not yet act on (lighting, `CLIP_PLANE` -- unused by the first
-//! client) is still decoded and tracked per the spec; see
-//! `docs/internals/c3d.md`'s implementation notes for the exact
-//! remainder. `CAP_GUESTMEM` stays clear: this board's `Memory` impl
-//! answers `None`/`false` for guest-space refs, so the register
-//! truthfully says so rather than advertising a capability the board
-//! cannot deliver. `MAX_CONTEXTS` is fixed at [`CONTEXT_COUNT`] and
-//! never configurable from `[c3d]` yet.
+//! hook), [`CAP_GUESTMEM`](super::proto::CAP_GUESTMEM) (space-1 refs for
+//! rings, bulk data and query results, described below), and -- since
+//! the transform-tier MVP landed in [`super::render`] --
+//! [`CAP_TRANSFORM`](super::proto::CAP_TRANSFORM) and
+//! [`CAP_MULTITEXTURE`](super::proto::CAP_MULTITEXTURE): GL-space draws
+//! in all three shapes (`DRAW_INLINE`/`DRAW_ARRAYS`/`DRAW_ELEMENTS`),
+//! viewport/depth-range, two-unit multitexture and texgen are all real.
+//! The transform-tier *state* the renderer does not yet act on
+//! (lighting, `CLIP_PLANE` -- unused by the first client) is still
+//! decoded and tracked per the spec; see `docs/internals/c3d.md`'s
+//! implementation notes for the exact remainder. `MAX_CONTEXTS` is
+//! fixed at [`CONTEXT_COUNT`] and never configurable from `[c3d]` yet.
+//!
+//! ## `CAP_GUESTMEM`
+//!
+//! A space-1 [`super::render::MemLoc::Guest`] address names ordinary
+//! guest memory -- chip/slow/motherboard/accelerator RAM or a RAM-backed
+//! Zorro board -- reached through [`DeviceHost::dma_read`]/
+//! [`DeviceHost::dma_write`]'s existing 24/32-bit decode, the same one
+//! the A2091/CDTV bus masters use. **Reads** happen synchronously inside
+//! the doorbell: `dma_read` takes `&self`, so no borrow of `self`
+//! conflicts with it, and this is also exactly what `CAP_REF_SYNC`
+//! promises ("captured before the `RING_TAIL` write... returns") -- a
+//! trivial truth here since the whole doorbell is synchronous, but
+//! worth stating plainly since `CAP_REF_SYNC` is "meaningful only with
+//! `CAP_GUESTMEM`" per the spec, and now it is meaningful. **Writes**
+//! stay on the existing one-tick-deferred `pending_dma` path (see
+//! `ApertureMemory::write` below and `take_pending_dma_writes`), not a
+//! new synchronous `dma_write` call, even though the host is available
+//! during the doorbell: `dma_write`/`dma_write_byte` only resolve
+//! ordinary RAM and *RAM-backed* Zorro windows
+//! (`ZorroChain::region_at`), never a *device-backed* board's window
+//! (`device_region_at`/`BoardBacking::Device`) -- so a synchronous write
+//! could never reach another board's aperture the way
+//! `CAP_SURFACE_GUESTADDR`'s readback path needs to. Routing every
+//! `Guest` write through `pending_dma` uniformly, regardless of
+//! destination kind, means the bus's `drain_cross_board_dma` pass -- the
+//! only code that already resolves both RAM and device-window
+//! destinations correctly -- decides where the bytes actually land, and
+//! a `QUERY` result written to ordinary guest RAM gets the exact same
+//! one-tick deferral its own fence-completion accounting already
+//! expects for a guest-address readback. A guest program simply cannot
+//! observe an incomplete write anyway: it learns a write landed only via
+//! `FENCE_COMPLETED` (or `RING_HEAD`), and both are deferred right along
+//! with it (see `ContextSlot::deferred_fence`).
+//!
+//! **Ring in guest memory.** The spec's `RING_BASE` register: "an
+//! aperture offset, or a guest address if bit 31 of `RING_SIZE` is set
+//! (`CAP_GUESTMEM`)" -- so unlike a ref, the ring itself may live in
+//! guest memory too, and the doorbell honours that: when the bit is set
+//! (and `CAP_GUESTMEM` is not masked off), the ring bytes are fetched
+//! with `DeviceHost::dma_read` instead of `read_aperture_range`, into
+//! exactly the same `Vec<u8>` shape `Context::submit` already expects --
+//! nothing downstream of the fetch needs to know which space the bytes
+//! came from. A guest that sets the bit while `CAP_GUESTMEM` is masked
+//! off gets an empty command stream (nothing decoded) rather than a
+//! register-level protocol error: `RING_BASE`/`RING_SIZE` are ordinary
+//! registers with no error-latch mechanism of their own (only ring
+//! *commands* raise `ERROR_CODE`), and a conformant guest never sets the
+//! bit when `CAPS0` does not advertise the capability in the first
+//! place.
 //!
 //! ## Window layout and the aperture buffer
 //!
@@ -94,17 +141,19 @@ pub const CONTEXT_COUNT: usize = 4;
 pub const RING_SIZE_LIMIT: u32 = 0x0004_0000; // 256 KiB
 
 /// Copperline's fitted `CAPS0` -- see the module doc comment's
-/// "Milestone scope". `CAP_TRANSFORM` and `CAP_MULTITEXTURE` are
-/// advertised now that the renderer implements the transform-tier MVP
-/// (GL-space draws in all three shapes, viewport/depth-range, two-unit
-/// multitexture, texgen); `CAP_GUESTMEM` stays clear -- this board's
-/// `Memory` impl still answers `None`/`false` for every guest-space ref,
-/// so the register truthfully says so.
+/// "Milestone scope" and "`CAP_GUESTMEM`". `CAP_TRANSFORM` and
+/// `CAP_MULTITEXTURE` are advertised now that the renderer implements
+/// the transform-tier MVP (GL-space draws in all three shapes,
+/// viewport/depth-range, two-unit multitexture, texgen); `CAP_GUESTMEM`
+/// is advertised now that `ApertureMemory` resolves space-1 refs (and
+/// a guest-memory ring) through `DeviceHost`, completing the spec's
+/// stated Copperline capability set (bits 0, 1, 2, 3, 4, 6).
 pub const CAPS0: u32 = proto::CAP_IRQ
     | proto::CAP_REF_SYNC
     | proto::CAP_SURFACE_GUESTADDR
     | proto::CAP_TRANSFORM
-    | proto::CAP_MULTITEXTURE;
+    | proto::CAP_MULTITEXTURE
+    | proto::CAP_GUESTMEM;
 
 // ---------------------------------------------------------------------
 // Global register offsets (`docs/internals/c3d.md`, "Global registers")
@@ -455,7 +504,7 @@ impl C3dBoard {
         }
     }
 
-    fn write_context(&mut self, n: usize, off: u32, value: u32) {
+    fn write_context(&mut self, n: usize, off: u32, value: u32, host: &DeviceHost) {
         if n >= self.contexts.len() {
             return;
         }
@@ -489,7 +538,7 @@ impl C3dBoard {
                     self.contexts[n].ctx.ring_tail = 0;
                 }
             }
-            RING_TAIL => self.doorbell(n, value),
+            RING_TAIL => self.doorbell(n, value, host),
             ERROR_ACK => {
                 self.contexts[n].ctx.error_ack();
             }
@@ -505,15 +554,28 @@ impl C3dBoard {
     /// The doorbell: `RING_TAIL` has just been written `new_tail`. See
     /// the module doc comment for why this runs synchronously and why
     /// the ring is copied out first.
-    fn doorbell(&mut self, n: usize, new_tail: u32) {
+    fn doorbell(&mut self, n: usize, new_tail: u32, host: &DeviceHost) {
         if n >= self.contexts.len() || !self.contexts[n].alloc || !self.contexts[n].enable {
             return;
         }
         self.activity = true;
 
         let ring_base = self.contexts[n].ctx.ring_base;
-        let ring_len = self.contexts[n].ctx.ring_size & 0x7FFF_FFFF;
-        let ring_bytes = self.read_aperture_range(ring_base, ring_len);
+        let ring_size_reg = self.contexts[n].ctx.ring_size;
+        let ring_len = ring_size_reg & 0x7FFF_FFFF;
+        // Bit 31 of RING_SIZE: RING_BASE names a guest address rather
+        // than an aperture offset (spec, `RING_BASE`/`RING_SIZE`; see the
+        // module doc comment's "Ring in guest memory"). Gated on the
+        // *effective* CAPS0, not the constant, so a masked-off
+        // CAP_GUESTMEM behaves as if the ring can only ever be
+        // aperture-backed.
+        let ring_bytes = if ring_size_reg & 0x8000_0000 != 0 && self.device_config().guestmem {
+            let mut buf = vec![0u8; ring_len as usize];
+            host.dma_read(ring_base, &mut buf);
+            buf
+        } else {
+            self.read_aperture_range(ring_base, ring_len)
+        };
 
         let config = self.device_config();
         let mut ops: Vec<RenderOp<'_>> = Vec::new();
@@ -530,6 +592,8 @@ impl C3dBoard {
                 let mut mem = ApertureMemory {
                     aperture: &mut self.aperture,
                     pending_dma: &mut self.pending_dma,
+                    host,
+                    guest_scratch: Vec::new(),
                 };
                 let errors = renderer.execute(&ops, state, &mut mem);
                 for e in &errors {
@@ -603,31 +667,50 @@ impl C3dBoard {
     }
 }
 
-/// Adapts the board's aperture buffer to [`Memory`]. A [`MemLoc::Aperture`]
-/// address is already **aperture-relative** -- `0` is the aperture's own
-/// first byte, not the window's -- exactly as the spec's "an aperture
-/// offset" phrasing means it for `RING_BASE` and for a space-`0`
-/// reference, so it is used directly as an index into `aperture` with no
-/// translation. (There is nothing to translate *from*: this struct does
-/// not even carry the window's `APERTURE_OFFSET`, on purpose, so that
-/// reintroducing a subtraction here is a type error, not a silent
-/// regression back to the bug this comment used to describe.)
-/// [`MemLoc::Guest`] is always `None`/`false`: this milestone's `CAPS0`
-/// has `CAP_GUESTMEM` clear, so the ring decoder never produces a guest
-/// reference in the first place, and a surface can only be aperture
-/// backed (`CAP_SURFACE_GUESTADDR` is likewise clear).
-struct ApertureMemory<'a> {
+/// Adapts the board's aperture buffer (plus, since `CAP_GUESTMEM`, the
+/// guest address space reached through [`DeviceHost`]) to [`Memory`]. A
+/// [`MemLoc::Aperture`] address is already **aperture-relative** -- `0`
+/// is the aperture's own first byte, not the window's -- exactly as the
+/// spec's "an aperture offset" phrasing means it for `RING_BASE` and for
+/// a space-`0` reference, so it is used directly as an index into
+/// `aperture` with no translation. (There is nothing to translate
+/// *from*: this struct does not even carry the window's
+/// `APERTURE_OFFSET`, on purpose, so that reintroducing a subtraction
+/// here is a type error, not a silent regression back to the bug this
+/// comment used to describe.)
+///
+/// [`MemLoc::Guest`] reads and writes are handled asymmetrically -- see
+/// the module doc comment's "`CAP_GUESTMEM`" for why: reads go straight
+/// through `host.dma_read` (synchronous, `&self`, no conflict with any
+/// other borrow live during the doorbell), writes are queued into
+/// `pending_dma` for the bus to apply one tick later (the only path that
+/// correctly reaches a *device-backed* board window, which a plain
+/// synchronous `dma_write` cannot). This struct is constructed fresh
+/// every doorbell that has ops to execute, never held across doorbells.
+struct ApertureMemory<'a, 'h> {
     aperture: &'a mut Vec<u8>,
     /// Where a [`MemLoc::Guest`] write is queued -- see
     /// `C3dBoard::take_pending_dma_writes`'s doc comment for why this
-    /// board cannot apply such a write itself. `None` would mean "this
-    /// milestone does not support guest-address surfaces at all"; M3
-    /// always supplies one, since `CAPS0`'s `CAP_SURFACE_GUESTADDR` bit
-    /// promises exactly this.
+    /// board cannot apply such a write itself.
     pending_dma: &'a mut Vec<crate::zorro_device::PendingDmaWrite>,
+    /// Host-services view used for [`MemLoc::Guest`] *reads*
+    /// (`dma_read`, `&self`, so borrowing it alongside `aperture`/
+    /// `pending_dma` needs no special care). A separate lifetime `'h`
+    /// from `'a`: this reference's own borrow is scoped to the doorbell
+    /// like everything else here, but the `DeviceHost` it points at was
+    /// itself already borrowed (from `ZorroDevice::write`'s caller) for
+    /// however long that call lives, an unrelated and typically longer
+    /// span.
+    host: &'a DeviceHost<'h>,
+    /// Owned backing for the slice a [`MemLoc::Guest`] read lends out --
+    /// `Memory::read` takes `&mut self` for exactly this reason. Reused
+    /// (not reallocated) across reads within one doorbell; its previous
+    /// contents are irrelevant since every read resizes and refills it
+    /// before returning a slice into it.
+    guest_scratch: Vec<u8>,
 }
 
-impl ApertureMemory<'_> {
+impl ApertureMemory<'_, '_> {
     fn range(&self, aperture_addr: u32, len: usize) -> Option<std::ops::Range<usize>> {
         let start = aperture_addr as usize;
         let end = start.checked_add(len)?;
@@ -635,21 +718,24 @@ impl ApertureMemory<'_> {
     }
 }
 
-impl Memory for ApertureMemory<'_> {
-    fn read(&self, loc: MemLoc, len: usize) -> Option<&[u8]> {
+impl Memory for ApertureMemory<'_, '_> {
+    fn read(&mut self, loc: MemLoc, len: usize) -> Option<&[u8]> {
         match loc {
             MemLoc::Aperture(addr) => {
                 let r = self.range(addr, len)?;
                 Some(&self.aperture[r])
             }
-            // Not supported by this milestone: CAP_GUESTMEM is clear
-            // (see the module doc comment's "Milestone scope"), so the
-            // ring decoder never produces a guest-space ref for TEX_IMAGE
-            // and friends to resolve through here in the first place.
-            // Only SURFACE_DEFINE's own guest-address *destination*
-            // (CAP_SURFACE_GUESTADDR, written to, never read from) is
-            // supported, in `write` below.
-            MemLoc::Guest(_) => None,
+            // CAP_GUESTMEM: pull the bytes straight from guest memory.
+            // `dma_read` never fails -- an address the bus cannot resolve
+            // reads back as 0xFF, the same "unmapped" convention every
+            // other DMA bus master in this codebase uses -- matching
+            // ring.rs's own note that reachability of a space-1 address
+            // is a higher layer's concern it cannot itself validate.
+            MemLoc::Guest(addr) => {
+                self.guest_scratch.resize(len, 0);
+                self.host.dma_read(addr, &mut self.guest_scratch);
+                Some(&self.guest_scratch[..len])
+            }
         }
     }
 
@@ -663,10 +749,13 @@ impl Memory for ApertureMemory<'_> {
                 None => false,
             },
             // Queued for the bus to apply after this tick -- see
-            // `ZorroDevice::take_pending_dma_writes`'s doc comment.
-            // Accepted unconditionally (never `false`): whether `addr`
-            // is actually reachable is the bus's question to answer when
-            // it resolves the address, not this board's.
+            // `ZorroDevice::take_pending_dma_writes`'s doc comment and
+            // the module doc comment's "CAP_GUESTMEM" (writes stay
+            // deferred even for ordinary guest RAM, not just a
+            // CAP_SURFACE_GUESTADDR cross-board target, so one code path
+            // handles both). Accepted unconditionally (never `false`):
+            // whether `addr` is actually reachable is the bus's question
+            // to answer when it resolves the address, not this board's.
             MemLoc::Guest(addr) => {
                 self.pending_dma.push(crate::zorro_device::PendingDmaWrite {
                     addr,
@@ -704,7 +793,7 @@ impl ZorroDevice for C3dBoard {
         extract_be(value, off & 0x3, size)
     }
 
-    fn write(&mut self, off: u32, size: usize, value: u32, _host: &mut DeviceHost) {
+    fn write(&mut self, off: u32, size: usize, value: u32, host: &mut DeviceHost) {
         let reg_off = off & !0x3;
         let sub = off & 0x3;
         if off < CONTEXT_PAGE_BASE {
@@ -724,7 +813,7 @@ impl ZorroDevice for C3dBoard {
             } else {
                 patch_be(self.read_context(n, reg_off), sub, size, value)
             };
-            self.write_context(n, reg_off, full);
+            self.write_context(n, reg_off, full, host);
         } else {
             // Plain aperture write -- ordinary board memory, no side
             // effects, matching the spec's "the guest reads and writes it
@@ -1197,5 +1286,382 @@ mod tests {
         // ERROR_ACK clears it.
         b.write(CONTEXT_PAGE_BASE + creg::ERROR_ACK, 4, 1, &mut h);
         assert_eq!(b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // CAP_GUESTMEM
+    // -----------------------------------------------------------------
+
+    /// A guest-backed surface (`SURFACE_DEFINE`'s `GUEST_ADDR` flag,
+    /// `CAP_SURFACE_GUESTADDR`) round-tripped through `SURFACE_UPLOAD`
+    /// (reads the surface's own backing memory into the GPU texture) and
+    /// `SURFACE_READBACK` (reads the GPU texture back out to the same
+    /// backing memory): this is a strong, pixel-level proof that
+    /// `Memory::read`'s `MemLoc::Guest` arm actually reaches guest
+    /// memory, not just that decoding tolerates a guest-space address.
+    /// If the upload's read were broken, `ensure_surface` still creates
+    /// a zero-initialized GPU texture before the read fails, so the
+    /// *readback* half still runs (errors don't stop later ops -- see
+    /// `Renderer::execute`) and writes zero pixels back over the guest
+    /// bytes this test pre-filled with a distinct colour -- so a broken
+    /// read is not silently invisible here, it flips every pixel to
+    /// black. `TEX_IMAGE`'s `data` ref exercises the identical
+    /// `Memory::read` arm (see the module doc comment's `CAP_GUESTMEM`);
+    /// `SURFACE_UPLOAD` was chosen because its counterpart
+    /// `SURFACE_READBACK` gives an observable pass/fail without probing
+    /// the renderer's private texture storage from another module.
+    #[test]
+    fn surface_upload_then_readback_round_trips_guest_backed_pixels_through_the_gpu_texture() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+
+        const GUEST_SURFACE_ADDR: u32 = 0x0000_0400;
+        const W: u32 = 4;
+        const H: u32 = 4;
+        const STRIDE: u32 = W * 4; // A8R8G8B8
+                                   // Opaque green (A R G B byte order, matching the M2 test).
+        let pixel = [0xFFu8, 0x00, 0xFF, 0x00];
+        for row in 0..H {
+            for col in 0..W {
+                let off = (GUEST_SURFACE_ADDR + row * STRIDE + col * 4) as usize;
+                mem.chip_ram[off..off + 4].copy_from_slice(&pixel);
+            }
+        }
+
+        let mut h = host(&mut mem);
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let mut cmds = Vec::<u32>::new();
+        // SURFACE_DEFINE id=1, guest-backed A8R8G8B8.
+        cmds.push(opcode_len(proto::OP_SURFACE_DEFINE, 8));
+        cmds.extend([
+            1,
+            W,
+            H,
+            STRIDE,
+            5, // A8R8G8B8
+            proto::SURFACE_DEFINE_FLAG_GUEST_ADDR,
+            GUEST_SURFACE_ADDR,
+        ]);
+        cmds.push(opcode_len(proto::OP_SET_DRAW_SURFACE, 2));
+        cmds.push(1);
+        cmds.push(opcode_len(proto::OP_SURFACE_UPLOAD, 5));
+        cmds.extend([0, 0, W, H]);
+        cmds.push(opcode_len(proto::OP_SURFACE_READBACK, 5));
+        cmds.extend([0, 0, W, H]);
+        cmds.push(opcode_len(proto::OP_FENCE, 2));
+        cmds.push(1);
+
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(b.aperture_offset + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "no protocol error decoding a guest-backed surface stream"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
+            bytes.len() as u32,
+            "every command consumed"
+        );
+
+        if b.renderer.is_none() {
+            eprintln!(
+                "skipping guest round-trip check: no wgpu adapter available (renderer_failed={})",
+                b.renderer_failed
+            );
+            return;
+        }
+
+        // SURFACE_READBACK addresses row by row, so expect one queued
+        // write per row (see render.rs's op_surface_readback).
+        let writes = b.take_pending_dma_writes();
+        assert_eq!(
+            writes.len(),
+            H as usize,
+            "SURFACE_READBACK's guest-space writes must be queued, not applied synchronously"
+        );
+        for w in &writes {
+            for (i, byte) in w.bytes.iter().enumerate() {
+                crate::zorro_device::dma_write_byte(&mut mem, w.addr + i as u32, *byte);
+            }
+        }
+
+        for row in 0..H {
+            for col in 0..W {
+                let off = (GUEST_SURFACE_ADDR + row * STRIDE + col * 4) as usize;
+                assert_eq!(
+                    &mem.chip_ram[off..off + 4],
+                    &pixel,
+                    "pixel ({col}, {row}) did not round-trip guest memory -> GPU texture -> guest memory"
+                );
+            }
+        }
+    }
+
+    /// `QUERY`'s `dest` in guest space: the result bytes must land in
+    /// actual guest memory. Since a `MemLoc::Guest` write always queues
+    /// into `pending_dma` (see the module doc comment's `CAP_GUESTMEM`
+    /// section) rather than landing synchronously, this drains it by
+    /// hand and applies it exactly the way `Bus::drain_cross_board_dma`
+    /// does for a plain-RAM target (`dma_write_byte`), the same
+    /// machinery the `CAP_SURFACE_GUESTADDR` bus-level test already
+    /// trusts. Needs a real renderer (`RenderOp::Query` is executed by
+    /// `Renderer::execute`, unlike `FENCE`) so this skips gracefully
+    /// without a wgpu adapter, mirroring the M2 pixel-check test.
+    #[test]
+    fn query_writes_its_result_into_guest_memory_via_the_deferred_dma_path() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        const GUEST_DEST_ADDR: u32 = 0x0000_0200;
+        const GL_CURRENT_COLOR: u32 = 0x0B00;
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let mut cmds = Vec::<u32>::new();
+        cmds.push(opcode_len(proto::OP_QUERY, 4));
+        cmds.extend([
+            GL_CURRENT_COLOR,
+            GUEST_DEST_ADDR,
+            0x8000_0000 | 16, // space 1 (guest), length 16 (vec4 of f32)
+        ]);
+
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(b.aperture_offset + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "no protocol error decoding a well-formed guest-dest QUERY"
+        );
+
+        if b.renderer.is_none() {
+            eprintln!(
+                "skipping guest-write check: no wgpu adapter available (renderer_failed={})",
+                b.renderer_failed
+            );
+            return;
+        }
+
+        let writes = b.take_pending_dma_writes();
+        assert_eq!(
+            writes.len(),
+            1,
+            "QUERY's guest-space write must be queued, not applied synchronously"
+        );
+        assert_eq!(writes[0].addr, GUEST_DEST_ADDR);
+        // GL_CURRENT_COLOR defaults to opaque white (state.rs's
+        // CurrentVertex::default): four big-endian 1.0f32 values.
+        let expected: Vec<u8> = [1.0f32; 4].iter().flat_map(|f| f.to_be_bytes()).collect();
+        assert_eq!(writes[0].bytes, expected);
+
+        // Apply it exactly the way Bus::drain_cross_board_dma would for a
+        // plain-RAM guest target.
+        for (i, byte) in writes[0].bytes.iter().enumerate() {
+            crate::zorro_device::dma_write_byte(&mut mem, GUEST_DEST_ADDR + i as u32, *byte);
+        }
+        assert_eq!(
+            &mem.chip_ram[GUEST_DEST_ADDR as usize..GUEST_DEST_ADDR as usize + 16],
+            expected.as_slice(),
+            "the query result must land in guest RAM once the bus applies the deferred write"
+        );
+    }
+
+    /// The masking side of the conformance switch for this bit: with
+    /// `CAP_GUESTMEM` cleared, a space-1 ref is `E_BAD_REF` (ring.rs's
+    /// `validate_ref`, exercised here through the real doorbell rather
+    /// than the decoder's own unit test).
+    #[test]
+    fn mask_caps_rejects_a_guest_space_ref_with_e_bad_ref() {
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_GUESTMEM);
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        assert_eq!(b.read(greg::CAPS0, 4, &mut h), CAPS0 & !proto::CAP_GUESTMEM);
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let mut cmds = Vec::<u32>::new();
+        cmds.push(opcode_len(proto::OP_QUERY, 4));
+        cmds.extend([0x0B00u32, 0x0000_0200, 0x8000_0000 | 16]);
+
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(b.aperture_offset + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            ErrorCode::BadRef as u32,
+            "a masked-off CAP_GUESTMEM must reject a space-1 ref"
+        );
+    }
+
+    /// `RING_BASE`/`RING_SIZE`: bit 31 of `RING_SIZE` names a guest
+    /// address for the ring itself (spec, "an aperture offset, or a
+    /// guest address if bit 31 of RING_SIZE is set"), not just for refs
+    /// inside the stream. The command bytes here live only in
+    /// `dummy_mem`'s `chip_ram`, never written to the aperture at all,
+    /// so this only passes if the doorbell's ring fetch itself reaches
+    /// guest memory.
+    #[test]
+    fn a_ring_living_in_guest_memory_is_fetched_through_the_host() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+
+        const GUEST_RING_ADDR: u32 = 0x0000_0300;
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        // FENCE id=7: needs no ref, and its completion doesn't depend on
+        // a renderer existing (see the module doc comment's doorbell
+        // section), so this proves the ring fetch alone, nothing else.
+        let cmds = [opcode_len(proto::OP_FENCE, 2), 7u32];
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        mem.chip_ram[GUEST_RING_ADDR as usize..GUEST_RING_ADDR as usize + bytes.len()]
+            .copy_from_slice(&bytes);
+
+        let mut h = host(&mut mem);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_BASE,
+            4,
+            GUEST_RING_ADDR,
+            &mut h,
+        );
+        // Bit 31 set: RING_BASE is a guest address.
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_SIZE,
+            4,
+            0x8000_0000 | 0x1000,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "a well-formed guest-memory ring must decode cleanly"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
+            bytes.len() as u32,
+            "the FENCE command was consumed from the guest-memory ring"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            7,
+            "the fence decoded from the guest-memory ring completed"
+        );
+    }
+
+    /// A guest that sets `RING_SIZE`'s guest-address bit while
+    /// `CAP_GUESTMEM` is masked off gets nothing decoded -- no register
+    /// exists to latch a protocol error for a misconfigured `RING_BASE`/
+    /// `RING_SIZE` (only ring *commands* raise `ERROR_CODE`), so "ignore
+    /// the whole ring" is this board's answer, documented in the module
+    /// doc comment's "Ring in guest memory".
+    #[test]
+    fn a_masked_cap_guestmem_ignores_a_guest_memory_ring_entirely() {
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_GUESTMEM);
+        let mut mem = dummy_mem();
+
+        const GUEST_RING_ADDR: u32 = 0x0000_0300;
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let cmds = [opcode_len(proto::OP_FENCE, 2), 7u32];
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        mem.chip_ram[GUEST_RING_ADDR as usize..GUEST_RING_ADDR as usize + bytes.len()]
+            .copy_from_slice(&bytes);
+
+        let mut h = host(&mut mem);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_BASE,
+            4,
+            GUEST_RING_ADDR,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_SIZE,
+            4,
+            0x8000_0000 | 0x1000,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
+            0,
+            "nothing was decoded from a guest-memory ring CAP_GUESTMEM cannot reach"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            0
+        );
     }
 }

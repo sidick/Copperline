@@ -233,7 +233,7 @@ impl FlatMemory {
 }
 
 impl Memory for FlatMemory {
-    fn read(&self, loc: MemLoc, len: usize) -> Option<&[u8]> {
+    fn read(&mut self, loc: MemLoc, len: usize) -> Option<&[u8]> {
         let (buf, addr) = match loc {
             MemLoc::Aperture(a) => (self.buf(false), a),
             MemLoc::Guest(a) => (self.buf(true), a),

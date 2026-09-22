@@ -98,21 +98,47 @@ project's spec-first loop exists to surface.
   so the distinction is dormant until an asynchronous render path gives
   it something to do.
 - **Capability honesty.** `CAPS0` reports `CAP_IRQ`, `CAP_REF_SYNC`,
-  `CAP_SURFACE_GUESTADDR` (since the cross-board DMA hook), and --
-  since the transform-tier MVP landed in the renderer --
-  `CAP_TRANSFORM` and `CAP_MULTITEXTURE`; the ring decoder is derived
-  from the same constant (`board.rs`'s `device_config`), so the register
-  and the decoder's idea of what is legal can never drift apart. The
-  transform-tier limit registers (`MAX_LIGHTS`, `MAX_CLIP_PLANES`, the
-  three matrix depths, `MAX_TEXTURE_UNITS`) report exactly the values
-  each context's `state::Limits::default()` enforces. `CAP_GUESTMEM`
-  alone stays clear: the board's guest-space memory access is not
-  implemented, and the register truthfully says so rather than
-  advertising a capability the board cannot deliver. Lighting and
-  `CLIP_PLANE` state is decoded and tracked per the spec but not yet
-  applied by the renderer (both are unused by the first client -- see
-  "Implementation order" below); a guest that enables them gets unlit,
-  unclipped rendering, not an error.
+  `CAP_SURFACE_GUESTADDR` (since the cross-board DMA hook),
+  `CAP_GUESTMEM` (since `ApertureMemory` resolves space-1 refs and a
+  guest-memory ring through `DeviceHost`, completing the spec's stated
+  Copperline capability set: bits 0, 1, 2, 3, 4, 6), and -- since the
+  transform-tier MVP landed in the renderer -- `CAP_TRANSFORM` and
+  `CAP_MULTITEXTURE`; the ring decoder is derived from the same constant
+  (`board.rs`'s `device_config`), so the register and the decoder's idea
+  of what is legal can never drift apart. The transform-tier limit
+  registers (`MAX_LIGHTS`, `MAX_CLIP_PLANES`, the three matrix depths,
+  `MAX_TEXTURE_UNITS`) report exactly the values each context's
+  `state::Limits::default()` enforces. Lighting and `CLIP_PLANE` state is
+  decoded and tracked per the spec but not yet applied by the renderer
+  (both are unused by the first client -- see "Implementation order"
+  below); a guest that enables them gets unlit, unclipped rendering, not
+  an error.
+- **`CAP_GUESTMEM`.** A space-1 ref names ordinary guest memory (chip/
+  slow/motherboard/accelerator RAM, or a RAM-backed Zorro board), reached
+  through the same `DeviceHost::dma_read`/`dma_write` decode the A2091
+  and CDTV bus masters use. Reads happen synchronously inside the
+  doorbell (`dma_read` takes `&self`, so it never conflicts with the
+  aperture/`pending_dma` borrows already live there) -- which is also
+  exactly what `CAP_REF_SYNC` promises, trivially true here since the
+  whole doorbell is synchronous, but worth stating since `CAP_REF_SYNC`
+  is "meaningful only with `CAP_GUESTMEM`" and now it is. Writes
+  deliberately stay on the existing one-tick-deferred `pending_dma` path
+  the `CAP_SURFACE_GUESTADDR` readback machinery already established,
+  rather than a new synchronous `dma_write` call: `dma_write`/
+  `dma_write_byte` only resolve ordinary RAM and *RAM-backed* Zorro
+  windows, never a *device-backed* board's window, so only the bus's
+  `drain_cross_board_dma` pass can correctly land a write regardless of
+  what the guest address actually names. A `QUERY` result written to
+  plain guest RAM gets the same one-tick deferral a `CAP_SURFACE_GUESTADDR`
+  readback already gets; a guest cannot observe the difference, since it
+  only learns a write landed via `FENCE_COMPLETED`/`RING_HEAD`, both
+  deferred right along with it. `RING_BASE` can itself name guest memory
+  too (`RING_SIZE` bit 31): the doorbell fetches the ring bytes with
+  `dma_read` instead of `read_aperture_range` when the bit is set and
+  `CAP_GUESTMEM` is not masked off; a masked device ignores such a ring
+  entirely (nothing decoded) rather than raising a protocol error, since
+  `RING_BASE`/`RING_SIZE` are ordinary registers with no error latch of
+  their own.
 - **Implementation order.** The first intended client is an OpenGL 1.x
   subset of the Quake-engine shape: immediate mode, matrices, textures
   with texenv, blend/alpha/depth/fog/scissor, vertex arrays with
