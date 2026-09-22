@@ -697,6 +697,32 @@ impl Mat4 {
         out
     }
 
+    /// Transforms a normal-space vector by `self`'s transpose, restricted
+    /// to the upper-left 3x3 -- i.e. `transpose(self) * v` for `v`
+    /// extended with an implied zero fourth component. Callers pass
+    /// `modelview.inverse()` as `self`, which makes this
+    /// `transpose(inverse(modelview)) * n`: GL 1.1's correct rule for
+    /// transforming a normal into eye space (fixed-function pipeline,
+    /// section 2.11), distinct from [`Mat4::transform_direction3`]'s
+    /// plain upper-3x3 multiply -- the two only agree when the modelview's
+    /// linear part is orthogonal (pure rotation, no scale). Under a
+    /// non-uniform scale the two diverge; a normal transformed by the
+    /// plain matrix (rather than the inverse-transpose) comes out
+    /// non-perpendicular to a correspondingly-scaled surface.
+    pub fn transform_normal3(&self, v: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for row in 0..3 {
+            let mut sum = 0.0f32;
+            for col in 0..3 {
+                // `self.get(col, row)`, not `(row, col)`: this is the
+                // transpose access pattern.
+                sum += self.get(col, row) * v[col];
+            }
+            out[row] = sum;
+        }
+        out
+    }
+
     /// The 4x4 inverse via Gauss-Jordan elimination with partial
     /// pivoting, or `None` if `self` is singular (GL leaves the result of
     /// transforming a clip plane or eye texgen plane by a singular
@@ -3141,6 +3167,40 @@ mod tests {
     fn singular_matrix_has_no_inverse() {
         let m = Mat4([0.0; 16]);
         assert_eq!(m.inverse(), None);
+    }
+
+    /// `Mat4::transform_normal3` must apply the *inverse-transpose*, not
+    /// the plain matrix -- GL 1.1's correct rule for transforming a
+    /// normal (section 2.11), which only coincides with the plain matrix
+    /// when the linear part is orthogonal (pure rotation, no scale). A
+    /// non-uniform scale of `2x` in `x` (and `1x` elsewhere) is the
+    /// simplest case where the two rules diverge and diverge in opposite
+    /// *directions*: the correct inverse-transpose scales an `x`-aligned
+    /// normal by `0.5` (the object got wider in `x`, so its surface
+    /// normal must lean *less* in `x` to stay perpendicular), while the
+    /// plain matrix -- the naive, wrong approach a render-side caller
+    /// could accidentally use instead -- would scale it by `2.0`, the
+    /// same direction a position transforms.
+    #[test]
+    fn transform_normal3_uses_inverse_transpose_not_the_plain_matrix() {
+        #[rustfmt::skip]
+        let modelview = Mat4([
+            2.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]);
+        let inv = modelview.inverse().unwrap();
+
+        let correct = inv.transform_normal3([1.0, 0.0, 0.0]);
+        assert_eq!(correct, [0.5, 0.0, 0.0]);
+
+        let wrong = modelview.transform_direction3([1.0, 0.0, 0.0]);
+        assert_eq!(wrong, [2.0, 0.0, 0.0]);
+        assert_ne!(
+            correct, wrong,
+            "the inverse-transpose and the plain matrix must diverge under non-uniform scale"
+        );
     }
 
     // -- max_lights/max_clip_planes as construction parameters ----------
