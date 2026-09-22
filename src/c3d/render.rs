@@ -62,13 +62,23 @@
 //!   draws ignore it, per the spec -- viewport is transform-tier), colour
 //!   mask, fog (linear/exp/exp2; per-vertex `FOGCOORD` when the format
 //!   carries it, else derived from `1 / rhw`, per the window-space rule).
+//! - Two-unit multitexture (`CAP_MULTITEXTURE`, `TEXCOORD1`): unit 0 and
+//!   unit 1 are each independently enabled/bound/`TEX_ENV`'d, per the spec
+//!   (`TEXTURE_2D` is a per-unit toggle with no rule coupling the units,
+//!   matching GL 1.1/`ARB_multitexture`). When both are active, unit 1's
+//!   texel cascades onto unit 0's result the way GL 1.1's fixed-function
+//!   multitexture does (see [`combine_formula`]'s doc comment); when only
+//!   one is active, that unit alone textures the draw, sourced from its
+//!   own texcoord (see [`Renderer::pipeline_key_from_state`]'s doc
+//!   comment). Units 2 and 3 (`TEXCOORD2`/`3`) remain out of scope:
+//!   `MAX_TEXTURE_UNITS` is 2.
 //!
 //! Deferred to M3: `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space only -- their
 //! `_WIN` window-space counterparts are implemented), lighting
 //! (`LIGHT`/`LIGHT_MODEL`/`MATERIAL`/`COLOR_MATERIAL`), texgen
-//! (`TEXGEN`/`TEXGEN_PLANE`), `CLIP_PLANE` user clipping, multitexture
-//! (`TEXCOORD1`-`3`), texel-space texture coordinates. Every one of these
-//! returns [`RenderError::Unimplemented`] rather than panicking.
+//! (`TEXGEN`/`TEXGEN_PLANE`), `CLIP_PLANE` user clipping, texture units
+//! beyond 1, texel-space texture coordinates. Every one of these returns
+//! [`RenderError::Unimplemented`] rather than panicking.
 //! (`TEX_PALETTE` is not in this list: it's spec-optional and Copperline
 //! correctly never advertises it, so `ring.rs` rejects it as
 //! `E_BAD_OPCODE` before it ever reaches this module -- see `ring.rs`'s
@@ -565,6 +575,10 @@ pub struct WinVertex {
     pub pos: [f32; 4], // x, y, z, rhw
     pub color: [f32; 4],
     pub texcoord0: [f32; 2],
+    /// Unit 1's texture coordinate (`CAP_MULTITEXTURE`, `TEXCOORD1`) --
+    /// `TEXCOORD0`'s per-unit `CURRENT_TEXCOORD` fallback rule applies here
+    /// too, just against unit 1's current value.
+    pub texcoord1: [f32; 2],
     /// `FOGCOORD` if the format carries it, else `CURRENT_FOGCOORD` --
     /// the ordinary "omitted component takes the current value" rule.
     /// Whether this or `1 / rhw` is what actually drives the fog
@@ -601,19 +615,24 @@ struct RawVertex {
     pos: [f32; 4],
     color: [f32; 4],
     texcoord0: [f32; 2],
+    /// Unit 1's texture coordinate (`CAP_MULTITEXTURE`). `TEXCOORD2`/`3`
+    /// (units 2/3) are still out of this milestone's scope -- their bytes
+    /// are walked and discarded, same as every optional component was
+    /// before multitexture existed at all.
+    texcoord1: [f32; 2],
     fogcoord: f32,
 }
 
 /// Parses `count` vertices out of `data`, `format`-interleaved, exactly
 /// as `DRAW_INLINE`/`DRAW_INLINE_WIN` lay them out. Every optional
 /// component in the format is walked and its words consumed --
-/// including ones this milestone doesn't render (`NORMAL`, `TEXCOORD1`-
+/// including ones this milestone doesn't render (`NORMAL`, `TEXCOORD2`-
 /// `3`) -- so a later vertex in the same command parses at the right
 /// offset even though this milestone only *uses*
-/// `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`FOGCOORD`. `NORMAL`'s "illegal in
-/// a window-space draw" rule is enforced at the dispatch/decode layer
-/// (`ring.rs`'s `check_window_space_format`), not here: both draw kinds
-/// must still walk its bytes to keep later components at the right
+/// `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`TEXCOORD1`/`FOGCOORD`. `NORMAL`'s
+/// "illegal in a window-space draw" rule is enforced at the dispatch/decode
+/// layer (`ring.rs`'s `check_window_space_format`), not here: both draw
+/// kinds must still walk its bytes to keep later components at the right
 /// offset. `current` supplies the value for any component the format
 /// omits. `Err` if `data` runs out before `count` vertices are read.
 fn parse_vertices_raw(
@@ -667,11 +686,14 @@ fn parse_vertices_raw(
             at += 8;
             texcoord0 = (s, t);
         }
-        for bit in [
-            VertexFormat::TEXCOORD1,
-            VertexFormat::TEXCOORD2,
-            VertexFormat::TEXCOORD3,
-        ] {
+        let mut texcoord1 = current.texcoord.get(1).copied().unwrap_or((0.0, 0.0));
+        if format.has(VertexFormat::TEXCOORD1) {
+            let s = read_f32(data, at).ok_or_else(bad)?;
+            let t = read_f32(data, at + 4).ok_or_else(bad)?;
+            at += 8;
+            texcoord1 = (s, t);
+        }
+        for bit in [VertexFormat::TEXCOORD2, VertexFormat::TEXCOORD3] {
             if format.has(bit) {
                 at += 8;
                 if at > data.len() {
@@ -689,6 +711,7 @@ fn parse_vertices_raw(
             pos,
             color,
             texcoord0: [texcoord0.0, texcoord0.1],
+            texcoord1: [texcoord1.0, texcoord1.1],
             fogcoord,
         });
     }
@@ -710,6 +733,7 @@ pub fn parse_window_vertices(
             pos: r.pos,
             color: r.color,
             texcoord0: r.texcoord0,
+            texcoord1: r.texcoord1,
             fogcoord: r.fogcoord,
         })
         .collect())
@@ -728,6 +752,7 @@ pub struct GlVertex {
     pub pos: [f32; 4], // object-space x, y, z, w
     pub color: [f32; 4],
     pub texcoord0: [f32; 2],
+    pub texcoord1: [f32; 2],
     pub fogcoord: f32,
 }
 
@@ -737,7 +762,7 @@ pub struct GlVertex {
 /// [`parse_window_vertices`]'s draw kind) but is not yet used: no
 /// lighting is implemented this milestone, so its words are walked (to
 /// keep later components at the right offset) and discarded, exactly
-/// like `TEXCOORD1`-`3` already are.
+/// like `TEXCOORD2`-`3` already are.
 pub fn parse_gl_vertices(
     data: &[u8],
     format: VertexFormat,
@@ -750,6 +775,7 @@ pub fn parse_gl_vertices(
             pos: r.pos,
             color: r.color,
             texcoord0: r.texcoord0,
+            texcoord1: r.texcoord1,
             fogcoord: r.fogcoord,
         })
         .collect())
@@ -970,9 +996,9 @@ fn decode_array_descriptors(
 /// Fetches one window-space vertex (`index`) from `descriptors`, the
 /// [`decode_array_descriptors`] output for a `DRAW_ARRAYS_WIN`/
 /// `DRAW_ELEMENTS_WIN` command. Only the components this milestone renders
-/// (`POS`, `COLOR`/`COLOR_PACKED`, `TEXCOORD0`, `FOGCOORD`) are actually
-/// read from memory; `NORMAL` (illegal here, rejected upstream) and
-/// `TEXCOORD1`-`3` (multitexture, out of scope) are present in
+/// (`POS`, `COLOR`/`COLOR_PACKED`, `TEXCOORD0`, `TEXCOORD1`, `FOGCOORD`) are
+/// actually read from memory; `NORMAL` (illegal here, rejected upstream) and
+/// `TEXCOORD2`-`3` (units 2/3, out of scope) are present in
 /// `descriptors` -- needed so later descriptors in the same command decode
 /// at the right byte offset -- but are never dereferenced, matching
 /// `parse_window_vertices`'s "consumed, unused" treatment of the same
@@ -987,6 +1013,7 @@ fn fetch_array_vertex(
     let mut pos = [0.0f32, 0.0, 0.0, 1.0];
     let mut color = current.color;
     let mut texcoord0 = current.texcoord.first().copied().unwrap_or((0.0, 0.0));
+    let mut texcoord1 = current.texcoord.get(1).copied().unwrap_or((0.0, 0.0));
     let mut fogcoord = current.fogcoord;
 
     for (bit, desc) in descriptors {
@@ -1009,12 +1036,17 @@ fn fetch_array_vertex(
                 let v = read_array_attribute(desc, ncomp, index, mem)?;
                 texcoord0 = (v[0], if ncomp >= 2 { v[1] } else { 0.0 });
             }
+            Some(b) if b == VertexFormat::TEXCOORD1 => {
+                let ncomp = descriptor_component_count(desc.array_type, 2)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                texcoord1 = (v[0], if ncomp >= 2 { v[1] } else { 0.0 });
+            }
             Some(b) if b == VertexFormat::FOGCOORD => {
                 let ncomp = descriptor_component_count(desc.array_type, 1)?;
                 let v = read_array_attribute(desc, ncomp, index, mem)?;
                 fogcoord = v[0];
             }
-            _ => {} // NORMAL / TEXCOORD1-3: see this function's doc comment
+            _ => {} // NORMAL / TEXCOORD2-3: see this function's doc comment
         }
     }
 
@@ -1022,6 +1054,7 @@ fn fetch_array_vertex(
         pos,
         color,
         texcoord0: [texcoord0.0, texcoord0.1],
+        texcoord1: [texcoord1.0, texcoord1.1],
         fogcoord,
     })
 }
@@ -1298,8 +1331,27 @@ pub fn primitive_index_order(
 /// caches one lazily per distinct key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PipelineKey {
+    /// Whether the *primary* texturing stage samples at all -- unit 0 when
+    /// it is active, or unit 1 acting as the sole active stage when unit 0
+    /// is not (see `Renderer::pipeline_key_from_state`'s doc comment).
+    /// Normalised to `false` (with `tex_env`/`tex0_source` at their
+    /// defaults) whenever neither unit is active, so the pipeline cache
+    /// never fragments over state that has no effect on the generated
+    /// shader.
     pub textured: bool,
     pub tex_env: TexEnvModeKey,
+    /// Which vertex varying the primary stage samples: `Texcoord0` when
+    /// unit 0 is the primary stage, `Texcoord1` when unit 1 is standing in
+    /// for it alone. Meaningless (and normalised to its default) when
+    /// `textured` is `false`.
+    pub tex0_source: TexCoordSourceKey,
+    /// The *second* texturing stage -- unit 1's own contribution cascaded
+    /// onto the primary stage's result. Only ever `true` when *both* units
+    /// are active simultaneously (unit 1 acting alone is the `tex0_source`
+    /// case above, not this one) -- see
+    /// `Renderer::pipeline_key_from_state`'s doc comment.
+    pub textured1: bool,
+    pub tex_env1: TexEnvModeKey,
     pub flat_shading: bool,
     pub alpha_test: Option<CompareFuncKey>,
     pub depth_test: Option<CompareFuncKey>,
@@ -1341,6 +1393,20 @@ impl From<TexEnvMode> for TexEnvModeKey {
             TexEnvMode::Add => Self::Add,
         }
     }
+}
+
+/// Which vertex varying [`PipelineKey`]'s primary texturing stage samples.
+/// Unit 0 and unit 1 share the same single-stage WGSL/bind-group shape
+/// (`tex`/`samp` at bindings 0/1) when only one of them is active -- this
+/// is the one thing that differs between "unit 0 is the sole active unit"
+/// and "unit 1 is the sole active unit" in that shape, so it has to be
+/// part of the pipeline key rather than implied by which unit happens to
+/// be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TexCoordSourceKey {
+    #[default]
+    Texcoord0,
+    Texcoord1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1643,12 +1709,14 @@ struct VsIn {
     @location(1) color: vec4<f32>,
     @location(2) texcoord0: vec2<f32>,
     @location(3) fog_distance: f32,
+    @location(4) texcoord1: vec2<f32>,
 };
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     __FLAT__ @location(0) color: vec4<f32>,
     @location(1) texcoord0: vec2<f32>,
     @location(2) fog_distance: f32,
+    @location(3) texcoord1: vec2<f32>,
 };
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -1657,28 +1725,73 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = in.color;
     out.texcoord0 = in.texcoord0;
     out.fog_distance = in.fog_distance;
+    out.texcoord1 = in.texcoord1;
     return out;
 }
 "#;
 
+/// Just the `VsOut` half of [`VERTEX_SHADER`] -- the fragment shader is a
+/// *separate* WGSL module (`build_pipeline` compiles `vs_src`/`fs_src` as
+/// two independent `create_shader_module` calls), so this struct must be
+/// hand-kept in lockstep with `VERTEX_SHADER`'s own copy: same fields, same
+/// `@location`s, same `__FLAT__` placement. There is no single source of
+/// truth to derive both from -- see the module doc comment's landmine note.
 const FRAGMENT_SHADER_HEADER: &str = r#"
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     __FLAT__ @location(0) color: vec4<f32>,
     @location(1) texcoord0: vec2<f32>,
     @location(2) fog_distance: f32,
+    @location(3) texcoord1: vec2<f32>,
 };
-@group(0) @binding(0) var tex: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
 "#;
 
+/// Builds one texture-env combine step's WGSL expression: `prev` is the
+/// running fragment colour going in (unit 0's is `in.color`, unit 1's is
+/// unit 0's own result -- the GL 1.1 fixed-function multitexture cascade:
+/// each active unit combines *the previous unit's output*, not the
+/// original vertex colour, with its own sampled texel), `texel` is this
+/// unit's sampled colour. Deliberately uses `prev` rather than the unit's
+/// own `TEX_ENV_COLOR` for `Blend`'s `Cc` term -- matching this module's
+/// pre-existing unit-0 `Blend` approximation (`docs/internals/c3d.md`'s
+/// `TEX_ENV_COLOR` is read by `state.rs` but never consulted here for
+/// either unit; see the module doc comment).
+fn combine_formula(mode: TexEnvModeKey, prev: &str, texel: &str) -> String {
+    match mode {
+        TexEnvModeKey::Replace => texel.to_string(),
+        TexEnvModeKey::Decal => {
+            format!("vec4<f32>(mix({prev}.rgb, {texel}.rgb, {texel}.a), {prev}.a)")
+        }
+        TexEnvModeKey::Blend => {
+            format!("vec4<f32>({prev}.rgb * (1.0 - {texel}.rgb), {prev}.a * {texel}.a)")
+        }
+        TexEnvModeKey::Add => format!("vec4<f32>({prev}.rgb + {texel}.rgb, {prev}.a * {texel}.a)"),
+        TexEnvModeKey::Modulate => format!("{prev} * {texel}"),
+    }
+}
+
 /// Builds the fragment shader body for one [`PipelineKey`]: samples the
-/// bound texture (if `textured`) and combines it with the interpolated
-/// colour per `tex_env`, then applies the alpha test (if any) via
-/// `discard`.
+/// primary texturing stage's bound texture (if `textured`) at
+/// `tex0_source` (unit 0's `texcoord0`, or unit 1's `texcoord1` when unit
+/// 1 is standing in as the sole active stage) and combines it with the
+/// interpolated vertex colour per `tex_env`, then -- if the second stage
+/// is also active (`textured1`, which only ever happens alongside the
+/// primary stage being unit 0 -- see `Renderer::pipeline_key_from_state`'s
+/// doc comment) -- samples unit 1's own texture at unit 1's own
+/// `texcoord1` and combines *that* with the primary stage's result per
+/// `tex_env1`, the GL 1.1 multitexture cascade (`combine_formula`'s doc
+/// comment). Finally applies the alpha test (if any) via `discard`.
+/// Declares `tex`/`samp` (the primary stage) and, only when `textured1`,
+/// `tex1`/`samp1` (the second stage) -- respectively bindings 0/1 and 2/3
+/// of `@group(0)`, matching `Renderer`'s
+/// `bind_group_layout_textured*`/`bind_group_layout_textured2*` pairs
+/// exactly.
 fn fragment_shader_source(key: &PipelineKey) -> String {
     let sample = if key.textured {
-        "let texel = textureSample(tex, samp, in.texcoord0);"
+        match key.tex0_source {
+            TexCoordSourceKey::Texcoord0 => "let texel = textureSample(tex, samp, in.texcoord0);",
+            TexCoordSourceKey::Texcoord1 => "let texel = textureSample(tex, samp, in.texcoord1);",
+        }
     } else {
         "let texel = vec4<f32>(1.0, 1.0, 1.0, 1.0);"
     };
@@ -1699,6 +1812,21 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
             TexEnvModeKey::Modulate => "var outc = in.color * texel;",
         }
     };
+    // Unit 1 (`CAP_MULTITEXTURE`): only ever emitted when `textured1` is
+    // set, which `pipeline_key_from_state` only ever sets alongside
+    // `textured` -- so `outc` (declared above, unconditionally, by
+    // `combine`) always exists by the time this reassigns it. This is the
+    // GL 1.1 multitexture cascade: unit 1's own env mode combines its own
+    // sampled texel with unit 0's *result*, not with the raw vertex
+    // colour.
+    let unit1 = if key.textured1 {
+        format!(
+            "let texel1 = textureSample(tex1, samp1, in.texcoord1);\n    outc = {};\n",
+            combine_formula(key.tex_env1, "outc", "texel1")
+        )
+    } else {
+        String::new()
+    };
     let alpha_test = match key.alpha_test {
         None => String::new(),
         Some(func) => {
@@ -1715,10 +1843,14 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
             format!("if (!({op})) {{ discard; }}\n",)
         }
     };
-    let alpha_ref_decl = if key.alpha_test.is_some() {
-        "@group(0) @binding(2) var<uniform> alpha_ref: f32;\n"
-    } else {
-        ""
+    let alpha_ref_decl = match (key.alpha_test.is_some(), key.textured1) {
+        (false, _) => "",
+        // Unit 1's own layout (`bind_group_layout_textured2_alpha`) puts
+        // `tex1`/`samp1` at bindings 2/3, so the alpha-ref uniform moves
+        // to binding 4; the single-unit layout keeps it at binding 2,
+        // unchanged from before multitexture existed.
+        (true, true) => "@group(0) @binding(4) var<uniform> alpha_ref: f32;\n",
+        (true, false) => "@group(0) @binding(2) var<uniform> alpha_ref: f32;\n",
     };
     // GL's real fixed-function order (texturing, then alpha test, then
     // fog) is followed here too, though it's only a correctness
@@ -1750,9 +1882,15 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
     } else {
         ""
     };
-    let header = FRAGMENT_SHADER_HEADER.replace("__FLAT__", flat);
+    let mut header = FRAGMENT_SHADER_HEADER.replace("__FLAT__", flat);
+    if key.textured {
+        header.push_str("@group(0) @binding(0) var tex: texture_2d<f32>;\n@group(0) @binding(1) var samp: sampler;\n");
+    }
+    if key.textured1 {
+        header.push_str("@group(0) @binding(2) var tex1: texture_2d<f32>;\n@group(0) @binding(3) var samp1: sampler;\n");
+    }
     format!(
-        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {sample}\n    {combine}\n    {alpha_test}    {fog}    return outc;\n}}\n",
+        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {sample}\n    {combine}\n    {unit1}    {alpha_test}    {fog}    return outc;\n}}\n",
     )
 }
 
@@ -1793,6 +1931,15 @@ pub struct Renderer {
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     bind_group_layout_textured: wgpu::BindGroupLayout,
     bind_group_layout_textured_alpha: wgpu::BindGroupLayout,
+    /// Two-unit multitexture (`CAP_MULTITEXTURE`): unit 0's texture+sampler
+    /// at bindings 0/1, unit 1's at bindings 2/3 -- used only when both
+    /// units are active (`PipelineKey::textured1`); a single active unit
+    /// still uses `bind_group_layout_textured`/`_alpha` above unchanged.
+    bind_group_layout_textured2: wgpu::BindGroupLayout,
+    /// As `bind_group_layout_textured2`, plus the alpha-test uniform at
+    /// binding 4 (bindings 0-3 are the same two units' texture/sampler
+    /// pairs).
+    bind_group_layout_textured2_alpha: wgpu::BindGroupLayout,
     /// One uniform (the clear colour + depth) -- see
     /// [`ClearRectPipelineKey`] and [`Renderer::op_clear`].
     bind_group_layout_clear_rect: wgpu::BindGroupLayout,
@@ -1969,6 +2116,63 @@ impl Renderer {
                 ],
             });
 
+        // Two-unit multitexture: unit 0's texture+sampler at bindings 0/1
+        // (same shape as `bind_group_layout_textured` above), unit 1's at
+        // bindings 2/3.
+        fn tex_sampler_entries(base_binding: u32) -> [wgpu::BindGroupLayoutEntry; 2] {
+            [
+                wgpu::BindGroupLayoutEntry {
+                    binding: base_binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: base_binding + 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ]
+        }
+        let unit0_entries = tex_sampler_entries(0);
+        let unit1_entries = tex_sampler_entries(2);
+        let alpha_ref_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bind_group_layout_textured2 =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d two-unit textured bind group layout"),
+                entries: &[
+                    unit0_entries[0],
+                    unit0_entries[1],
+                    unit1_entries[0],
+                    unit1_entries[1],
+                ],
+            });
+        let bind_group_layout_textured2_alpha =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d two-unit textured+alpha-test bind group layout"),
+                entries: &[
+                    unit0_entries[0],
+                    unit0_entries[1],
+                    unit1_entries[0],
+                    unit1_entries[1],
+                    alpha_ref_entry(4),
+                ],
+            });
+
         let bind_group_layout_clear_rect =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("c3d clear-rect bind group layout"),
@@ -1993,6 +2197,8 @@ impl Renderer {
             pipelines: HashMap::new(),
             bind_group_layout_textured,
             bind_group_layout_textured_alpha,
+            bind_group_layout_textured2,
+            bind_group_layout_textured2_alpha,
             bind_group_layout_clear_rect,
             surfaces: HashMap::new(),
             textures: HashMap::new(),
@@ -2124,7 +2330,11 @@ impl Renderer {
                 source: wgpu::ShaderSource::Wgsl(fs_src.into()),
             });
 
-        let layout = if key.textured && key.alpha_test.is_some() {
+        let layout = if key.textured1 && key.alpha_test.is_some() {
+            Some(&self.bind_group_layout_textured2_alpha)
+        } else if key.textured1 {
+            Some(&self.bind_group_layout_textured2)
+        } else if key.textured && key.alpha_test.is_some() {
             Some(&self.bind_group_layout_textured_alpha)
         } else if key.textured {
             Some(&self.bind_group_layout_textured)
@@ -2166,6 +2376,11 @@ impl Renderer {
                     format: wgpu::VertexFormat::Float32,
                     offset: 40,
                     shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 44,
+                    shader_location: 4,
                 },
             ],
         };
@@ -2356,10 +2571,32 @@ impl Renderer {
             })
     }
 
+    /// `unit0_active`/`unit1_active` are each unit's own independent
+    /// "enabled and has a real bound texture" state (`docs/internals/
+    /// c3d.md`: `TEXTURE_2D` is toggled per unit with no rule coupling
+    /// unit 1 to unit 0, matching GL 1.1/`ARB_multitexture`) -- a guest
+    /// may legally enable only unit 1. Rather than needing a distinct
+    /// "unit 1 alone" bind-group-layout shape for that case, unit 1 is
+    /// treated as the *primary* texturing stage (`textured`/`tex_env`/
+    /// `tex0_source`) whenever it is the only active unit -- it reuses
+    /// exactly the same single-stage layout/shader shape unit 0 alone
+    /// uses, just sourced from `texcoord1` instead of `texcoord0`
+    /// (`tex0_source`) and bound to unit 1's own texture/sampler. The
+    /// *second* stage (`textured1`/`tex_env1`, unit 1 cascaded onto the
+    /// primary stage's result per `combine_formula`'s doc comment) is only
+    /// ever active when *both* units are active simultaneously, in which
+    /// case unit 0 is always the primary stage and unit 1 is always the
+    /// second -- this is the only case that needs the two-unit
+    /// `bind_group_layout_textured2`/`_alpha` shapes. `tex_env`/
+    /// `tex0_source`/`tex_env1` are all normalised to their defaults
+    /// whenever the stage they belong to is inactive, so the pipeline
+    /// cache never fragments over `TEX_ENV`/`ACTIVE_UNIT` state that has
+    /// no effect on the generated shader.
     fn pipeline_key_from_state(
         &self,
         state: &State,
-        unit0_bound: bool,
+        unit0_active: bool,
+        unit1_active: bool,
         surface_format: wgpu::TextureFormat,
         topology: PrimTopologyKey,
     ) -> PipelineKey {
@@ -2379,14 +2616,41 @@ impl Renderer {
         } else {
             None
         };
-        let tex_env = state
+        let env0 = state
             .texture_units
             .first()
             .map(|u| u.env_mode.into())
             .unwrap_or(TexEnvModeKey::Modulate);
+        let env1 = state
+            .texture_units
+            .get(1)
+            .map(|u| u.env_mode.into())
+            .unwrap_or(TexEnvModeKey::Modulate);
+        // The primary stage is unit 0 when it's active; otherwise unit 1
+        // standing in alone (see this function's doc comment). Neither
+        // active normalises to the untextured default.
+        let (textured, tex_env, tex0_source) = if unit0_active {
+            (true, env0, TexCoordSourceKey::Texcoord0)
+        } else if unit1_active {
+            (true, env1, TexCoordSourceKey::Texcoord1)
+        } else {
+            (false, TexEnvModeKey::Modulate, TexCoordSourceKey::default())
+        };
+        // The second stage only exists when both units are active at
+        // once -- unit 1 alone is the primary-stage case above, not this
+        // one.
+        let textured1 = unit0_active && unit1_active;
+        let tex_env1 = if textured1 {
+            env1
+        } else {
+            TexEnvModeKey::Modulate
+        };
         PipelineKey {
-            textured: unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false),
+            textured,
             tex_env,
+            tex0_source,
+            textured1,
+            tex_env1,
             flat_shading: raster.shade_model == ShadeModel::Flat,
             alpha_test,
             depth_test,
@@ -2860,6 +3124,7 @@ impl Renderer {
                 color: v.color,
                 texcoord0: v.texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { clip_w },
+                texcoord1: v.texcoord1,
             }
         };
 
@@ -2992,6 +3257,7 @@ impl Renderer {
                 color: v.color,
                 texcoord0: v.texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { -eye[2] },
+                texcoord1: v.texcoord1,
             }
         };
 
@@ -3022,10 +3288,28 @@ impl Renderer {
         vbuf: Vec<GpuVertex>,
     ) -> Result<(), RenderError> {
         let unit0 = state.texture_units.first();
-        let bound_tex = unit0.map(|u| u.bound_texture).unwrap_or(0);
-        let unit0_bound = bound_tex != 0 && self.textures.contains_key(&bound_tex);
+        let bound_tex0 = unit0.map(|u| u.bound_texture).unwrap_or(0);
+        let unit0_bound = bound_tex0 != 0 && self.textures.contains_key(&bound_tex0);
+        let unit0_active =
+            unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false);
+        let unit1 = state.texture_units.get(1);
+        let bound_tex1 = unit1.map(|u| u.bound_texture).unwrap_or(0);
+        let unit1_bound = bound_tex1 != 0 && self.textures.contains_key(&bound_tex1);
+        let unit1_active = unit1_bound && state.enables.texture_2d.get(1).copied().unwrap_or(false);
+        // The primary texturing stage: unit 0 when active, else unit 1
+        // standing in alone -- see `pipeline_key_from_state`'s doc
+        // comment. Only meaningful when `key.textured` (computed from
+        // exactly this pair below), same as `bound_tex0`/`bound_tex1`
+        // were before multitexture existed.
+        let primary_bound_tex = if unit0_active { bound_tex0 } else { bound_tex1 };
         let surface_format = INTERNAL_COLOR_FORMAT;
-        let key = self.pipeline_key_from_state(state, unit0_bound, surface_format, topology);
+        let key = self.pipeline_key_from_state(
+            state,
+            unit0_active,
+            unit1_active,
+            surface_format,
+            topology,
+        );
 
         if topology == PrimTopologyKey::Triangles && key.cull == Some(FaceKey::FrontAndBack) {
             return Ok(()); // culls every triangle: nothing to draw
@@ -3053,7 +3337,28 @@ impl Renderer {
         // interleaving) keeps that split straightforward for the borrow
         // checker.
         let sampler_key = if key.textured {
-            let obj = state.texture(bound_tex);
+            let obj = state.texture(primary_bound_tex);
+            let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
+                TexWrap::Repeat,
+                TexWrap::Repeat,
+                TexFilter::Linear,
+            ));
+            let k = (
+                tex_wrap_to_address_mode(ws),
+                tex_wrap_to_address_mode(wt),
+                tex_filter_to_wgpu(min),
+            );
+            self.sampler(k.0, k.1, k.2);
+            Some(k)
+        } else {
+            None
+        };
+        // The second stage is always unit 1's own texture object (and
+        // therefore its own wrap/filter params) -- `textured1` is only
+        // ever set alongside both units active, with unit 0 as the
+        // primary stage (see `pipeline_key_from_state`'s doc comment).
+        let sampler_key1 = if key.textured1 {
+            let obj = state.texture(bound_tex1);
             let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
                 TexWrap::Repeat,
                 TexWrap::Repeat,
@@ -3072,8 +3377,68 @@ impl Renderer {
         self.pipeline_for(&key);
         let pipeline = self.pipelines.get(&key).expect("just ensured");
 
-        let bind_group = if key.textured {
-            let tex = &self.textures[&bound_tex];
+        let bind_group = if key.textured1 {
+            // `textured1` only ever holds when unit 0 is active (it's the
+            // primary stage in that combination -- see
+            // `pipeline_key_from_state`'s doc comment), so `bound_tex0` is
+            // exactly `primary_bound_tex` here.
+            let tex = &self.textures[&bound_tex0];
+            let sampler = self
+                .sampler_cache
+                .get(&sampler_key.expect("textured implies a sampler key"))
+                .expect("just ensured");
+            let tex1 = &self.textures[&bound_tex1];
+            let sampler1 = self
+                .sampler_cache
+                .get(&sampler_key1.expect("textured1 implies a sampler key"))
+                .expect("just ensured");
+            let mut entries = vec![
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&tex1.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler1),
+                },
+            ];
+            let alpha_ref_buf;
+            let layout = if key.alpha_test.is_some() {
+                let alpha_ref_bytes = state.raster.alpha_ref.to_le_bytes();
+                alpha_ref_buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("c3d alpha ref"),
+                        contents: &alpha_ref_bytes,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: alpha_ref_buf.as_entire_binding(),
+                });
+                &self.bind_group_layout_textured2_alpha
+            } else {
+                &self.bind_group_layout_textured2
+            };
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("c3d two-unit textured bind group"),
+                layout,
+                entries: &entries,
+            }))
+        } else if key.textured {
+            // Single active stage -- unit 0 or unit 1 alone, whichever
+            // `primary_bound_tex` resolved to; the layout/shader shape
+            // (and this bind group) is identical either way, only
+            // `tex0_source` in the key differs.
+            let tex = &self.textures[&primary_bound_tex];
             let sampler = self
                 .sampler_cache
                 .get(&sampler_key.expect("textured implies a sampler key"))
@@ -3813,7 +4178,11 @@ impl Renderer {
 /// `attr` per fragment" the spec asks for, with no per-fragment division
 /// written by this module. `fog_distance` is carried unconditionally
 /// (like `texcoord0` for an untextured draw) even on a pipeline with fog
-/// disabled, where the fragment shader simply never reads it.
+/// disabled, where the fragment shader simply never reads it. `texcoord1`
+/// (unit 1, `CAP_MULTITEXTURE`) is carried the same unconditional way,
+/// after `fog_distance` -- see [`GpuVertex`]'s vertex-buffer layout in
+/// `Renderer::build_pipeline`, which must stay in lockstep with this field
+/// order.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuVertex {
@@ -3821,6 +4190,7 @@ struct GpuVertex {
     color: [f32; 4],
     texcoord0: [f32; 2],
     fog_distance: f32,
+    texcoord1: [f32; 2],
 }
 
 /// Serialises a vertex list to the plain little-endian bytes a wgpu vertex
@@ -3840,6 +4210,9 @@ fn gpu_vertices_to_bytes(vertices: &[GpuVertex]) -> Vec<u8> {
             out.extend_from_slice(&f.to_le_bytes());
         }
         out.extend_from_slice(&v.fog_distance.to_le_bytes());
+        for f in v.texcoord1 {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
     }
     out
 }
@@ -6439,6 +6812,428 @@ mod tests {
             &pixels[idx..idx + 4],
             &[255, 255, 255, 255],
             "bottom-left pixel should be covered by the indexed triangle: {pixels:?}"
+        );
+    }
+
+    // -- Two-unit multitexture: pixel-level ---------------------------
+
+    /// Draws a single fully-covering opaque triangle over a black-cleared
+    /// 4x4 surface with texture units 0 and 1 both bound, enabled and
+    /// given their own `TEX_ENV` mode, and returns the RGBA8 bytes at a
+    /// pixel known to be inside it. `tex1_texels` is `tex1_wh.0 *
+    /// tex1_wh.1` `RGBA8` entries, row-major. Every vertex carries the
+    /// *same* `texcoord0`/`texcoord1`, so the whole triangle samples one
+    /// texel per unit (no interpolation to account for) -- shared by every
+    /// two-unit multitexture pixel test below.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_two_unit_textured_triangle(
+        tex0_rgba: [u8; 4],
+        tex0_env: TexEnvMode,
+        tex1_wh: (u32, u32),
+        tex1_texels: &[[u8; 4]],
+        tex1_env: TexEnvMode,
+        texcoord0: (f32, f32),
+        texcoord1: (f32, f32),
+    ) -> Option<[u8; 4]> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        state.tex_create(1);
+        state.tex_create(2);
+        state.tex_bind(0, 1);
+        state.tex_bind(1, 2);
+        state.set_tex_env(0, state::TexEnvParam::Mode(tex0_env));
+        state.set_tex_env(1, state::TexEnvParam::Mode(tex1_env));
+        state.set_active_unit(0);
+        state.enable(state::Capability::Texture2D);
+        state.set_active_unit(1);
+        state.enable(state::Capability::Texture2D);
+        state.set_active_unit(0);
+
+        let mut mem = TestMemory::new(65536);
+        let tex0_addr = 0x1000u32;
+        mem.aperture[tex0_addr as usize..tex0_addr as usize + 4].copy_from_slice(&tex0_rgba);
+
+        let tex1_addr = 0x2000u32;
+        let (tw, th) = tex1_wh;
+        assert_eq!(tex1_texels.len(), (tw * th) as usize, "test setup bug");
+        for (i, texel) in tex1_texels.iter().enumerate() {
+            let at = tex1_addr as usize + i * 4;
+            mem.aperture[at..at + 4].copy_from_slice(texel);
+        }
+
+        // An oversized triangle fully covering the whole 4x4 surface,
+        // POS_COUNT=1 (3 words: x, y, z; rhw defaults to 1.0), TEXCOORD0
+        // and TEXCOORD1 both present and identical on every vertex.
+        let tri = [(-4.0f32, -4.0f32), (-4.0, 12.0), (12.0, -4.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            for w in [texcoord0.0, texcoord0.1, texcoord1.0, texcoord1.1] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat(
+            (1 << VertexFormat::POS_COUNT_SHIFT)
+                | VertexFormat::TEXCOORD0
+                | VertexFormat::TEXCOORD1,
+        );
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 1,
+                    height: 1,
+                    row_bytes: 4,
+                    data: Ref {
+                        address: tex0_addr,
+                        space: RefSpace::Aperture,
+                        length: 4,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 2,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: tw,
+                    height: th,
+                    row_bytes: tw * 4,
+                    data: Ref {
+                        address: tex1_addr,
+                        space: RefSpace::Aperture,
+                        length: tw * th * 4,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(2 * 4 + 2) * 4..][..4];
+        Some([px[0], px[1], px[2], px[3]])
+    }
+
+    /// Unit 0 (`REPLACE`, solid opaque red) and unit 1 (`MODULATE`, solid
+    /// 50%-grey) must combine as a true single-pass cascade: unit 1's
+    /// texel multiplies unit 0's *result*, not the original vertex
+    /// colour. Red is chosen as exactly `1.0` so unit 0's contribution to
+    /// the red channel is a no-op multiplier -- the expected output is
+    /// unit 1's grey value in the red channel and `0` everywhere else,
+    /// byte-exact with no rounding tolerance needed.
+    #[test]
+    fn two_unit_multitexture_cascades_unit1_onto_unit0s_result() {
+        let Some(px) = draw_two_unit_textured_triangle(
+            [255, 0, 0, 255],
+            TexEnvMode::Replace,
+            (1, 1),
+            &[[128, 128, 128, 255]],
+            TexEnvMode::Modulate,
+            (0.5, 0.5),
+            (0.5, 0.5),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px,
+            [128, 0, 0, 255],
+            "unit 1's grey (128) should modulate unit 0's red (255 -> a no-op multiplier), \
+             not the original vertex colour: {px:?}"
+        );
+    }
+
+    /// Unit 1 must sample at its *own* `TEXCOORD1`, not unit 0's
+    /// `TEXCOORD0` -- unit 0 is solid white under `REPLACE` (so its
+    /// result is a pure pass-through, `1.0` in every channel, and
+    /// `MODULATE`ing unit 1 onto it reproduces unit 1's texel exactly),
+    /// unit 1 is a 2x1 `NEAREST`-sampled texture (red at u<0.5, green at
+    /// u>=0.5). `texcoord0` is fixed at the *green* half (`u=0.75`) and
+    /// `texcoord1` at the *red* half (`u=0.25`) -- a renderer that
+    /// (bug) sampled unit 1 with `in.texcoord0` instead of `in.texcoord1`
+    /// would read green, not red.
+    #[test]
+    fn two_unit_multitexture_unit1_samples_its_own_texcoord_not_unit0s() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let Some(px) = draw_two_unit_textured_triangle(
+            [255, 255, 255, 255],
+            TexEnvMode::Replace,
+            (2, 1),
+            &[red, green],
+            TexEnvMode::Modulate,
+            (0.75, 0.5), // unit 0's texcoord: irrelevant (unit 0 has no texcoord1-shaped texture)
+            (0.25, 0.5), // unit 1's texcoord: left half (red)
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, red,
+            "unit 1 must sample at its own texcoord1 (u=0.25, red), not unit 0's \
+             texcoord0 (u=0.75, which would read green): {px:?}"
+        );
+    }
+
+    /// The refactor that generalised `submit_draw`/`pipeline_key_from_state`
+    /// to two units must leave the single-unit (unit 1 disabled) path
+    /// byte-identical to before: same pipeline shape, same bind group,
+    /// same output. Unit 1 is bound and enabled with a texture that WOULD
+    /// change the result if sampled (opaque blue, `REPLACE`) but
+    /// `TEXTURE_2D` is left disabled on unit 1, so it must never
+    /// contribute.
+    #[test]
+    fn two_unit_multitexture_with_unit1_disabled_matches_the_single_unit_path() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        state.tex_create(1);
+        state.tex_create(2);
+        state.tex_bind(0, 1);
+        state.tex_bind(1, 2);
+        state.set_tex_env(0, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        state.set_tex_env(1, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        // Unit 0 only: unit 1 stays disabled (TEXTURE_2D never enabled
+        // for it), even though it has a real, bound, would-change-the-
+        // result texture.
+        state.set_active_unit(0);
+        state.enable(state::Capability::Texture2D);
+
+        let mut mem = TestMemory::new(65536);
+        let tex0_addr = 0x1000u32;
+        mem.aperture[tex0_addr as usize..tex0_addr as usize + 4].copy_from_slice(&[0, 255, 0, 255]); // solid green
+        let tex1_addr = 0x2000u32;
+        mem.aperture[tex1_addr as usize..tex1_addr as usize + 4].copy_from_slice(&[0, 0, 255, 255]); // solid blue -- must never show up
+
+        let tri = [(-4.0f32, -4.0f32), (-4.0, 12.0), (12.0, -4.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            for w in [0.5f32, 0.5, 0.5, 0.5] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat(
+            (1 << VertexFormat::POS_COUNT_SHIFT)
+                | VertexFormat::TEXCOORD0
+                | VertexFormat::TEXCOORD1,
+        );
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 1,
+                    height: 1,
+                    row_bytes: 4,
+                    data: Ref {
+                        address: tex0_addr,
+                        space: RefSpace::Aperture,
+                        length: 4,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 2,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 1,
+                    height: 1,
+                    row_bytes: 4,
+                    data: Ref {
+                        address: tex1_addr,
+                        space: RefSpace::Aperture,
+                        length: 4,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(2 * 4 + 2) * 4..][..4];
+        assert_eq!(
+            px,
+            [0, 255, 0, 255],
+            "unit 1 (blue) must not contribute while TEXTURE_2D is disabled for it -- \
+             only unit 0's green REPLACE result should show: {px:?}"
+        );
+    }
+
+    /// A guest may legally enable `TEXTURE_2D` on unit 1 while leaving
+    /// unit 0 off entirely (`docs/internals/c3d.md`: `TEXTURE_2D` is a
+    /// per-unit toggle with no rule coupling the units, matching GL
+    /// 1.1/`ARB_multitexture`) -- this must still texture the draw, from
+    /// unit 1's *own* texture and its *own* `texcoord1`, not silently
+    /// render as plain vertex colour. Unit 0 is left entirely unbound
+    /// (the default null texture); unit 1 is a 2x1 `NEAREST`-sampled
+    /// `REPLACE` texture (red at `u<0.5`, green at `u>=0.5`).
+    /// `texcoord0` is fixed at the *green* half (`u=0.75`) and
+    /// `texcoord1` at the *red* half (`u=0.25`) -- a renderer that
+    /// (bug) sourced the single-active-stage sample from `texcoord0`
+    /// would read green, not red.
+    #[test]
+    fn two_unit_multitexture_unit1_only_samples_its_own_texture_and_texcoord() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        // Unit 0 is left entirely alone: never created, never bound,
+        // never enabled. Unit 1 only.
+        state.tex_create(2);
+        state.tex_bind(1, 2);
+        state.set_tex_env(1, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        state.set_active_unit(1);
+        state.enable(state::Capability::Texture2D);
+
+        let mut mem = TestMemory::new(65536);
+        let tex1_addr = 0x2000u32;
+        // Red at texel 0 (u<0.5), green at texel 1 (u>=0.5).
+        mem.aperture[tex1_addr as usize..tex1_addr as usize + 4].copy_from_slice(&[255, 0, 0, 255]);
+        mem.aperture[tex1_addr as usize + 4..tex1_addr as usize + 8]
+            .copy_from_slice(&[0, 255, 0, 255]);
+
+        let tri = [(-4.0f32, -4.0f32), (-4.0, 12.0), (12.0, -4.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            // texcoord0 = green half, texcoord1 = red half.
+            for w in [0.75f32, 0.5, 0.25, 0.5] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat(
+            (1 << VertexFormat::POS_COUNT_SHIFT)
+                | VertexFormat::TEXCOORD0
+                | VertexFormat::TEXCOORD1,
+        );
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 2,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 1,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: tex1_addr,
+                        space: RefSpace::Aperture,
+                        length: 8,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(2 * 4 + 2) * 4..][..4];
+        assert_eq!(
+            px,
+            [255, 0, 0, 255],
+            "unit 1 alone must texture the draw from its own texture, sampled at its own \
+             texcoord1 (u=0.25, red) -- not unit 0's texcoord0 (u=0.75, green), and not \
+             plain untextured vertex colour: {px:?}"
         );
     }
 }
