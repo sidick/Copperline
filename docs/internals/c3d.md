@@ -133,6 +133,32 @@ project's spec-first loop exists to surface.
   approximation, carried through unchanged to unit 1). This is renderer-
   side only -- `CAPS0` still does not advertise `CAP_MULTITEXTURE` (see
   "Capability honesty" above), so no real guest can reach it yet.
+- **GL-space `DRAW_ARRAYS`/`DRAW_ELEMENTS`.** `src/c3d/render.rs`
+  combines the window-space array/indexed-array vertex-fetch machinery
+  with the GL-space (`CAP_TRANSFORM`) position-transform path: array and
+  element (indexed) draws now go through matrix transform, `VIEWPORT` and
+  `DEPTH_RANGE` exactly like `DRAW_INLINE` (GL-space) does, not just the
+  window-space rasteriser. Implemented as a parse-wrapper/shared-tail
+  split mirroring the window-space refactor: `op_draw_inline_gl` (parses
+  `DRAW_INLINE`'s bytes), `op_draw_arrays_gl` and `op_draw_elements_gl`
+  (fetch from array/index memory) all hand a `Vec<GlVertex>` to the
+  shared `op_draw_gl` tail, which is `op_draw_inline_gl`'s pre-refactor
+  body moved verbatim -- no transform-math changes. `NORMAL` is a legal
+  format bit for a GL-space array draw (unlike the window-space fetch,
+  which `ring.rs` rejects outright before this module ever sees it), but
+  `GlVertex` still carries no normal field this milestone (no lighting is
+  implemented yet) -- its descriptor is decoded (so later descriptors in
+  the same command land at the right slot) but never dereferenced,
+  exactly like `TEXCOORD2`-`3`. A follow-up milestone adding lighting
+  would extend `GlVertex` and its fetch functions to actually read it.
+  Position component-count validation (`2..=4`, no `glVertex1f`) and the
+  `min_index`/`max_index`-are-never-consulted reasoning (including the
+  spec's `0xFFFF_FFFF` self-scan sentinel) and the
+  `MAX_ARRAY_DRAW_VERTICES` allocation-size cap are shared with the
+  window-space array fetch, unchanged: the DoS/allocation-abort reasoning
+  and the position-component-count rule are both space-independent.
+  `CAPS0` still does not advertise `CAP_TRANSFORM` (see "Capability
+  honesty" above), so no real guest can reach any GL-space draw path yet.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
