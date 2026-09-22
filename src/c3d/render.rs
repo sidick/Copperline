@@ -62,13 +62,16 @@
 //!   draws ignore it, per the spec -- viewport is transform-tier), colour
 //!   mask, fog (linear/exp/exp2; per-vertex `FOGCOORD` when the format
 //!   carries it, else derived from `1 / rhw`, per the window-space rule).
-//! - Two-unit multitexture (`CAP_MULTITEXTURE`, `TEXCOORD1`): unit 1's own
-//!   bound texture, `TEX_ENV` mode and texcoord, cascaded onto unit 0's
-//!   result the way GL 1.1's fixed-function multitexture does (see
-//!   [`combine_formula`]'s doc comment). Unit 1 only ever contributes when
-//!   unit 0 is also textured -- see
-//!   [`Renderer::pipeline_key_from_state`]'s doc comment for why. Units 2
-//!   and 3 (`TEXCOORD2`/`3`) remain out of scope: `MAX_TEXTURE_UNITS` is 2.
+//! - Two-unit multitexture (`CAP_MULTITEXTURE`, `TEXCOORD1`): unit 0 and
+//!   unit 1 are each independently enabled/bound/`TEX_ENV`'d, per the spec
+//!   (`TEXTURE_2D` is a per-unit toggle with no rule coupling the units,
+//!   matching GL 1.1/`ARB_multitexture`). When both are active, unit 1's
+//!   texel cascades onto unit 0's result the way GL 1.1's fixed-function
+//!   multitexture does (see [`combine_formula`]'s doc comment); when only
+//!   one is active, that unit alone textures the draw, sourced from its
+//!   own texcoord (see [`Renderer::pipeline_key_from_state`]'s doc
+//!   comment). Units 2 and 3 (`TEXCOORD2`/`3`) remain out of scope:
+//!   `MAX_TEXTURE_UNITS` is 2.
 //!
 //! Deferred to M3: `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space only -- their
 //! `_WIN` window-space counterparts are implemented), lighting
@@ -1328,11 +1331,25 @@ pub fn primitive_index_order(
 /// caches one lazily per distinct key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PipelineKey {
+    /// Whether the *primary* texturing stage samples at all -- unit 0 when
+    /// it is active, or unit 1 acting as the sole active stage when unit 0
+    /// is not (see `Renderer::pipeline_key_from_state`'s doc comment).
+    /// Normalised to `false` (with `tex_env`/`tex0_source` at their
+    /// defaults) whenever neither unit is active, so the pipeline cache
+    /// never fragments over state that has no effect on the generated
+    /// shader.
     pub textured: bool,
     pub tex_env: TexEnvModeKey,
-    /// Unit 1 (`CAP_MULTITEXTURE`). Only ever `true` when `textured` is
-    /// also `true` -- see `Renderer::pipeline_key_from_state`'s doc
-    /// comment for why unit 1 is deliberately never sampled on its own.
+    /// Which vertex varying the primary stage samples: `Texcoord0` when
+    /// unit 0 is the primary stage, `Texcoord1` when unit 1 is standing in
+    /// for it alone. Meaningless (and normalised to its default) when
+    /// `textured` is `false`.
+    pub tex0_source: TexCoordSourceKey,
+    /// The *second* texturing stage -- unit 1's own contribution cascaded
+    /// onto the primary stage's result. Only ever `true` when *both* units
+    /// are active simultaneously (unit 1 acting alone is the `tex0_source`
+    /// case above, not this one) -- see
+    /// `Renderer::pipeline_key_from_state`'s doc comment.
     pub textured1: bool,
     pub tex_env1: TexEnvModeKey,
     pub flat_shading: bool,
@@ -1376,6 +1393,20 @@ impl From<TexEnvMode> for TexEnvModeKey {
             TexEnvMode::Add => Self::Add,
         }
     }
+}
+
+/// Which vertex varying [`PipelineKey`]'s primary texturing stage samples.
+/// Unit 0 and unit 1 share the same single-stage WGSL/bind-group shape
+/// (`tex`/`samp` at bindings 0/1) when only one of them is active -- this
+/// is the one thing that differs between "unit 0 is the sole active unit"
+/// and "unit 1 is the sole active unit" in that shape, so it has to be
+/// part of the pipeline key rather than implied by which unit happens to
+/// be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TexCoordSourceKey {
+    #[default]
+    Texcoord0,
+    Texcoord1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1739,22 +1770,28 @@ fn combine_formula(mode: TexEnvModeKey, prev: &str, texel: &str) -> String {
     }
 }
 
-/// Builds the fragment shader body for one [`PipelineKey`]: samples unit
-/// 0's bound texture (if `textured`) and combines it with the interpolated
-/// vertex colour per `tex_env`, then -- if unit 1 is also active
-/// (`textured1`) -- samples unit 1's own texture at unit 1's own
-/// `texcoord1` and combines *that* with unit 0's result per `tex_env1`,
-/// the GL 1.1 multitexture cascade (`combine_formula`'s doc comment).
-/// Finally applies the alpha test (if any) via `discard`. Declares
-/// `tex`/`samp` (unit 0) and, only when `textured1`, `tex1`/`samp1` (unit 1)
-/// -- respectively bindings 0/1 and 2/3 of `@group(0)`, matching
-/// `Renderer`'s `bind_group_layout_textured*`/`bind_group_layout_textured2*`
-/// pairs exactly. `textured1` is only ever true when `textured` also is
-/// (see `Renderer::pipeline_key_from_state`'s doc comment), so unit 1 never
-/// appears without unit 0's own declarations already in the header.
+/// Builds the fragment shader body for one [`PipelineKey`]: samples the
+/// primary texturing stage's bound texture (if `textured`) at
+/// `tex0_source` (unit 0's `texcoord0`, or unit 1's `texcoord1` when unit
+/// 1 is standing in as the sole active stage) and combines it with the
+/// interpolated vertex colour per `tex_env`, then -- if the second stage
+/// is also active (`textured1`, which only ever happens alongside the
+/// primary stage being unit 0 -- see `Renderer::pipeline_key_from_state`'s
+/// doc comment) -- samples unit 1's own texture at unit 1's own
+/// `texcoord1` and combines *that* with the primary stage's result per
+/// `tex_env1`, the GL 1.1 multitexture cascade (`combine_formula`'s doc
+/// comment). Finally applies the alpha test (if any) via `discard`.
+/// Declares `tex`/`samp` (the primary stage) and, only when `textured1`,
+/// `tex1`/`samp1` (the second stage) -- respectively bindings 0/1 and 2/3
+/// of `@group(0)`, matching `Renderer`'s
+/// `bind_group_layout_textured*`/`bind_group_layout_textured2*` pairs
+/// exactly.
 fn fragment_shader_source(key: &PipelineKey) -> String {
     let sample = if key.textured {
-        "let texel = textureSample(tex, samp, in.texcoord0);"
+        match key.tex0_source {
+            TexCoordSourceKey::Texcoord0 => "let texel = textureSample(tex, samp, in.texcoord0);",
+            TexCoordSourceKey::Texcoord1 => "let texel = textureSample(tex, samp, in.texcoord1);",
+        }
     } else {
         "let texel = vec4<f32>(1.0, 1.0, 1.0, 1.0);"
     };
@@ -2534,24 +2571,32 @@ impl Renderer {
             })
     }
 
-    /// `unit1_bound` is only ever folded into `textured1` when `textured`
-    /// (unit 0) is also set: this renderer's multitexture cascade always
-    /// starts at unit 0 (GL 1.1's fixed-function multitexture combines
-    /// unit 1's texel with unit 0's *result*, not with the raw vertex
-    /// colour -- see `combine_formula`'s doc comment), so a guest enabling
-    /// only unit 1 while leaving unit 0 off (a state GL technically allows
-    /// but which the target client -- `docs/internals/c3d.md`'s
-    /// `MGLDrawMultitexBuffer`/ARB-multitexture usage -- never produces)
-    /// draws untextured rather than needing a whole separate "unit 1
-    /// alone" bind-group-layout shape. This keeps the two-unit milestone
-    /// bounded to the two layouts documented on
-    /// `bind_group_layout_textured2`/`_alpha` instead of the 6+ layout
-    /// shapes full unit independence would need.
+    /// `unit0_active`/`unit1_active` are each unit's own independent
+    /// "enabled and has a real bound texture" state (`docs/internals/
+    /// c3d.md`: `TEXTURE_2D` is toggled per unit with no rule coupling
+    /// unit 1 to unit 0, matching GL 1.1/`ARB_multitexture`) -- a guest
+    /// may legally enable only unit 1. Rather than needing a distinct
+    /// "unit 1 alone" bind-group-layout shape for that case, unit 1 is
+    /// treated as the *primary* texturing stage (`textured`/`tex_env`/
+    /// `tex0_source`) whenever it is the only active unit -- it reuses
+    /// exactly the same single-stage layout/shader shape unit 0 alone
+    /// uses, just sourced from `texcoord1` instead of `texcoord0`
+    /// (`tex0_source`) and bound to unit 1's own texture/sampler. The
+    /// *second* stage (`textured1`/`tex_env1`, unit 1 cascaded onto the
+    /// primary stage's result per `combine_formula`'s doc comment) is only
+    /// ever active when *both* units are active simultaneously, in which
+    /// case unit 0 is always the primary stage and unit 1 is always the
+    /// second -- this is the only case that needs the two-unit
+    /// `bind_group_layout_textured2`/`_alpha` shapes. `tex_env`/
+    /// `tex0_source`/`tex_env1` are all normalised to their defaults
+    /// whenever the stage they belong to is inactive, so the pipeline
+    /// cache never fragments over `TEX_ENV`/`ACTIVE_UNIT` state that has
+    /// no effect on the generated shader.
     fn pipeline_key_from_state(
         &self,
         state: &State,
-        unit0_bound: bool,
-        unit1_bound: bool,
+        unit0_active: bool,
+        unit1_active: bool,
         surface_format: wgpu::TextureFormat,
         topology: PrimTopologyKey,
     ) -> PipelineKey {
@@ -2571,22 +2616,39 @@ impl Renderer {
         } else {
             None
         };
-        let tex_env = state
+        let env0 = state
             .texture_units
             .first()
             .map(|u| u.env_mode.into())
             .unwrap_or(TexEnvModeKey::Modulate);
-        let tex_env1 = state
+        let env1 = state
             .texture_units
             .get(1)
             .map(|u| u.env_mode.into())
             .unwrap_or(TexEnvModeKey::Modulate);
-        let textured = unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false);
-        let textured1 =
-            textured && unit1_bound && state.enables.texture_2d.get(1).copied().unwrap_or(false);
+        // The primary stage is unit 0 when it's active; otherwise unit 1
+        // standing in alone (see this function's doc comment). Neither
+        // active normalises to the untextured default.
+        let (textured, tex_env, tex0_source) = if unit0_active {
+            (true, env0, TexCoordSourceKey::Texcoord0)
+        } else if unit1_active {
+            (true, env1, TexCoordSourceKey::Texcoord1)
+        } else {
+            (false, TexEnvModeKey::Modulate, TexCoordSourceKey::default())
+        };
+        // The second stage only exists when both units are active at
+        // once -- unit 1 alone is the primary-stage case above, not this
+        // one.
+        let textured1 = unit0_active && unit1_active;
+        let tex_env1 = if textured1 {
+            env1
+        } else {
+            TexEnvModeKey::Modulate
+        };
         PipelineKey {
             textured,
             tex_env,
+            tex0_source,
             textured1,
             tex_env1,
             flat_shading: raster.shade_model == ShadeModel::Flat,
@@ -3226,14 +3288,28 @@ impl Renderer {
         vbuf: Vec<GpuVertex>,
     ) -> Result<(), RenderError> {
         let unit0 = state.texture_units.first();
-        let bound_tex = unit0.map(|u| u.bound_texture).unwrap_or(0);
-        let unit0_bound = bound_tex != 0 && self.textures.contains_key(&bound_tex);
+        let bound_tex0 = unit0.map(|u| u.bound_texture).unwrap_or(0);
+        let unit0_bound = bound_tex0 != 0 && self.textures.contains_key(&bound_tex0);
+        let unit0_active =
+            unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false);
         let unit1 = state.texture_units.get(1);
         let bound_tex1 = unit1.map(|u| u.bound_texture).unwrap_or(0);
         let unit1_bound = bound_tex1 != 0 && self.textures.contains_key(&bound_tex1);
+        let unit1_active = unit1_bound && state.enables.texture_2d.get(1).copied().unwrap_or(false);
+        // The primary texturing stage: unit 0 when active, else unit 1
+        // standing in alone -- see `pipeline_key_from_state`'s doc
+        // comment. Only meaningful when `key.textured` (computed from
+        // exactly this pair below), same as `bound_tex0`/`bound_tex1`
+        // were before multitexture existed.
+        let primary_bound_tex = if unit0_active { bound_tex0 } else { bound_tex1 };
         let surface_format = INTERNAL_COLOR_FORMAT;
-        let key =
-            self.pipeline_key_from_state(state, unit0_bound, unit1_bound, surface_format, topology);
+        let key = self.pipeline_key_from_state(
+            state,
+            unit0_active,
+            unit1_active,
+            surface_format,
+            topology,
+        );
 
         if topology == PrimTopologyKey::Triangles && key.cull == Some(FaceKey::FrontAndBack) {
             return Ok(()); // culls every triangle: nothing to draw
@@ -3261,7 +3337,7 @@ impl Renderer {
         // interleaving) keeps that split straightforward for the borrow
         // checker.
         let sampler_key = if key.textured {
-            let obj = state.texture(bound_tex);
+            let obj = state.texture(primary_bound_tex);
             let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
                 TexWrap::Repeat,
                 TexWrap::Repeat,
@@ -3277,10 +3353,10 @@ impl Renderer {
         } else {
             None
         };
-        // Unit 1 has its own texture object and therefore its own
-        // wrap/filter params -- `pipeline_key_from_state`'s doc comment on
-        // why `textured1` is only ever set alongside `textured` is why
-        // this is only computed in that combination.
+        // The second stage is always unit 1's own texture object (and
+        // therefore its own wrap/filter params) -- `textured1` is only
+        // ever set alongside both units active, with unit 0 as the
+        // primary stage (see `pipeline_key_from_state`'s doc comment).
         let sampler_key1 = if key.textured1 {
             let obj = state.texture(bound_tex1);
             let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
@@ -3302,7 +3378,11 @@ impl Renderer {
         let pipeline = self.pipelines.get(&key).expect("just ensured");
 
         let bind_group = if key.textured1 {
-            let tex = &self.textures[&bound_tex];
+            // `textured1` only ever holds when unit 0 is active (it's the
+            // primary stage in that combination -- see
+            // `pipeline_key_from_state`'s doc comment), so `bound_tex0` is
+            // exactly `primary_bound_tex` here.
+            let tex = &self.textures[&bound_tex0];
             let sampler = self
                 .sampler_cache
                 .get(&sampler_key.expect("textured implies a sampler key"))
@@ -3354,7 +3434,11 @@ impl Renderer {
                 entries: &entries,
             }))
         } else if key.textured {
-            let tex = &self.textures[&bound_tex];
+            // Single active stage -- unit 0 or unit 1 alone, whichever
+            // `primary_bound_tex` resolved to; the layout/shader shape
+            // (and this bind group) is identical either way, only
+            // `tex0_source` in the key differs.
+            let tex = &self.textures[&primary_bound_tex];
             let sampler = self
                 .sampler_cache
                 .get(&sampler_key.expect("textured implies a sampler key"))
@@ -7040,6 +7124,116 @@ mod tests {
             [0, 255, 0, 255],
             "unit 1 (blue) must not contribute while TEXTURE_2D is disabled for it -- \
              only unit 0's green REPLACE result should show: {px:?}"
+        );
+    }
+
+    /// A guest may legally enable `TEXTURE_2D` on unit 1 while leaving
+    /// unit 0 off entirely (`docs/internals/c3d.md`: `TEXTURE_2D` is a
+    /// per-unit toggle with no rule coupling the units, matching GL
+    /// 1.1/`ARB_multitexture`) -- this must still texture the draw, from
+    /// unit 1's *own* texture and its *own* `texcoord1`, not silently
+    /// render as plain vertex colour. Unit 0 is left entirely unbound
+    /// (the default null texture); unit 1 is a 2x1 `NEAREST`-sampled
+    /// `REPLACE` texture (red at `u<0.5`, green at `u>=0.5`).
+    /// `texcoord0` is fixed at the *green* half (`u=0.75`) and
+    /// `texcoord1` at the *red* half (`u=0.25`) -- a renderer that
+    /// (bug) sourced the single-active-stage sample from `texcoord0`
+    /// would read green, not red.
+    #[test]
+    fn two_unit_multitexture_unit1_only_samples_its_own_texture_and_texcoord() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 4,
+                height: 4,
+                stride_bytes: 16,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        // Unit 0 is left entirely alone: never created, never bound,
+        // never enabled. Unit 1 only.
+        state.tex_create(2);
+        state.tex_bind(1, 2);
+        state.set_tex_env(1, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        state.set_active_unit(1);
+        state.enable(state::Capability::Texture2D);
+
+        let mut mem = TestMemory::new(65536);
+        let tex1_addr = 0x2000u32;
+        // Red at texel 0 (u<0.5), green at texel 1 (u>=0.5).
+        mem.aperture[tex1_addr as usize..tex1_addr as usize + 4].copy_from_slice(&[255, 0, 0, 255]);
+        mem.aperture[tex1_addr as usize + 4..tex1_addr as usize + 8]
+            .copy_from_slice(&[0, 255, 0, 255]);
+
+        let tri = [(-4.0f32, -4.0f32), (-4.0, 12.0), (12.0, -4.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            // texcoord0 = green half, texcoord1 = red half.
+            for w in [0.75f32, 0.5, 0.25, 0.5] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat(
+            (1 << VertexFormat::POS_COUNT_SHIFT)
+                | VertexFormat::TEXCOORD0
+                | VertexFormat::TEXCOORD1,
+        );
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 2,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 1,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: tex1_addr,
+                        space: RefSpace::Aperture,
+                        length: 8,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = &pixels[(2 * 4 + 2) * 4..][..4];
+        assert_eq!(
+            px,
+            [255, 0, 0, 255],
+            "unit 1 alone must texture the draw from its own texture, sampled at its own \
+             texcoord1 (u=0.25, red) -- not unit 0's texcoord0 (u=0.75, green), and not \
+             plain untextured vertex colour: {px:?}"
         );
     }
 }

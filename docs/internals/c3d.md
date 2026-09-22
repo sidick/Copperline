@@ -121,6 +121,18 @@ project's spec-first loop exists to surface.
   (`guest/c3d/test/c3dtest.c`) and nothing more; M1's renderer already
   covers considerably more of the baseline tier (textures, blending,
   every primitive's triangulation) than M2's board exercises yet.
+- **Two-unit multitexture.** `src/c3d/render.rs` implements true
+  single-pass two-unit multitexture: unit 0 and unit 1 are each
+  independently enabled/bound/`TEX_ENV`'d (`TEXTURE_2D` and `TEX_ENV`
+  are per-unit with no rule coupling the units, matching GL 1.1's fixed-
+  function pipeline). When both units are active, unit 1's texel
+  cascades onto unit 0's result per unit 1's own `TEX_ENV` mode; when
+  only one unit is active (either one), that unit alone textures the
+  draw from its own texture and its own texcoord. `TEX_ENV_COLOR` is not
+  yet consulted by either unit's `BLEND` mode (an existing unit-0
+  approximation, carried through unchanged to unit 1). This is renderer-
+  side only -- `CAPS0` still does not advertise `CAP_MULTITEXTURE` (see
+  "Capability honesty" above), so no real guest can reach it yet.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
