@@ -423,6 +423,31 @@ fn apply_texgen(
     out
 }
 
+/// GL 1.1 texture-matrix application: `(s, t)` is extended to the full
+/// texture coordinate `(s, t, 0, 1)`, transformed by the unit's texture
+/// matrix (the top of its own stack -- see
+/// [`state::State::texture_matrix`]), and the transformed `q` divided
+/// back out per GL's fixed-function rule. Applied *after* texgen, per GL
+/// 1.1's pipeline order (generated coordinates are transformed like
+/// supplied ones). The `q` divide happens per **vertex** here, not per
+/// fragment -- the wire format has no per-texcoord projective `q` in
+/// version 1 (the spec's one-`rhw` rule), so a projective texture matrix
+/// gets the same per-vertex approximation period fixed-function hardware
+/// gave it; the common translate/scale/rotate texture matrices keep
+/// `q == 1` and are exact. A `q` of ~0 (degenerate projective matrix,
+/// legal wire input) falls back to the undivided values rather than
+/// dividing by zero -- same never-NaN discipline as `sphere_map_texgen`'s
+/// `m == 0` guard and the transform path's `safe_w`.
+fn apply_texture_matrix(m: &Mat4, tc: [f32; 2]) -> [f32; 2] {
+    let out = m.transform_point([tc[0], tc[1], 0.0, 1.0]);
+    let q = out[3];
+    if q.abs() < 1e-8 {
+        [out[0], out[1]]
+    } else {
+        [out[0] / q, out[1] / q]
+    }
+}
+
 /// `CLAMP`/`CLAMP_TO_EDGE` both map to wgpu's edge clamp; `CLAMP` never
 /// gets a border colour (the spec: "this is the behaviour period software
 /// expects and a device must not introduce a border").
@@ -3597,6 +3622,17 @@ impl Renderer {
         let (near, far) = state.raster.depth_range;
         let (w, h) = (def.width as f32, def.height as f32);
 
+        // Per-unit texture matrices, hoisted out of the per-vertex loop
+        // (per-draw constants). `None` doubles as "identity, skip the
+        // multiply entirely" so the overwhelmingly common untransformed
+        // case stays byte-identical to the pre-texture-matrix path.
+        let tex_matrix = |unit: usize| -> Option<Mat4> {
+            state
+                .texture_matrix(unit)
+                .filter(|m| m.0 != Mat4::identity().0)
+        };
+        let (tex_matrix0, tex_matrix1) = (tex_matrix(0), tex_matrix(1));
+
         // Fog distance: the spec's "`FOGCOORD` if present, else derived
         // from `rhw`" rule is stated only for the window-space vertex
         // format, which has no `w` in the GL-space sense at all. For a
@@ -3688,6 +3724,16 @@ impl Renderer {
             let texcoord1 = match state.texgen.get(1) {
                 Some(tg) => apply_texgen(v.texcoord1, gen_s1, gen_t1, tg, v.pos, eye, eye_normal),
                 None => v.texcoord1,
+            };
+            // The per-unit texture matrix applies AFTER texgen, per GL
+            // 1.1's pipeline order -- see `apply_texture_matrix`.
+            let texcoord0 = match &tex_matrix0 {
+                Some(m) => apply_texture_matrix(m, texcoord0),
+                None => texcoord0,
+            };
+            let texcoord1 = match &tex_matrix1 {
+                Some(m) => apply_texture_matrix(m, texcoord1),
+                None => texcoord1,
             };
 
             GpuVertex {
@@ -7060,6 +7106,90 @@ mod tests {
             px, blue,
             "S must be generated (overriding the 0.05 decoy) and T must stay the vertex's \
              own 0.75, landing on (s>=.5, t>=.5): {px:?}"
+        );
+    }
+
+    /// The unit-0 `GL_TEXTURE` matrix must actually transform the
+    /// texcoords a GL-space draw samples with -- not just sit decoded in
+    /// `state.rs`'s per-unit stacks (which it did, fully tracked but
+    /// never applied, until the first client's driver made
+    /// `glMatrixMode(GL_TEXTURE)` real in v27.2 and the gap became
+    /// load-bearing). A constant wire `TEXCOORD0` of `(0.05, 0.75)`
+    /// samples the `(s<.5, t>=.5)` texel untransformed; a texture-matrix
+    /// `TRANSLATE(0.5, 0, 0)` must carry `s` to `0.55`, landing on
+    /// `(s>=.5, t>=.5)` (blue) instead.
+    ///
+    /// Verified per this session's practice: temporarily reverting the
+    /// `apply_texture_matrix` wiring in `op_draw_gl` (passing the
+    /// texgen output straight through, the pre-fix behaviour) was
+    /// confirmed to sample yellow instead of blue before restoring.
+    #[test]
+    fn the_texture_matrix_transforms_sampled_texcoords() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |s| {
+                s.set_matrix_mode(MatrixMode::Texture);
+                s.translate(0.5, 0.0, 0.0);
+                s.set_matrix_mode(MatrixMode::Modelview);
+            },
+            [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
+            (0.05, 0.75),
+            [red, green, yellow, blue],
+            (13, 8),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "TRANSLATE(0.5) on the texture matrix should carry s = 0.05 to 0.55: {px:?}"
+        );
+    }
+
+    /// GL 1.1's pipeline order: the texture matrix applies to the
+    /// *texgen output*, not to the wire coordinate texgen then
+    /// overwrites. `OBJECT_LINEAR` with plane `(0, 0, 0, 0.125)`
+    /// generates a constant `s = 0.125` (position-independent: the plane
+    /// dots only against `w = 1`); a texture-matrix `TRANSLATE(0.5)`
+    /// applied AFTER texgen carries it to `0.625` (blue half). Applied
+    /// in the wrong order -- or not at all -- texgen's own `0.125`
+    /// (yellow half) is what samples; both failure modes land on the
+    /// same wrong texel, so one assertion discriminates the order and
+    /// the wiring at once.
+    #[test]
+    fn the_texture_matrix_applies_after_texgen_not_before() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |s| {
+                s.enable(state::Capability::TextureGenS);
+                s.set_texgen_mode(0, state::TexCoord::S, TexGenMode::ObjectLinear);
+                s.set_texgen_plane(
+                    0,
+                    state::TexCoord::S,
+                    state::TexGenPlaneKind::ObjectPlane,
+                    [0.0, 0.0, 0.0, 0.125],
+                );
+                s.set_matrix_mode(MatrixMode::Texture);
+                s.translate(0.5, 0.0, 0.0);
+                s.set_matrix_mode(MatrixMode::Modelview);
+            },
+            [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
+            (0.9, 0.75), // decoy s (texgen must override), pass-through t
+            [red, green, yellow, blue],
+            (13, 8),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "texgen's s = 0.125 then TRANSLATE(0.5) should sample at 0.625: {px:?}"
         );
     }
 

@@ -954,7 +954,11 @@ impl Default for Limits {
             texture_units: 2,
             modelview_depth: 32,
             projection_depth: 2,
-            texture_depth: 2,
+            // The spec's minimum is 2, but the first client's driver
+            // (v27.2) carries a real 10-deep GL_TEXTURE stack it may map
+            // 1:1 onto the board's -- 16 gives it headroom without the
+            // guest library having to flatten pushes client-side.
+            texture_depth: 16,
             max_lights: 8,
             max_clip_planes: 6,
         }
@@ -1722,6 +1726,16 @@ impl State {
             MatrixMode::Projection => Some(&self.projection),
             MatrixMode::Texture => self.texture.get(self.active_unit as usize),
         }
+    }
+
+    /// The top of `unit`'s texture matrix stack, regardless of which unit
+    /// `ACTIVE_UNIT` currently selects -- [`MatrixMode::Texture`] via
+    /// [`Self::top_matrix`] resolves through the *active* unit (the
+    /// command-stream view), but the renderer needs every unit's matrix
+    /// at draw time whatever unit happens to be active. `None` for a
+    /// unit past the configured limit.
+    pub fn texture_matrix(&self, unit: usize) -> Option<Mat4> {
+        self.texture.get(unit).map(|s| *s.top())
     }
 
     /// The top of the current-mode matrix stack, i.e. what `QUERY` would
@@ -2591,6 +2605,35 @@ mod tests {
         s.set_matrix_mode(MatrixMode::Projection);
         s.push_matrix().unwrap(); // depth 2, at the limit
         assert_eq!(s.push_matrix(), Err(GlError::StackOverflow));
+    }
+
+    #[test]
+    fn texture_stack_depth_covers_the_first_clients_ten_deep_stack() {
+        // The driver (v27.2) carries a real 10-deep GL_TEXTURE stack; the
+        // board's default must accept at least that many levels so a
+        // guest library can map its stack 1:1. Default is 16: 15 pushes
+        // (16 levels) succeed, the 16th push overflows.
+        let mut s = state();
+        s.set_matrix_mode(MatrixMode::Texture);
+        for _ in 0..15 {
+            s.push_matrix().unwrap();
+        }
+        assert_eq!(s.push_matrix(), Err(GlError::StackOverflow));
+    }
+
+    #[test]
+    fn texture_matrix_reads_any_units_stack_regardless_of_active_unit() {
+        let mut s = state();
+        s.set_matrix_mode(MatrixMode::Texture);
+        s.set_active_unit(0);
+        s.translate(1.0, 0.0, 0.0);
+        s.set_active_unit(1);
+        s.translate(2.0, 0.0, 0.0);
+        // Active unit is 1, but the renderer-facing accessor must still
+        // see unit 0's own matrix.
+        assert_eq!(s.texture_matrix(0).unwrap().0[12], 1.0);
+        assert_eq!(s.texture_matrix(1).unwrap().0[12], 2.0);
+        assert_eq!(s.texture_matrix(99), None);
     }
 
     #[test]

@@ -196,6 +196,19 @@ project's spec-first loop exists to surface.
   array-supplied per-vertex normal falls back to the current-state
   normal there; `SPHERE_MAP`/`EYE_LINEAR` with true per-vertex array
   normals is the documented follow-up alongside lighting.
+- **Texture matrix.** The per-unit `GL_TEXTURE` matrix (the third
+  matrix mode, its own stack per unit) is applied to each unit's
+  texture coordinates in GL-space draws, *after* texgen per GL 1.1's
+  pipeline order, CPU-side like the rest of the transform path. The
+  transformed `q` is divided out per vertex, not per fragment (the wire
+  format has no per-texcoord projective `q` in version 1 -- the spec's
+  one-`rhw` rule -- so a projective texture matrix gets the same
+  per-vertex approximation period fixed-function hardware gave it; the
+  common translate/scale/rotate matrices keep `q == 1` and are exact).
+  The default texture-stack depth is 16 (`MAX_MATRIX_DEPTH_TEX`), above
+  the spec's minimum of 2, so a guest library carrying the first
+  client's 10-deep `GL_TEXTURE` stack can map its pushes 1:1 instead of
+  flattening client-side.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
