@@ -6,21 +6,26 @@
 //! protocol specification (linked from `docs/internals/c3d.md`) is the
 //! contract; this module is Copperline's one implementation of it.
 //!
-//! ## Milestone scope (M2)
+//! ## Milestone scope
 //!
-//! This board fits the baseline rasteriser tier only: `CAPS0` reports
-//! [`CAP_IRQ`](super::proto::CAP_IRQ) and
-//! [`CAP_REF_SYNC`](super::proto::CAP_REF_SYNC) and nothing else, so
-//! `CAP_TRANSFORM`/`CAP_MULTITEXTURE`/`CAP_GUESTMEM`/
-//! `CAP_SURFACE_GUESTADDR` all read clear and the ring decoder rejects
-//! their opcodes as `E_BAD_OPCODE` before they ever reach the renderer --
-//! [`super::render`] does not yet implement the GL-space draw path those
-//! bits would admit, so the register truthfully says so rather than
-//! advertising a capability the board cannot deliver. Every surface is
-//! aperture-backed; a `CAP_SURFACE_GUESTADDR` surface reaching into
-//! another board's VRAM is scheduled for M3's `DeviceHost` hook (see
-//! `C3D-SURVEY.md`'s Q5 finding). `MAX_CONTEXTS` is fixed at
-//! [`CONTEXT_COUNT`] and never configurable from `[c3d]` yet.
+//! `CAPS0` reports [`CAP_IRQ`](super::proto::CAP_IRQ),
+//! [`CAP_REF_SYNC`](super::proto::CAP_REF_SYNC),
+//! [`CAP_SURFACE_GUESTADDR`](super::proto::CAP_SURFACE_GUESTADDR)
+//! (surfaces backed by another board's VRAM via the cross-board DMA
+//! hook), and -- since the transform-tier MVP landed in
+//! [`super::render`] -- [`CAP_TRANSFORM`](super::proto::CAP_TRANSFORM)
+//! and [`CAP_MULTITEXTURE`](super::proto::CAP_MULTITEXTURE): GL-space
+//! draws in all three shapes (`DRAW_INLINE`/`DRAW_ARRAYS`/
+//! `DRAW_ELEMENTS`), viewport/depth-range, two-unit multitexture and
+//! texgen are all real. The transform-tier *state* the renderer does
+//! not yet act on (lighting, `CLIP_PLANE` -- unused by the first
+//! client) is still decoded and tracked per the spec; see
+//! `docs/internals/c3d.md`'s implementation notes for the exact
+//! remainder. `CAP_GUESTMEM` stays clear: this board's `Memory` impl
+//! answers `None`/`false` for guest-space refs, so the register
+//! truthfully says so rather than advertising a capability the board
+//! cannot deliver. `MAX_CONTEXTS` is fixed at [`CONTEXT_COUNT`] and
+//! never configurable from `[c3d]` yet.
 //!
 //! ## Window layout and the aperture buffer
 //!
@@ -88,10 +93,18 @@ pub const CONTEXT_COUNT: usize = 4;
 /// offset) for the same reason as [`CONTEXT_COUNT`]/`greg::MAX_CONTEXTS`.
 pub const RING_SIZE_LIMIT: u32 = 0x0004_0000; // 256 KiB
 
-/// Copperline's fitted `CAPS0` for this milestone -- see the module doc
-/// comment's "Milestone scope" for why `CAP_TRANSFORM` and friends are
-/// not here yet.
-pub const CAPS0: u32 = proto::CAP_IRQ | proto::CAP_REF_SYNC | proto::CAP_SURFACE_GUESTADDR;
+/// Copperline's fitted `CAPS0` -- see the module doc comment's
+/// "Milestone scope". `CAP_TRANSFORM` and `CAP_MULTITEXTURE` are
+/// advertised now that the renderer implements the transform-tier MVP
+/// (GL-space draws in all three shapes, viewport/depth-range, two-unit
+/// multitexture, texgen); `CAP_GUESTMEM` stays clear -- this board's
+/// `Memory` impl still answers `None`/`false` for every guest-space ref,
+/// so the register truthfully says so.
+pub const CAPS0: u32 = proto::CAP_IRQ
+    | proto::CAP_REF_SYNC
+    | proto::CAP_SURFACE_GUESTADDR
+    | proto::CAP_TRANSFORM
+    | proto::CAP_MULTITEXTURE;
 
 // ---------------------------------------------------------------------
 // Global register offsets (`docs/internals/c3d.md`, "Global registers")
@@ -275,7 +288,6 @@ impl C3dBoard {
             multitexture: CAPS0 & proto::CAP_MULTITEXTURE != 0,
             surface_guestaddr: CAPS0 & proto::CAP_SURFACE_GUESTADDR != 0,
             aperture_size: self.aperture_size(),
-            max_texture_units: 1,
             ..DeviceConfig::default()
         }
     }
@@ -326,16 +338,18 @@ impl C3dBoard {
             MAX_CONTEXTS => CONTEXT_COUNT as u32,
             MAX_RING_SIZE => RING_SIZE_LIMIT,
             MAX_TEXTURE_SIZE => 1024,
-            MAX_TEXTURE_UNITS => 1,
+            MAX_TEXTURE_UNITS => self.device_config().max_texture_units,
             MAX_TEXTURES => 256,
             MAX_SURFACES => 16,
-            // Transform-tier limits read zero while CAP_TRANSFORM is
-            // clear, per the spec's own note on MAX_LIGHTS/MAX_CLIP_PLANES.
-            MAX_LIGHTS
-            | MAX_CLIP_PLANES
-            | MAX_MATRIX_DEPTH_MV
-            | MAX_MATRIX_DEPTH_PROJ
-            | MAX_MATRIX_DEPTH_TEX => 0,
+            // Transform-tier limits report the same values every
+            // per-context `state::Limits::default()` actually enforces
+            // (the spec's stated minimums) -- they read zero only while
+            // CAP_TRANSFORM is clear, which it no longer is.
+            MAX_LIGHTS => state::Limits::default().max_lights as u32,
+            MAX_CLIP_PLANES => state::Limits::default().max_clip_planes as u32,
+            MAX_MATRIX_DEPTH_MV => state::Limits::default().modelview_depth as u32,
+            MAX_MATRIX_DEPTH_PROJ => state::Limits::default().projection_depth as u32,
+            MAX_MATRIX_DEPTH_TEX => state::Limits::default().texture_depth as u32,
             TEXFMT_SUPPORTED => self.device_config().texfmt_supported,
             SURFFMT_SUPPORTED_LO => (self.device_config().surffmt_supported & 0xFFFF_FFFF) as u32,
             SURFFMT_SUPPORTED_HI => (self.device_config().surffmt_supported >> 32) as u32,
@@ -798,12 +812,42 @@ mod tests {
     }
 
     #[test]
-    fn transform_tier_limits_read_zero_while_the_capability_is_clear() {
+    fn transform_tier_limits_report_the_enforced_spec_minimums() {
+        // With CAP_TRANSFORM/CAP_MULTITEXTURE advertised, these registers
+        // must report exactly what each context's `state::Limits::default()`
+        // actually enforces -- the spec's stated minimums -- never zero
+        // (that was the pre-transform-tier behaviour) and never a value
+        // the state layer would then reject.
         let mut b = board();
         let mut mem = dummy_mem();
         let mut h = host(&mut mem);
-        assert_eq!(b.read(greg::MAX_LIGHTS, 4, &mut h), 0);
-        assert_eq!(b.read(greg::MAX_CLIP_PLANES, 4, &mut h), 0);
+        assert_ne!(CAPS0 & proto::CAP_TRANSFORM, 0);
+        assert_ne!(CAPS0 & proto::CAP_MULTITEXTURE, 0);
+        let limits = state::Limits::default();
+        assert_eq!(
+            b.read(greg::MAX_LIGHTS, 4, &mut h),
+            limits.max_lights as u32
+        );
+        assert_eq!(
+            b.read(greg::MAX_CLIP_PLANES, 4, &mut h),
+            limits.max_clip_planes as u32
+        );
+        assert_eq!(
+            b.read(greg::MAX_MATRIX_DEPTH_MV, 4, &mut h),
+            limits.modelview_depth as u32
+        );
+        assert_eq!(
+            b.read(greg::MAX_MATRIX_DEPTH_PROJ, 4, &mut h),
+            limits.projection_depth as u32
+        );
+        assert_eq!(
+            b.read(greg::MAX_MATRIX_DEPTH_TEX, 4, &mut h),
+            limits.texture_depth as u32
+        );
+        assert_eq!(
+            b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h),
+            limits.texture_units as u32
+        );
     }
 
     #[test]
@@ -843,6 +887,61 @@ mod tests {
         );
         b.write(ctl, 4, 0, &mut h);
         assert_eq!(b.read(ctl, 4, &mut h), 0);
+    }
+
+    /// The CAPS0 flip's own end-to-end guard: a transform-tier opcode
+    /// (`MATRIX_MODE`+`LOAD_IDENTITY`) and a multitexture opcode
+    /// (`ACTIVE_UNIT` with unit 1) submitted through the real register
+    /// path must decode cleanly -- before the flip, the very first of
+    /// them was `E_BAD_OPCODE` at the decoder and the stream would stop
+    /// there. Mirrors the full-command-stream test's harness.
+    #[test]
+    fn transform_and_multitexture_opcodes_pass_the_doorbell_with_caps0_advertised() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        let mut cmds = Vec::<u32>::new();
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        cmds.push(opcode_len(proto::OP_MATRIX_MODE, 2));
+        cmds.push(0x1700); // GL_MODELVIEW
+        cmds.push(opcode_len(proto::OP_LOAD_IDENTITY, 1));
+        cmds.push(opcode_len(proto::OP_ACTIVE_UNIT, 2));
+        cmds.push(1); // unit 1: E_BAD_OPCODE-adjacent E_LIMIT without CAP_MULTITEXTURE
+        cmds.push(opcode_len(proto::OP_ACTIVE_UNIT, 2));
+        cmds.push(0); // back to unit 0, leaving clean state
+
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_window_off = b.aperture_offset;
+        for (i, b_) in bytes.iter().enumerate() {
+            b.write(ring_window_off + i as u32, 1, *b_ as u32, &mut h);
+        }
+
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "transform/multitexture opcodes must decode cleanly with CAPS0 advertising them"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
+            bytes.len() as u32,
+            "every command consumed, none rejected as E_BAD_OPCODE"
+        );
     }
 
     #[test]

@@ -97,12 +97,22 @@ project's spec-first loop exists to surface.
   doorbell returns, which is also "by the fence" and "on first read",
   so the distinction is dormant until an asynchronous render path gives
   it something to do.
-- **Capability honesty.** `CAPS0` reports only `CAP_IRQ` and
-  `CAP_REF_SYNC` -- `CAP_TRANSFORM`, `CAP_MULTITEXTURE`,
-  `CAP_GUESTMEM` and `CAP_SURFACE_GUESTADDR` are all clear, and the ring
-  decoder is configured to match: a transform-tier opcode is `E_BAD_OPCODE`
-  before it would ever reach a renderer that cannot execute it, rather
-  than the register advertising a capability M2 does not deliver.
+- **Capability honesty.** `CAPS0` reports `CAP_IRQ`, `CAP_REF_SYNC`,
+  `CAP_SURFACE_GUESTADDR` (since the cross-board DMA hook), and --
+  since the transform-tier MVP landed in the renderer --
+  `CAP_TRANSFORM` and `CAP_MULTITEXTURE`; the ring decoder is derived
+  from the same constant (`board.rs`'s `device_config`), so the register
+  and the decoder's idea of what is legal can never drift apart. The
+  transform-tier limit registers (`MAX_LIGHTS`, `MAX_CLIP_PLANES`, the
+  three matrix depths, `MAX_TEXTURE_UNITS`) report exactly the values
+  each context's `state::Limits::default()` enforces. `CAP_GUESTMEM`
+  alone stays clear: the board's guest-space memory access is not
+  implemented, and the register truthfully says so rather than
+  advertising a capability the board cannot deliver. Lighting and
+  `CLIP_PLANE` state is decoded and tracked per the spec but not yet
+  applied by the renderer (both are unused by the first client -- see
+  "Implementation order" below); a guest that enables them gets unlit,
+  unclipped rendering, not an error.
 - **Implementation order.** The first intended client is an OpenGL 1.x
   subset of the Quake-engine shape: immediate mode, matrices, textures
   with texenv, blend/alpha/depth/fog/scissor, vertex arrays with
@@ -130,9 +140,9 @@ project's spec-first loop exists to surface.
   only one unit is active (either one), that unit alone textures the
   draw from its own texture and its own texcoord. `TEX_ENV_COLOR` is not
   yet consulted by either unit's `BLEND` mode (an existing unit-0
-  approximation, carried through unchanged to unit 1). This is renderer-
-  side only -- `CAPS0` still does not advertise `CAP_MULTITEXTURE` (see
-  "Capability honesty" above), so no real guest can reach it yet.
+  approximation, carried through unchanged to unit 1). `CAPS0`
+  advertises `CAP_MULTITEXTURE` (see "Capability honesty" above), so
+  this is guest-reachable.
 - **GL-space `DRAW_ARRAYS`/`DRAW_ELEMENTS`.** `src/c3d/render.rs`
   combines the window-space array/indexed-array vertex-fetch machinery
   with the GL-space (`CAP_TRANSFORM`) position-transform path: array and
@@ -157,8 +167,8 @@ project's spec-first loop exists to surface.
   `MAX_ARRAY_DRAW_VERTICES` allocation-size cap are shared with the
   window-space array fetch, unchanged: the DoS/allocation-abort reasoning
   and the position-component-count rule are both space-independent.
-  `CAPS0` still does not advertise `CAP_TRANSFORM` (see "Capability
-  honesty" above), so no real guest can reach any GL-space draw path yet.
+  `CAPS0` advertises `CAP_TRANSFORM` (see "Capability honesty" above),
+  so every GL-space draw path is guest-reachable.
 - **Texgen.** `TEXGEN`/`TEXGEN_PLANE` are implemented per unit, per
   coordinate (`S`/`T` independently enabled, matching the first client's
   own usage -- see "Implementation order" above), for `OBJECT_LINEAR`,
@@ -185,8 +195,7 @@ project's spec-first loop exists to surface.
   descriptor without reading its data yet (see the bullet above), so an
   array-supplied per-vertex normal falls back to the current-state
   normal there; `SPHERE_MAP`/`EYE_LINEAR` with true per-vertex array
-  normals is the documented follow-up alongside lighting. `CAPS0` still
-  does not advertise `CAP_TRANSFORM` (see "Capability honesty" above).
+  normals is the documented follow-up alongside lighting.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
