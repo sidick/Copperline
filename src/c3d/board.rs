@@ -53,10 +53,19 @@
 //! destinations correctly -- decides where the bytes actually land, and
 //! a `QUERY` result written to ordinary guest RAM gets the exact same
 //! one-tick deferral its own fence-completion accounting already
-//! expects for a guest-address readback. A guest program simply cannot
-//! observe an incomplete write anyway: it learns a write landed only via
-//! `FENCE_COMPLETED` (or `RING_HEAD`), and both are deferred right along
-//! with it (see `ContextSlot::deferred_fence`).
+//! expects for a guest-address readback. **`RING_HEAD`/`CTX_STATUS.
+//! IDLE_RING` are not part of that deferral and must not be read as if
+//! they were**: `Context::submit` advances `RING_HEAD` synchronously,
+//! every doorbell, regardless of whether anything it decoded is still
+//! pending a deferred write -- and the spec says exactly that:
+//! `RING_HEAD` is "commands before it have been *consumed* (decoded
+//! and, if by-reference and `CAP_REF_SYNC`, captured), not necessarily
+//! executed". A guest that infers "the write has landed" from
+//! `RING_HEAD`/`IDLE_RING` rather than `FENCE_COMPLETED` is reading a
+//! signal the spec never promised that meaning for; `FENCE_COMPLETED`
+//! is the only architected completion signal, and it is the one this
+//! board actually defers alongside the write (see
+//! `ContextSlot::deferred_fence`).
 //!
 //! **Ring in guest memory.** The spec's `RING_BASE` register: "an
 //! aperture offset, or a guest address if bit 31 of `RING_SIZE` is set
@@ -67,12 +76,18 @@
 //! exactly the same `Vec<u8>` shape `Context::submit` already expects --
 //! nothing downstream of the fetch needs to know which space the bytes
 //! came from. A guest that sets the bit while `CAP_GUESTMEM` is masked
-//! off gets an empty command stream (nothing decoded) rather than a
-//! register-level protocol error: `RING_BASE`/`RING_SIZE` are ordinary
-//! registers with no error-latch mechanism of their own (only ring
-//! *commands* raise `ERROR_CODE`), and a conformant guest never sets the
-//! bit when `CAPS0` does not advertise the capability in the first
-//! place.
+//! off gets nothing decoded (`doorbell` returns before ever building a
+//! ring slice) rather than a register-level protocol error:
+//! `RING_BASE`/`RING_SIZE` are ordinary registers with no error-latch
+//! mechanism of their own (only ring *commands* raise `ERROR_CODE`, and
+//! this case never reaches a command decoder), and a conformant guest
+//! never sets the bit when `CAPS0` does not advertise the capability in
+//! the first place. This is a dedicated early return, not a third arm
+//! folded into the aperture-vs-guest `if` below: `ring_base` is a guest
+//! address here, and letting it fall through to
+//! `read_aperture_range(ring_base, ...)` would decode whatever
+//! unrelated aperture bytes happen to sit at that offset as commands --
+//! wrong, not merely a missed capability.
 //!
 //! ## Window layout and the aperture buffer
 //!
@@ -568,8 +583,31 @@ impl C3dBoard {
         // module doc comment's "Ring in guest memory"). Gated on the
         // *effective* CAPS0, not the constant, so a masked-off
         // CAP_GUESTMEM behaves as if the ring can only ever be
-        // aperture-backed.
-        let ring_bytes = if ring_size_reg & 0x8000_0000 != 0 && self.device_config().guestmem {
+        // aperture-backed -- and, critically, the aperture-read branch
+        // below must never run for a bit-31 ring: `ring_base` is a guest
+        // address, not an aperture offset, and reading the aperture at
+        // that number would decode whatever unrelated bytes happen to
+        // live there as commands, not "nothing". A guest-address ring
+        // with `CAP_GUESTMEM` masked off is therefore handled by its own
+        // early return below, before this two-way `if` can be reached at
+        // all, rather than folded into it as a third arm of the same
+        // condition.
+        let ring_is_guest = ring_size_reg & 0x8000_0000 != 0;
+        if ring_is_guest && !self.device_config().guestmem {
+            // No register-level error exists for this: RING_BASE/
+            // RING_SIZE are ordinary registers with no error latch of
+            // their own (only ring *commands*, decoded from ring bytes
+            // this device never reaches here, raise ERROR_CODE -- see
+            // the spec's error table), and a guest-address ring is not a
+            // ref either, so E_BAD_REF does not apply. RING_TAIL still
+            // echoes the write, matching every other RW register's
+            // ordinary behaviour, but nothing is decoded: RING_HEAD does
+            // not advance, no fence completes, no error latches.
+            self.contexts[n].ctx.ring_tail = new_tail;
+            self.update_irq_status(n);
+            return;
+        }
+        let ring_bytes = if ring_is_guest {
             let mut buf = vec![0u8; ring_len as usize];
             host.dma_read(ring_base, &mut buf);
             buf
@@ -1616,6 +1654,18 @@ mod tests {
     /// `RING_SIZE` (only ring *commands* raise `ERROR_CODE`), so "ignore
     /// the whole ring" is this board's answer, documented in the module
     /// doc comment's "Ring in guest memory".
+    ///
+    /// Deliberately prefills the *aperture* at the numeric offset
+    /// `RING_BASE` names (a real command, not zero bytes) before the
+    /// doorbell: an implementation that mishandles this case by falling
+    /// through to `read_aperture_range(ring_base, ...)` -- treating the
+    /// guest address as an aperture offset -- would decode that command
+    /// instead of doing nothing, which a check against an untouched
+    /// (all-zero) aperture cannot distinguish from correctly-ignored
+    /// (zero bytes decode as `BadLength` and halt at offset zero too,
+    /// landing on the same `RING_HEAD == 0`). Asserting `ERROR_CODE == 0`
+    /// as well as `RING_HEAD == 0` is what actually tells "genuinely
+    /// ignored" apart from "halted after misreading the aperture".
     #[test]
     fn a_masked_cap_guestmem_ignores_a_guest_memory_ring_entirely() {
         let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_GUESTMEM);
@@ -1629,6 +1679,21 @@ mod tests {
             .copy_from_slice(&bytes);
 
         let mut h = host(&mut mem);
+
+        // Garbage (a real, well-formed FENCE id=99) at the aperture
+        // offset numerically equal to GUEST_RING_ADDR -- the offset the
+        // old buggy fallback would have misread `RING_BASE` as.
+        let garbage = [opcode_len(proto::OP_FENCE, 2), 99u32];
+        let garbage_bytes: Vec<u8> = garbage.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in garbage_bytes.iter().enumerate() {
+            b.write(
+                b.aperture_offset + GUEST_RING_ADDR + i as u32,
+                1,
+                *byte as u32,
+                &mut h,
+            );
+        }
+
         b.write(
             CONTEXT_PAGE_BASE + creg::RING_BASE,
             4,
@@ -1655,13 +1720,19 @@ mod tests {
         );
 
         assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "genuinely ignored, not halted on a misread of the aperture's garbage bytes"
+        );
+        assert_eq!(
             b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
             0,
             "nothing was decoded from a guest-memory ring CAP_GUESTMEM cannot reach"
         );
         assert_eq!(
             b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
-            0
+            0,
+            "the aperture's garbage FENCE id=99 must not have been decoded and completed"
         );
     }
 }
