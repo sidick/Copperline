@@ -2598,6 +2598,7 @@ for the register model.
 ```toml
 [c3d]
 enabled = true
+# mask_caps = ["transform", "multitexture"]   # conformance testing only
 ```
 
 Fits a virtual fixed-function 3D accelerator board on the Zorro chain,
@@ -2608,9 +2609,19 @@ of its own, so a build that does not want 3D pays nothing for it). It
 prefers a hardware adapter and falls back to a software one; if neither is
 available the board still autoconfigs and answers registers, but every
 doorbell's rendering work is silently dropped (a warning is logged once).
-Board size, context count, capability mask, timing preset and trace
-capture are not yet configuration knobs -- Copperline fits one fixed
-32 MiB Zorro III window with 4 contexts. The device specification is
+
+`mask_caps` is the specification's conformance switch: it forces the
+named `CAPS0` capability bits clear (`"guestmem"`, `"irq"`,
+`"transform"`, `"multitexture"`, `"surface-guestaddr"`, `"ref-sync"`),
+so a guest library can be exercised against the baseline (every bit
+masked), each bit cleared singly, and the full set (no mask) on the same
+build. A masked bit behaves exactly like a device built without it: it
+reads clear, its opcodes are rejected, and dependent limit registers
+(`MAX_LIGHTS` and friends under `"transform"`, `MAX_TEXTURE_UNITS` under
+`"multitexture"`) report accordingly. Leave it unset for normal use.
+Board size, context count, timing preset and trace capture are not yet
+configuration knobs -- Copperline fits one fixed 32 MiB Zorro III window
+with 4 contexts. The device specification is
 published separately from Copperline's own docs; see [](../internals/c3d)
 for Copperline's implementation notes and where to find it, and
 [](../zorro) for the autoconfig identity.

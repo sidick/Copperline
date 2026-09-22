@@ -1054,6 +1054,15 @@ pub(crate) struct RawC3d {
     /// `docs/internals/c3d.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) enabled: Option<bool>,
+    /// `CAPS0` capability bits to mask OFF, by name: `"guestmem"`,
+    /// `"irq"`, `"transform"`, `"multitexture"`, `"surface-guestaddr"`,
+    /// `"ref-sync"`. The spec's conformance matrix drives this switch
+    /// (baseline = all of them, each bit cleared singly, and the full
+    /// set = an empty list); a masked bit reads clear in `CAPS0`, its
+    /// opcodes are rejected exactly as on a device without it, and the
+    /// dependent limit registers report accordingly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mask_caps: Option<Vec<String>>,
 }
 
 /// `[hostsocket]` bundled bsdsocket.library board: a host-side TCP/IP stack

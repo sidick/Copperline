@@ -427,6 +427,9 @@ slow = "512K"
 # other options exist yet; see docs/internals/c3d.md.
 # [c3d]
 # enabled = true
+# mask_caps = ["transform"]  # conformance testing: force CAPS0 bits clear
+#                            # (guestmem, irq, transform, multitexture,
+#                            #  surface-guestaddr, ref-sync)
 
 
 # zz9k: a ZZ9000 SDK v2 crypto accelerator (the MNT ZZ9000's CORE + MEMORY

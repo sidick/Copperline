@@ -218,6 +218,15 @@ impl Default for ContextSlot {
 pub struct C3dBoard {
     window_bytes: u32,
     aperture_offset: u32,
+    /// The effective `CAPS0` this board instance reports: the full fitted
+    /// set ([`CAPS0`]) minus any bits masked off by `[c3d] mask_caps` --
+    /// the spec's conformance switch ("a configuration switch that masks
+    /// any subset off"). Config-derived like `window_bytes`, so save
+    /// states never carry it. Everything capability-dependent
+    /// (`device_config`, the limit registers) derives from this field,
+    /// never from the constant, so a masked bit behaves exactly like a
+    /// device built without it.
+    caps0: u32,
     aperture: Vec<u8>,
     control: u32,
     irq_status: u32,
@@ -255,6 +264,12 @@ impl C3dBoard {
     /// aperture is everything from `APERTURE_OFFSET_DEFAULT` to the end
     /// of it.
     pub fn new(window_bytes: u32) -> Self {
+        Self::with_masked_caps(window_bytes, 0)
+    }
+
+    /// [`Self::new`] with `mask_caps` bits (`[c3d] mask_caps`, resolved
+    /// to a `CAPS0` bitmask by config validation) forced clear.
+    pub fn with_masked_caps(window_bytes: u32, mask_caps: u32) -> Self {
         let aperture_offset = proto::APERTURE_OFFSET_DEFAULT;
         let aperture_len = window_bytes.saturating_sub(aperture_offset) as usize;
         let mut contexts = Vec::with_capacity(CONTEXT_COUNT);
@@ -262,6 +277,7 @@ impl C3dBoard {
         C3dBoard {
             window_bytes,
             aperture_offset,
+            caps0: CAPS0 & !mask_caps,
             aperture: vec![0u8; aperture_len],
             control: CONTROL_ENABLE,
             irq_status: 0,
@@ -283,10 +299,10 @@ impl C3dBoard {
     /// idea of what is legal can never drift apart.
     fn device_config(&self) -> DeviceConfig {
         DeviceConfig {
-            guestmem: CAPS0 & proto::CAP_GUESTMEM != 0,
-            transform: CAPS0 & proto::CAP_TRANSFORM != 0,
-            multitexture: CAPS0 & proto::CAP_MULTITEXTURE != 0,
-            surface_guestaddr: CAPS0 & proto::CAP_SURFACE_GUESTADDR != 0,
+            guestmem: self.caps0 & proto::CAP_GUESTMEM != 0,
+            transform: self.caps0 & proto::CAP_TRANSFORM != 0,
+            multitexture: self.caps0 & proto::CAP_MULTITEXTURE != 0,
+            surface_guestaddr: self.caps0 & proto::CAP_SURFACE_GUESTADDR != 0,
             aperture_size: self.aperture_size(),
             ..DeviceConfig::default()
         }
@@ -327,7 +343,7 @@ impl C3dBoard {
         match off {
             ID => proto::ID_MAGIC,
             VERSION => proto::PROTOCOL_VERSION,
-            CAPS0 => self::CAPS0,
+            CAPS0 => self.caps0,
             CAPS1 => 0,
             STATUS => self.status(),
             CONTROL => self.control,
@@ -338,13 +354,31 @@ impl C3dBoard {
             MAX_CONTEXTS => CONTEXT_COUNT as u32,
             MAX_RING_SIZE => RING_SIZE_LIMIT,
             MAX_TEXTURE_SIZE => 1024,
-            MAX_TEXTURE_UNITS => self.device_config().max_texture_units,
+            // `MAX_TEXTURE_UNITS > 1` is documented to imply
+            // `CAP_MULTITEXTURE`, so a masked bit caps the report at 1.
+            MAX_TEXTURE_UNITS => {
+                if self.caps0 & proto::CAP_MULTITEXTURE != 0 {
+                    self.device_config().max_texture_units
+                } else {
+                    1
+                }
+            }
             MAX_TEXTURES => 256,
             MAX_SURFACES => 16,
             // Transform-tier limits report the same values every
             // per-context `state::Limits::default()` actually enforces
-            // (the spec's stated minimums) -- they read zero only while
-            // CAP_TRANSFORM is clear, which it no longer is.
+            // (the spec's stated minimums) -- and read zero while
+            // `CAP_TRANSFORM` is clear (whether never fitted or masked
+            // off by `[c3d] mask_caps`), per the spec's own note.
+            MAX_LIGHTS
+            | MAX_CLIP_PLANES
+            | MAX_MATRIX_DEPTH_MV
+            | MAX_MATRIX_DEPTH_PROJ
+            | MAX_MATRIX_DEPTH_TEX
+                if self.caps0 & proto::CAP_TRANSFORM == 0 =>
+            {
+                0
+            }
             MAX_LIGHTS => state::Limits::default().max_lights as u32,
             MAX_CLIP_PLANES => state::Limits::default().max_clip_planes as u32,
             MAX_MATRIX_DEPTH_MV => state::Limits::default().modelview_depth as u32,
@@ -887,6 +921,56 @@ mod tests {
         );
         b.write(ctl, 4, 0, &mut h);
         assert_eq!(b.read(ctl, 4, &mut h), 0);
+    }
+
+    /// `[c3d] mask_caps`'s contract: a masked bit reads clear in `CAPS0`,
+    /// its dependent limit registers report as on a device without it,
+    /// and its opcodes are rejected -- the spec's conformance switch
+    /// ("baseline, each bit cleared singly, and the full set"). This is
+    /// the each-bit-cleared-singly case for `CAP_TRANSFORM`, plus the
+    /// `CAP_MULTITEXTURE`-caps-`MAX_TEXTURE_UNITS` rule.
+    #[test]
+    fn mask_caps_clears_the_bit_its_limits_and_its_opcodes() {
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_TRANSFORM);
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        assert_eq!(
+            b.read(greg::CAPS0, 4, &mut h),
+            CAPS0 & !proto::CAP_TRANSFORM
+        );
+        assert_eq!(b.read(greg::MAX_LIGHTS, 4, &mut h), 0);
+        assert_eq!(b.read(greg::MAX_MATRIX_DEPTH_TEX, 4, &mut h), 0);
+
+        // A transform-tier opcode through the real doorbell must be
+        // E_BAD_OPCODE again, exactly as before the CAPS0 flip.
+        let words = [((proto::OP_LOAD_IDENTITY as u32) << 16) | 1];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(b.aperture_offset + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+        assert_ne!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "a masked-off CAP_TRANSFORM must reject its opcodes"
+        );
+
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_MULTITEXTURE);
+        let mut h = host(&mut mem);
+        assert_eq!(b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h), 1);
     }
 
     /// The CAPS0 flip's own end-to-end guard: a transform-tier opcode

@@ -321,6 +321,10 @@ pub struct Config {
     /// build with the `c3d` feature (off by default; see
     /// `docs/internals/c3d.md`).
     pub c3d: bool,
+    /// `[c3d] mask_caps`: `CAPS0` bits to force clear, resolved from the
+    /// raw config's capability names (see `RawC3d::mask_caps`). `0` when
+    /// unset -- the full fitted capability set.
+    pub c3d_mask_caps: u32,
     /// HostSocket board backend (`[hostsocket] net`): when set, the bundled
     /// bsdsocket.library plugin board is fitted with this backend. The board
     /// itself travels in [`Config::wasm_boards`]; this field records the
@@ -2692,6 +2696,7 @@ impl Default for Config {
             recording: RecordingConfig::default(),
             mhi: false,
             c3d: false,
+            c3d_mask_caps: 0,
             hostsocket_net: None,
             hostsocket_transport: None,
             rtg: RtgCard::None,

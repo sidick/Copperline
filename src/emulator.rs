@@ -4089,7 +4089,7 @@ fn build_machine_inner(
         zorro.add_board(crate::zorro::BoardSpec::c3d(slot, WINDOW_BYTES as usize))?;
         info!("c3d: 3D accelerator board on the Zorro chain (slot {slot})");
         devices.push(crate::zorro_device::BoardDevice::C3d(Box::new(
-            crate::c3d::board::C3dBoard::new(WINDOW_BYTES),
+            crate::c3d::board::C3dBoard::with_masked_caps(WINDOW_BYTES, cfg.c3d_mask_caps),
         )));
     }
     #[cfg(not(feature = "c3d"))]

@@ -924,6 +924,30 @@ impl TryFrom<RawConfig> for Config {
         };
         let mhi = raw.mhi.enabled.unwrap_or(defaults.mhi);
         let c3d = raw.c3d.enabled.unwrap_or(defaults.c3d);
+        // `[c3d] mask_caps`: names -> CAPS0 bits to clear. Validated even
+        // when the board is disabled, so a typo never hides until a
+        // conformance run flips `enabled` on.
+        let c3d_mask_caps = {
+            let mut mask = 0u32;
+            for name in raw.c3d.mask_caps.as_deref().unwrap_or(&[]) {
+                mask |= match name.as_str() {
+                    "guestmem" => 1 << 0,
+                    "irq" => 1 << 1,
+                    "transform" => 1 << 2,
+                    "multitexture" => 1 << 3,
+                    "surface-guestaddr" => 1 << 4,
+                    "ref-sync" => 1 << 6,
+                    other => {
+                        return Err(anyhow!(
+                            "[c3d] mask_caps: unknown capability \"{other}\" (expected \
+                             guestmem, irq, transform, multitexture, surface-guestaddr \
+                             or ref-sync)"
+                        ))
+                    }
+                };
+            }
+            mask
+        };
 
         // `[recording]`: the clip ring is bounded in time (and by a byte
         // budget in gifclip.rs); the rate caps at the field rate.
@@ -1437,6 +1461,7 @@ impl TryFrom<RawConfig> for Config {
             recording,
             mhi,
             c3d,
+            c3d_mask_caps,
             hostsocket_net,
             hostsocket_transport,
             rtg,
