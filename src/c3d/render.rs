@@ -34,11 +34,10 @@
 //!   transform only**: object-space `(x, y, z, w)` transformed by
 //!   `modelview` then `projection` ([`Renderer::op_draw_inline_gl`]), then
 //!   `VIEWPORT` and `DEPTH_RANGE`, per GL 1.1's fixed-function pipeline
-//!   exactly as the spec requires. Colour and `TEXCOORD0` pass through
-//!   unlit and untexgen'd, same as the window-space path; `NORMAL` is
-//!   parsed (legal here, unlike window-space) but not yet used.
-//!   `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space), lighting, texgen and
-//!   `CLIP_PLANE` remain deferred -- see the updated list below.
+//!   exactly as the spec requires. Colour passes through unlit, same as
+//!   the window-space path. `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space),
+//!   lighting and `CLIP_PLANE` remain deferred -- see the updated list
+//!   below.
 //! - [`RenderOp::TexImage`]/[`RenderOp::TexSubImage`] for the conforming
 //!   minimum texture formats, `TEXTURE_2D` sampling with the filter and
 //!   wrap modes (`CLAMP` behaving as `CLAMP_TO_EDGE`, never a border
@@ -72,12 +71,26 @@
 //!   own texcoord (see [`Renderer::pipeline_key_from_state`]'s doc
 //!   comment). Units 2 and 3 (`TEXCOORD2`/`3`) remain out of scope:
 //!   `MAX_TEXTURE_UNITS` is 2.
+//! - `TEXGEN`/`TEXGEN_PLANE` (`CAP_TRANSFORM`), per unit and per
+//!   coordinate (`S`/`T` independently enabled -- the first client's own
+//!   usage pattern): `OBJECT_LINEAR`, `EYE_LINEAR` and `SPHERE_MAP`,
+//!   computed CPU-side in [`Renderer::op_draw_inline_gl`] and folded
+//!   straight into the existing `texcoord0`/`texcoord1` fields (no new
+//!   WGSL). `NORMAL` -- needed for `EYE_LINEAR`/`SPHERE_MAP`'s eye-space
+//!   normal -- is now extracted by [`parse_gl_vertices`] rather than
+//!   merely walked-and-discarded, transformed by the modelview's
+//!   inverse-transpose ([`state::Mat4::transform_normal3`]), GL 1.1's
+//!   correct rule (not the modelview itself, which only agrees under
+//!   pure rotation). `DRAW_INLINE` (GL-space) only; the still-deferred
+//!   `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space) don't yet extract `NORMAL`
+//!   in their own vertex-fetch path either, so texgen there is a
+//!   follow-up once that draw shape lands.
 //!
 //! Deferred to M3: `DRAW_ARRAYS`/`DRAW_ELEMENTS` (GL-space only -- their
 //! `_WIN` window-space counterparts are implemented), lighting
-//! (`LIGHT`/`LIGHT_MODEL`/`MATERIAL`/`COLOR_MATERIAL`), texgen
-//! (`TEXGEN`/`TEXGEN_PLANE`), `CLIP_PLANE` user clipping, texture units
-//! beyond 1, texel-space texture coordinates. Every one of these returns
+//! (`LIGHT`/`LIGHT_MODEL`/`MATERIAL`/`COLOR_MATERIAL`), `CLIP_PLANE` user
+//! clipping, texture units beyond 1, texel-space texture coordinates.
+//! Every one of these returns
 //! [`RenderError::Unimplemented`] rather than panicking.
 //! (`TEX_PALETTE` is not in this list: it's spec-optional and Copperline
 //! correctly never advertises it, so `ring.rs` rejects it as
@@ -120,7 +133,7 @@ use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
     self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
     PrimitiveType, ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode,
-    TexFilter, TexFormat, TexWrap,
+    TexFilter, TexFormat, TexGenMode, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -284,6 +297,130 @@ pub fn unpack_color(word: u32) -> [f32; 4] {
 /// GL-space vertex path M3 adds does not have to rediscover it.
 pub fn gl_clip_z_to_wgpu(clip_z_gl: f32, clip_w: f32) -> f32 {
     (clip_z_gl + clip_w) * 0.5
+}
+
+/// A 3-vector normalised to unit length, or `(0, 0, 1)` for a
+/// (degenerate) zero-length input -- an arbitrary but total fallback, the
+/// same shape as [`state::Mat4::inverse`]'s singular-matrix substitution:
+/// keeps every caller a pure total function instead of propagating `NaN`
+/// from a `0/0` division.
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len < 1e-12 {
+        return [0.0, 0.0, 1.0];
+    }
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/// `OBJECT_LINEAR`/`EYE_LINEAR` texgen (GL 1.1 section 2.10.4): the
+/// generated coordinate is `dot(pos, plane)`, a plain 4-component dot
+/// product of the vertex position and the plane equation. The only
+/// difference between the two modes is *which* position/plane pair the
+/// caller passes in -- object-space vertex with the object plane, or
+/// eye-space vertex with the eye plane (already transformed by the
+/// inverse modelview at `TEXGEN_PLANE` command time, per
+/// `state::State::set_texgen_plane` -- this function does no further
+/// transform, it only takes the dot product). `pos`'s `w` is the vertex's
+/// own `w` (usually `1.0`), included in the dot product exactly as GL's
+/// `p1*x + p2*y + p3*z + p4*w` formula requires.
+fn linear_texgen(pos: [f32; 4], plane: [f32; 4]) -> f32 {
+    pos[0] * plane[0] + pos[1] * plane[1] + pos[2] * plane[2] + pos[3] * plane[3]
+}
+
+/// `SPHERE_MAP` texgen (GL 1.1 section 2.10.4's normative formula): given
+/// the eye-space vertex position and the eye-space normal (both
+/// normalised internally by this function, regardless of the `NORMALIZE`
+/// capability -- the reflection formula below needs unit vectors, and GL
+/// specifies the sphere-map derivation independently of that cap), returns
+/// `(s, t)`.
+///
+/// ```text
+/// u = normalize(eye_pos)            // vector from the eye (origin in eye
+///                                    // space) to the vertex
+/// n = normalize(eye_normal)
+/// r = u - 2 * n * dot(n, u)         // reflection of u about n
+/// m = 2 * sqrt(rx^2 + ry^2 + (rz + 1)^2)
+/// s = rx / m + 0.5
+/// t = ry / m + 0.5
+/// ```
+///
+/// `m == 0` only when `r == (0, 0, -1)` exactly (the reflection points
+/// straight back at the viewer) -- GL leaves this undefined; this
+/// function substitutes the map's own centre `(0.5, 0.5)` rather than
+/// dividing by zero.
+fn sphere_map_texgen(eye_pos: [f32; 3], eye_normal: [f32; 3]) -> (f32, f32) {
+    let u = normalize3(eye_pos);
+    let n = normalize3(eye_normal);
+    let dot_nu = n[0] * u[0] + n[1] * u[1] + n[2] * u[2];
+    let r = [
+        u[0] - 2.0 * n[0] * dot_nu,
+        u[1] - 2.0 * n[1] * dot_nu,
+        u[2] - 2.0 * n[2] * dot_nu,
+    ];
+    let m = 2.0 * (r[0] * r[0] + r[1] * r[1] + (r[2] + 1.0) * (r[2] + 1.0)).sqrt();
+    if m < 1e-8 {
+        return (0.5, 0.5);
+    }
+    (r[0] / m + 0.5, r[1] / m + 0.5)
+}
+
+/// Applies `unit`'s `TEXGEN`/`TEXGEN_PLANE` state to one texture
+/// coordinate pair, overriding whichever of `s`/`t` has `TEXTURE_GEN_S`/
+/// `TEXTURE_GEN_T` enabled (the two are independently enabled per the
+/// spec -- a vertex can have `S` generated and `T` taken from the vertex
+/// data in the same draw). `obj_pos` is the vertex's object-space
+/// position (for `OBJECT_LINEAR`); `eye_pos`/`eye_normal` are its
+/// eye-space position/normal (for `EYE_LINEAR`/`SPHERE_MAP`). Returns
+/// `tc` unchanged, component by component, for any coordinate whose
+/// `TEXTURE_GEN_*` is disabled.
+#[allow(clippy::too_many_arguments)]
+fn apply_texgen(
+    tc: [f32; 2],
+    gen_s: bool,
+    gen_t: bool,
+    texgen: &state::TexGenUnit,
+    obj_pos: [f32; 4],
+    eye_pos: [f32; 4],
+    eye_normal: [f32; 3],
+) -> [f32; 2] {
+    if !gen_s && !gen_t {
+        return tc;
+    }
+    // Computed lazily (not per-coordinate): both `S` and `T` can be
+    // `SPHERE_MAP` at once and must agree on the same `u`/`n`/`r`.
+    let sphere = if texgen.mode_s == TexGenMode::SphereMap || texgen.mode_t == TexGenMode::SphereMap
+    {
+        Some(sphere_map_texgen(
+            [eye_pos[0], eye_pos[1], eye_pos[2]],
+            eye_normal,
+        ))
+    } else {
+        None
+    };
+    let mut out = tc;
+    if gen_s {
+        out[0] = match texgen.mode_s {
+            TexGenMode::ObjectLinear => linear_texgen(obj_pos, texgen.object_plane_s),
+            TexGenMode::EyeLinear => linear_texgen(eye_pos, texgen.eye_plane_s),
+            TexGenMode::SphereMap => {
+                sphere
+                    .expect("computed above when either coord is SphereMap")
+                    .0
+            }
+        };
+    }
+    if gen_t {
+        out[1] = match texgen.mode_t {
+            TexGenMode::ObjectLinear => linear_texgen(obj_pos, texgen.object_plane_t),
+            TexGenMode::EyeLinear => linear_texgen(eye_pos, texgen.eye_plane_t),
+            TexGenMode::SphereMap => {
+                sphere
+                    .expect("computed above when either coord is SphereMap")
+                    .1
+            }
+        };
+    }
+    out
 }
 
 /// `CLAMP`/`CLAMP_TO_EDGE` both map to wgpu's edge clamp; `CLAMP` never
@@ -621,20 +758,28 @@ struct RawVertex {
     /// before multitexture existed at all.
     texcoord1: [f32; 2],
     fogcoord: f32,
+    /// Object-space normal (`NORMAL`), or [`state::CurrentVertex::normal`]
+    /// when the format omits it. Ignored by [`WinVertex`] (illegal in a
+    /// window-space draw), used by [`GlVertex`] for `SPHERE_MAP`/
+    /// `EYE_LINEAR` texgen, which need the eye-space normal.
+    normal: [f32; 3],
 }
 
 /// Parses `count` vertices out of `data`, `format`-interleaved, exactly
 /// as `DRAW_INLINE`/`DRAW_INLINE_WIN` lay them out. Every optional
 /// component in the format is walked and its words consumed --
-/// including ones this milestone doesn't render (`NORMAL`, `TEXCOORD2`-
-/// `3`) -- so a later vertex in the same command parses at the right
-/// offset even though this milestone only *uses*
-/// `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`TEXCOORD1`/`FOGCOORD`. `NORMAL`'s
-/// "illegal in a window-space draw" rule is enforced at the dispatch/decode
-/// layer (`ring.rs`'s `check_window_space_format`), not here: both draw
-/// kinds must still walk its bytes to keep later components at the right
-/// offset. `current` supplies the value for any component the format
-/// omits. `Err` if `data` runs out before `count` vertices are read.
+/// including ones this milestone doesn't render for every draw kind
+/// (`TEXCOORD2`-`3`) -- so a later vertex in the same command parses at
+/// the right offset even though this milestone only *uses*
+/// `COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`TEXCOORD1`/`FOGCOORD`/`NORMAL`.
+/// `NORMAL`'s "illegal in a window-space draw" rule is enforced at the
+/// dispatch/decode layer (`ring.rs`'s `check_window_space_format`), not
+/// here: both draw kinds still walk its bytes (and this function now
+/// extracts its value, since [`GlVertex`] uses it for texgen) to keep
+/// later components at the right offset; [`WinVertex`] simply never
+/// copies the resulting field out. `current` supplies the value for any
+/// component the format omits. `Err` if `data` runs out before `count`
+/// vertices are read.
 fn parse_vertices_raw(
     data: &[u8],
     format: VertexFormat,
@@ -668,15 +813,19 @@ fn parse_vertices_raw(
             color = unpack_color(word);
         }
 
+        let mut normal = current.normal;
         if format.has(VertexFormat::NORMAL) {
             // Illegal in a window-space draw per the spec (E_BAD_ARG); the
             // decode layer is expected to have rejected this already, but
             // this parser still has to consume the words if asked to keep
-            // decoding, so it treats it as an ordinary (unused) component.
+            // decoding, so it treats it as an ordinary component -- used by
+            // GL-space texgen ([`GlVertex`]), ignored by [`WinVertex`].
+            normal = [
+                read_f32(data, at).ok_or_else(bad)?,
+                read_f32(data, at + 4).ok_or_else(bad)?,
+                read_f32(data, at + 8).ok_or_else(bad)?,
+            ];
             at += 4 * 3;
-            if at > data.len() {
-                return Err(bad());
-            }
         }
 
         let mut texcoord0 = current.texcoord.first().copied().unwrap_or((0.0, 0.0));
@@ -713,6 +862,7 @@ fn parse_vertices_raw(
             texcoord0: [texcoord0.0, texcoord0.1],
             texcoord1: [texcoord1.0, texcoord1.1],
             fogcoord,
+            normal,
         });
     }
     Ok(out)
@@ -754,15 +904,20 @@ pub struct GlVertex {
     pub texcoord0: [f32; 2],
     pub texcoord1: [f32; 2],
     pub fogcoord: f32,
+    /// Object-space normal (`NORMAL`, or [`state::CurrentVertex::normal`]
+    /// when the format omits it) -- used by `SPHERE_MAP`/`EYE_LINEAR`
+    /// texgen, which need it transformed into eye space
+    /// ([`Mat4::transform_normal3`]). Lighting (which also needs it)
+    /// remains unimplemented.
+    pub normal: [f32; 3],
 }
 
 /// Parses `count` GL-space vertices out of `data`, `format`-interleaved,
 /// exactly as `DRAW_INLINE` lays them out -- see [`parse_vertices_raw`],
 /// which this wraps. `NORMAL` is legal in this format (unlike
-/// [`parse_window_vertices`]'s draw kind) but is not yet used: no
-/// lighting is implemented this milestone, so its words are walked (to
-/// keep later components at the right offset) and discarded, exactly
-/// like `TEXCOORD2`-`3` already are.
+/// [`parse_window_vertices`]'s draw kind) and is used by texgen
+/// (`SPHERE_MAP`/`EYE_LINEAR`); lighting, which also needs it, remains
+/// unimplemented.
 pub fn parse_gl_vertices(
     data: &[u8],
     format: VertexFormat,
@@ -777,6 +932,7 @@ pub fn parse_gl_vertices(
             texcoord0: r.texcoord0,
             texcoord1: r.texcoord1,
             fogcoord: r.fogcoord,
+            normal: r.normal,
         })
         .collect())
 }
@@ -1128,6 +1284,12 @@ fn fetch_array_vertex_gl(
         texcoord0: [texcoord0.0, texcoord0.1],
         texcoord1: [texcoord1.0, texcoord1.1],
         fogcoord,
+        // The NORMAL descriptor's data is decoded-but-not-read this
+        // milestone (see this function's doc comment), so even a format
+        // that carries the bit falls back to the current-state normal --
+        // texgen with array-supplied per-vertex normals is the documented
+        // follow-up alongside lighting.
+        normal: current.normal,
     })
 }
 
@@ -3443,6 +3605,14 @@ impl Renderer {
         // distance `-eye.z` (positive in front of the viewer), computed
         // from the modelview-only transform before projection.
         let has_fogcoord = format.has(VertexFormat::FOGCOORD);
+        // GL 1.1's normal transform is the inverse-transpose of the
+        // modelview's upper 3x3, not the modelview itself (see
+        // `Mat4::transform_normal3`'s doc comment) -- computed once per
+        // draw call, not per vertex, since the modelview is fixed for the
+        // whole call. A singular modelview falls back to the identity,
+        // same fallback `Mat4::inverse` and `eye_transform` already use
+        // elsewhere in this pipeline.
+        let normal_matrix = modelview.inverse().unwrap_or_else(Mat4::identity);
         let to_gpu = |v: &GlVertex| -> GpuVertex {
             let eye = modelview.transform_point(v.pos);
             let clip = projection.transform_point(eye);
@@ -3488,6 +3658,38 @@ impl Renderer {
             // traps").
             let depth_clip_z = near * safe_w + (far - near) * gl_clip_z_to_wgpu(clip[2], safe_w);
 
+            // Texgen (`TEXGEN`/`TEXGEN_PLANE`, `TEXTURE_GEN_S`/`_T`):
+            // per-unit, per-coordinate, replacing the vertex-supplied (or
+            // `CURRENT_TEXCOORD`-defaulted) `s`/`t` component-by-component
+            // -- `apply_texgen` is a no-op when neither cap is enabled for
+            // a unit, which every window-space-style draw (no `TEXGEN`
+            // ever set) hits. The eye-space normal needs the modelview's
+            // inverse-transpose, not the modelview itself -- see
+            // `normal_matrix`'s own comment above.
+            let eye_normal = normal_matrix.transform_normal3(v.normal);
+            let gen_s0 = state
+                .enables
+                .texture_gen_s
+                .first()
+                .copied()
+                .unwrap_or(false);
+            let gen_t0 = state
+                .enables
+                .texture_gen_t
+                .first()
+                .copied()
+                .unwrap_or(false);
+            let texcoord0 = match state.texgen.first() {
+                Some(tg) => apply_texgen(v.texcoord0, gen_s0, gen_t0, tg, v.pos, eye, eye_normal),
+                None => v.texcoord0,
+            };
+            let gen_s1 = state.enables.texture_gen_s.get(1).copied().unwrap_or(false);
+            let gen_t1 = state.enables.texture_gen_t.get(1).copied().unwrap_or(false);
+            let texcoord1 = match state.texgen.get(1) {
+                Some(tg) => apply_texgen(v.texcoord1, gen_s1, gen_t1, tg, v.pos, eye, eye_normal),
+                None => v.texcoord1,
+            };
+
             GpuVertex {
                 clip_pos: [
                     final_ndc_x * safe_w,
@@ -3496,9 +3698,9 @@ impl Renderer {
                     safe_w,
                 ],
                 color: v.color,
-                texcoord0: v.texcoord0,
+                texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { -eye[2] },
-                texcoord1: v.texcoord1,
+                texcoord1,
             }
         };
 
@@ -6548,12 +6750,12 @@ mod tests {
     }
 
     /// `parse_gl_vertices` must accept `NORMAL` (illegal only in a
-    /// window-space draw, per `ring.rs`'s `check_window_space_format`) and
-    /// still walk its three words so a following component lands at the
-    /// right offset -- mirroring `parse_window_vertices`'s existing
-    /// coverage of `NORMAL` as an "unused but consumed" component.
+    /// window-space draw, per `ring.rs`'s `check_window_space_format`),
+    /// walk its three words so a following component lands at the right
+    /// offset, and -- now that texgen needs it -- actually extract its
+    /// value into [`GlVertex::normal`], rather than merely skipping it.
     #[test]
-    fn parse_gl_vertices_accepts_and_skips_normal() {
+    fn parse_gl_vertices_extracts_normal() {
         let format = VertexFormat(
             (1 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::NORMAL | VertexFormat::COLOR,
         );
@@ -6569,8 +6771,10 @@ mod tests {
             // COLOR
             bytes.extend_from_slice(&w.to_bits().to_be_bytes());
         }
-        for w in [0.0f32, 0.0, 1.0] {
-            // NORMAL (skipped)
+        for w in [0.0f32, 1.0, 0.0] {
+            // NORMAL -- deliberately NOT the current-value default
+            // ([0, 0, 1]), so a bug that silently fell back to the
+            // default instead of reading the bytes would be caught.
             bytes.extend_from_slice(&w.to_bits().to_be_bytes());
         }
 
@@ -6578,6 +6782,285 @@ mod tests {
         assert_eq!(verts.len(), 1);
         assert_eq!(verts[0].pos, [1.0, 2.0, 3.0, 1.0]);
         assert_eq!(verts[0].color, [0.5, 0.25, 0.75, 1.0]);
+        assert_eq!(verts[0].normal, [0.0, 1.0, 0.0]);
+    }
+
+    /// An omitted `NORMAL` takes [`state::CurrentVertex::normal`] (`CURRENT_NORMAL`'s
+    /// "omitted component takes the current value" rule, same as every
+    /// other optional component).
+    #[test]
+    fn parse_gl_vertices_normal_falls_back_to_current_normal() {
+        let format = VertexFormat(1 << VertexFormat::POS_COUNT_SHIFT); // POS only
+        let mut bytes = Vec::new();
+        for w in [1.0f32, 2.0, 3.0] {
+            bytes.extend_from_slice(&w.to_bits().to_be_bytes());
+        }
+        let mut cur = current();
+        cur.normal = [0.5, 0.5, 0.5];
+
+        let verts = parse_gl_vertices(&bytes, format, 1, &cur).unwrap();
+        assert_eq!(verts[0].normal, [0.5, 0.5, 0.5]);
+    }
+
+    // -- TEXGEN / TEXGEN_PLANE (transform tier) ------------------------
+
+    /// GL 1.1's normative `SPHERE_MAP` derivation (section 2.10.4): a
+    /// normal pointing straight back at the eye, with the vertex directly
+    /// in front of it along the same axis, reflects the view vector
+    /// straight back out along `+z` -- the one case the formula's own
+    /// geometry makes exact by inspection, landing precisely on the
+    /// sphere map's own centre `(0.5, 0.5)` with no rounding.
+    #[test]
+    fn sphere_map_texgen_centre_case() {
+        let (s, t) = sphere_map_texgen([0.0, 0.0, -1.0], [0.0, 0.0, 1.0]);
+        assert_eq!((s, t), (0.5, 0.5));
+    }
+
+    /// A less trivial `SPHERE_MAP` case (both inputs already unit length,
+    /// so `normalize3` is a no-op and the whole computation is exact in
+    /// binary floating point): a `3-4-5`-derived unit normal
+    /// `(0.36, 0.48, 0.8)` against the view vector `(0, 0, -1)` reflects
+    /// to `r = (0.576, 0.768, 0.28)`, `m = 3.2` exactly, giving
+    /// `s = 0.68`, `t = 0.74` -- values chosen so every intermediate
+    /// division comes out to a terminating decimal, not just the final
+    /// answer, avoiding any "did I get lucky on the last digit" doubt.
+    #[test]
+    fn sphere_map_texgen_off_centre_case() {
+        let (s, t) = sphere_map_texgen([0.0, 0.0, -1.0], [0.36, 0.48, 0.8]);
+        assert!((s - 0.68).abs() < 1e-6, "s = {s}");
+        assert!((t - 0.74).abs() < 1e-6, "t = {t}");
+    }
+
+    /// `SPHERE_MAP` normalises its inputs internally -- scaling the eye
+    /// position or the normal by an arbitrary positive factor must not
+    /// change the result (both `u` and `n` are directions, not
+    /// magnitudes).
+    #[test]
+    fn sphere_map_texgen_is_scale_invariant() {
+        let base = sphere_map_texgen([0.0, 0.0, -1.0], [0.36, 0.48, 0.8]);
+        let scaled = sphere_map_texgen([0.0, 0.0, -7.0], [1.8, 2.4, 4.0]);
+        assert!((base.0 - scaled.0).abs() < 1e-6);
+        assert!((base.1 - scaled.1).abs() < 1e-6);
+    }
+
+    /// `OBJECT_LINEAR`/`EYE_LINEAR` (the same `dot(pos, plane)` formula
+    /// for both, just fed different position/plane pairs by the caller):
+    /// a plane that only reads `x` reproduces `x`, and a plane that only
+    /// reads `w` proves the fourth component genuinely participates in
+    /// the dot product (a bug that only summed `x, y, z` would silently
+    /// pass every other case here).
+    #[test]
+    fn linear_texgen_dot_product() {
+        let pos = [3.0, 4.0, 5.0, 2.0];
+        assert_eq!(linear_texgen(pos, [1.0, 0.0, 0.0, 0.0]), 3.0);
+        assert_eq!(linear_texgen(pos, [0.0, 1.0, 0.0, 0.0]), 4.0);
+        assert_eq!(linear_texgen(pos, [0.0, 0.0, 0.0, 1.0]), 2.0);
+        assert_eq!(linear_texgen(pos, [1.0, 1.0, 1.0, 1.0]), 14.0);
+    }
+
+    /// Draws one `TRIANGLES` `DRAW_INLINE` (GL-space) on a fresh 16x16
+    /// surface with identity `MODELVIEW`/`PROJECTION` (so eye space
+    /// equals object space, and NDC equals eye `x, y` directly -- see the
+    /// call sites' own comments for how the vertex coordinates were
+    /// chosen), texture unit 0 bound to a `2x2` `RGBA8` texture, `REPLACE`
+    /// env mode so the sampled texel is the output colour unchanged.
+    /// Returns the RGBA8 pixel at `sample_col_row` (each call site picks
+    /// its own, confirmed by direct computation to land inside its
+    /// triangle with margin), or `None` with no adapter.
+    fn draw_gl_space_texgen_triangle(
+        set_extra_state: impl FnOnce(&mut State),
+        verts_xy: [(f32, f32); 3],
+        wire_texcoord0: (f32, f32),
+        texels_2x2: [[u8; 4]; 4], // row0: (s<.5,t<.5), (s>=.5,t<.5); row1: (s<.5,t>=.5), (s>=.5,t>=.5)
+        sample_col_row: (usize, usize),
+    ) -> Option<[u8; 4]> {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return None;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+
+        state.tex_create(1);
+        state.tex_bind(0, 1);
+        state.set_tex_env(0, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        state.enable(state::Capability::Texture2D);
+
+        set_extra_state(&mut state);
+
+        let mut mem = TestMemory::new(65536);
+        let tex_addr = 0x1000u32;
+        for (i, texel) in texels_2x2.iter().enumerate() {
+            let at = tex_addr as usize + i * 4;
+            mem.aperture[at..at + 4].copy_from_slice(texel);
+        }
+
+        let mut verts = Vec::new();
+        for (x, y) in verts_xy {
+            for w in [x, y, -1.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            for w in [wire_texcoord0.0, wire_texcoord0.1] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat((1 << VertexFormat::POS_COUNT_SHIFT) | VertexFormat::TEXCOORD0);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 2,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: tex_addr,
+                        space: RefSpace::Aperture,
+                        length: 16,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: false,
+                    vertices: DrawVertices::Inline(&verts),
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let (col, row) = sample_col_row;
+        let at = (row * 16 + col) * 4;
+        Some(pixels[at..at + 4].try_into().unwrap())
+    }
+
+    /// `SPHERE_MAP` texgen, enabled on both `S` and `T` for unit 0, must
+    /// actually drive which texel a GL-space draw samples -- not just
+    /// decode into unused state. Object-space vertices `(0.3, 0.9, -1)`,
+    /// `(0.9, 0.3, -1)`, `(0.6, 0.8, -1)` under identity `MODELVIEW`/
+    /// `PROJECTION` (eye space = object space) each generate `s, t > 0.5`
+    /// with GL 1.1's default normal `(0, 0, 1)` (`CURRENT_NORMAL`'s
+    /// default, no per-vertex `NORMAL` needed) against view direction
+    /// `(x, y, -1)` -- confirmed by direct computation, `s, t >= 0.558`,
+    /// clear of the `0.5` texel boundary. Interpolated `s`/`t` across the
+    /// triangle is a convex combination of the three vertices' generated
+    /// values, so every fragment stays on the same side of `0.5` the
+    /// vertices are on -- the sample point `(12, 2)` (confirmed by
+    /// barycentric computation to land inside, with margin, not on an
+    /// edge) must be the `(s>=.5, t>=.5)` texel (blue) even though the
+    /// vertex-supplied `TEXCOORD0` is a decoy.
+    ///
+    /// Verified per this session's practice: temporarily dropping the
+    /// `+ 1.0` from `sphere_map_texgen`'s `m` (a one-character mutation
+    /// of the normative formula) was confirmed to change the sampled
+    /// pixel away from blue before restoring the fix.
+    #[test]
+    fn sphere_map_texgen_drives_texture_sampling() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |s| {
+                s.enable(state::Capability::TextureGenS);
+                s.enable(state::Capability::TextureGenT);
+                s.set_texgen_mode(0, state::TexCoord::S, TexGenMode::SphereMap);
+                s.set_texgen_mode(0, state::TexCoord::T, TexGenMode::SphereMap);
+            },
+            [(0.3, 0.9), (0.9, 0.3), (0.6, 0.8)],
+            // Decoy wire TEXCOORD0: if texgen didn't override it, this
+            // would sample (s<.5, t<.5) = red instead.
+            (0.05, 0.05),
+            [red, green, yellow, blue],
+            (12, 2),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "SPHERE_MAP-generated (s, t) should land in the (s>=.5, t>=.5) texel: {px:?}"
+        );
+    }
+
+    /// `TEXTURE_GEN_S`/`TEXTURE_GEN_T` are independently enabled per the
+    /// spec (`docs/internals/c3d.md`'s "Lighting, clipping and texgen":
+    /// `TEXGEN` takes effect "when `TEXTURE_GEN_S`/`TEXTURE_GEN_T` is
+    /// enabled", stated separately per coordinate) -- confirmed as the
+    /// first client's own usage pattern (S and T enabled independently,
+    /// per this project's own notes). Only `S` is enabled here
+    /// (`OBJECT_LINEAR`, plane `(1, 0, 0, 0)`, i.e. generated `s =
+    /// object-space x`); `T` must still come from the vertex's own
+    /// `TEXCOORD0`. All three vertices share `x in {0.6, 0.6, 0.9}` (all
+    /// `> 0.5`, so the generated `s` stays on the same side of the texel
+    /// boundary everywhere in the triangle by the same convexity
+    /// argument as the `SPHERE_MAP` test) and an identical wire `t =
+    /// 0.75` (`>= 0.5`, and exactly constant since it is never
+    /// generated), landing on the `(s>=.5, t>=.5)` texel (blue) at the
+    /// same sample point. The wire `s = 0.05` is a decoy the generated
+    /// value must override.
+    ///
+    /// Verified per this session's practice: temporarily swapping which
+    /// of `gen_s0`/`gen_t0` gates which coordinate in `op_draw_inline_gl`
+    /// (so `S` incorrectly took `T`'s enable and vice versa) was
+    /// confirmed to change the sampled pixel away from blue (the swap
+    /// leaves `S` ungenerated -- back to the `0.05` decoy -- while `T`
+    /// gets wrongly generated) before restoring the fix.
+    #[test]
+    fn texgen_s_and_t_are_independently_enabled() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |s| {
+                s.enable(state::Capability::TextureGenS);
+                // TextureGenT deliberately left disabled.
+                s.set_texgen_mode(0, state::TexCoord::S, TexGenMode::ObjectLinear);
+                s.set_texgen_plane(
+                    0,
+                    state::TexCoord::S,
+                    state::TexGenPlaneKind::ObjectPlane,
+                    [1.0, 0.0, 0.0, 0.0],
+                );
+            },
+            [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
+            (0.05, 0.75), // decoy s, real (must-pass-through) t
+            [red, green, yellow, blue],
+            (13, 8),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "S must be generated (overriding the 0.05 decoy) and T must stay the vertex's \
+             own 0.75, landing on (s>=.5, t>=.5): {px:?}"
+        );
     }
 
     /// `QUERY` needs no GPU work at all -- `dispatch::Context` has

@@ -159,6 +159,34 @@ project's spec-first loop exists to surface.
   and the position-component-count rule are both space-independent.
   `CAPS0` still does not advertise `CAP_TRANSFORM` (see "Capability
   honesty" above), so no real guest can reach any GL-space draw path yet.
+- **Texgen.** `TEXGEN`/`TEXGEN_PLANE` are implemented per unit, per
+  coordinate (`S`/`T` independently enabled, matching the first client's
+  own usage -- see "Implementation order" above), for `OBJECT_LINEAR`,
+  `EYE_LINEAR` and `SPHERE_MAP`, computed CPU-side in the shared
+  `op_draw_gl` tail alongside the existing modelview/projection
+  transform and folded straight into `GpuVertex`'s existing
+  `texcoord0`/`texcoord1` fields -- no new WGSL, pipeline key, or bind
+  group. `OBJECT_LINEAR`/`EYE_LINEAR` are the same `dot(pos, plane)`
+  formula fed different position/plane pairs (`EYE_LINEAR`'s plane is
+  already transformed by the inverse modelview at `TEXGEN_PLANE` command
+  time, per `state.rs`'s `set_texgen_plane`, so the render side does no
+  further transform); `SPHERE_MAP` is GL 1.1's normative reflection
+  formula from the eye-space vertex position and the eye-space normal.
+  The eye-space normal needs `NORMAL`, which `parse_vertices_raw` used to
+  walk-and-discard for every draw kind; it now extracts the value (into
+  `GlVertex::normal`; `WinVertex` still never copies it, matching
+  `NORMAL`'s "illegal in a window-space draw" rule) and transforms it by
+  the modelview's inverse-transpose (`Mat4::transform_normal3`), not the
+  modelview itself -- the two only coincide when the modelview's linear
+  part is orthogonal (pure rotation), and diverge under scale. Because
+  texgen lives in the shared `op_draw_gl` tail, it applies to every
+  GL-space draw shape (`DRAW_INLINE`, `DRAW_ARRAYS`, `DRAW_ELEMENTS`)
+  -- but the array/element vertex fetch decodes the `NORMAL`
+  descriptor without reading its data yet (see the bullet above), so an
+  array-supplied per-vertex normal falls back to the current-state
+  normal there; `SPHERE_MAP`/`EYE_LINEAR` with true per-vertex array
+  normals is the documented follow-up alongside lighting. `CAPS0` still
+  does not advertise `CAP_TRANSFORM` (see "Capability honesty" above).
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
