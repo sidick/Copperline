@@ -174,6 +174,7 @@ impl Default for DeviceConfig {
             surffmt_supported: (1 << 1) // R5G6B5
                 | (1 << 3) // R5G5B5
                 | (1 << 5) // A8R8G8B8
+                | (1 << 6) // B8G8R8A8 -- RTG_COLOR_FORMAT_BGRA (z3660), glQuake's screen format
                 | (1 << 7) // R8G8B8A8
                 | (1 << 8) // R8G8B8
                 | (1 << 9), // B8G8R8
@@ -1964,6 +1965,32 @@ mod tests {
                 height: 32,
                 stride_bytes: 256,
                 format: 5,
+                flags: 0,
+                address: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn surface_define_with_b8g8r8a8_decodes_under_the_default_config() {
+        // B8G8R8A8 (format 6): RTG_COLOR_FORMAT_BGRA, the ZZ9000/z3660's
+        // 32-bit RTG mode and glQuake's screen format -- a guest defining
+        // a C3D surface matching that layout (for a direct blit/compose,
+        // or a CAP_SURFACE_GUESTADDR target into the card's own VRAM)
+        // must not hit E_UNSUPPORTED_FORMAT on Copperline's own default
+        // config. Same 4 bytes/pixel layout as A8R8G8B8, so the same
+        // stride/extent numbers apply.
+        let words = surface_define_words(1, 64, 32, 256, 6, 0, 0);
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 32);
+        assert_eq!(
+            step,
+            Step::Command(Command::SurfaceDefine {
+                id: 1,
+                width: 64,
+                height: 32,
+                stride_bytes: 256,
+                format: 6,
                 flags: 0,
                 address: 0,
             })
