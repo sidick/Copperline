@@ -857,6 +857,12 @@ pub struct MachineSetup {
     /// drop a `[mhi] enabled` set by some other build -- only the launcher
     /// row/toggle that edits it is feature-gated.
     mhi: bool,
+    /// The C3D virtual 3D accelerator board, edited on the System tab
+    /// (`[c3d] enabled`) in a `c3d` build, the only build that can fit the
+    /// board. Kept as an unconditional passthrough field even in a
+    /// non-`c3d` build, same reason as `mhi` above -- only the launcher
+    /// row/toggle that edits it is feature-gated.
+    c3d: bool,
     /// Currently visible host bridge adapters: stable identifier + label.
     bridge_interfaces: Vec<(String, String)>,
     /// Input device names for the sampler picker: filled when the screen opens

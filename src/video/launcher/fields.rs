@@ -400,6 +400,14 @@ pub enum LauncherField {
     Rtc,
     Identify,
     Rtg,
+    /// The C3D virtual 3D accelerator board: fitted or not (`[c3d]
+    /// enabled`). No other options exist (see docs/internals/c3d.md).
+    /// Present only in a `c3d` build, the only build that can fit the
+    /// board. Not part of the `Rtg` cycle field: unlike an RTG card, C3D
+    /// is a 3D accelerator, not a display replacement, so it can coexist
+    /// with any RTG choice (or none).
+    #[cfg(feature = "c3d")]
+    C3d,
     // CPU
     Cpu,
     Fpu,
@@ -885,6 +893,19 @@ pub(super) fn cartridge_label(model: Option<crate::cartridge::CartridgeModel>) -
     model.map_or("None", |m| m.display_name())
 }
 
+#[cfg(feature = "c3d")]
+pub(super) const SYSTEM_ROWS: [Row; 9] = [
+    row(F::Chipset, "Chipset", Cycle),
+    row(F::Agnus, "Agnus", Cycle),
+    row(F::Denise, "Denise", Cycle),
+    row(F::Video, "Video", Cycle),
+    row(F::Rtc, "Real-time clock", Cycle),
+    row(F::Identify, "Identify board", Cycle),
+    row(F::Rtg, "RTG card", Cycle),
+    row(F::C3d, "C3D 3D accelerator", Cycle),
+    row(F::Cartridge, "Freezer cartridge", Cycle),
+];
+#[cfg(not(feature = "c3d"))]
 pub(super) const SYSTEM_ROWS: [Row; 8] = [
     row(F::Chipset, "Chipset", Cycle),
     row(F::Agnus, "Agnus", Cycle),

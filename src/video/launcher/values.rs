@@ -50,6 +50,8 @@ boolean_settings! {
     Toccata => toccata,
     #[cfg(feature = "mhi")]
     Mhi => mhi,
+    #[cfg(feature = "c3d")]
+    C3d => c3d,
     #[cfg(feature = "coppersynth")]
     CsynthPanel => csynth_panel,
 }

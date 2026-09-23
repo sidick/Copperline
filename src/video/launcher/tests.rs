@@ -4796,6 +4796,29 @@ fn toccata_and_mhi_boards_toggle_and_round_trip() {
     assert_eq!(s.to_raw().mhi.enabled, None);
 }
 
+#[cfg(feature = "c3d")]
+#[test]
+fn c3d_board_toggles_and_round_trips() {
+    let mut s = MachineSetup::default();
+    // Off is the baseline, so nothing is written until fitted.
+    assert!(!s.toggle_value(LauncherField::C3d));
+    assert_eq!(s.to_raw().c3d.enabled, None);
+
+    s.cycle(LauncherField::C3d, true);
+    assert!(s.toggle_value(LauncherField::C3d));
+    assert_eq!(s.to_raw().c3d.enabled, Some(true));
+
+    // The written config has to load back into the same setting.
+    let cfg = s.build_config().expect("valid config");
+    assert!(cfg.c3d);
+    let reloaded = MachineSetup::from_raw(&s.to_raw()).expect("valid raw");
+    assert!(reloaded.toggle_value(LauncherField::C3d));
+
+    s.cycle(LauncherField::C3d, false);
+    assert!(!s.toggle_value(LauncherField::C3d));
+    assert_eq!(s.to_raw().c3d.enabled, None);
+}
+
 #[test]
 fn hostsocket_keeps_uneditable_keys_across_a_launcher_save() {
     // dns_server/hostname/address/gateway/resolver have no launcher

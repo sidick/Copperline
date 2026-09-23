@@ -38,15 +38,21 @@ decision proven wrong by building it is exactly the kind of thing this
 project's spec-first loop exists to surface.
 
 - **Feature and configuration.** The board is behind the `c3d` cargo
-  feature and a `[c3d] enabled = true` table (`src/c3d/board.rs`,
-  `docs/guide/configuration.md`'s `[c3d]` section). As of M2 `enabled` is
-  the only key; `size`, `contexts`, `caps_mask`, `timing` and `trace` are
-  not yet configuration knobs -- the board fits one fixed 32 MiB Zorro
-  III window with 4 contexts. A build without the feature still parses
-  and ignores the table, the same contract every other optional board's
-  config keeps. Browser and `--no-default-features` builds carry none of
-  the board or the renderer; the pure-logic modules stay in them
-  regardless (see this chapter's opening paragraphs).
+  feature and a `[c3d]` table (`src/c3d/board.rs`,
+  `docs/guide/configuration.md`'s `[c3d]` section): `enabled` fits the
+  board, and `mask_caps` is the spec's conformance switch (forces named
+  `CAPS0` bits clear). `size`, `contexts`, `timing` and `trace` are not
+  yet configuration knobs -- the board fits one fixed 32 MiB Zorro III
+  window with 4 contexts. `enabled` is also a System-tab row in the GUI
+  launcher (`src/video/launcher/fields.rs`'s `F::C3d`, a `c3d`-build-only
+  toggle passed through unconditionally otherwise, the same pattern
+  `F::Mhi` uses); `mask_caps` is config-file/CLI only, being a
+  conformance-testing knob rather than something normal use ever
+  touches. A build without the feature still parses and ignores the
+  table, the same contract every other optional board's config keeps.
+  Browser and `--no-default-features` builds carry none of the board or
+  the renderer; the pure-logic modules stay in them regardless (see this
+  chapter's opening paragraphs).
 - **GPU.** The board owns a headless `wgpu` device of its own (created
   lazily, on the first doorbell that needs it, so `[c3d] enabled = true`
   alone never requires a GPU); it never shares the window's `pixels`
