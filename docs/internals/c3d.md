@@ -262,6 +262,62 @@ project's spec-first loop exists to surface.
   the spec's minimum of 2, so a guest library carrying the first
   client's 10-deep `GL_TEXTURE` stack can map its pushes 1:1 instead of
   flattening client-side.
+- **`CALL`.** `CALL` (`0x0005`, Control group, draft 0.14) replays a
+  linear command buffer -- the aperture or, under `CAP_GUESTMEM`, guest
+  memory -- in place of the `CALL` command itself: baseline tier, no
+  capability bit, since it is purely a decode-side addressing mode. The
+  buffer is decoded with a second [`RingCursor`](../../src/c3d/ring.rs)
+  built by `RingCursor::new_linear`, a dedicated constructor rather than
+  a `head`/`tail` pair fed to the ordinary one: the ordinary constructor's
+  `E_RING_OVERRUN` check exists only to tell "full" from "empty" on a
+  *circular* ring, and applying that same "one word short of full"
+  arithmetic to a buffer whose `tail` always equals its own length would
+  spuriously halt on every buffer a guest fills exactly to the end.
+  `new_linear` also disables the ordinary cursor's "a command landing
+  exactly on the physical end wraps `head` back to `0`" behaviour (correct
+  only for a real ring, where `tail` wraps independently) -- without that,
+  a called buffer entirely consumed by its last command would wrap back to
+  offset `0` and silently re-decode itself instead of stopping. Nesting
+  (a `CALL` decoded while already decoding a called buffer) is bounded to
+  one level **by construction**: `Context::apply_call_buffer` never calls
+  itself or `Context::submit_with`, so there is no code path that can go
+  two levels deep, and no depth counter to get wrong. Every error raised
+  while decoding a called buffer -- including a nested `CALL`, which is
+  `E_BAD_OPCODE` -- latches the *outer* `CALL`'s own ring offset in
+  `ERROR_OFFSET`, per the spec's "a command in a called buffer has no ring
+  offset to report"; a halting error abandons the call and halts the
+  context, and since the outer ring cursor has already advanced past the
+  `CALL` command by the time its buffer is decoded (`CALL` itself decoded
+  structurally fine), `RING_HEAD` is left exactly where the spec wants it
+  after `ERROR_ACK`: right after the `CALL`, as if it had completed.
+  `FENCE` needs no special-casing inside a called buffer -- it reaches the
+  same `Context::apply` as everywhere else. The buffer-fetch itself is an
+  injected closure (`Context::submit_with`'s `fetch_call_buffer`), reusing
+  `board.rs`'s doorbell's existing aperture-range/`DeviceHost::dma_read`
+  fetch (the same two primitives it already used to fetch a guest-memory
+  ring, one level down) for both address spaces through one code path; a
+  fetch returning bytes stores them in a caller-owned `Vec<Vec<u8>>`
+  (`call_storage`, living exactly as long as the submission's `RenderOp`s
+  do) via `stash_call_buffer`, a small, carefully-documented `unsafe`
+  helper -- a called buffer's bytes must be owned (there is no borrowable
+  backing for a guest-space fetch, and an aperture-backed one cannot alias
+  the board's own `&mut` aperture the way the top-level `ring` slice,
+  captured once up front, already does), yet a `DRAW_INLINE`/
+  `DRAW_ARRAYS`/`DRAW_ELEMENTS` inside the buffer still needs to borrow a
+  `'a`-lifetime slice of it, and safe Rust cannot prove that pushing a
+  second buffer into a `Vec<Vec<u8>>` doesn't invalidate a slice already
+  handed out from the first (it factually doesn't -- each `Vec<u8>`
+  element is its own stable heap allocation -- but the borrow checker
+  cannot see that fact through `Vec`'s ordinary API). The lifetime
+  exemption from `CAP_REF_SYNC` a called buffer (and every ref inside it)
+  gets is purely documentation/behavioural: Copperline's doorbell is
+  already fully synchronous, so it satisfies the baseline lifetime rule
+  trivially and needs no eager-capture mechanism to build. The no-`CALL`
+  path (`Context::submit`) costs nothing extra: it forwards to
+  `submit_with` with a throwaway empty `Vec::new()` (no allocation until
+  pushed to) and a closure that always returns `None`, never invoking
+  `stash_call_buffer`, so every one of this milestone's pre-existing tests
+  keeps calling `submit` unchanged.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field

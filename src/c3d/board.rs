@@ -617,9 +617,43 @@ impl C3dBoard {
 
         let config = self.device_config();
         let mut ops: Vec<RenderOp<'_>> = Vec::new();
-        self.contexts[n]
-            .ctx
-            .submit(&ring_bytes, new_tail, &config, &mut ops);
+        // `CALL`'s buffer-fetch closure: the same two primitives this
+        // function already used above to fetch the ring itself when it
+        // lives in guest memory, one level down. `ring.rs`'s `validate_ref`
+        // has already checked `data`'s alignment, aperture bound and
+        // `CAP_GUESTMEM` gating as part of ordinary decoding, so this
+        // closure only needs to resolve bytes, not re-validate. Borrows
+        // only `self.aperture` (disjoint from `self.contexts`, which
+        // `submit_with` below needs `&mut` access to) and `host`, which is
+        // already a separate parameter.
+        let aperture = &self.aperture;
+        let mut fetch_call_buffer = |r: proto::Ref| -> Option<Vec<u8>> {
+            Some(match r.space {
+                proto::RefSpace::Aperture => {
+                    let start = r.address as usize;
+                    let end = start.saturating_add(r.length as usize).min(aperture.len());
+                    if start >= aperture.len() || start >= end {
+                        Vec::new()
+                    } else {
+                        aperture[start..end].to_vec()
+                    }
+                }
+                proto::RefSpace::Guest => {
+                    let mut buf = vec![0u8; r.length as usize];
+                    host.dma_read(r.address, &mut buf);
+                    buf
+                }
+            })
+        };
+        let mut call_storage: Vec<Vec<u8>> = Vec::new();
+        self.contexts[n].ctx.submit_with(
+            &ring_bytes,
+            new_tail,
+            &config,
+            &mut ops,
+            &mut call_storage,
+            &mut fetch_call_buffer,
+        );
 
         if !ops.is_empty() {
             let queued_before = self.pending_dma.len();
@@ -1280,6 +1314,125 @@ mod tests {
                     &b.aperture[px..px + 4],
                     &[0xFFu8, 0xFF, 0x00, 0x00],
                     "pixel ({col}, {row}) is not opaque red after CLEAR + SURFACE_READBACK"
+                );
+            }
+        }
+    }
+
+    /// End-to-end `CALL`: the outer ring holds just a single `CALL`
+    /// pointing at a buffer placed elsewhere in the aperture; the buffer
+    /// holds the same `SURFACE_DEFINE`+`SET_DRAW_SURFACE`+`CLEAR_COLOR`+
+    /// `CLEAR`+`SURFACE_READBACK`+`FENCE` stream the plain full-command-
+    /// stream test above uses. Asserts the buffer's commands actually took
+    /// effect (fence completed, no error, cleared pixels) and that
+    /// `RING_HEAD` advanced past the `CALL` in the *outer* ring, not into
+    /// the buffer.
+    #[test]
+    fn call_replays_a_buffer_and_its_commands_take_effect() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        const RING_BASE_APERTURE_REL: u32 = 0;
+        const RING_SIZE: u32 = 0x1000;
+        const BUFFER_APERTURE_REL: u32 = RING_SIZE;
+        const SURFACE_APERTURE_REL: u32 = RING_SIZE + 0x1000;
+        const SURFACE_W: u32 = 4;
+        const SURFACE_H: u32 = 4;
+        const SURFACE_STRIDE: u32 = SURFACE_W * 4;
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+
+        let mut buf_cmds = Vec::<u32>::new();
+        buf_cmds.push(opcode_len(proto::OP_SURFACE_DEFINE, 8));
+        buf_cmds.extend([
+            1,
+            SURFACE_W,
+            SURFACE_H,
+            SURFACE_STRIDE,
+            5,
+            0,
+            SURFACE_APERTURE_REL,
+        ]);
+        buf_cmds.push(opcode_len(proto::OP_SET_DRAW_SURFACE, 2));
+        buf_cmds.push(1);
+        buf_cmds.push(opcode_len(proto::OP_CLEAR_COLOR, 5));
+        buf_cmds.extend([1.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+        buf_cmds.push(opcode_len(proto::OP_CLEAR, 2));
+        buf_cmds.push(proto::CLEAR_MASK_COLOR);
+        buf_cmds.push(opcode_len(proto::OP_SURFACE_READBACK, 5));
+        buf_cmds.extend([0, 0, SURFACE_W, SURFACE_H]);
+        buf_cmds.push(opcode_len(proto::OP_FENCE, 2));
+        buf_cmds.push(1);
+        let buf_bytes: Vec<u8> = buf_cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let buf_off = b.aperture_offset + BUFFER_APERTURE_REL;
+        for (i, b_) in buf_bytes.iter().enumerate() {
+            b.write(buf_off + i as u32, 1, *b_ as u32, &mut h);
+        }
+
+        // Outer ring: one CALL to the buffer above.
+        let mut ring_cmds = Vec::<u32>::new();
+        ring_cmds.push(opcode_len(proto::OP_CALL, 3));
+        ring_cmds.push(BUFFER_APERTURE_REL); // ref address (aperture space)
+        ring_cmds.push(buf_bytes.len() as u32); // ref length, space bit 31 clear
+        let ring_bytes: Vec<u8> = ring_cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_off = b.aperture_offset + RING_BASE_APERTURE_REL;
+        for (i, b_) in ring_bytes.iter().enumerate() {
+            b.write(ring_off + i as u32, 1, *b_ as u32, &mut h);
+        }
+
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_BASE,
+            4,
+            RING_BASE_APERTURE_REL,
+            &mut h,
+        );
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, RING_SIZE, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            ring_bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "no protocol error replaying a well-formed called buffer"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::RING_HEAD, 4, &mut h),
+            ring_bytes.len() as u32,
+            "RING_HEAD advances past the CALL in the OUTER ring, not into the buffer"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            1,
+            "the FENCE inside the called buffer completed"
+        );
+
+        if b.renderer.is_none() {
+            eprintln!(
+                "skipping pixel check: no wgpu adapter available (renderer_failed={})",
+                b.renderer_failed
+            );
+            return;
+        }
+        let start = (b.aperture_offset + SURFACE_APERTURE_REL) as usize;
+        for row in 0..SURFACE_H {
+            for col in 0..SURFACE_W {
+                let px = start + (row * SURFACE_STRIDE) as usize + (col * 4) as usize
+                    - b.aperture_offset as usize;
+                assert_eq!(
+                    &b.aperture[px..px + 4],
+                    &[0xFFu8, 0xFF, 0x00, 0x00],
+                    "pixel ({col}, {row}) is not opaque red after a CALLed CLEAR + SURFACE_READBACK"
                 );
             }
         }
