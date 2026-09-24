@@ -157,6 +157,13 @@ pub const OP_FENCE: u16 = 0x0001;
 pub const OP_FLUSH: u16 = 0x0002;
 pub const OP_FINISH: u16 = 0x0003;
 pub const OP_CTX_RESET_STATE: u16 = 0x0004;
+/// `CALL` (draft 0.14): replay the commands found at a [`Ref`] as if they
+/// appeared in the ring at the `CALL` site, then resume after it. Baseline
+/// tier -- purely a decode-side addressing mode, not a rendering feature --
+/// so it needs no capability bit; see [`super::dispatch`]'s nested-decode
+/// handling and this crate's `docs/internals/c3d.md` for the one-level
+/// nesting/error-offset rules `c3d-cmd-control` documents.
+pub const OP_CALL: u16 = 0x0005;
 
 // Surfaces (0x01xx) -- `c3d-cmd-surfaces`.
 pub const OP_SURFACE_DEFINE: u16 = 0x0100;
@@ -649,6 +656,11 @@ pub enum Command<'a> {
     Flush,
     Finish,
     CtxResetState,
+    /// `CALL`: replay the linear command buffer at `data` in place. See
+    /// [`OP_CALL`] and [`super::dispatch`]'s nested-decode handling.
+    Call {
+        data: Ref,
+    },
 
     // Surfaces (0x01xx).
     SurfaceDefine {

@@ -284,6 +284,61 @@ impl QueryResult {
     }
 }
 
+/// Appends `bytes` to `storage` and returns a slice into it with the
+/// caller-chosen lifetime `'a` -- deliberately **not** tied to `storage`'s
+/// own (much shorter) borrow. Used by [`Context::submit_with`]/
+/// [`Context::apply_call_buffer`] to keep a `CALL`ed buffer's fetched bytes
+/// alive long enough for a draw command inside it to borrow from, exactly
+/// as an ordinary ring-inline draw borrows from `ring` itself.
+///
+/// # Why a called buffer's bytes must be owned in the first place
+///
+/// `ring` (the top-level ring) is a slice the *caller* already holds for
+/// `'a` before calling `submit`/`submit_with` at all -- `board.rs`'s
+/// `doorbell` reads it into a local `Vec<u8>` up front. A called buffer's
+/// bytes are different: which buffer to fetch is only known once decoding
+/// reaches the `CALL` command itself, so there is no `'a`-lifetime slice to
+/// hand back from `fetch_call_buffer` -- especially for a guest-space
+/// (`CAP_GUESTMEM`) buffer, which has no backing slice in this process at
+/// all until `DeviceHost::dma_read` copies it into a fresh buffer.
+///
+/// # Why that forces this function to be `unsafe`
+///
+/// [`RenderOp::Draw`]'s inline vertices/array descriptors need to borrow
+/// `&'a [u8]`, the same lifetime the whole submission's `out` uses -- so a
+/// called buffer's owned bytes need to outlive `apply_call_buffer`'s own
+/// stack frame, all the way out to wherever the caller eventually drains
+/// `out`. Safe Rust cannot express "push an element now, hand out a
+/// long-lived borrow of it, then push again" against a single
+/// `&mut Vec<Vec<u8>>`: proving two non-overlapping calls to this function
+/// don't alias requires knowing that each already-pushed `Vec<u8>` element
+/// is never touched again, which is exactly the invariant documented below
+/// but not something the borrow checker can see through `Vec`'s ordinary
+/// API.
+///
+/// # Safety
+///
+/// The caller must treat `storage` as **append-only**: nothing may remove,
+/// replace, reorder, or otherwise mutate an element already pushed while
+/// any slice this function previously returned from it is still alive.
+/// Given that, the returned slice stays valid regardless of further
+/// pushes: each element is its own independent heap allocation (a
+/// `Vec<u8>`), and growing the *outer* `Vec<Vec<u8>>` can move the
+/// `Vec<u8>` header (pointer/len/cap) around but never the bytes it points
+/// to. `Context::submit_with`/`apply_call_buffer` uphold this themselves
+/// (they only ever `Vec::push` onto `call_storage`, never truncate or
+/// index-assign into it); the caller across a whole `submit_with` call is
+/// additionally required to keep `call_storage` itself alive at least as
+/// long as `'a` -- in practice, alongside `out`, until every `RenderOp` in
+/// it has been consumed (see [`RenderOp`]'s doc comment, which already
+/// asks the same of `ring`).
+fn stash_call_buffer<'a>(storage: &mut Vec<Vec<u8>>, bytes: Vec<u8>) -> &'a [u8] {
+    storage.push(bytes);
+    let last = storage.last().expect("just pushed");
+    // SAFETY: see this function's doc comment.
+    unsafe { std::slice::from_raw_parts(last.as_ptr(), last.len()) }
+}
+
 fn rect_as_f32(r: state::Rect) -> [f32; 4] {
     [r.x as f32, r.y as f32, r.w as f32, r.h as f32]
 }
@@ -401,6 +456,52 @@ impl Context {
         config: &DeviceConfig,
         out: &mut Vec<RenderOp<'a>>,
     ) {
+        // No `CALL` support: a `CALL` encountered here always fails to
+        // fetch (skip-class `E_BAD_REF`, latched at the `CALL`'s own ring
+        // offset -- see `submit_with`), which is what every caller that
+        // predates `CALL` (every test in this module) already expects to
+        // never happen. `Vec::new()` allocates nothing until pushed to, and
+        // nothing is ever pushed to it since the fetch closure always
+        // returns `None`, so this path costs the same as before `CALL`
+        // existed.
+        self.submit_with(ring, new_tail, config, out, &mut Vec::new(), &mut |_| None);
+    }
+
+    /// [`Context::submit`], plus `CALL` (`0x0005`) support: `fetch_call_buffer`
+    /// is asked for a called buffer's bytes given its already-validated
+    /// [`Ref`] (`ring.rs`'s `validate_ref` already ran on it as part of
+    /// ordinary decoding); returning `None` is reported the same as any
+    /// other unresolvable ref, `E_BAD_REF` at the `CALL`'s own ring offset.
+    /// `board.rs`'s `doorbell` is the real caller, implementing this with
+    /// exactly the aperture-range/`DeviceHost::dma_read` fetch its own
+    /// guest-ring precedent already uses -- reused here for one fetch code
+    /// path instead of two.
+    ///
+    /// `call_storage` is where the fetched bytes are kept alive: a called
+    /// buffer's bytes must be owned (see `stash_call_buffer`'s doc comment
+    /// for the full reasoning and the `unsafe` this implies), and the
+    /// caller must keep `call_storage` alive at least as long as `out` --
+    /// in practice, until every `RenderOp` in `out` has actually been
+    /// consumed, exactly the same lifetime discipline `ring` itself already
+    /// requires (see [`RenderOp`]'s doc comment).
+    ///
+    /// **Nesting is bounded to one level by construction, not by a
+    /// counter**: a `CALL` decoded from the *top-level ring* is handled
+    /// right here and fetches+recurses into [`Context::apply_call_buffer`]
+    /// exactly once; a `CALL` decoded *from inside* `apply_call_buffer`
+    /// (i.e. already one level deep) is handled entirely within that
+    /// method, which never calls back into this one or into itself. There
+    /// is no code path that can go two levels deep, so there is no depth
+    /// counter to get wrong and no state to restore on the way back out.
+    pub fn submit_with<'a>(
+        &mut self,
+        ring: &'a [u8],
+        new_tail: u32,
+        config: &DeviceConfig,
+        out: &mut Vec<RenderOp<'a>>,
+        call_storage: &mut Vec<Vec<u8>>,
+        fetch_call_buffer: &mut dyn FnMut(Ref) -> Option<Vec<u8>>,
+    ) {
         self.ring_tail = new_tail;
         if self.halted {
             return;
@@ -410,13 +511,74 @@ impl Context {
         loop {
             let start = cursor.head();
             match cursor.step() {
+                Some(ring::Step::Command(Command::Call { data })) => {
+                    match fetch_call_buffer(data) {
+                        Some(bytes) => {
+                            let bytes = stash_call_buffer(call_storage, bytes);
+                            self.apply_call_buffer(bytes, config, start, out);
+                            if self.halted {
+                                // A halting error inside the buffer
+                                // abandons the call and halts the context;
+                                // the outer cursor has already advanced
+                                // past the CALL command itself (it decoded
+                                // structurally fine), so breaking here and
+                                // letting `self.ring_head = cursor.head()`
+                                // run below is exactly the spec's "after
+                                // ERROR_ACK, decoding resumes in the ring
+                                // after the CALL" -- no offset bookkeeping
+                                // needed.
+                                break;
+                            }
+                        }
+                        None => self.latch_protocol_error(ErrorCode::BadRef, start),
+                    }
+                }
                 Some(ring::Step::Command(cmd)) => self.apply(cmd, start, out),
                 Some(ring::Step::Error(err)) => self.latch_protocol_error(err.code, err.offset),
                 None => break,
             }
         }
         self.ring_head = cursor.head();
-        self.halted = cursor.is_halted();
+        self.halted = self.halted || cursor.is_halted();
+    }
+
+    /// Decodes and applies a `CALL`ed buffer's commands in place of the
+    /// `CALL` itself, per `c3d-cmd-control`'s `CALL` prose: framed exactly
+    /// like the ring but linear -- no wraparound, no `RING_HEAD`/
+    /// `RING_TAIL` of its own ([`RingCursor::new_linear`]) -- and every
+    /// error, **including a nested `CALL`** (illegal: `E_BAD_OPCODE`, skip,
+    /// decoding of this buffer continues), latching `call_start` (the
+    /// *outer* `CALL` command's own ring offset) rather than a position
+    /// inside the buffer, which has none of its own to report. `FENCE`
+    /// needs no special handling here -- it reaches the same `apply` as
+    /// everywhere else, which is what "behaves identically" means.
+    fn apply_call_buffer<'a>(
+        &mut self,
+        bytes: &'a [u8],
+        config: &DeviceConfig,
+        call_start: u32,
+        out: &mut Vec<RenderOp<'a>>,
+    ) {
+        let mut cursor = RingCursor::new_linear(bytes, *config);
+        loop {
+            match cursor.step() {
+                // Nesting is illegal: `ring.rs` itself raises `E_BAD_OPCODE`
+                // for a `CALL` decoded from a `new_linear` cursor (ahead of
+                // even looking at its ref), so `Command::Call` is never
+                // produced here -- it always arrives via the `Step::Error`
+                // arm below instead, which already latches `call_start` and
+                // (being skip-class) loops on to the next command.
+                Some(ring::Step::Command(cmd)) => self.apply(cmd, call_start, out),
+                Some(ring::Step::Error(err)) => {
+                    self.latch_protocol_error(err.code, call_start);
+                    if err.halt {
+                        self.halted = true;
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
     }
 
     /// The renderer calls this once every op up to and including fence
@@ -473,6 +635,13 @@ impl Context {
             Command::Nop | Command::Flush | Command::Finish => {}
             Command::Fence { id } => out.push(RenderOp::Fence { id }),
             Command::CtxResetState => self.state.reset_state(),
+            // Intercepted in `submit_with`/`apply_call_buffer` before `apply`
+            // is ever called for it (handling it means fetching more bytes
+            // and running a nested decode pass, which `apply` has no cursor
+            // access to do) -- see this type's doc comment. Never reached.
+            Command::Call { .. } => {
+                debug_assert!(false, "Command::Call must be intercepted before apply");
+            }
 
             Command::SurfaceDefine {
                 id,
@@ -1668,5 +1837,317 @@ mod tests {
         assert!(!ctx.halted); // neither error class halts here
         assert_eq!(ctx.error_code, ErrorCode::BadRect as u32);
         assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
+    }
+
+    // -- CALL -----------------------------------------------------------
+
+    fn buffer_of(commands: &[Vec<u8>]) -> Vec<u8> {
+        commands.concat()
+    }
+
+    /// A `FENCE` inside a called buffer completes normally -- it reaches
+    /// the same `apply` as everywhere else -- and `RING_HEAD` (the outer
+    /// ring's) advances past the `CALL` command itself.
+    #[test]
+    fn call_replays_a_buffer_and_its_fence_completes() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let buffer = buffer_of(&[cmd(OP_FENCE, &[9])]);
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                None
+            }
+        };
+        ctx.submit_with(
+            &ring,
+            call_len,
+            &config(),
+            &mut out,
+            &mut storage,
+            &mut fetch,
+        );
+        assert_eq!(out, vec![RenderOp::Fence { id: 9 }]);
+        assert_eq!(ctx.ring_head, call_len, "RING_HEAD past the CALL");
+        assert_eq!(ctx.error_code, 0);
+        assert!(!ctx.halted);
+    }
+
+    /// Nesting is illegal: a `CALL` decoded while already decoding a
+    /// called buffer is `E_BAD_OPCODE`, skipped -- decoding of the
+    /// (outer) called buffer continues past it, proven here by a marker
+    /// `FENCE` right after the illegal nested `CALL` still executing.
+    #[test]
+    fn call_nesting_is_illegal_and_decoding_of_the_buffer_continues_past_it() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let nested_call = cmd(OP_CALL, &[0x2000, 4]);
+        let marker = cmd(OP_FENCE, &[55]);
+        let buffer = [nested_call, marker].concat();
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut nested_fetch_invoked = false;
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                // The illegal nested CALL must never even be fetched --
+                // it's rejected as E_BAD_OPCODE before any fetch happens.
+                nested_fetch_invoked = true;
+                None
+            }
+        };
+        ctx.submit_with(
+            &ring,
+            call_len,
+            &config(),
+            &mut out,
+            &mut storage,
+            &mut fetch,
+        );
+        assert!(!nested_fetch_invoked, "a nested CALL must never be fetched");
+        assert_eq!(
+            out,
+            vec![RenderOp::Fence { id: 55 }],
+            "the marker after the illegal nested CALL still executes"
+        );
+        assert_eq!(ctx.error_code, ErrorCode::BadOpcode as u32);
+        assert_eq!(
+            ctx.error_offset, 0,
+            "latches the OUTER CALL's own ring offset, not a position inside the buffer"
+        );
+        assert!(!ctx.halted, "E_BAD_OPCODE is skip-class");
+    }
+
+    /// Nesting is `E_BAD_OPCODE` even when the nested `CALL`'s own ref is
+    /// malformed (here, misaligned -- which would otherwise be `E_BAD_REF`
+    /// for an ordinary top-level `CALL`): nesting is checked first, before
+    /// the ref is looked at at all, so a malformed nested ref must not leak
+    /// through as the wrong error code.
+    #[test]
+    fn call_nesting_is_e_bad_opcode_even_with_a_malformed_nested_ref() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let nested_call = cmd(OP_CALL, &[0x2001, 4]); // misaligned address
+        let marker = cmd(OP_FENCE, &[55]);
+        let buffer = [nested_call, marker].concat();
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                panic!("the illegal nested CALL must never be fetched");
+            }
+        };
+        ctx.submit_with(
+            &ring,
+            call_len,
+            &config(),
+            &mut out,
+            &mut storage,
+            &mut fetch,
+        );
+        assert_eq!(
+            out,
+            vec![RenderOp::Fence { id: 55 }],
+            "the marker after the illegal nested CALL still executes"
+        );
+        assert_eq!(
+            ctx.error_code,
+            ErrorCode::BadOpcode as u32,
+            "nesting is rejected before the malformed ref is ever validated"
+        );
+        assert!(!ctx.halted, "E_BAD_OPCODE is skip-class");
+    }
+
+    /// A skip-class error raised by a command *inside* a called buffer
+    /// (here `SURFACE_DESTROY 0`, `E_BAD_ID`) latches the enclosing
+    /// `CALL`'s own ring offset -- not a position inside the buffer, which
+    /// has none of its own -- and decoding of the buffer continues past
+    /// it (a marker command in the same buffer still executes).
+    #[test]
+    fn a_skip_class_error_inside_a_called_buffer_latches_the_calls_offset_and_continues() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let filler = cmd(OP_CTX_RESET_STATE, &[]);
+        let bad = cmd(OP_SURFACE_DESTROY, &[0]); // id 0: E_BAD_ID
+        let marker = cmd(OP_FENCE, &[77]);
+        let buffer = [filler, bad, marker].concat();
+        // A leading FENCE in the outer ring gives the CALL a non-zero
+        // offset, distinguishable from any buffer-local offset (the bad
+        // command's own buffer-local offset is non-zero too, at 4).
+        let leading = cmd(OP_FENCE, &[1]);
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_start = leading.len() as u32;
+        let total = (leading.len() + call_cmd.len()) as u32;
+        let ring = ring_of(&[leading, call_cmd]);
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                None
+            }
+        };
+        ctx.submit_with(&ring, total, &config(), &mut out, &mut storage, &mut fetch);
+        assert_eq!(
+            out,
+            vec![RenderOp::Fence { id: 1 }, RenderOp::Fence { id: 77 }],
+            "the marker after the skipped bad command still executes"
+        );
+        assert_eq!(ctx.error_code, ErrorCode::BadId as u32);
+        assert_eq!(
+            ctx.error_offset, call_start,
+            "latches the CALL's own ring offset, not the buffer-local one"
+        );
+        assert!(!ctx.halted);
+    }
+
+    /// A framing error against the *buffer's own end* (its last command's
+    /// declared length runs past it) is `E_BAD_LENGTH`, halting -- the
+    /// call is abandoned entirely, `ERROR_OFFSET` latches the `CALL`'s own
+    /// ring offset (not anything inside the buffer), and after the halt
+    /// `RING_HEAD` (the outer ring's) is left right after the `CALL`,
+    /// exactly as if it had completed -- because the outer cursor already
+    /// advanced past the `CALL` itself before the buffer was ever decoded.
+    #[test]
+    fn a_framing_error_in_a_called_buffer_halts_and_latches_the_calls_offset() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        // A leading FENCE in the outer ring gives the CALL a non-zero
+        // offset, and a harmless filler command in the buffer gives the
+        // truncated FENCE a non-zero *buffer-local* offset too -- so a
+        // latch that used either the wrong (buffer-local) offset or offset
+        // 0 by coincidence would be caught here, unlike a same-valued
+        // 0/0 case.
+        let leading = cmd(OP_FENCE, &[1]);
+        let filler = cmd(OP_CTX_RESET_STATE, &[]);
+        // Declares FENCE (length 2 words = 8 bytes) but is truncated to 4
+        // bytes -- runs past the buffer's own end.
+        let mut truncated_fence = cmd(OP_FENCE, &[9]);
+        truncated_fence.truncate(4);
+        let buffer = [filler, truncated_fence].concat();
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_start = leading.len() as u32;
+        let total = (leading.len() + call_cmd.len()) as u32;
+        let ring = ring_of(&[leading, call_cmd]);
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                None
+            }
+        };
+        ctx.submit_with(&ring, total, &config(), &mut out, &mut storage, &mut fetch);
+        assert_eq!(
+            out,
+            vec![RenderOp::Fence { id: 1 }],
+            "only the outer ring's leading FENCE took effect"
+        );
+        assert!(ctx.halted, "E_BAD_LENGTH halts");
+        assert_eq!(ctx.error_code, ErrorCode::BadLength as u32);
+        assert_eq!(
+            ctx.error_offset, call_start,
+            "latches the CALL's own ring offset, not inside the buffer"
+        );
+        assert_eq!(
+            ctx.ring_head, total,
+            "resumes in the ring right after the CALL, as if it had completed"
+        );
+    }
+
+    /// A `CALL` to a guest-space (`CAP_GUESTMEM`) buffer works exactly
+    /// like an aperture one -- the fetch closure just sees `RefSpace::Guest`.
+    #[test]
+    fn call_to_a_guest_space_buffer_works_under_cap_guestmem() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let buffer = buffer_of(&[cmd(OP_FENCE, &[42])]);
+        let ref_len_word = 0x8000_0000 | buffer.len() as u32; // space 1 (guest)
+        let call_cmd = cmd(OP_CALL, &[0x2000_0000, ref_len_word]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut seen_space = None;
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            seen_space = Some(r.space);
+            if r.address == 0x2000_0000 {
+                Some(buffer.clone())
+            } else {
+                None
+            }
+        };
+        ctx.submit_with(
+            &ring,
+            call_len,
+            &config(),
+            &mut out,
+            &mut storage,
+            &mut fetch,
+        );
+        assert_eq!(seen_space, Some(RefSpace::Guest));
+        assert_eq!(out, vec![RenderOp::Fence { id: 42 }]);
+        assert_eq!(ctx.error_code, 0);
+    }
+
+    /// A `CALL` to a space-1 buffer with `CAP_GUESTMEM` masked off must go
+    /// through the ordinary `validate_ref` path exactly like any other
+    /// ref -- `E_BAD_REF` at the `CALL`'s own ref, raised by `ring.rs`
+    /// before `dispatch.rs` ever sees `Command::Call`, so the fetch
+    /// closure must never even run.
+    #[test]
+    fn call_to_a_guest_space_buffer_is_e_bad_ref_without_cap_guestmem() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let mut c = config();
+        c.guestmem = false;
+        let ref_len_word = 0x8000_0000 | 16u32;
+        let call_cmd = cmd(OP_CALL, &[0x2000_0000, ref_len_word]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut fetch_invoked = false;
+        let mut fetch = |_r: Ref| -> Option<Vec<u8>> {
+            fetch_invoked = true;
+            None
+        };
+        ctx.submit_with(&ring, call_len, &c, &mut out, &mut storage, &mut fetch);
+        assert!(
+            !fetch_invoked,
+            "validate_ref must reject this before dispatch ever sees Command::Call"
+        );
+        assert!(out.is_empty());
+        assert_eq!(ctx.error_code, ErrorCode::BadRef as u32);
+    }
+
+    /// The no-`CALL` path (`Context::submit`) is unaffected: a `CALL`
+    /// command reaching it (no caller wired up `submit_with`) always
+    /// fails to fetch, which is skip-class `E_BAD_REF` at the `CALL`'s own
+    /// offset -- proving `submit`'s convenience wrapper still behaves
+    /// sanely even if a ring somehow contained a `CALL`, without needing
+    /// any of `submit_with`'s extra parameters.
+    #[test]
+    fn plain_submit_treats_an_unfetchable_call_as_e_bad_ref() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let call_cmd = cmd(OP_CALL, &[0x1000, 16]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        ctx.submit(&ring, call_len, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.error_code, ErrorCode::BadRef as u32);
+        assert_eq!(ctx.error_offset, 0);
+        assert!(!ctx.halted);
     }
 }
