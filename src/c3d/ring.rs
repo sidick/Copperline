@@ -925,6 +925,7 @@ impl<'a> RingCursor<'a> {
                 check!(self.check_pow2_dims(width, height, start));
                 check!(self.check_texture_size(width, height, start));
                 check!(self.check_texfmt(format, start));
+                check!(self.check_texture_row_bytes(w32(body, 5), start));
                 let data = Ref::decode(w32(body, 6), w32(body, 7));
                 check!(self.validate_ref(data, start));
                 Command::TexImage {
@@ -946,6 +947,7 @@ impl<'a> RingCursor<'a> {
                 check!(self.check_id(id, self.config.max_textures, start));
                 check!(self.check_texture_size(width, height, start));
                 check!(self.check_texfmt(format, start));
+                check!(self.check_texture_row_bytes(w32(body, 7), start));
                 let data = Ref::decode(w32(body, 8), w32(body, 9));
                 check!(self.validate_ref(data, start));
                 Command::TexSubImage {
@@ -1217,6 +1219,15 @@ impl<'a> RingCursor<'a> {
         start: u32,
         window_space: bool,
     ) -> Result<(u32, VertexFormat, u32, &'a [u8]), Step<'a>> {
+        // `prim`/`format`/`count` need 3 body words (12 bytes) before
+        // anything else is even readable -- reject a too-short command
+        // here, before the first `w32` call, rather than let it index
+        // past `body`'s end (the same bug class `CALL`'s sub-word-buffer
+        // fix addressed: a guest-controlled `length_words` below a fixed
+        // opcode's own minimum must never reach unchecked indexing).
+        if length_words < 4 {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
         let prim = w32(body, 0);
         let format = VertexFormat(w32(body, 1));
         let count = w32(body, 2);
@@ -1243,6 +1254,11 @@ impl<'a> RingCursor<'a> {
         start: u32,
         window_space: bool,
     ) -> Result<(u32, VertexFormat, u32, &'a [u8]), Step<'a>> {
+        // Same guard as `decode_draw_inline`: 3 body words minimum before
+        // any `w32` call is safe.
+        if length_words < 4 {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
         let prim = w32(body, 0);
         let format = VertexFormat(w32(body, 1));
         let count = w32(body, 2);
@@ -1270,6 +1286,13 @@ impl<'a> RingCursor<'a> {
         start: u32,
         window_space: bool,
     ) -> Result<(u32, VertexFormat, u32, u32, u32, u32, Ref, &'a [u8]), Step<'a>> {
+        // `prim`/`format`/`count`/`index_type`/`min_index`/`max_index`/
+        // `index_ref` need 8 body words (32 bytes) before anything else is
+        // readable -- same guard as `decode_draw_inline`/`decode_draw_arrays`,
+        // sized for this opcode's larger fixed header.
+        if length_words < 9 {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
         let prim = w32(body, 0);
         let format = VertexFormat(w32(body, 1));
         let count = w32(body, 2);
@@ -1393,6 +1416,28 @@ impl<'a> RingCursor<'a> {
     fn check_surface_size(&mut self, width: u32, height: u32, start: u32) -> Result<(), Step<'a>> {
         if width > self.config.max_surface_width || height > self.config.max_surface_height {
             return Err(self.raise(ErrorCode::Limit, start));
+        }
+        Ok(())
+    }
+
+    /// `TEX_IMAGE`/`TEX_SUBIMAGE`'s `row_bytes` carries GL's unpack padding
+    /// ("so rows may carry GL's unpack padding without repacking" --
+    /// `c3d-cmd-textures`) and has no reportable limit register of its own,
+    /// but it is NOT free to be arbitrary: `render.rs` multiplies it by
+    /// `height` for one unbounded read from the image's `ref` (unlike
+    /// `SURFACE_UPLOAD`/`READBACK`'s row-by-row addressing, which never
+    /// forms one huge length), and for a guest-space ref that length drives
+    /// a real allocation with no other cap -- a guest-controlled
+    /// `row_bytes` near `u32::MAX` times a legal `height` is an
+    /// unbounded-allocation DoS, not a rendering request. `MAX_TEXTURE_SIZE`
+    /// is already reported and already bounds `width`; four bytes covers
+    /// every wire texture format's largest `bytes_per_pixel` (`RGBA8`), so
+    /// this bound can never reject any row a legitimately-formatted,
+    /// legitimately-sized texture could actually need -- it only rejects a
+    /// `row_bytes` with no relationship to the image it claims to describe.
+    fn check_texture_row_bytes(&mut self, row_bytes: u32, start: u32) -> Result<(), Step<'a>> {
+        if row_bytes > self.config.max_texture_size.saturating_mul(4) {
+            return Err(self.raise(ErrorCode::BadArg, start));
         }
         Ok(())
     }
@@ -2236,6 +2281,79 @@ mod tests {
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
     }
 
+    /// `row_bytes` multiplied by `height` drives one unbounded
+    /// guest-memory read in `render.rs` (unlike `SURFACE_UPLOAD`/
+    /// `READBACK`'s row-by-row addressing, which never forms one huge
+    /// length) -- for a guest-space ref that length resizes a scratch
+    /// buffer with no other cap, so a guest-controlled `row_bytes` near
+    /// `u32::MAX` is an unbounded-allocation DoS, not a rendering request.
+    /// Must be `E_BAD_ARG` at decode time, tied to the already-reported
+    /// `MAX_TEXTURE_SIZE` (times the largest wire format's bytes/pixel),
+    /// well before it reaches `render.rs`.
+    #[test]
+    fn tex_image_rejects_a_row_bytes_with_no_relationship_to_the_image() {
+        let mut c = config(true);
+        c.max_texture_size = 64;
+        let words = [
+            header(OP_TEX_IMAGE, 9),
+            1,           // id
+            0,           // level
+            0,           // format: RGBA8
+            64,          // width
+            64,          // height
+            0xFFFF_FFFF, // row_bytes: absurd
+            0x0010_0000,
+            0,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 36, c);
+        assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn tex_subimage_rejects_a_row_bytes_with_no_relationship_to_the_image() {
+        let mut c = config(true);
+        c.max_texture_size = 64;
+        let words = [
+            header(OP_TEX_SUBIMAGE, 11),
+            1, // id
+            0, // level
+            0, // x
+            0, // y
+            64,
+            64,
+            0,           // format: RGBA8
+            0xFFFF_FFFF, // row_bytes: absurd
+            0x0010_0000,
+            0,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 44, c);
+        assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn tex_image_accepts_row_bytes_up_to_max_texture_size_times_max_bpp() {
+        // A legitimate row for a max-size, max-bpp (RGBA8) texture must
+        // never be rejected by the new bound.
+        let mut c = config(true);
+        c.max_texture_size = 64;
+        let words = [
+            header(OP_TEX_IMAGE, 9),
+            1,
+            0,
+            0, // format: RGBA8
+            64,
+            64,
+            64 * 4, // row_bytes: exactly width * bpp, the tightest legal packing
+            0x0010_0000,
+            0,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 36, c);
+        assert!(matches!(step, Step::Command(Command::TexImage { .. })));
+    }
+
     // -- E_BAD_ID -----------------------------------------------------------
 
     #[test]
@@ -2579,6 +2697,34 @@ mod tests {
         let ring = ring_with(4096, 0, &bad_words);
         let step = decode_one(&ring, 0, (correct_length - 1) * 4);
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    /// A `DRAW_INLINE`/`DRAW_ARRAYS`/`DRAW_ELEMENTS` command declaring a
+    /// `length_words` below its opcode's own fixed-header minimum must
+    /// decode as `E_BAD_ARG`, not index past `body`'s end reading `prim`/
+    /// `format`/`count` (or, for `DRAW_ELEMENTS`, the index-type/min/max/
+    /// ref fields) before any length check ran -- the same bug class the
+    /// `CALL` sub-word-buffer fix addressed, found in these three opcodes'
+    /// shared decoders instead (which, unlike every other opcode arm,
+    /// didn't use the `fixed!` macro and so had no length floor at all).
+    #[test]
+    fn a_too_short_draw_family_command_is_e_bad_arg_not_a_panic() {
+        for op in [
+            OP_DRAW_INLINE,
+            OP_DRAW_INLINE_WIN,
+            OP_DRAW_ARRAYS,
+            OP_DRAW_ARRAYS_WIN,
+        ] {
+            // length_words = 1: just the header word, body is empty.
+            let ring = ring_with(4096, 0, &[header(op, 1)]);
+            let step = decode_one(&ring, 0, 4);
+            assert_eq!(step, err(ErrorCode::BadArg, 0, false), "opcode {op:#06x}");
+        }
+        for op in [OP_DRAW_ELEMENTS, OP_DRAW_ELEMENTS_WIN] {
+            let ring = ring_with(4096, 0, &[header(op, 1)]);
+            let step = decode_one(&ring, 0, 4);
+            assert_eq!(step, err(ErrorCode::BadArg, 0, false), "opcode {op:#06x}");
+        }
     }
 
     #[test]
