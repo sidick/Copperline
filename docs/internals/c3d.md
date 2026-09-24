@@ -326,6 +326,23 @@ project's spec-first loop exists to surface.
   there; and nesting is rejected as `E_BAD_OPCODE` by `ring.rs` itself,
   ahead of even decoding the nested `CALL`'s ref, so a nested `CALL` with
   a malformed ref reports `E_BAD_OPCODE` rather than `E_BAD_REF`.
+- **Fence state across page reallocation (draft 0.15).** `FENCE_COMPLETED`/
+  `FENCE_IRQ_TARGET` must return to `0` when `CTX_CONTROL.ALLOC` transitions
+  from clear to set, and must NOT be touched by `CTX_CONTROL.RESET` (bit
+  2) -- a live owner's mid-life reset must not strand a wait on an
+  already-emitted fence ID. `board.rs`'s `write_context` already satisfied
+  both halves incidentally before this draft existed: the freeing branch
+  (`ALLOC` 1->0) replaces the whole `ContextSlot` with its `Default`,
+  which already zeroes both registers well before any later realloc --
+  behaviourally equivalent to zeroing on the 0->1 transition itself, since
+  a context can only reach `ALLOC=1` a second time by first passing back
+  through `ALLOC=0`; and `RESET`'s handler (`Context::reset_all`) only
+  ever touches GL state and the error latches, never `fence_completed` or
+  the board-level `fence_irq_target` field. No code change was needed --
+  two tests (`fence_state_does_not_survive_a_free_and_realloc`,
+  `ctx_control_reset_leaves_fence_state_untouched`) pin this down as an
+  explicit, spec-cited invariant instead of leaving it an incidental
+  side effect of the freeing branch's unrelated full wipe.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field

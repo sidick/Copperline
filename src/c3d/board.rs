@@ -1084,6 +1084,124 @@ mod tests {
         assert_eq!(b.read(ctl, 4, &mut h), 0);
     }
 
+    /// Spec draft 0.15's `CTX_CONTROL` rule: freeing a context (`ALLOC`
+    /// cleared) and reallocating it must not carry `FENCE_COMPLETED`/
+    /// `FENCE_IRQ_TARGET` forward -- a stale high value from the previous
+    /// owner would satisfy the new owner's every fence wait instantly
+    /// (unsigned reached-or-passed compare) before any of its work had
+    /// run. `write_context`'s freeing branch already resets the whole
+    /// `ContextSlot` to its default on `ALLOC` 1->0 (every object this
+    /// context held is destroyed, per `CTX_CONTROL`'s own doc), which
+    /// already zeroes both registers well before any later realloc --
+    /// behaviourally equivalent to zeroing on the 0->1 transition itself,
+    /// since a context can only reach `ALLOC=1` a second time by first
+    /// having passed back through `ALLOC=0`. This test pins that down as
+    /// an explicit, spec-cited invariant rather than an incidental
+    /// side effect of the freeing branch's existing full wipe.
+    #[test]
+    fn fence_state_does_not_survive_a_free_and_realloc() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        let ctl = CONTEXT_PAGE_BASE + creg::CONTROL;
+        let ring_off = 0u32;
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let cmds = [opcode_len(proto::OP_FENCE, 2), 5];
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_window_off = b.aperture_offset + ring_off;
+        for (i, b_) in bytes.iter().enumerate() {
+            b.write(ring_window_off + i as u32, 1, *b_ as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, ring_off, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(ctl, 4, CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, 42, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            5,
+            "sanity: the fence actually completed before freeing"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, &mut h),
+            42
+        );
+
+        // Free, then reallocate the same page.
+        b.write(ctl, 4, 0, &mut h);
+        b.write(ctl, 4, CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE, &mut h);
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            0,
+            "FENCE_COMPLETED must not carry the previous owner's progress"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, &mut h),
+            0,
+            "FENCE_IRQ_TARGET must be disarmed for the new owner"
+        );
+    }
+
+    /// The other half of spec draft 0.15's `CTX_CONTROL` rule:
+    /// `CTX_CONTROL.RESET` (bit 2) is explicitly excluded -- a live
+    /// owner's mid-life reset must leave `FENCE_COMPLETED`/
+    /// `FENCE_IRQ_TARGET` untouched, since zeroing them would strand a
+    /// wait on an already-emitted fence ID until the next fence happened
+    /// to land.
+    #[test]
+    fn ctx_control_reset_leaves_fence_state_untouched() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        let ctl = CONTEXT_PAGE_BASE + creg::CONTROL;
+        let ring_off = 0u32;
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let cmds = [opcode_len(proto::OP_FENCE, 2), 9];
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_window_off = b.aperture_offset + ring_off;
+        for (i, b_) in bytes.iter().enumerate() {
+            b.write(ring_window_off + i as u32, 1, *b_ as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, ring_off, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(ctl, 4, CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, 7, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            9
+        );
+
+        b.write(
+            ctl,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE | CTX_CONTROL_RESET,
+            &mut h,
+        );
+
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
+            9,
+            "RESET must not strand a wait on an already-emitted fence ID"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, &mut h),
+            7,
+            "RESET must not disarm a live IRQ target"
+        );
+    }
+
     /// `[c3d] mask_caps`'s contract: a masked bit reads clear in `CAPS0`,
     /// its dependent limit registers report as on a device without it,
     /// and its opcodes are rejected -- the spec's conformance switch
