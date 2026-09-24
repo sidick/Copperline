@@ -562,13 +562,12 @@ impl Context {
         let mut cursor = RingCursor::new_linear(bytes, *config);
         loop {
             match cursor.step() {
-                Some(ring::Step::Command(Command::Call { .. })) => {
-                    // Nesting is illegal. The cursor has already advanced
-                    // past this command (it decoded structurally fine), so
-                    // "skip" falls out of just not calling `apply` for it
-                    // and looping again.
-                    self.latch_protocol_error(ErrorCode::BadOpcode, call_start);
-                }
+                // Nesting is illegal: `ring.rs` itself raises `E_BAD_OPCODE`
+                // for a `CALL` decoded from a `new_linear` cursor (ahead of
+                // even looking at its ref), so `Command::Call` is never
+                // produced here -- it always arrives via the `Step::Error`
+                // arm below instead, which already latches `call_start` and
+                // (being skip-class) loops on to the next command.
                 Some(ring::Step::Command(cmd)) => self.apply(cmd, call_start, out),
                 Some(ring::Step::Error(err)) => {
                     self.latch_protocol_error(err.code, call_start);
@@ -1923,6 +1922,50 @@ mod tests {
         assert_eq!(
             ctx.error_offset, 0,
             "latches the OUTER CALL's own ring offset, not a position inside the buffer"
+        );
+        assert!(!ctx.halted, "E_BAD_OPCODE is skip-class");
+    }
+
+    /// Nesting is `E_BAD_OPCODE` even when the nested `CALL`'s own ref is
+    /// malformed (here, misaligned -- which would otherwise be `E_BAD_REF`
+    /// for an ordinary top-level `CALL`): nesting is checked first, before
+    /// the ref is looked at at all, so a malformed nested ref must not leak
+    /// through as the wrong error code.
+    #[test]
+    fn call_nesting_is_e_bad_opcode_even_with_a_malformed_nested_ref() {
+        let mut ctx = context();
+        let mut out = Vec::new();
+        let mut storage = Vec::new();
+        let nested_call = cmd(OP_CALL, &[0x2001, 4]); // misaligned address
+        let marker = cmd(OP_FENCE, &[55]);
+        let buffer = [nested_call, marker].concat();
+        let call_cmd = cmd(OP_CALL, &[0x1000, buffer.len() as u32]);
+        let call_len = call_cmd.len() as u32;
+        let ring = ring_of(&[call_cmd]);
+        let mut fetch = |r: Ref| -> Option<Vec<u8>> {
+            if r.address == 0x1000 {
+                Some(buffer.clone())
+            } else {
+                panic!("the illegal nested CALL must never be fetched");
+            }
+        };
+        ctx.submit_with(
+            &ring,
+            call_len,
+            &config(),
+            &mut out,
+            &mut storage,
+            &mut fetch,
+        );
+        assert_eq!(
+            out,
+            vec![RenderOp::Fence { id: 55 }],
+            "the marker after the illegal nested CALL still executes"
+        );
+        assert_eq!(
+            ctx.error_code,
+            ErrorCode::BadOpcode as u32,
+            "nesting is rejected before the malformed ref is ever validated"
         );
         assert!(!ctx.halted, "E_BAD_OPCODE is skip-class");
     }

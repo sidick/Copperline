@@ -317,7 +317,15 @@ project's spec-first loop exists to surface.
   `submit_with` with a throwaway empty `Vec::new()` (no allocation until
   pushed to) and a closure that always returns `None`, never invoking
   `stash_call_buffer`, so every one of this milestone's pre-existing tests
-  keeps calling `submit` unchanged.
+  keeps calling `submit` unchanged. Two edge cases `RingCursor::step`
+  handles explicitly for a `new_linear` cursor, since a called buffer's
+  length comes straight from a `CALL`'s ref length word with only
+  alignment/aperture-bound checking (`validate_ref`), not a 4-byte
+  minimum: a buffer shorter than one command header (1-3 bytes) is
+  `E_BAD_LENGTH`, not an out-of-bounds read of the header word that isn't
+  there; and nesting is rejected as `E_BAD_OPCODE` by `ring.rs` itself,
+  ahead of even decoding the nested `CALL`'s ref, so a nested `CALL` with
+  a malformed ref reports `E_BAD_OPCODE` rather than `E_BAD_REF`.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field

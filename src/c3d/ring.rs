@@ -332,6 +332,19 @@ impl<'a> RingCursor<'a> {
         let ring_size = self.ring.len() as u32;
         let start = self.head;
 
+        // Reading a command's header word needs 4 physical bytes at
+        // `start`. For a circular top-level ring this is always true --
+        // `head` only ever takes 0 or a sum of whole (4-byte-aligned)
+        // command lengths, so it never lands within 4 bytes of the
+        // physical end without exactly reaching it (which wraps `head` to
+        // 0 below, not here). A `new_linear` buffer has no such guarantee:
+        // its `tail` is just `ring.len()`, which a `CALL`'s ref length can
+        // set to anything, including 1-3 bytes. Guard here rather than let
+        // `read_u32` index out of bounds.
+        if ring_size - start < 4 {
+            return Some(self.raise(ErrorCode::BadLength, start));
+        }
+
         let word0 = read_u32(self.ring, start);
         let opcode = (word0 >> 16) as u16;
         let length_words = word0 & 0xFFFF;
@@ -482,6 +495,16 @@ impl<'a> RingCursor<'a> {
             }
             OP_CALL => {
                 fixed!(2);
+                // Nesting is illegal (`c3d-cmd-control`): a `CALL` decoded
+                // while already decoding a called buffer is unconditionally
+                // `E_BAD_OPCODE`, before its ref is looked at at all -- so
+                // this must be checked ahead of `validate_ref` below, not
+                // left for `dispatch.rs` to reclassify after the fact,
+                // otherwise a nested CALL with a malformed ref would report
+                // `E_BAD_REF` instead.
+                if self.linear {
+                    return self.raise(ErrorCode::BadOpcode, start);
+                }
                 let data = Ref::decode(w32(body, 0), w32(body, 1));
                 check!(self.validate_ref(data, start));
                 Command::Call { data }
@@ -2992,5 +3015,51 @@ mod tests {
         let mut cursor = RingCursor::new_linear(&buf, config(true));
         assert_eq!(cursor.step(), Some(err(ErrorCode::BadLength, 0, true)));
         assert!(cursor.is_halted());
+    }
+
+    #[test]
+    fn new_linear_reports_e_bad_length_instead_of_panicking_on_a_sub_word_buffer() {
+        // A CALL's ref length is only checked for alignment/aperture bound
+        // by validate_ref, not for a 4-byte minimum -- a buffer of 1-3
+        // bytes must decode as a graceful E_BAD_LENGTH framing error, not
+        // index out of bounds trying to read a 4-byte command header that
+        // isn't there.
+        for len in 1..4 {
+            let buf = vec![0u8; len];
+            let mut cursor = RingCursor::new_linear(&buf, config(true));
+            assert_eq!(
+                cursor.step(),
+                Some(err(ErrorCode::BadLength, 0, true)),
+                "buffer length {len}"
+            );
+            assert!(cursor.is_halted(), "buffer length {len}");
+        }
+    }
+
+    #[test]
+    fn new_linear_reports_e_bad_length_for_a_stray_byte_after_a_valid_command() {
+        // A buffer whose length isn't a multiple of 4 (one valid FENCE
+        // plus one stray trailing byte) must not panic reading a second
+        // command header past the buffer's true end.
+        let words = [header(OP_FENCE, 2), 7];
+        let mut buf = ring_with(8, 0, &words);
+        buf.push(0); // 9 bytes total.
+        let mut cursor = RingCursor::new_linear(&buf, config(true));
+        assert_eq!(cursor.step(), Some(Step::Command(Command::Fence { id: 7 })));
+        assert_eq!(cursor.step(), Some(err(ErrorCode::BadLength, 8, true)));
+        assert!(cursor.is_halted());
+    }
+
+    #[test]
+    fn call_nested_inside_a_called_buffer_is_e_bad_opcode_even_with_a_malformed_ref() {
+        // Nesting must be rejected as E_BAD_OPCODE unconditionally -- before
+        // the nested CALL's own ref is even looked at -- so a malformed ref
+        // (here, a misaligned address that would otherwise be E_BAD_REF)
+        // must not leak through as the wrong error code.
+        let words = [header(OP_CALL, 3), 0x1001, 4]; // misaligned address
+        let buf = ring_with(12, 0, &words);
+        let mut cursor = RingCursor::new_linear(&buf, config(true));
+        assert_eq!(cursor.step(), Some(err(ErrorCode::BadOpcode, 0, false)));
+        assert!(!cursor.is_halted(), "E_BAD_OPCODE is skip-class");
     }
 }
