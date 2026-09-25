@@ -326,6 +326,30 @@ project's spec-first loop exists to surface.
   there; and nesting is rejected as `E_BAD_OPCODE` by `ring.rs` itself,
   ahead of even decoding the nested `CALL`'s ref, so a nested `CALL` with
   a malformed ref reports `E_BAD_OPCODE` rather than `E_BAD_REF`.
+- **`POLYGON_MODE`.** State tracking (`state::set_polygon_mode`) predates
+  this note; `render.rs`'s pipeline construction was the missing half.
+  `wgpu::PolygonMode::Line`/`Point` are gated behind the optional wgpu
+  features `POLYGON_MODE_LINE`/`POLYGON_MODE_POINT`, requested only as
+  the intersection of what this module ever wants and what the adapter
+  actually advertises (`Renderer::new`, never blindly requested) --
+  notably Metal has no native polygon-mode point at all, only fill/line,
+  so requesting it unconditionally would fail device creation outright on
+  that backend. A guest asking for `GL_POINT` where the adapter lacks
+  that feature falls back to `GL_LINE` (still strictly more faithful than
+  silently filling); asking for `GL_LINE` where even that is unsupported
+  falls all the way back to `Fill`. Like `CULL_FACE`, a decoded
+  `POLYGON_MODE` only ever reaches the pipeline for `Triangles` topology
+  -- a POINTS/LINES-family draw is already just points or lines, nothing
+  to "fill" or "outline". Unlike `cull_mode`/`front_face`, which discard
+  a whole face, wgpu has no per-face polygon mode: `glPolygonMode` can
+  set front and back independently and both can be visible at once with
+  culling disabled, but a pipeline can only rasterise one mode. This is
+  approximated as a single pipeline-wide mode taken from the *front*
+  face (`PipelineKey::polygon_mode`, `Renderer::pipeline_key_from_state`)
+  -- exact whenever front and back agree, which is the overwhelmingly
+  common case (`glPolygonMode(GL_FRONT_AND_BACK, ...)` is what almost
+  every real client calls), and a documented approximation when a guest
+  genuinely sets them differently.
 - **Fence state across page reallocation (draft 0.15).** `FENCE_COMPLETED`/
   `FENCE_IRQ_TARGET` must return to `0` when `CTX_CONTROL.ALLOC` transitions
   from clear to set, and must NOT be touched by `CTX_CONTROL.RESET` (bit

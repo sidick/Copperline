@@ -132,8 +132,8 @@ use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
     self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
-    PrimitiveType, ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode,
-    TexFilter, TexFormat, TexGenMode, TexWrap,
+    PolygonMode, PrimitiveType, ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat,
+    TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -1715,6 +1715,12 @@ pub struct PipelineKey {
     pub blend_equation: BlendEquationKey,
     pub cull: Option<FaceKey>,
     pub front_face_ccw: bool,
+    /// `POLYGON_MODE`, gated to `Fill` at pipeline-build time for any
+    /// non-`Triangles` topology (see `build_pipeline`'s doc comment on
+    /// `polygon_mode`): meaningless for POINTS/LINES-family primitives,
+    /// same reasoning as `cull`. Front/back is approximated to a single
+    /// value here -- see `Renderer::pipeline_key_from_state`.
+    pub polygon_mode: PolygonModeKey,
     pub color_write: (bool, bool, bool, bool),
     pub surface_format: TextureFormatKey,
     pub polygon_offset: Option<PolygonOffsetKey>,
@@ -1984,6 +1990,60 @@ impl From<Face> for FaceKey {
             Face::Front => Self::Front,
             Face::Back => Self::Back,
             Face::FrontAndBack => Self::FrontAndBack,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolygonModeKey {
+    Point,
+    Line,
+    Fill,
+}
+impl From<PolygonMode> for PolygonModeKey {
+    fn from(m: PolygonMode) -> Self {
+        match m {
+            PolygonMode::Point => Self::Point,
+            PolygonMode::Line => Self::Line,
+            PolygonMode::Fill => Self::Fill,
+        }
+    }
+}
+
+/// Maps a decoded `POLYGON_MODE` to the closest `wgpu::PolygonMode` this
+/// device can actually build a pipeline with. `Fill` is universal.
+/// `Line`/`Point` are each gated on the wgpu feature the current adapter
+/// advertised support for (`Renderer::polygon_mode_line_supported`/
+/// `polygon_mode_point_supported`, computed once in `Renderer::new` from
+/// the adapter's own feature set, never blindly requested) -- notably,
+/// Metal has no native "polygon mode point" at all (only fill/line), so
+/// requesting `wgpu::Features::POLYGON_MODE_POINT` unconditionally would
+/// make device creation itself fail on that backend. A guest asking for
+/// `GL_POINT` on such a backend falls back to `Line` (still strictly more
+/// faithful than silently filling); asking for `GL_LINE` where even that
+/// is unsupported falls all the way back to `Fill`.
+fn polygon_mode_to_wgpu(
+    mode: PolygonModeKey,
+    line_supported: bool,
+    point_supported: bool,
+) -> wgpu::PolygonMode {
+    match mode {
+        PolygonModeKey::Fill => wgpu::PolygonMode::Fill,
+        PolygonModeKey::Line => {
+            if line_supported {
+                wgpu::PolygonMode::Line
+            } else {
+                wgpu::PolygonMode::Fill
+            }
+        }
+        PolygonModeKey::Point => {
+            if point_supported {
+                wgpu::PolygonMode::Point
+            } else if line_supported {
+                wgpu::PolygonMode::Line
+            } else {
+                wgpu::PolygonMode::Fill
+            }
         }
     }
 }
@@ -2297,6 +2357,12 @@ pub struct Renderer {
     surfaces: HashMap<u32, GpuSurface>,
     textures: HashMap<u32, GpuTexture>,
     clear_rect_pipelines: HashMap<ClearRectPipelineKey, wgpu::RenderPipeline>,
+    /// Whether this device's adapter advertised `POLYGON_MODE_LINE`/
+    /// `POLYGON_MODE_POINT` -- computed once from the adapter's own
+    /// feature set (never blindly requested; see `polygon_mode_to_wgpu`'s
+    /// doc comment for why, e.g. Metal has no native polygon-mode point).
+    polygon_mode_line_supported: bool,
+    polygon_mode_point_supported: bool,
 }
 
 /// Ranks a [`wgpu::AdapterInfo`]'s device type for adapter selection:
@@ -2402,15 +2468,34 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
 
+        // POLYGON_MODE_LINE/_POINT are optional wgpu features (not every
+        // backend supports non-fill rasterisation -- notably Metal has
+        // no native polygon-mode point at all). Request only what this
+        // adapter actually advertises, intersected against what this
+        // module ever wants, rather than requesting them unconditionally
+        // and failing device creation outright on a backend that lacks
+        // one. See `polygon_mode_to_wgpu`'s doc comment for the runtime
+        // fallback this enables.
+        let wanted_polygon_mode_features =
+            wgpu::Features::POLYGON_MODE_LINE | wgpu::Features::POLYGON_MODE_POINT;
+        let polygon_mode_features = adapter.features() & wanted_polygon_mode_features;
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("c3d headless device"),
-            required_features: wgpu::Features::empty(),
+            required_features: polygon_mode_features,
             required_limits: wgpu::Limits::downlevel_defaults(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
             ..Default::default()
         }))
         .map_err(|e| RenderError::DeviceRequest(e.to_string()))?;
+
+        let polygon_mode_line_supported = device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE);
+        let polygon_mode_point_supported = device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_POINT);
 
         let bind_group_layout_textured =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2554,6 +2639,8 @@ impl Renderer {
             surfaces: HashMap::new(),
             textures: HashMap::new(),
             clear_rect_pipelines: HashMap::new(),
+            polygon_mode_line_supported,
+            polygon_mode_point_supported,
         })
     }
 
@@ -2801,7 +2888,19 @@ impl Renderer {
                         None
                     },
                     unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
+                    // GL's POLYGON_MODE, like face culling just above,
+                    // only ever applies to actual polygons: a
+                    // POINTS/LINES-family draw is already just points or
+                    // lines, nothing to "fill" or "outline".
+                    polygon_mode: if key.topology == PrimTopologyKey::Triangles {
+                        polygon_mode_to_wgpu(
+                            key.polygon_mode,
+                            self.polygon_mode_line_supported,
+                            self.polygon_mode_point_supported,
+                        )
+                    } else {
+                        wgpu::PolygonMode::Fill
+                    },
                     conservative: false,
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -3014,6 +3113,17 @@ impl Renderer {
             blend_equation: raster.blend_equation.into(),
             cull,
             front_face_ccw: raster.front_face == FrontFace::Ccw,
+            // wgpu has no per-face POLYGON_MODE (unlike cull_mode/
+            // front_face, which discard a whole face; polygon mode
+            // changes *how* a face draws, and both can be visible at
+            // once with culling disabled) -- approximated as a single
+            // pipeline-wide mode taken from the front face, which is
+            // exact whenever front and back agree (by far the common
+            // case: `glPolygonMode(GL_FRONT_AND_BACK, ...)` is what
+            // almost every real client calls) and a documented
+            // approximation when they genuinely differ. See
+            // docs/internals/c3d.md's POLYGON_MODE bullet.
+            polygon_mode: raster.polygon_mode_front.into(),
             color_write: (
                 raster.color_mask.r,
                 raster.color_mask.g,
@@ -7362,6 +7472,109 @@ mod tests {
         assert_eq!(
             back, 0,
             "a back-facing (CW in y-down window space) triangle was drawn"
+        );
+    }
+
+    /// `POLYGON_MODE::Line` must actually change rendered output: a large,
+    /// fully-covering triangle rasterised in `Line` mode should leave
+    /// interior pixels at the background colour that `Fill` mode would
+    /// have covered. This is the one behaviour this whole change is
+    /// about -- decode and state tracking already existed
+    /// (`state::set_polygon_mode`); only `render.rs`'s pipeline
+    /// construction was missing.
+    #[test]
+    fn polygon_mode_line_leaves_interior_pixels_unfilled_unlike_fill() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        if !renderer.polygon_mode_line_supported {
+            eprintln!("skipping: adapter has no POLYGON_MODE_LINE support");
+            return;
+        }
+
+        // A large triangle covering most of a 32x32 surface, wound CCW
+        // in y-down window space (matches the culling test above).
+        let tri = [(2.0f32, 2.0f32), (2.0, 30.0), (30.0, 2.0)];
+
+        // Draws `tri` under `mode` and returns (lit-pixel count, the
+        // pixel at (10, 10) -- well inside the triangle, away from every
+        // edge, so it distinguishes Fill's interior fill from Line's bare
+        // outline).
+        let draw = |renderer: &mut Renderer, mode: state::PolygonMode| -> (usize, [u8; 4]) {
+            let mut state = State::new(state::Limits::default());
+            state.surface_define(
+                1,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    stride_bytes: 128,
+                    format: WireSurfaceFormat::A8r8g8b8,
+                    backing: state::Backing::Aperture(0),
+                },
+            );
+            state.set_draw_surface(1);
+            state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+            state.set_polygon_mode(Face::FrontAndBack, mode);
+
+            let mut verts = Vec::new();
+            for (x, y) in tri {
+                for w in [x, y, 0.5f32, 1.0f32] {
+                    verts.extend_from_slice(&w.to_bits().to_be_bytes());
+                }
+            }
+            let mut mem = TestMemory::new(65536);
+            let errs = renderer.execute(
+                &[
+                    RenderOp::Clear {
+                        mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                    },
+                    RenderOp::Draw {
+                        prim: PrimitiveType::Triangles,
+                        format: VertexFormat(0),
+                        count: 3,
+                        window_space: true,
+                        vertices: DrawVertices::Inline(&verts),
+                    },
+                ],
+                &state,
+                &mut mem,
+            );
+            assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+            let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+            let lit = pixels.chunks(4).filter(|px| px[..3] != [0, 0, 0]).count();
+            let idx = (10 * 32 + 10) * 4; // well inside the triangle
+            let interior = [
+                pixels[idx],
+                pixels[idx + 1],
+                pixels[idx + 2],
+                pixels[idx + 3],
+            ];
+            (lit, interior)
+        };
+
+        let (fill_count, fill_interior) = draw(&mut renderer, PolygonMode::Fill);
+        let (line_count, line_interior) = draw(&mut renderer, PolygonMode::Line);
+        assert!(
+            fill_count > line_count,
+            "Line mode ({line_count} lit pixels) did not leave fewer lit \
+             pixels than Fill ({fill_count}) -- POLYGON_MODE::Line is not \
+             actually reaching the rasteriser"
+        );
+        assert_ne!(
+            fill_interior[..3],
+            [0, 0, 0],
+            "Fill mode should have lit the triangle's interior"
+        );
+        assert_eq!(
+            line_interior[..3],
+            [0, 0, 0],
+            "Line mode should have left the triangle's interior at the \
+             background colour"
         );
     }
 
