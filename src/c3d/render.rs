@@ -7565,6 +7565,12 @@ mod tests {
              pixels than Fill ({fill_count}) -- POLYGON_MODE::Line is not \
              actually reaching the rasteriser"
         );
+        assert!(
+            line_count > 0,
+            "Line mode drew nothing at all -- the previous assertion alone \
+             would pass vacuously if the pipeline silently dropped the draw \
+             instead of actually outlining the triangle"
+        );
         assert_ne!(
             fill_interior[..3],
             [0, 0, 0],
