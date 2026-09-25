@@ -23,11 +23,11 @@
 pub const ID_MAGIC: u32 = 0x4333_4420;
 
 /// `VERSION` register reset value: `major << 16 | minor`. This is the
-/// protocol draft Copperline implements (0.15 as of this writing, the
+/// protocol draft Copperline implements (0.16 as of this writing, the
 /// draft published at the specification's own repository), not the
 /// eventual 1.0 release; see `c3d-versioning`. Bump this whenever a
 /// change here catches Copperline up to a newer draft.
-pub const PROTOCOL_VERSION: u32 = 0x0000_000F;
+pub const PROTOCOL_VERSION: u32 = 0x0000_0010;
 
 // ---------------------------------------------------------------------
 // Global registers (`c3d-global-registers`). Offsets are bytes from the
