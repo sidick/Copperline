@@ -390,6 +390,19 @@ project's spec-first loop exists to surface.
   padding untouched) was already correct -- documented as deliberate in
   `op_read_pixels`'s own doc comment rather than left to read as
   incidental.
+- **`R5G6B5_LE` mandatory floor (draft 0.18).** `SURFFMT_SUPPORTED`'s
+  required minimum grew to `R5G6B5`, `R5G6B5_LE` and `A8R8G8B8` -- the
+  common Cirrus-class companion RTG hardware of the target era scans
+  16-bit framebuffers little-endian, so a device without the `_LE`
+  format consigns that pairing to a deeper-format fallback for every
+  16-bit screen. `ring.rs`'s default `DeviceConfig` now sets bit 2
+  (`R5G6B5_LE`) alongside the pre-existing mandatory bits. `R5G5B5_LE`
+  (bit 4) stays spec-optional but is recommended for the same reason;
+  Copperline advertises it too, since `encode_pixel`/`decode_pixel`
+  already fully implement both `_LE` formats. Same class of gap as
+  `B8G8R8A8`'s own missing bit (mentioned in the `READ_PIXELS` bullet
+  above, fixed in `d494119e`): a format the render path already handles
+  correctly, but the capability bitmask never advertised.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field

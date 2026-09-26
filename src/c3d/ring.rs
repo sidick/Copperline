@@ -153,8 +153,14 @@ impl Default for DeviceConfig {
     /// (the first client's two-unit multitexture target). `texfmt_supported`
     /// covers the spec's required minimum set (`RGBA8`..`A8`, bits 0-7);
     /// `surffmt_supported` covers the required minimum (`R5G6B5`,
-    /// `A8R8G8B8`) plus the other chunky formats Copperline's surfaces
-    /// also accept.
+    /// `R5G6B5_LE` since spec draft 0.18, `A8R8G8B8`) plus the other
+    /// chunky formats Copperline's surfaces also accept, including
+    /// `R5G5B5_LE` -- optional per the spec but recommended for the same
+    /// reason `R5G6B5_LE` is mandatory (the common Cirrus-class companion
+    /// RTG hardware of the target era scans 16-bit framebuffers
+    /// little-endian), and already fully implemented by `encode_pixel`/
+    /// `decode_pixel` alongside its big-endian sibling, so advertising it
+    /// costs nothing.
     fn default() -> Self {
         DeviceConfig {
             guestmem: true,
@@ -172,7 +178,9 @@ impl Default for DeviceConfig {
             max_surface_height: 768,
             texfmt_supported: 0xFF, // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
             surffmt_supported: (1 << 1) // R5G6B5
+                | (1 << 2) // R5G6B5_LE -- mandatory floor since spec draft 0.18
                 | (1 << 3) // R5G5B5
+                | (1 << 4) // R5G5B5_LE -- optional, recommended; free, already implemented
                 | (1 << 5) // A8R8G8B8
                 | (1 << 6) // B8G8R8A8 -- RTG_COLOR_FORMAT_BGRA (z3660), glQuake's screen format
                 | (1 << 7) // R8G8B8A8
@@ -2121,6 +2129,38 @@ mod tests {
                 address: 0,
             })
         );
+    }
+
+    /// Spec draft 0.18: `R5G6B5_LE` joins the mandatory surface-format
+    /// floor (`R5G6B5`, `R5G6B5_LE`, `A8R8G8B8`) -- the common
+    /// Cirrus-class companion RTG hardware of the target era scans
+    /// 16-bit framebuffers little-endian, so a device without it
+    /// consigns that pairing to a deeper-format fallback. Must not hit
+    /// `E_UNSUPPORTED_FORMAT` on Copperline's own default config.
+    #[test]
+    fn surface_define_with_r5g6b5_le_decodes_under_the_default_config() {
+        let words = surface_define_words(1, 64, 32, 128, 2, 0, 0);
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 32);
+        assert!(matches!(
+            step,
+            Step::Command(Command::SurfaceDefine { format: 2, .. })
+        ));
+    }
+
+    /// `R5G5B5_LE` stays optional per the spec but is recommended for the
+    /// same reason `R5G6B5_LE` is mandatory, and costs nothing since
+    /// `encode_pixel`/`decode_pixel` already implement it -- Copperline
+    /// advertises it too.
+    #[test]
+    fn surface_define_with_r5g5b5_le_decodes_under_the_default_config() {
+        let words = surface_define_words(1, 64, 32, 128, 4, 0, 0);
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 32);
+        assert!(matches!(
+            step,
+            Step::Command(Command::SurfaceDefine { format: 4, .. })
+        ));
     }
 
     #[test]
