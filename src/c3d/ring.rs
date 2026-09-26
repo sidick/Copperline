@@ -1181,12 +1181,7 @@ impl<'a> RingCursor<'a> {
                 if flags & !READ_PIXELS_FLAG_ROWS_BOTTOM_UP != 0 {
                     return self.raise(ErrorCode::BadArg, start);
                 }
-                // DEPTH (255) is always allowed for READ_PIXELS and isn't
-                // tracked by SURFFMT_SUPPORTED at all -- see
-                // `check_surffmt`'s doc comment.
-                if format != 255 {
-                    check!(self.check_surffmt(format, start));
-                }
+                check!(self.check_read_pixels_format(format, start));
                 let dest = Ref::decode(w32(body, 7), w32(body, 8));
                 check!(self.validate_ref(dest, start));
                 Command::ReadPixels {
@@ -1479,12 +1474,29 @@ impl<'a> RingCursor<'a> {
 
     /// See `DeviceConfig::surffmt_supported`'s doc comment for why a
     /// format `>= 64` (in particular `DEPTH` = `255`) always fails this and
-    /// why `READ_PIXELS` special-cases `DEPTH` before calling it.
+    /// why `READ_PIXELS` uses `check_read_pixels_format` instead of this.
     fn check_surffmt(&mut self, format: u32, start: u32) -> Result<(), Step<'a>> {
         if format >= 64 || (self.config.surffmt_supported >> format) & 1 == 0 {
             return Err(self.raise(ErrorCode::UnsupportedFormat, start));
         }
         Ok(())
+    }
+
+    /// `READ_PIXELS`'s `format` names the client layout of the
+    /// *destination* (`c3d-cmd-query`, spec draft 0.17) -- independent of
+    /// `SURFFMT_SUPPORTED`, which governs render targets (`SURFACE_DEFINE`)
+    /// only. Every device converts a readback to any non-reserved surface
+    /// format in the table (`1..=9`, or `255`=`DEPTH`, legal only for
+    /// `READ_PIXELS`) regardless of what it can render to -- so, unlike
+    /// `check_surffmt`, this never consults `self.config.surffmt_supported`
+    /// at all. A reserved value (`CLUT8`=32, or any of the `10-31`/`33-63`
+    /// reserved ranges) is still rejected, the same `E_UNSUPPORTED_FORMAT`
+    /// every other "no such format" case in this module raises.
+    fn check_read_pixels_format(&mut self, format: u32, start: u32) -> Result<(), Step<'a>> {
+        match format {
+            1..=9 | 255 => Ok(()),
+            _ => Err(self.raise(ErrorCode::UnsupportedFormat, start)),
+        }
     }
 
     /// `check_surffmt` plus decoding the value into a
@@ -2628,8 +2640,16 @@ mod tests {
         ));
     }
 
+    /// Spec draft 0.17: `READ_PIXELS`'s `format` is the client layout of
+    /// the *destination*, independent of `SURFFMT_SUPPORTED` (which
+    /// governs render targets only) -- every device converts a readback
+    /// to any non-reserved format regardless of what it can render to.
+    /// A non-reserved, non-`DEPTH` format must decode even with
+    /// `surffmt_supported = 0` (nothing advertised as a render target at
+    /// all).
     #[test]
-    fn read_pixels_with_an_unsupported_non_depth_format_is_e_unsupported_format() {
+    fn read_pixels_with_a_non_reserved_format_is_allowed_even_when_unsupported_as_a_render_target()
+    {
         let mut c = config(true);
         c.surffmt_supported = 0;
         let words = [
@@ -2638,7 +2658,35 @@ mod tests {
             0,
             4,
             4,
-            5, // A8R8G8B8, not DEPTH, not supported
+            5, // A8R8G8B8: not a render target here, but a legal READ_PIXELS format
+            16,
+            0,
+            0x0010_0000,
+            16,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 40, c);
+        assert!(matches!(
+            step,
+            Step::Command(Command::ReadPixels { format: 5, .. })
+        ));
+    }
+
+    /// A genuinely reserved format value (`CLUT8` = 32, "not implemented
+    /// in version 1") is `E_UNSUPPORTED_FORMAT` for `READ_PIXELS` even
+    /// with every `SURFFMT_SUPPORTED` bit set -- the exemption from that
+    /// register is not an exemption from the format table itself.
+    #[test]
+    fn read_pixels_with_a_reserved_format_is_e_unsupported_format_even_with_everything_supported() {
+        let mut c = config(true);
+        c.surffmt_supported = u64::MAX;
+        let words = [
+            header(OP_READ_PIXELS, 10),
+            0,
+            0,
+            4,
+            4,
+            32, // CLUT8: reserved, not implemented in version 1
             16,
             0,
             0x0010_0000,

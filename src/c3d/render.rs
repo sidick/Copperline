@@ -4520,6 +4520,13 @@ impl Renderer {
     /// only their order -- so a client with a bottom-left image origin
     /// (`glReadPixels`) needs no row-reversal of its own.
     #[allow(clippy::too_many_arguments)]
+    /// Spec draft 0.17 pinned down two points about the row loop below
+    /// (already correct before that draft, restated here so the intent
+    /// reads as deliberate, not incidental): each row writes exactly `w *
+    /// bpp` bytes -- `row_out`'s own length -- then the *next* row starts
+    /// `row_bytes` further on; the bytes between two rows' writes are
+    /// never touched, so a guest may point `dest` straight at a client
+    /// buffer whose final row carries no trailing pack padding.
     fn op_read_pixels(
         &mut self,
         x: u32,

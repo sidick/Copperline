@@ -367,6 +367,29 @@ project's spec-first loop exists to surface.
   `ctx_control_reset_leaves_fence_state_untouched`) pin this down as an
   explicit, spec-cited invariant instead of leaving it an incidental
   side effect of the freeing branch's unrelated full wipe.
+- **`READ_PIXELS` format independence (draft 0.17).** `format` names the
+  client layout of the *destination* and is independent of
+  `SURFFMT_SUPPORTED`, which governs render targets (`SURFACE_DEFINE`)
+  only -- every device converts a readback to any non-reserved format
+  regardless of what it can render to. `ring.rs`'s decode previously
+  gated `READ_PIXELS`'s `format` through the same `check_surffmt` render-
+  target check `SURFACE_DEFINE` uses (special-casing only `DEPTH`=255),
+  so a guest requesting a readback in a format the device happened not
+  to advertise as a render target incorrectly got `E_UNSUPPORTED_FORMAT`
+  -- concretely reachable, since Copperline's own `B8G8R8A8` bit was
+  itself missing from the default `SURFFMT_SUPPORTED` bitmask until
+  `d494119e`, meaning a `READ_PIXELS` in that format would have failed
+  even after `B8G8R8A8` became a legal render target. Fixed with a
+  dedicated `check_read_pixels_format` that accepts every non-reserved
+  format (`1..=9`, or `255`=`DEPTH`) unconditionally and never consults
+  `surffmt_supported` -- `CLUT8` (32) and the other reserved ranges stay
+  `E_UNSUPPORTED_FORMAT` regardless of that register's value, since the
+  exemption is from the capability register, not from the format table
+  itself. The draft's second clarification (`render.rs`'s row loop
+  writing exactly the rectangle's byte length and leaving inter-row
+  padding untouched) was already correct -- documented as deliberate in
+  `op_read_pixels`'s own doc comment rather than left to read as
+  incidental.
 - **Snapshots.** The board serialises in the `ZORR` chunk like every
   other board: GL state, texture images and surface definitions as
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
