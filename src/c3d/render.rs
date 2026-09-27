@@ -495,33 +495,80 @@ pub const INTERNAL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dept
 /// format and has no encoding here (`READ_PIXELS` -- which does read
 /// depth -- is deferred to M3).
 pub fn encode_pixel(fmt: WireSurfaceFormat, rgba: [u8; 4]) -> Result<Vec<u8>, RenderError> {
+    let mut buf = [0u8; 4];
+    let n = encode_pixel_into(fmt, rgba, &mut buf)?;
+    Ok(buf[..n].to_vec())
+}
+
+/// [`encode_pixel`] without the allocation: writes the encoded pixel into
+/// the front of `out` and returns how many bytes it wrote (2, 3 or 4 --
+/// [`surface_format_bytes_per_pixel`] for `fmt`).
+///
+/// The readback loops call this once per pixel, so the `Vec` the
+/// convenience wrapper above returns was one heap allocation *per pixel*:
+/// measured at 61% of a 640x480 `SURFACE_READBACK`'s total time, and the
+/// reason readback cost four times its mirror-image upload, which was
+/// always allocation-free ([`decode_pixel`] returns `[u8; 4]`).
+///
+/// `out` must have room for the format's bytes per pixel; a short slice is
+/// [`RenderError::ShortPayload`] rather than a panic, since the caller
+/// derives its row buffer from guest-supplied width and stride.
+pub fn encode_pixel_into(
+    fmt: WireSurfaceFormat,
+    rgba: [u8; 4],
+    out: &mut [u8],
+) -> Result<usize, RenderError> {
     let [r, g, b, a] = rgba;
-    Ok(match fmt {
-        WireSurfaceFormat::A8r8g8b8 => vec![a, r, g, b],
-        WireSurfaceFormat::B8g8r8a8 => vec![b, g, r, a],
-        WireSurfaceFormat::R8g8b8a8 => vec![r, g, b, a],
-        WireSurfaceFormat::R8g8b8 => vec![r, g, b],
-        WireSurfaceFormat::B8g8r8 => vec![b, g, r],
+    let bytes: [u8; 4];
+    let n = match fmt {
+        WireSurfaceFormat::A8r8g8b8 => {
+            bytes = [a, r, g, b];
+            4
+        }
+        WireSurfaceFormat::B8g8r8a8 => {
+            bytes = [b, g, r, a];
+            4
+        }
+        WireSurfaceFormat::R8g8b8a8 => {
+            bytes = [r, g, b, a];
+            4
+        }
+        WireSurfaceFormat::R8g8b8 => {
+            bytes = [r, g, b, 0];
+            3
+        }
+        WireSurfaceFormat::B8g8r8 => {
+            bytes = [b, g, r, 0];
+            3
+        }
         WireSurfaceFormat::R5g6b5 => {
-            let v = pack565(r, g, b);
-            v.to_be_bytes().to_vec()
+            let [hi, lo] = pack565(r, g, b).to_be_bytes();
+            bytes = [hi, lo, 0, 0];
+            2
         }
         WireSurfaceFormat::R5g6b5Le => {
-            let v = pack565(r, g, b);
-            v.to_le_bytes().to_vec()
+            let [hi, lo] = pack565(r, g, b).to_le_bytes();
+            bytes = [hi, lo, 0, 0];
+            2
         }
         WireSurfaceFormat::R5g5b5 => {
-            let v = pack555(r, g, b, a);
-            v.to_be_bytes().to_vec()
+            let [hi, lo] = pack555(r, g, b, a).to_be_bytes();
+            bytes = [hi, lo, 0, 0];
+            2
         }
         WireSurfaceFormat::R5g5b5Le => {
-            let v = pack555(r, g, b, a);
-            v.to_le_bytes().to_vec()
+            let [hi, lo] = pack555(r, g, b, a).to_le_bytes();
+            bytes = [hi, lo, 0, 0];
+            2
         }
         WireSurfaceFormat::Depth => {
             return Err(RenderError::Unimplemented("DEPTH surface readback"));
         }
-    })
+    };
+    out.get_mut(..n)
+        .ok_or(RenderError::ShortPayload("encode_pixel destination"))?
+        .copy_from_slice(&bytes[..n]);
+    Ok(n)
 }
 
 /// Bytes per pixel of a wire [`WireSurfaceFormat`], mirroring
@@ -4561,19 +4608,26 @@ impl Renderer {
         } else {
             surface_format_bytes_per_pixel(format)
         };
-        let encode_at = |raw: &[u8], sx: u32, sy: u32| -> Result<Vec<u8>, RenderError> {
-            let at = ((sy * def.width + sx) * 4) as usize;
-            if format == WireSurfaceFormat::Depth {
-                let depth = f32::from_le_bytes(
-                    *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
-                );
-                let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
-                Ok(scaled.to_be_bytes().to_vec())
-            } else {
-                let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
-                encode_pixel(format, pixel)
-            }
-        };
+        // Writes one encoded pixel into the front of `out` and reports its
+        // length, rather than returning a fresh `Vec` per pixel -- see
+        // `encode_pixel_into`.
+        let encode_at =
+            |raw: &[u8], sx: u32, sy: u32, out: &mut [u8]| -> Result<usize, RenderError> {
+                let at = ((sy * def.width + sx) * 4) as usize;
+                if format == WireSurfaceFormat::Depth {
+                    let depth = f32::from_le_bytes(
+                        *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
+                    );
+                    let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
+                    out.get_mut(..4)
+                        .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
+                        .copy_from_slice(&scaled.to_be_bytes());
+                    Ok(4)
+                } else {
+                    let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
+                    encode_pixel_into(format, pixel, out)
+                }
+            };
         let raw = if format == WireSurfaceFormat::Depth {
             let depth = gpu.depth.clone();
             self.copy_texture_to_cpu(&depth, def.width, def.height)?
@@ -4592,9 +4646,8 @@ impl Renderer {
                 if sx >= def.width || sy >= def.height {
                     continue;
                 }
-                let encoded = encode_at(&raw, sx, sy)?;
                 let at = (col * bpp) as usize;
-                row_out[at..at + encoded.len()].copy_from_slice(&encoded);
+                encode_at(&raw, sx, sy, &mut row_out[at..])?;
             }
             let loc = offset_ref(dest, out_row * row_bytes).ok_or_else(|| {
                 RenderError::BadMemory(format!(
@@ -4654,9 +4707,8 @@ impl Renderer {
                     rgba[src_at + 2],
                     rgba[src_at + 3],
                 ];
-                let encoded = encode_pixel(def.format, pixel)?;
                 let dst_at = (col * bpp) as usize;
-                out_row[dst_at..dst_at + encoded.len()].copy_from_slice(&encoded);
+                encode_pixel_into(def.format, pixel, &mut out_row[dst_at..])?;
             }
             let row_offset = (y + row) * def.stride_bytes + x * bpp;
             let loc = offset_backing(def.backing, row_offset);
