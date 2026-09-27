@@ -222,15 +222,41 @@ impl FlatMemory {
         }
     }
 
-    fn put(&mut self, is_guest: bool, address: u32, data: &[u8]) {
-        let buf = self.buf_mut(is_guest);
+    /// `address`/`data.len()` come straight from a trace file's `APER`/
+    /// `BLOB` section fields (or, via [`Memory::write`], a
+    /// `SURFACE_READBACK`/`QUERY` destination `Ref` decoded from a
+    /// `RING` section) with no bound checking anywhere upstream --
+    /// `ring.rs`'s own `E_BAD_REF` aperture-bound check applies only to
+    /// refs *inside* a dispatched ring command against a real device's
+    /// configured `aperture_size`, not to these pre-dispatch sections or
+    /// to this tool's implementation-agnostic replay, which has no one
+    /// device's aperture size to check against. Bounded here instead
+    /// against [`MAX_FLAT_MEMORY_SIZE`] so an untrusted or corrupted
+    /// trace's offset/length can't drive an unbounded allocation from a
+    /// small file.
+    fn put(&mut self, is_guest: bool, address: u32, data: &[u8]) -> Result<(), String> {
         let end = address as usize + data.len();
+        if end > MAX_FLAT_MEMORY_SIZE {
+            return Err(format!(
+                "{} write at {address:#x} + {} bytes exceeds the {MAX_FLAT_MEMORY_SIZE:#x}-byte replay bound",
+                if is_guest { "guest" } else { "aperture" },
+                data.len()
+            ));
+        }
+        let buf = self.buf_mut(is_guest);
         if buf.len() < end {
             buf.resize(end, 0);
         }
         buf[address as usize..end].copy_from_slice(data);
+        Ok(())
     }
 }
+
+/// Absolute ceiling on a single [`FlatMemory::put`]'s resulting buffer
+/// size: the spec's own largest defined Zorro III aperture is 256 MiB
+/// (`c3d-bus-profiles`), and no legitimate guest access this tool ever
+/// replays needs more.
+const MAX_FLAT_MEMORY_SIZE: usize = 256 * 1024 * 1024;
 
 impl Memory for FlatMemory {
     fn read(&mut self, loc: MemLoc, len: usize) -> Option<&[u8]> {
@@ -246,7 +272,7 @@ impl Memory for FlatMemory {
             MemLoc::Aperture(a) => self.put(false, a, data),
             MemLoc::Guest(a) => self.put(true, a, data),
         }
-        true
+        .is_ok()
     }
 }
 
@@ -261,6 +287,15 @@ struct ReplayContext {
 }
 
 const RING_BUF_SIZE: usize = 1 << 20; // 1 MiB: comfortably larger than any M1 trace's ring usage.
+
+/// Absolute ceiling on distinct ring contexts a single replay creates --
+/// each gets its own `RING_BUF_SIZE` (1 MiB) buffer up front, so an
+/// untrusted or corrupted trace naming many distinct (and individually
+/// tiny) `RING` sections' `context` values could otherwise drive an
+/// unbounded allocation from a small file. No real hardware or
+/// spec-legal implementation needs anywhere near this many concurrent
+/// contexts (Copperline's own board fixes `CONTEXT_COUNT` at 4).
+const MAX_REPLAY_CONTEXTS: usize = 256;
 
 /// Replays every section of `bytes` against a fresh set of contexts and a
 /// fresh [`FlatMemory`], executing every [`RenderOp`] through `renderer`
@@ -281,7 +316,7 @@ fn replay(
         let section = section.map_err(|e| e.to_string())?;
         match section {
             Section::Header(_) => {}
-            Section::Aperture(a) => mem.put(false, a.offset, a.data),
+            Section::Aperture(a) => mem.put(false, a.offset, a.data)?,
             Section::Blob(b) => {
                 // `space` is the container's own flag: 0 the data
                 // aperture, 1 guest memory, matching a command-stream
@@ -289,11 +324,16 @@ fn replay(
                 // device carries blobs in both, and replaying one into
                 // the wrong space would corrupt the replay silently, so
                 // the flag is honoured rather than assumed.
-                mem.put(b.space == 1, b.address, b.data);
+                mem.put(b.space == 1, b.address, b.data)?;
             }
             Section::Gold(_) => {}
             Section::Unknown { .. } => {}
             Section::Ring(r) => {
+                if !contexts.contains_key(&r.context) && contexts.len() >= MAX_REPLAY_CONTEXTS {
+                    return Err(format!(
+                        "trace names more than {MAX_REPLAY_CONTEXTS} distinct ring contexts"
+                    ));
+                }
                 let entry = contexts.entry(r.context).or_insert_with(|| ReplayContext {
                     ctx: Context::new(Limits::default()),
                     ring: vec![0u8; RING_BUF_SIZE],
@@ -462,7 +502,7 @@ fn compare_frame(gold: (u32, u32, &[u8]), actual: &CapturedFrame) -> Result<Comp
     }
     let mut differing = 0usize;
     let mut max_diff = 0u8;
-    let total = (gw * gh) as usize;
+    let total = (gw as usize) * (gh as usize);
     for i in 0..total {
         let g = &gpix[i * 4..i * 4 + 4];
         let a = &actual.rgba[i * 4..i * 4 + 4];
@@ -726,8 +766,29 @@ fn check_triangle(frame: &CapturedFrame) -> Result<(), String> {
         ));
     }
 
+    // (0, 7) has y > x, outside the triangle's y <= x interior (see
+    // above), so it must still be the clear colour -- catches a
+    // renderer that fills the whole surface regardless of geometry,
+    // which the interior-colour check alone couldn't distinguish from
+    // a correctly-bounded triangle.
+    let bg_x = 0u32;
+    let bg_y = 7u32.min(frame.height.saturating_sub(1));
+    let bg_idx = ((bg_y * frame.width + bg_x) * 4) as usize;
+    let bg_pixel = &frame.rgba[bg_idx..bg_idx + 4];
+    let bg_diff: u8 = bg_pixel
+        .iter()
+        .zip(bg.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(255);
+    if bg_diff > PIXEL_TOLERANCE {
+        return Err(format!(
+            "background at ({bg_x},{bg_y}) is {bg_pixel:?}, expected close to {bg:?}"
+        ));
+    }
+
     let mut covered = 0usize;
-    let total = (frame.width * frame.height) as usize;
+    let total = (frame.width as usize) * (frame.height as usize);
     for px in frame.rgba.chunks(4) {
         let d: u8 = px
             .iter()
@@ -744,7 +805,6 @@ fn check_triangle(frame: &CapturedFrame) -> Result<(), String> {
     // half of it; a loose band avoids over-fitting to exact rasteriser
     // edge behaviour.
     if !(0.2..=0.8).contains(&fraction) {
-        let _ = bg;
         return Err(format!(
             "triangle covers {:.1}% of the surface, expected roughly 20-80%",
             fraction * 100.0
