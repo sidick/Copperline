@@ -148,6 +148,78 @@ pub(crate) fn dma_write_byte(mem: &mut Memory, addr: u32, b: u8) -> bool {
     false
 }
 
+/// Which RAM bank a whole DMA span resolved to, plus the byte offset of
+/// the span's first byte inside that bank's backing slice. Produced by
+/// [`dma_span_region`], which owns the region order so the bulk read and
+/// write paths cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmaRegion {
+    Chip(usize),
+    Slow(usize),
+    Mb(usize),
+    Accel(usize),
+    Zorro { board: usize, off: usize },
+}
+
+/// Resolves `addr..addr + len` to a single RAM bank for the bulk DMA fast
+/// path, or `None` when the span cannot be served by one slice copy and
+/// the caller must fall back to the per-byte decode.
+///
+/// The decode order is exactly [`dma_read_byte`]/[`dma_write_byte`]'s --
+/// chip, slow, motherboard, accelerator, then the Zorro board windows --
+/// and this resolves the span's **first byte** through that order before
+/// requiring the rest of the span to lie in the same bank. Resolving the
+/// first byte first is what makes the fast path provably equivalent to the
+/// per-byte loop: a span whose first byte is in one bank but which runs off
+/// its end is declined here rather than silently re-resolved against a
+/// later bank, because the per-byte loop would decode each of those trailing
+/// bytes independently and they may legitimately land in a *different* bank,
+/// or nowhere at all (reading `0xFF`, dropping on write).
+///
+/// `None` is likewise returned for an empty span (the callers' no-op) and
+/// for one that would wrap past `0xFFFF_FFFF`, since the per-byte
+/// `addr.wrapping_add(i)` sends the wrapped tail back to low addresses that
+/// no single slice covers.
+fn dma_span_region(mem: &Memory, addr: u32, len: usize) -> Option<DmaRegion> {
+    if len == 0 {
+        return None;
+    }
+    let a = addr as u64;
+    let end = a + len as u64; // exclusive
+    if end > u64::from(u32::MAX) + 1 {
+        return None;
+    }
+
+    let chip = mem.chip_ram.len() as u64;
+    if a < chip {
+        return (end <= chip).then_some(DmaRegion::Chip(a as usize));
+    }
+    let slow = SLOW_RAM_BASE;
+    if a >= slow && a < slow + mem.slow_ram.len() as u64 {
+        return (end <= slow + mem.slow_ram.len() as u64)
+            .then_some(DmaRegion::Slow((a - slow) as usize));
+    }
+    let mb = mem.mb_ram_base();
+    if a >= mb && a < mb + mem.mb_ram.len() as u64 {
+        return (end <= mb + mem.mb_ram.len() as u64).then_some(DmaRegion::Mb((a - mb) as usize));
+    }
+    let accel = ACCEL_RAM_BASE;
+    if a >= accel && a < accel + mem.accel_ram.len() as u64 {
+        return (end <= accel + mem.accel_ram.len() as u64)
+            .then_some(DmaRegion::Accel((a - accel) as usize));
+    }
+
+    // Zorro board windows. `region_at` already takes a size and only
+    // matches a window the whole span fits inside, but it returns the
+    // first window that fits *at that size* -- which, if windows ever
+    // overlapped, could be a later window than the one the first byte
+    // alone resolves to. Requiring both queries to name the same board
+    // keeps the first-byte rule above intact.
+    let (first_board, _) = mem.zorro.region_at(addr, 1)?;
+    let (board, off) = mem.zorro.region_at(addr, len)?;
+    (board == first_board).then_some(DmaRegion::Zorro { board, off })
+}
+
 /// One board's queued write into a guest address, destined for another
 /// device-backed board's window (or, rarely, ordinary RAM, which the
 /// board could have written directly but chose to route through the same
@@ -353,6 +425,27 @@ impl<'a> DeviceHost<'a> {
     /// decode; unmapped bytes read as 0xFF). The WASM plugin host's `dma_read`
     /// import routes here.
     pub fn dma_read(&self, addr: u32, buf: &mut [u8]) {
+        // Fast path: one region decode for the whole span, then one slice
+        // copy. A transfer that does not lie wholly inside a single bank
+        // (or is empty, or wraps) falls through to the per-byte decode
+        // below, which stays the definition of what this does -- see
+        // `dma_span_region`.
+        if let Some(region) = dma_span_region(self.mem, addr, buf.len()) {
+            let n = buf.len();
+            let src = match region {
+                DmaRegion::Chip(o) => self.mem.chip_ram.get(o..o + n),
+                DmaRegion::Slow(o) => self.mem.slow_ram.get(o..o + n),
+                DmaRegion::Mb(o) => self.mem.mb_ram.get(o..o + n),
+                DmaRegion::Accel(o) => self.mem.accel_ram.get(o..o + n),
+                DmaRegion::Zorro { board, off } => {
+                    self.mem.zorro.board_ram(board).get(off..off + n)
+                }
+            };
+            if let Some(src) = src {
+                buf.copy_from_slice(src);
+                return;
+            }
+        }
         for (i, b) in buf.iter_mut().enumerate() {
             *b = dma_read_byte(self.mem, addr.wrapping_add(i as u32)).unwrap_or(0xFF);
         }
@@ -362,8 +455,29 @@ impl<'a> DeviceHost<'a> {
     /// unmapped bytes dropped). The WASM plugin host's `dma_write` import
     /// routes here.
     pub fn dma_write(&mut self, addr: u32, buf: &[u8]) {
+        // Set unconditionally, before any early return: these report that
+        // the board reached for guest memory at all, not that a byte
+        // landed, and an entirely unmapped write still counts (the CPU
+        // bus's cache invalidation depends on it).
         self.touched_memory = true;
         self.wrote_memory = true;
+        // Fast path: see `DeviceHost::dma_read`.
+        if let Some(region) = dma_span_region(self.mem, addr, buf.len()) {
+            let n = buf.len();
+            let dst = match region {
+                DmaRegion::Chip(o) => self.mem.chip_ram.get_mut(o..o + n),
+                DmaRegion::Slow(o) => self.mem.slow_ram.get_mut(o..o + n),
+                DmaRegion::Mb(o) => self.mem.mb_ram.get_mut(o..o + n),
+                DmaRegion::Accel(o) => self.mem.accel_ram.get_mut(o..o + n),
+                DmaRegion::Zorro { board, off } => {
+                    self.mem.zorro.board_ram_mut(board).get_mut(off..off + n)
+                }
+            };
+            if let Some(dst) = dst {
+                dst.copy_from_slice(buf);
+                return;
+            }
+        }
         for (i, b) in buf.iter().enumerate() {
             dma_write_byte(self.mem, addr.wrapping_add(i as u32), *b);
         }
@@ -793,5 +907,322 @@ mod tests {
         mem.accel_ram = vec![0u8; 0x100];
         assert_eq!(dma_read_word(&mem, 0xFFFF_FFFF), None);
         assert_eq!(dma_read_byte(&mem, 0xFFFF_FFFF), None);
+    }
+
+    // -- Bulk DMA: the single-slice fast path vs the per-byte decode -----
+    //
+    // `DeviceHost::dma_read`/`dma_write` resolve a whole span to one RAM
+    // bank and do a single slice copy where they can, falling back to the
+    // per-byte decode otherwise. That fast path is a pure speed change:
+    // every case below asserts it is byte-identical to the per-byte loop it
+    // replaces, which these tests keep a reference copy of.
+
+    /// The per-byte decode the bulk helpers are optimising, kept verbatim
+    /// as the definition of correct so the fast path can be differentially
+    /// compared against it.
+    fn reference_read(mem: &Memory, addr: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| dma_read_byte(mem, addr.wrapping_add(i as u32)).unwrap_or(0xFF))
+            .collect()
+    }
+
+    fn reference_write(mem: &mut Memory, addr: u32, buf: &[u8]) {
+        for (i, b) in buf.iter().enumerate() {
+            dma_write_byte(mem, addr.wrapping_add(i as u32), *b);
+        }
+    }
+
+    /// Chip, slow, motherboard and accelerator RAM all fitted and filled
+    /// with a per-bank pattern, plus a configured Zorro board RAM window,
+    /// so a span can be aimed at any bank and a wrong-bank copy shows up as
+    /// wrong bytes rather than coincidentally-equal zeroes.
+    fn mem_all_banks() -> Memory {
+        let mut mem = mem_with(0x200, 0x200);
+        mem.mb_ram = vec![0u8; 0x200];
+        mem.accel_ram = vec![0u8; 0x200];
+        for (i, b) in mem.chip_ram.iter_mut().enumerate() {
+            *b = 0x10u8.wrapping_add(i as u8);
+        }
+        for (i, b) in mem.slow_ram.iter_mut().enumerate() {
+            *b = 0x40u8.wrapping_add(i as u8);
+        }
+        for (i, b) in mem.mb_ram.iter_mut().enumerate() {
+            *b = 0x70u8.wrapping_add(i as u8);
+        }
+        for (i, b) in mem.accel_ram.iter_mut().enumerate() {
+            *b = 0xA0u8.wrapping_add(i as u8);
+        }
+        mem.zorro
+            .add_board_configured_at(
+                crate::zorro::BoardSpec::fast_ram(64 * 1024),
+                ZORRO_TEST_BASE,
+            )
+            .expect("configuring the test board");
+        if let Some((board, _)) = mem.zorro.region_at(ZORRO_TEST_BASE, 1) {
+            for (i, b) in mem.zorro.board_ram_mut(board).iter_mut().enumerate() {
+                *b = 0xD0u8.wrapping_add(i as u8);
+            }
+        }
+        mem
+    }
+
+    const ZORRO_TEST_BASE: u32 = 0x0020_0000;
+
+    /// Reads: the fast path must agree with the per-byte decode for a span
+    /// wholly inside each bank, one straddling two banks, one running from
+    /// mapped into unmapped space, one entirely unmapped, one that wraps the
+    /// 32-bit address space, and an empty one.
+    #[test]
+    fn bulk_dma_read_matches_the_per_byte_decode_across_every_span_shape() {
+        let mem = mem_all_banks();
+        let slow = SLOW_RAM_BASE as u32;
+        let accel = ACCEL_RAM_BASE as u32;
+        let mb = mem.mb_ram_base() as u32;
+
+        let cases: &[(u32, usize, &str)] = &[
+            (0, 0, "empty"),
+            (0x10, 16, "inside chip"),
+            (0, 0x200, "exactly all of chip"),
+            (0x1F0, 32, "chip running off its end into unmapped space"),
+            (slow + 0x10, 16, "inside slow"),
+            (slow + 0x1F0, 32, "slow running off its end"),
+            (mb + 0x10, 16, "inside motherboard"),
+            (mb + 0x1F0, 32, "motherboard running into accelerator"),
+            (accel + 0x10, 16, "inside accelerator"),
+            (accel + 0x1F0, 32, "accelerator running off its end"),
+            (ZORRO_TEST_BASE + 0x10, 16, "inside the Zorro board window"),
+            (
+                ZORRO_TEST_BASE - 8,
+                32,
+                "unmapped running into the Zorro window",
+            ),
+            (0x0050_0000, 16, "entirely unmapped"),
+            (0xFFFF_FFF8, 16, "wrapping the 32-bit address space"),
+            (0xFFFF_FFFF, 1, "the single top byte"),
+        ];
+
+        for &(addr, len, what) in cases {
+            let mut actual = vec![0u8; len];
+            {
+                let mut probe = mem_all_banks();
+                let host = DeviceHost::new(&mut probe);
+                host.dma_read(addr, &mut actual);
+            }
+            let expected = reference_read(&mem, addr, len);
+            assert_eq!(actual, expected, "read mismatch: {what} ({addr:#x}, {len})");
+        }
+    }
+
+    /// Writes: the same span shapes, asserting the resulting memory image is
+    /// byte-identical to the per-byte decode's -- including that the tail of
+    /// a span running into unmapped space is dropped rather than landing
+    /// somewhere it should not.
+    #[test]
+    fn bulk_dma_write_matches_the_per_byte_decode_across_every_span_shape() {
+        let base = mem_all_banks();
+        let slow = SLOW_RAM_BASE as u32;
+        let accel = ACCEL_RAM_BASE as u32;
+        let mb = base.mb_ram_base() as u32;
+
+        let cases: &[(u32, usize, &str)] = &[
+            (0, 0, "empty"),
+            (0x10, 16, "inside chip"),
+            (0, 0x200, "exactly all of chip"),
+            (0x1F0, 32, "chip running off its end into unmapped space"),
+            (slow + 0x10, 16, "inside slow"),
+            (slow + 0x1F0, 32, "slow running off its end"),
+            (mb + 0x10, 16, "inside motherboard"),
+            (mb + 0x1F0, 32, "motherboard running into accelerator"),
+            (accel + 0x10, 16, "inside accelerator"),
+            (accel + 0x1F0, 32, "accelerator running off its end"),
+            (ZORRO_TEST_BASE + 0x10, 16, "inside the Zorro board window"),
+            (
+                ZORRO_TEST_BASE - 8,
+                32,
+                "unmapped running into the Zorro window",
+            ),
+            (0x0050_0000, 16, "entirely unmapped"),
+            (0xFFFF_FFF8, 16, "wrapping the 32-bit address space"),
+            (0xFFFF_FFFF, 1, "the single top byte"),
+        ];
+
+        for &(addr, len, what) in cases {
+            let payload: Vec<u8> = (0..len).map(|i| 0xE0u8.wrapping_add(i as u8)).collect();
+
+            let mut fast = mem_all_banks();
+            {
+                let mut host = DeviceHost::new(&mut fast);
+                host.dma_write(addr, &payload);
+            }
+            let mut slow_ref = mem_all_banks();
+            reference_write(&mut slow_ref, addr, &payload);
+
+            assert_eq!(
+                fast.chip_ram, slow_ref.chip_ram,
+                "chip mismatch: {what} ({addr:#x}, {len})"
+            );
+            assert_eq!(
+                fast.slow_ram, slow_ref.slow_ram,
+                "slow mismatch: {what} ({addr:#x}, {len})"
+            );
+            assert_eq!(
+                fast.mb_ram, slow_ref.mb_ram,
+                "motherboard mismatch: {what} ({addr:#x}, {len})"
+            );
+            assert_eq!(
+                fast.accel_ram, slow_ref.accel_ram,
+                "accelerator mismatch: {what} ({addr:#x}, {len})"
+            );
+            let fast_board = fast.zorro.region_at(ZORRO_TEST_BASE, 1).map(|(b, _)| b);
+            let ref_board = slow_ref.zorro.region_at(ZORRO_TEST_BASE, 1).map(|(b, _)| b);
+            assert_eq!(fast_board, ref_board);
+            if let (Some(f), Some(r)) = (fast_board, ref_board) {
+                assert_eq!(
+                    fast.zorro.board_ram(f),
+                    slow_ref.zorro.board_ram(r),
+                    "Zorro board mismatch: {what} ({addr:#x}, {len})"
+                );
+            }
+        }
+    }
+
+    /// A sweep over a range of addresses and lengths around every bank
+    /// boundary: the cheapest way to be sure the fast path's containment
+    /// arithmetic has no off-by-one the hand-picked cases above miss.
+    #[test]
+    fn bulk_dma_matches_the_per_byte_decode_over_a_boundary_sweep() {
+        let base = mem_all_banks();
+        let boundaries = [
+            0u32,
+            0x200,
+            SLOW_RAM_BASE as u32,
+            SLOW_RAM_BASE as u32 + 0x200,
+            base.mb_ram_base() as u32,
+            ACCEL_RAM_BASE as u32,
+            ACCEL_RAM_BASE as u32 + 0x200,
+            ZORRO_TEST_BASE,
+        ];
+        for b in boundaries {
+            for delta in -4i64..=4 {
+                let addr = (b as i64 + delta) as u32;
+                for len in [0usize, 1, 2, 3, 4, 7, 8, 15, 16] {
+                    let mut actual = vec![0u8; len];
+                    {
+                        let mut probe = mem_all_banks();
+                        let host = DeviceHost::new(&mut probe);
+                        host.dma_read(addr, &mut actual);
+                    }
+                    assert_eq!(
+                        actual,
+                        reference_read(&base, addr, len),
+                        "read sweep mismatch at {addr:#x} len {len}"
+                    );
+
+                    let payload: Vec<u8> = (0..len).map(|i| 0x5Au8.wrapping_add(i as u8)).collect();
+                    let mut fast = mem_all_banks();
+                    {
+                        let mut host = DeviceHost::new(&mut fast);
+                        host.dma_write(addr, &payload);
+                    }
+                    let mut slow_ref = mem_all_banks();
+                    reference_write(&mut slow_ref, addr, &payload);
+                    assert_eq!(
+                        (
+                            &fast.chip_ram,
+                            &fast.slow_ram,
+                            &fast.mb_ram,
+                            &fast.accel_ram
+                        ),
+                        (
+                            &slow_ref.chip_ram,
+                            &slow_ref.slow_ram,
+                            &slow_ref.mb_ram,
+                            &slow_ref.accel_ram
+                        ),
+                        "write sweep mismatch at {addr:#x} len {len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `dma_write` reports that the board reached for guest memory whether
+    /// or not any byte actually landed -- the CPU bus's cache invalidation
+    /// depends on it, and the fast path's early return must not skip it.
+    #[test]
+    fn bulk_dma_write_reports_touching_memory_even_when_entirely_unmapped() {
+        let mut mem = mem_all_banks();
+        let mut host = DeviceHost::new(&mut mem);
+        host.dma_write(0x0050_0000, &[1, 2, 3, 4]); // unmapped
+        assert!(host.touched_memory());
+        assert!(host.wrote_memory());
+    }
+
+    /// The differential tests above would all still pass if the fast path
+    /// never fired and every transfer fell back to the per-byte decode --
+    /// correct, but with none of the point of this change. This pins down
+    /// which spans actually take it, so a regression that quietly disables
+    /// it is a test failure rather than an invisible slowdown.
+    #[test]
+    fn the_bulk_dma_fast_path_is_actually_taken_for_an_in_bank_span() {
+        let mem = mem_all_banks();
+        let slow = SLOW_RAM_BASE as u32;
+        let accel = ACCEL_RAM_BASE as u32;
+        let mb = mem.mb_ram_base() as u32;
+        let zorro_board = mem
+            .zorro
+            .region_at(ZORRO_TEST_BASE, 1)
+            .map(|(b, _)| b)
+            .expect("the test board is configured");
+
+        assert_eq!(dma_span_region(&mem, 0x10, 16), Some(DmaRegion::Chip(0x10)));
+        assert_eq!(
+            dma_span_region(&mem, slow + 0x10, 16),
+            Some(DmaRegion::Slow(0x10))
+        );
+        assert_eq!(
+            dma_span_region(&mem, mb + 0x10, 16),
+            Some(DmaRegion::Mb(0x10))
+        );
+        assert_eq!(
+            dma_span_region(&mem, accel + 0x10, 16),
+            Some(DmaRegion::Accel(0x10))
+        );
+        assert_eq!(
+            dma_span_region(&mem, ZORRO_TEST_BASE + 0x10, 16),
+            Some(DmaRegion::Zorro {
+                board: zorro_board,
+                off: 0x10
+            })
+        );
+
+        // The real C3D shape this change exists for: a whole command ring
+        // fetched out of one bank in a single copy.
+        assert!(dma_span_region(&mem, 0, 0x200).is_some());
+
+        // And the cases that must still decline.
+        assert_eq!(
+            dma_span_region(&mem, 0x1F0, 32),
+            None,
+            "off the end of chip"
+        );
+        assert_eq!(dma_span_region(&mem, 0xFFFF_FFF8, 16), None, "wrapping");
+        assert_eq!(dma_span_region(&mem, 0x0050_0000, 16), None, "unmapped");
+    }
+
+    /// A zero-length transfer is a no-op on both paths, and must not set
+    /// `dma_read` up to copy from a region it never resolved.
+    #[test]
+    fn bulk_dma_zero_length_is_a_no_op() {
+        let before = mem_all_banks();
+        let mut mem = mem_all_banks();
+        {
+            let mut host = DeviceHost::new(&mut mem);
+            host.dma_write(0x10, &[]);
+            let mut empty: [u8; 0] = [];
+            host.dma_read(0x10, &mut empty);
+        }
+        assert_eq!(mem.chip_ram, before.chip_ram);
+        assert_eq!(dma_span_region(&before, 0x10, 0), None);
     }
 }
