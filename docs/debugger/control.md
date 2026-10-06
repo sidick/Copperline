@@ -333,7 +333,8 @@ queue has lost.
 - **`event.media`:** A floppy disk, CD image, or PCMCIA card was inserted or
   ejected (`kind`, `action`, and `drive` or `name` where they apply).
 - **`event.debug`:** Guest debug output through the
-  [uaelib trap](../guide/run.md#uaelib-trap): one notification per item, with
+  [uaelib trap](../guide/run.md#uaelib-trap) or
+  [memory-write debug ports](../guide/run.md#winuae-debug-port): one notification per item, with
   `kind` `log` (`text`, a `KPrintF` line, also echoed on the host console) or
   `resource` (`action` and the registered `resource`, as `debug.resources`
   reports it). `dropped_events` counts items the bounded queue lost before
@@ -528,6 +529,11 @@ fails with code `-32006`.
   unsupported error.
 
 ### Diagnostics and profiling
+
+Instruction profiles retain at most 262,144 pending samples. `profile.status`
+and `profile.stop` report `samples_buffer_limit` and cumulative
+`samples_dropped`; a nonzero count marks an incomplete instruction capture.
+See [profiling limits](profiling.md) for overflow behavior and debugger stepping.
 - `chipset.validate {"enabled": ..., "clear": ...}` / `chipset.report`: Arm or query custom register access validator.
 - `smc.detect {"enabled": ..., "clear": ...}` / `smc.report`: Arm or query self-modifying code detector.
 - `fault.inject {"addr": ..., "len": ..., "on": "read"|"write"|"both", "count": ...}`: Make accesses to `len` bytes at `addr` (default 2) raise a bus error in the guest: reads, writes, or both (the default), for the next `count` matching accesses (default: every access). Returns the fault's id.
@@ -609,7 +615,7 @@ The same card is printed without a session by
 pretty-printed JSON with the same fields.
 
 ### Framebuffer capture
-- `capture.screenshot {"path": "...", "overlays": ["blits", "overdraw", "sources"]}`:
+- `capture.screenshot {"path": "...", "native": false, "overlays": ["blits", "overdraw", "sources"]}`:
   Write a PNG from the side-effect-free display renderer and return its
   `path`, `width` and `height`. Optional overlays outline recorded blitter
   destinations (`blits`), heat pixels by repeated D-channel and other
@@ -618,6 +624,12 @@ pretty-printed JSON with the same fields.
   by playfield 1, playfield 2, sprite number, background, or outside-DIW
   provenance (`sources`). They work in headless sessions, and the MCP bridge
   returns the resulting PNG as its image block.
+  With `native: true`, captures original pixels cropped to the active
+  playfield at 1:1, or RTG at its native resolution. Interlaced chipset
+  output captures the current field without weaving; see
+  [native screenshots](../guide/headless.md#capturing-screenshots).
+  Native capture cannot be combined with diagnostic overlays. Digest,
+  input and overlay coordinates continue to use the default capture's raster.
 - `capture.digest`: Return FNV-1a hash digest of current frame.
 - `capture.region_digest {"x": ..., "y": ..., "w": ..., "h": ...}`: Return the FNV-1a hash of the `w` by `h` rectangle at (`x`, `y`) (default 0, 0), in `capture.screenshot` coordinates; a rectangle outside the frame is an error.
 

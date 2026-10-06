@@ -122,8 +122,9 @@ pacing_budget = "cycles"
 # WinUAE-compatible "uaelib" trap at $F0FF60 (enabled by default): allows guest
 # software to toggle warp speed, emit KPrintF debug logs to the host console and
 # control protocol, and register bitmaps/palettes/copper lists with the debugger
-# (see docs/guide/run.md). Set to false to leave $F0FF60 unmapped. On CDTV
-# configurations the extended ROM at $F00000 covers the trap.
+# (see docs/guide/run.md). Also enables WinUAE's printf-style writes at $BFFF00
+# (arguments) / $BFFF04 (format pointer). Set to false to disable the ports and
+# leave $F0FF60 unmapped. On CDTV the extended ROM covers only the trap.
 # uaelib = true
 
 # Permit uaelib debug_load/debug_save calls to read and write files below the
@@ -465,12 +466,13 @@ slow = "512K"
 # autoboots on Kickstart 1.3+, so it does not depend on the Kickstart IDE
 # driver (which only probes the master on stock 3.1). Drive paths accept the
 # same images as [ide]: RDB HDFs, bare partition hardfiles, gzip-compressed
-# hardfiles (.hdz), CHD hard-disk images (.chd), or host directories. A path
-# ending in .cue, .iso, .nrg, or a .chd holding a CD (chdman createcd; a
-# createhd one is a hard disk -- the CHD's metadata decides, not its name)
-# attaches a SCSI CD-ROM drive at that ID instead (read-only; mount it in the
-# guest with a CD filesystem pointed at the controller's scsi.device and that
-# unit number). CD audio tracks play through the machine's audio output, and
+# hardfiles (.hdz), CHD hard-disk images (.chd), VHDs (.vhd), or host
+# directories. A path ending in .cue, .iso, .nrg, or a .chd holding a CD
+# (chdman createcd; a createhd one is a hard disk -- the CHD's metadata
+# decides, not its name) attaches a SCSI CD-ROM drive at that ID instead
+# (read-only; mount it in the guest with a CD filesystem pointed at the
+# controller's scsi.device and that unit number). CD audio tracks play
+# through the machine's audio output, and
 # discs swap at runtime (status-bar CD buttons, drag-and-drop,
 # --insert-cd-after).
 #
@@ -520,7 +522,7 @@ slow = "512K"
 # and atbus2008 have one channel). Each is independent, so any slot can be
 # left empty -- the same shape as [ide]'s master/slave and [scsi]'s
 # unit0..unit6, taking the same bare-path/table image forms (RDB HDFs, bare
-# partition hardfiles, .hdz, .chd, host directories, CD images). The older
+# partition hardfiles, .hdz, .chd, .vhd, host directories, CD images). The older
 # positional `drives = [...]` array is still read for existing configs.
 # [lide]
 # board = "ripple"
@@ -534,7 +536,7 @@ slow = "512K"
 # none of a real chip's register timing to model. Up to seven units, same
 # bare-path/table drive form as [ide]/[scsi]/[lide]: RDB HDFs, bare partition
 # hardfiles, gzip-compressed hardfiles (.hdz), CHD hard-disk images (.chd),
-# and host directories all work the same way, RDB and RDB-less images
+# VHDs (.vhd), and host directories all work the same way, RDB and RDB-less images
 # handled identically to the other controllers. Hard disks only -- a CD image
 # path (.cue/.iso/.nrg, or a .chd holding a CD) is rejected; attach CD images
 # to [scsi] or [ide]/[lide] instead. No rom key:
@@ -592,7 +594,9 @@ video = "PAL"
 # is decompressed a sector at a time and never written: guest writes go to a
 # copy-on-write overlay beside it, disk.chd.wov, which persists across
 # sessions (delete it to return to the pristine image). If the overlay cannot
-# be created the disk attaches write-protected. A path may also name a host
+# be created the disk attaches write-protected. A VHD (fixed or dynamic, the
+# container WinUAE creates hardfiles in; recognised by content) is read and
+# written in place like an HDF. A path may also name a host
 # directory, mounted as an in-memory FFS or OFS volume (guest writes are
 # likewise not synced back to the host).
 #
@@ -700,7 +704,9 @@ video = "PAL"
 
 
 # Presentation options. overscan: "tv" (default; mask deep horizontal
-# overscan like a CRT bezel) or "full".
+# overscan like a CRT bezel), "smart" (bounded automatic horizontal centring),
+# or "full". Smart waits for 25 stable emulated frames and moves at most eight
+# lo-res pixels; manual centring adds a trim.
 # tv_h_centre / tv_v_centre: centre the TV picture on the glass, like a
 # monitor's front-panel H-CENTER/V-CENTER controls. tv_h_centre in lo-res
 # pixels (-16..16, positive right), tv_v_centre in scan lines (-8..8,
@@ -726,7 +732,9 @@ video = "PAL"
 # window programmed by hardware (default false), allowing games with smaller
 # viewports to fill more of wide screens. When combined with integer scaling,
 # the integer multiplier is recalculated against the cropped area. Autocrop
-# only affects window presentation (capture outputs retain full aperture),
+# in smart mode uses the unmasked raster before the TV aperture clips it,
+# preserving the full detected display at the largest fitting integer scale.
+# It only affects window presentation (capture outputs retain full aperture),
 # works with CRT shaders and programmable multisync modes, and is automatically
 # suspended when using monitor bezels or RTG modes.
 # deinterlace: motion-adaptive weaving of interlaced displays (default
@@ -764,6 +772,19 @@ video = "PAL"
 # captures are never tinted, and RTG board scanout stays untinted.
 # full_screen: open the window fullscreen at start (default false; also
 # --full-screen / --windowed, and Cmd/Alt+F toggles it live).
+# maximized: open a bordered, maximized window with the desktop taskbar
+# visible (default false; also --maximized). full_screen takes precedence.
+# monitor: host display, "auto" (default), "primary", a one-based number
+# from --list-monitors (e.g. "2"), or an exact display name. Prefix a name
+# with "name:" if it resembles a number or keyword. Also --monitor.
+# Missing/ambiguous displays fall back to auto. Wayland controls ordinary
+# window placement; only fullscreen can request a particular display.
+# position: [X, Y] of the window's top-left corner, in logical pixels from
+# the selected monitor's top-left (or primary monitor when monitor is auto).
+# Example: position = [100, 80]. Omit to use automatic/centred placement.
+# Also --window-position X Y. Fullscreen and maximized modes ignore it.
+# window_scale: multiply the initial window width and height by 0.5-4.0
+# (default 1.0; also --window-scale). 2 opens at twice the normal size.
 # status_bar: show the status bar at start (default true; also
 # --show-status-bar / --hide-status-bar, and Cmd/Alt+Shift+F toggles it live).
 # menu_scale: how large the pop-up menu is drawn. "1x" (default) or "2x";
@@ -795,6 +816,9 @@ video = "PAL"
 # tint = "none"
 # menu_scale = "1x"
 # full_screen = false
+# maximized = false
+# monitor = "auto"
+# window_scale = 1.0
 # status_bar = true
 # vsync = true
 # hidpi_texture = true
@@ -925,6 +949,11 @@ floppy_sounds_volume = 100
 # motion over the display still drives the emulated mouse whatever this is set
 # to. Also --mouse-capture MODE and the launcher's Input tab.
 # mouse_capture = "click"
+
+# Release capture with middle click. Off by default, so middle click reaches
+# the guest. The release click is consumed while captured; uncaptured clicks
+# keep their usual behavior. Also the launcher's Input tab.
+# middle_click_release = false
 
 # Autofire: pulse a HELD fire button this many times per second (0 = off, the
 # default; up to 30). Live input only -- the gamepad and the keyboard mapping;

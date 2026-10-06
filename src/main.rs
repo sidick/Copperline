@@ -808,6 +808,9 @@ fn main() -> Result<()> {
     if cli.list_serial_ports {
         return list_serial_ports();
     }
+    if cli.list_monitors {
+        return video::window::print_monitors();
+    }
     if cli.list_audio_devices {
         return print_audio_output_devices();
     }
@@ -1419,11 +1422,16 @@ fn main() -> Result<()> {
         cfg.vsync,
         config::resolve_tint(cfg.tint),
         cfg.full_screen,
+        cfg.maximized,
+        cfg.monitor.clone(),
+        cfg.window_position,
+        cfg.window_scale,
         !cfg.status_bar,
         cfg.emulation.warp_speed,
         cfg.joystick_input_mode,
         cfg.mouse_sensitivity,
         cfg.mouse_capture,
+        cfg.middle_click_release,
         config::about_machine_lines(&cfg),
         raw_cfg,
         if cli.load_state.is_some() {
@@ -1435,6 +1443,7 @@ fn main() -> Result<()> {
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
     app.set_expect_screenshots(cli.expect_screenshot);
+    app.set_native_screenshots(cli.native_screenshots);
     if let Some(marker) = run_done_marker {
         app.set_exit_on_return(marker);
     }
@@ -1598,6 +1607,10 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         // The config-screen placeholder is always a normal windowed UI.
         false,
         false,
+        config::HostMonitor::Auto,
+        None,
+        1.0,
+        false,
         config::WarpSpeed::default(),
         config::JoystickInputMode::default(),
         50,
@@ -1605,6 +1618,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         // belongs to the machine, and run_machine installs the real setting
         // when one is started.
         config::MouseCapture::default(),
+        false,
         vec![config::ABOUT_PLACEHOLDER_LINE.to_string()],
         raw_cfg,
         None,
@@ -1636,8 +1650,10 @@ fn launcher_requested(cli: &CliArgs) -> bool {
         && cli.whdload.is_none()
         && cli.run.is_none()
         && cli.overrides.is_empty()
+        && !cli.list_monitors
         && !Path::new("copperline.toml").exists()
         && cli.screenshot_after.is_empty()
+        && !cli.native_screenshots
         && cli.expect_screenshot.is_empty()
         && !cli.exit_on_return
         && cli.save_state_after.is_empty()
@@ -1949,6 +1965,105 @@ mod tests {
         ));
         assert!(!launcher_requested(&parse(&["--noaudio"]).unwrap()));
         assert!(!launcher_requested(&parse(&["--run", "hello"]).unwrap()));
+    }
+
+    #[test]
+    fn window_scale_cli_composes_with_run_and_borderless_fullscreen() {
+        let cli = parse(&[
+            "--run",
+            "build/hello",
+            "--window-scale",
+            "2",
+            "--full-screen",
+        ])
+        .unwrap();
+        assert_eq!(cli.overrides.window_scale, Some(2.0));
+        assert_eq!(cli.overrides.full_screen, Some(true));
+        assert_eq!(cli.overrides.maximized, Some(false));
+        assert!(!launcher_requested(&cli));
+        assert!(!launcher_requested(
+            &parse(&["--window-scale", "2"]).unwrap()
+        ));
+        let cli = parse(&["--full-screen", "--window-scale", "1.5", "--windowed"]).unwrap();
+        assert_eq!(cli.overrides.window_scale, Some(1.5));
+        assert_eq!(cli.overrides.full_screen, Some(false));
+        assert_eq!(cli.overrides.maximized, Some(false));
+        assert!(parse(&["--window-scale"]).is_err());
+        for value in ["big", "0", "-1", "0.49", "4.01", "NaN", "inf", "-inf"] {
+            assert!(
+                parse(&["--window-scale", value]).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn maximized_window_cli_uses_the_last_window_mode() {
+        let cli = parse(&["--run", "build/hello", "--full-screen", "--maximized"]).unwrap();
+        assert_eq!(cli.overrides.full_screen, Some(false));
+        assert_eq!(cli.overrides.maximized, Some(true));
+        assert!(!launcher_requested(&cli));
+        for flag in ["--full-screen", "--windowed"] {
+            let cli = parse(&["--maximized", flag]).unwrap();
+            assert_eq!(cli.overrides.maximized, Some(false));
+            assert_eq!(cli.overrides.full_screen, Some(flag == "--full-screen"));
+        }
+    }
+
+    #[test]
+    fn host_monitor_cli_selects_without_opening_launcher() {
+        use config::HostMonitor;
+        for (selector, expected) in [
+            ("auto", HostMonitor::Auto),
+            ("primary", HostMonitor::Primary),
+            ("2", HostMonitor::Index(2)),
+            (
+                "External display",
+                HostMonitor::Name("External display".into()),
+            ),
+        ] {
+            let cli = parse(&["--monitor", selector, "--full-screen"]).unwrap();
+            assert_eq!(
+                cli.overrides
+                    .monitor
+                    .unwrap()
+                    .parse::<HostMonitor>()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(cli.overrides.full_screen, Some(true));
+            assert!(!launcher_requested(
+                &parse(&["--monitor", selector]).unwrap()
+            ));
+        }
+        for args in [
+            vec!["--monitor"],
+            vec!["--monitor", "0"],
+            vec!["--monitor", "-1"],
+            vec!["--monitor", "--full-screen"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+        let cli = parse(&["--monitor", "2", "--monitor", "auto"]).unwrap();
+        assert_eq!(cli.overrides.monitor.as_deref(), Some("auto"));
+        let cli = parse(&["--list-monitors"]).unwrap();
+        assert!(cli.list_monitors);
+        assert!(!launcher_requested(&cli));
+    }
+
+    #[test]
+    fn window_position_cli_accepts_signed_coordinates_and_requires_both() {
+        let cli = parse(&["--monitor", "2", "--window-position", "-40", "75"]).unwrap();
+        assert_eq!(cli.overrides.window_position, Some([-40, 75]));
+        assert!(!launcher_requested(&cli));
+        for args in [
+            vec!["--window-position"],
+            vec!["--window-position", "2"],
+            vec!["--window-position", "x", "2"],
+            vec!["--window-position", "2", "--maximized"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]
@@ -2392,6 +2507,24 @@ mod tests {
         );
         assert_eq!(args.expect_screenshot[0].tolerance, Tolerance::Pixels(3));
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn native_screenshots_is_opt_in_and_composes_with_expectations() -> Result<()> {
+        assert!(!parse(&["--screenshot-after", "1", "x.png"])?.native_screenshots);
+        let args = parse(&[
+            "--native-screenshots",
+            "--screenshot-after",
+            "1",
+            "x.png",
+            "--expect-screenshot",
+            "1",
+            "x.png",
+        ])?;
+        assert!(args.native_screenshots);
+        assert_eq!(args.screenshot_after.len(), 1);
+        assert_eq!(args.expect_screenshot.len(), 1);
         Ok(())
     }
 

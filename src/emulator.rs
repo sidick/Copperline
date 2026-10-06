@@ -569,7 +569,15 @@ impl Emulator {
     pub fn profile_status_value(&self) -> serde_json::Value {
         self.profile.as_ref().map_or_else(
             || serde_json::json!({ "active": false }),
-            |profile| profile.status_value(true),
+            |profile| {
+                let mut status = profile.status_value(true);
+                status["samples_dropped"] = serde_json::Value::from(
+                    profile
+                        .samples_dropped()
+                        .max(self.machine.profile_samples_dropped()),
+                );
+                status
+            },
         )
     }
 
@@ -665,6 +673,7 @@ impl Emulator {
             return Ok(serde_json::json!({ "active": false }));
         };
         capture.set_stack_bounds(crate::amigaos::stack_bounds_on_bus(self.bus()));
+        capture.note_samples_dropped(self.machine.profile_samples_dropped());
         self.machine.stop_profile_samples();
         if capture.options().coverage {
             if let Some(collector) = self.machine.stop_coverage() {
@@ -704,6 +713,9 @@ impl Emulator {
     #[cfg(feature = "control")]
     fn profile_poll(&mut self) -> Result<()> {
         use serde_json::{json, Value};
+        if let Some(profile) = self.profile.as_mut() {
+            profile.note_samples_dropped(self.machine.profile_samples_dropped());
+        }
         let Some(opts) = self
             .profile
             .as_ref()
@@ -953,6 +965,7 @@ impl Emulator {
                 record["samples_meta"] = Value::from(stats.metadata_name);
                 record["sample_count"] = Value::from(stats.count);
                 record["samples_total"] = Value::from(stats.samples_total);
+                record["samples_dropped"] = Value::from(profile.samples_dropped());
                 record["irq_cck"] = Value::from(stats.irq_cck);
             }
             profile
@@ -1101,7 +1114,7 @@ impl Emulator {
             .is_some_and(|u| u.take_exit_request())
     }
 
-    /// Queued guest debug events (uaelib functions 86 and 88) and the
+    /// Queued guest debug events (uaelib functions 86/88 and printf ports) and the
     /// number dropped since the last take.
     pub fn take_uaelib_debug_events(&mut self) -> (Vec<crate::uaelib::DebugEvent>, u64) {
         self.bus_mut()
@@ -1433,24 +1446,20 @@ impl Emulator {
         &mut self,
         load: impl FnOnce(&mut cpu::M68kMachine) -> Result<crate::config::MachineDescriptor>,
     ) -> Result<StateLoadOutcome> {
-        // Channel mode, stereo separation, and the filter override are host
-        // preferences, not part of the saved machine, so carry the current
-        // choices across the load.
+        // The uaelib host file root is a host preference, not part of the
+        // saved machine, so carry the current choice across the load.
+        // Paula's output preferences (volume, channel mode, stereo width,
+        // filter override) ride `Bus::adopt_host_resources` instead, which
+        // every restore path shares.
         let uaelib_file_authority = self
             .bus()
             .uaelib
             .as_ref()
             .and_then(crate::uaelib::UaeLib::file_authority);
-        let mono = self.bus_mut().paula.mono_output();
-        let separation = self.bus_mut().paula.stereo_separation();
-        let filter = self.bus_mut().paula.led_filter_mode();
         let loaded = load(&mut self.machine)?;
         if let Some(uaelib) = self.bus_mut().uaelib.as_mut() {
             uaelib.set_file_authority(uaelib_file_authority);
         }
-        self.bus_mut().paula.set_mono_output(mono);
-        self.bus_mut().paula.set_stereo_separation(separation);
-        self.bus_mut().paula.set_led_filter_mode(filter);
         let reconfigured = loaded != self.descriptor;
         if reconfigured {
             let diffs = self.descriptor.differences(&loaded).join(", ");
@@ -1605,24 +1614,18 @@ impl Emulator {
     /// coordinate to `pos`. The pacing anchor is re-baselined like a normal
     /// save-state load.
     fn restore_blob(&mut self, blob: &[u8], pos: u64) -> Result<()> {
-        // Preserve host-side channel mode, separation, and filter override
-        // across the restore (see load_state).
+        // Preserve the host-side uaelib file root across the restore (see
+        // adopt_loaded_state).
         let uaelib_file_authority = self
             .bus()
             .uaelib
             .as_ref()
             .and_then(crate::uaelib::UaeLib::file_authority);
-        let mono = self.bus_mut().paula.mono_output();
-        let separation = self.bus_mut().paula.stereo_separation();
-        let filter = self.bus_mut().paula.led_filter_mode();
         let mut cursor = std::io::Cursor::new(blob);
         self.machine.apply_state(&mut cursor)?;
         if let Some(uaelib) = self.bus_mut().uaelib.as_mut() {
             uaelib.set_file_authority(uaelib_file_authority);
         }
-        self.bus_mut().paula.set_mono_output(mono);
-        self.bus_mut().paula.set_stereo_separation(separation);
-        self.bus_mut().paula.set_led_filter_mode(filter);
         self.retired_instructions = pos;
         self.reset_realtime_quantum();
         self.reset_live_audio_after_timeline_jump();
@@ -1671,7 +1674,9 @@ impl Emulator {
     }
 
     /// Restore a local checkpoint from [`Self::netplay_snapshot`], preserving
-    /// live host resources and resetting the real-time stepping quantum.
+    /// live host resources and output preferences (volume, channel mode,
+    /// stereo width, filter override) and resetting the real-time stepping
+    /// quantum.
     pub fn netplay_restore(&mut self, blob: &[u8]) -> Result<()> {
         self.machine
             .apply_rollback_state(&mut std::io::Cursor::new(blob))?;
@@ -1691,17 +1696,11 @@ impl Emulator {
             .uaelib
             .as_ref()
             .and_then(crate::uaelib::UaeLib::file_authority);
-        let mono = self.bus_mut().paula.mono_output();
-        let separation = self.bus_mut().paula.stereo_separation();
-        let filter = self.bus_mut().paula.led_filter_mode();
         let mut cursor = std::io::Cursor::new(blob);
         self.machine.apply_state(&mut cursor)?;
         if let Some(uaelib) = self.bus_mut().uaelib.as_mut() {
             uaelib.set_file_authority(uaelib_file_authority);
         }
-        self.bus_mut().paula.set_mono_output(mono);
-        self.bus_mut().paula.set_stereo_separation(separation);
-        self.bus_mut().paula.set_led_filter_mode(filter);
         self.reset_realtime_quantum();
         Ok(())
     }
@@ -5902,6 +5901,72 @@ mod tests {
             emu.retired_instructions >= retired_at_anchor,
             "the position coordinate stays monotonic across an anchor restore"
         );
+    }
+
+    /// Paula's host output preferences: volume percent, mono, stereo
+    /// separation, filter override.
+    type HostAudioPrefs = (u8, bool, f32, crate::config::AudioFilterMode);
+
+    fn host_audio_prefs(emu: &super::Emulator) -> HostAudioPrefs {
+        let paula = &emu.bus().paula;
+        (
+            paula.output_volume_percent(),
+            paula.mono_output(),
+            paula.stereo_separation(),
+            paula.led_filter_mode(),
+        )
+    }
+
+    fn set_host_audio_prefs(emu: &mut super::Emulator, prefs: HostAudioPrefs) {
+        let (volume, mono, separation, filter) = prefs;
+        let bus = emu.bus_mut();
+        bus.set_output_volume_percent(volume);
+        bus.paula.set_mono_output(mono);
+        bus.paula.set_stereo_separation(separation);
+        bus.paula.set_led_filter_mode(filter);
+    }
+
+    #[test]
+    fn host_audio_preferences_survive_every_restore_path() {
+        use crate::config::AudioFilterMode;
+        // Neither the defaults nor each other, so a restore that reset a
+        // preference or took it from the snapshot shows up as a mismatch.
+        let at_snapshot = (60, false, 0.5, AudioFilterMode::Off);
+        let live = (37, true, 0.25, AudioFilterMode::On);
+        let mut emu = emulator_with_audio(Box::new(crate::audio::NullSink));
+        emu.step_frame().unwrap();
+        set_host_audio_prefs(&mut emu, at_snapshot);
+        let file = emu.save_state_bytes().unwrap();
+        let rewind = emu.snapshot_blob().unwrap();
+        let runahead = emu.runahead_snapshot().unwrap();
+        let rollback = emu.netplay_snapshot().unwrap();
+        set_host_audio_prefs(&mut emu, live);
+
+        emu.load_state_bytes(&file).unwrap();
+        assert_eq!(host_audio_prefs(&emu), live, "state load");
+        let pos = emu.retired_instructions;
+        emu.restore_blob(&rewind, pos).unwrap();
+        assert_eq!(host_audio_prefs(&emu), live, "rewind");
+        emu.runahead_restore(&runahead).unwrap();
+        assert_eq!(host_audio_prefs(&emu), live, "run-ahead restore");
+        emu.netplay_restore(&rollback).unwrap();
+        assert_eq!(host_audio_prefs(&emu), live, "netplay rollback");
+        // The carried override also drives the effective filter, not just
+        // the setting the menu reads back.
+        assert!(emu.bus().paula.led_filter_enabled());
+    }
+
+    #[test]
+    fn netplay_snapshot_ignores_host_output_preferences() {
+        let mut emu = emulator_with_audio(Box::new(crate::audio::NullSink));
+        emu.step_frame().unwrap();
+        let before = emu.netplay_snapshot().unwrap();
+        // Peers checksum these bytes: a local volume, channel mode, or width
+        // change must not read as a desync.
+        emu.bus_mut().set_output_volume_percent(20);
+        emu.bus_mut().paula.set_mono_output(true);
+        emu.bus_mut().paula.set_stereo_separation(0.4);
+        assert_eq!(emu.netplay_snapshot().unwrap(), before);
     }
 
     #[test]

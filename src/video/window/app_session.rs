@@ -133,7 +133,7 @@ impl App {
             info!("fullscreen off");
             self.show_osd("Fullscreen off");
         } else {
-            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            window.set_fullscreen(Some(Fullscreen::Borderless(self.selected_host_monitor())));
             info!("fullscreen on");
             self.show_osd(format!(
                 "Fullscreen on ({HOST_SHORTCUT_MODIFIER_LABEL}+F restores)"
@@ -513,23 +513,35 @@ impl App {
         }
     }
 
+    /// Drain the core's bounded pending queue into the window's session
+    /// scrollback, whether or not the console pane has been opened yet.
+    pub(super) fn service_console_lines(&mut self) {
+        let lines = self.emu.take_uaelib_console_lines();
+        #[cfg(feature = "gdb")]
+        self.gdb_log_lines(&lines);
+        let has_visible_output = self.console_panel.is_some() && !lines.is_empty();
+        for line in lines {
+            let line = format!("DBG: {line}");
+            if self.console_backlog.len() >= ui::CONSOLE_SCROLLBACK_LINES {
+                self.console_backlog.pop_front();
+            }
+            if let Some(panel) = self.console_panel.as_mut() {
+                panel.push_output(line.clone());
+            }
+            self.console_backlog.push_back(line);
+        }
+        if has_visible_output {
+            // A step or breakpoint can leave the machine paused, with
+            // no paced inspector redraw to replace the cached egui frame.
+            self.request_redraw();
+        }
+    }
+
     /// The guest's `warpmode()` through the uaelib trap, once per retired
     /// frame. Returns true when pacing changed, so the burst can break and
     /// the new pacing takes effect at this frame.
     pub(super) fn service_uaelib(&mut self) -> bool {
-        // Drain the console mirror every committed frame (keeping the ring
-        // from sitting full); the lines only land somewhere when the pane
-        // is open. Ones emitted while it is closed are not replayed: they
-        // already reached stdout, and opening the console is opening a new
-        // terminal on the channel, not a scrollback of the old one.
-        let lines = self.emu.take_uaelib_console_lines();
-        #[cfg(feature = "gdb")]
-        self.gdb_log_lines(&lines);
-        if let Some(panel) = self.console_panel.as_mut() {
-            for line in lines {
-                panel.push_output(format!("DBG: {line}"));
-            }
-        }
+        self.service_console_lines();
         match self.emu.take_uaelib_warp_request() {
             Some(on) => self.set_warp(on, WarpSource::Guest).changed,
             None => false,
@@ -614,7 +626,7 @@ impl App {
     /// three times a second: retrying would walk the clipboard protocols
     /// (and log a warning from inside `arboard`) that often, for the whole
     /// run. Said once, it tells the user why sharing is doing nothing.
-    fn host_clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+    pub(super) fn host_clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.host_clipboard.is_none() && !self.host_clipboard_unavailable {
             match arboard::Clipboard::new() {
                 Ok(clip) => self.host_clipboard = Some(clip),
@@ -1208,7 +1220,7 @@ impl App {
             src_rows,
             self.present_width,
             self.overscan,
-            self.tv_centre,
+            self.present_tv_centre,
             self.present_tv_aperture_rows,
             &mut out,
         );
@@ -1242,7 +1254,7 @@ impl App {
         let source = super::ClipRingSource {
             generation: self.present_fb_generation,
             overscan: self.overscan,
-            tv_centre: self.tv_centre,
+            tv_centre: self.present_tv_centre,
             tv_aperture_rows: self.present_tv_aperture_rows,
             capture_rows: crate::video::capture_height(),
             rtg: self.rtg_present_dims.is_some(),
@@ -1567,11 +1579,10 @@ impl App {
     /// The presented frame as a screenshot captures it, before encoding:
     /// the single path behind saved screenshots and `--expect-screenshot`.
     ///
-    /// COPPERLINE_SHOT_RAW captures the raw woven framebuffer (716x570
-    /// for standard fields, the native scan height for programmable
-    /// modes): the presentation resampler blends adjacent lines, so
-    /// per-scanline forensics need the unscaled field.
     pub(super) fn capture_present_image(&self) -> super::present::PresentImage<'_> {
+        if self.native_screenshots {
+            return self.capture_native_image();
+        }
         let src_rows = self.present_rows;
         if self.rtg_present_dims.is_some() {
             // An RTG board's frame already has one presentation row per
@@ -1590,7 +1601,7 @@ impl App {
             src_rows,
             self.present_width,
             self.overscan,
-            self.tv_centre,
+            self.present_tv_centre,
             self.present_tv_aperture_rows,
         )
     }
@@ -1600,6 +1611,32 @@ impl App {
         match screenshot::save(path, &image.pixels, image.width, image.height) {
             Ok(()) => info!("screenshot saved: {}", path.display()),
             Err(e) => warn!("screenshot save failed ({}): {e:#}", path.display()),
+        }
+    }
+
+    fn capture_native_image(&self) -> super::present::PresentImage<'static> {
+        let (pixels, rows, width) = screenshot::render_native(self.emu.bus());
+        super::present::PresentImage {
+            pixels: std::borrow::Cow::Owned(pixels),
+            width: width as u32,
+            height: rows as u32,
+        }
+    }
+
+    pub(super) fn take_native_screenshot(&mut self) {
+        let path = screenshot::auto_filename();
+        let image = self.capture_native_image();
+        match screenshot::save(&path, &image.pixels, image.width, image.height) {
+            Ok(()) => self.show_osd(format!(
+                "Saved {} ({}×{})",
+                display_file_name(&path),
+                image.width,
+                image.height
+            )),
+            Err(e) => {
+                warn!("native screenshot save failed ({}): {e:#}", path.display());
+                self.show_osd("Screenshot save failed");
+            }
         }
     }
 
@@ -1694,7 +1731,7 @@ impl App {
             src_rows,
             self.present_width,
             self.overscan,
-            self.tv_centre,
+            self.present_tv_centre,
             self.present_tv_aperture_rows,
         );
         match result {

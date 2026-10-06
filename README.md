@@ -16,7 +16,7 @@ It boots out of the box with the bundled open-source AROS Kickstart replacement,
 - **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF, SCP), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
 - **Audio and video**: 4-channel Paula audio, RTG graphics cards (Picasso II/II+, Z3660), host MIDI in/out bridging, and built-in Roland MT-32 and General MIDI synthesis.
 - **Expansion and networking**: Zorro II/III autoconfig, A2065 Ethernet, host-backed bsdsocket.library, and sandboxed WebAssembly expansion plugins.
-- **Debugging**: CPU and chipset debugger, reverse stepping, live Kickstart/AROS symbols, frame and instruction profiling, VCD waveforms, and source debugging through GDB or DAP. Both the native VS Code extension and the [Copperline fork of Bartman's extension](docs/debugger/vscode-bartman.md) are supported.
+- **Debugging**: CPU and chipset debugger, reverse stepping, live Kickstart/AROS symbols, frame and [instruction profiling](docs/debugger/profiling.md) with bounded sample buffering and overflow reporting, VCD waveforms, and source debugging through GDB or DAP. Both the native VS Code extension and the [Copperline fork of Bartman's extension](docs/debugger/vscode-bartman.md) are supported.
 - **Automation and replay**: [Save states](docs/guide/ui.md#save-states), [WinUAE state import](docs/guide/winuae-state.md), headless input scripts and captures, and a JSON-RPC control protocol. `copperline-ctl` also provides DAP (`--dap`) and MCP (`--mcp`) servers.
 - **Freezer cartridge**: Action Replay-style cartridge support with bundled HRTMon (`--cartridge hrtmon`), allowing running software to be frozen into the monitor via the menu, a hotkey, headless `--freeze-after`, or the control protocol.
 - **Direct launching**: Boot directly into WHDLoad game packages (`--whdload`) or host-built Amiga executables (`--run`, including bare Kickstart 1.3), with a WinUAE-compatible `uaelib` trap allowing guest code to control warp speed, log debug messages, and register debug resources.
@@ -62,6 +62,11 @@ cargo build --release
 Run the resulting `target/release/copperline` binary. `--release` is a Cargo
 build option; unoptimized debug builds are too slow for real-time emulation.
 
+**Video Settings -> Framing -> Smart** automatically corrects small horizontal
+display offsets. Combine it with **Autocrop** and **Integer** scaling to fit
+the detected display at the largest whole-pixel scale, including artwork
+outside the normal TV aperture. See [display configuration](docs/guide/configuration.md).
+
 The [Debug workspace](docs/debugger/window.md) puts the Amiga display beside
 its debugger, Frame Analyzer, and Console in one desktop window. Open
 **Debugger...** in the menu or press
@@ -96,6 +101,17 @@ To boot directly into a Kickstart ROM, configuration file, or floppy image:
 ./target/release/copperline --config path/to/copperline.toml
 ./target/release/copperline --model A1200 --fast 8M KICK31.ROM --insert-disk-after 0 df0 game.adf
 ```
+
+For a build pipeline, use `copperline --run build/hello --window-scale 2` to
+start at twice the normal window width and height. `--maximized` opens a
+maximized window with its title bar and desktop taskbar visible;
+`--full-screen` opens borderless fullscreen.
+Use `--list-monitors` to list host displays and `--monitor 2` to open on the
+second display, or select *Host monitor* in the launcher's Display category.
+Use `--window-position 100 80` or the launcher's *Window position* field to
+place its top-left corner 100 by 80 logical pixels into that display.
+On Wayland, monitor selection applies to fullscreen; the compositor places
+ordinary windows.
 
 ### Essential keyboard shortcuts
 

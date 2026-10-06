@@ -81,6 +81,11 @@ range checks as the equivalent TOML fields:
 | `--coverage FILE` | (none; needs `--run`) | write lcov line/function coverage of the `--run` program to FILE when it exits or the run ends ([coverage](../debugger/profiling.md#guest-coverage)) |
 | `--coverage-source-map FROM=TO` | (none; needs `--coverage`) | rewrite a source path prefix in the coverage file; repeatable |
 | `--full-screen` / `--windowed` | `[display] full_screen` | open fullscreen or windowed at start (default windowed) |
+| `--maximized` | `[display] maximized` | open a maximized window with borders and the desktop taskbar visible |
+| `--monitor SELECTOR` | `[display] monitor` | host display: `auto`, `primary`, a one-based number, or an exact name |
+| `--window-position X Y` | `[display] position = [X, Y]` | window top-left in logical pixels relative to the selected monitor |
+| `--list-monitors` | -- | list host display numbers, names, resolutions and scale factors, then exit |
+| `--window-scale SCALE` | `[display] window_scale` | initial window width and height multiplier, 0.5-4.0 (default 1) |
 | `--show-status-bar` / `--hide-status-bar` | `[display] status_bar` | status bar at start (default shown) |
 | `--perf-overlay` | `[display] perf_overlay` | show performance overlay at start |
 | `--menu-scale SIZE` | `[display] menu_scale` | size of the pop-up menu: `1x` (default) or `2x` |
@@ -433,7 +438,7 @@ warp_speed = "max"         # turbo limit: "2x", "4x", "8x", "16x", or "max"
 warp_boot = false          # warp the boot until storage goes idle
 warp_boot_idle = 10        # ...for this many emulated seconds
 # warp_until = 12.0        # or warp until an absolute emulated time
-uaelib = true              # WinUAE-compatible uaelib trap at $F0FF60
+uaelib = true              # uaelib trap and WinUAE memory-write debug output
 uaelib_files = false       # opt-in file helpers, below the --run directory
 rewind = false             # true = record rewind history from power-on
 rewind_budget_mb = 256     # host memory the rewind history may hold
@@ -515,8 +520,10 @@ carried no information.)
   `$F0FF60`. Guest programs can use this interface to toggle warp mode (via
   `warpmode()` in the vscode-amiga-debug template), emit debug log messages,
   and register bitmaps, palettes, and copper lists with the debugger (see
-  [](run)). Setting this to `false` leaves `$F0FF60` unmapped. On CDTV
-  configurations, the extended ROM occupies `$F00000` and covers this space.
+  [](run)). It also enables the [memory-write debug ports](run.md#winuae-debug-port)
+  at `$BFFF00` / `$BFFF04`. Setting this to `false` disables the ports and
+  leaves `$F0FF60` unmapped. On CDTV configurations, the extended ROM occupies
+  `$F00000` and covers the trap; the debug ports remain available.
 - `uaelib_files = true` lets the uaelib `debug_load` / `debug_save` calls
   read and write files below the `--run` program's directory. It is off by
   default because guest programs may be untrusted; absolute paths,
@@ -727,7 +734,7 @@ BPLCON3 SPRES output, BPLCON4, and CLXCON2. Remaining gaps are recorded in
 
 ```toml
 [display]
-overscan = "tv"       # "tv" (default) or "full"
+overscan = "tv"       # "tv" (default), "smart" or "full"
 tv_h_centre = 0       # TV picture centring in lo-res pixels, -16..16 (+ = right)
 tv_v_centre = 0       # TV picture centring in scan lines, -8..8 (+ = down)
 pixel_aspect = "tv"   # "tv" (default, 4:3 CRT) or "square" (exact 2x2 lo-res)
@@ -742,7 +749,10 @@ bezel = "off"         # monitor front: "off" (default), "1084", or "classic"
 perf_overlay = false  # show the performance overlay at start (default false)
 tint = "none"         # "none" (default), "bw", "green", "amber", or "sepia"
 menu_scale = "1x"     # size of the pop-up menu: "1x" (default) or "2x"
-full_screen = false   # open fullscreen at start (default false)
+full_screen = false   # open borderless fullscreen at start (default false)
+maximized = false     # maximize with title bar and desktop taskbar (default false)
+monitor = "auto"      # host display: auto, primary, one-based number, or exact name
+window_scale = 1.0    # initial window width and height multiplier, 0.5-4.0
 status_bar = true     # show the status bar at start (default true)
 vsync = true          # synchronise desktop presentation to vblank (default true)
 hidpi_texture = true  # draw the presentation texture at device-pixel density (default true)
@@ -780,12 +790,28 @@ edge with no black bezel columns. The live window and PNG screenshots /
 that shape because both apertures fill the same glass: an NTSC scan's
 shorter crop (the 200-line standard window plus the same overscan margin)
 is scaled onto the same output rows. `"full"` shows everything, which is
-useful when debugging display alignment. `COPPERLINE_OVERSCAN=full|tv`
-overrides this for a single run. In both modes the presentation geometry
+useful when debugging display alignment. `COPPERLINE_OVERSCAN=full|tv|smart`
+overrides this for a single run. In all modes the presentation geometry
 holds steady across the blank frames a screen change produces: a frame
 showing only border colour keeps the previous frame's aperture and
 centring instead of snapping to the full framebuffer, so the picture does
 not jump sideways at Kickstart screen changes.
+
+`"smart"` keeps the TV aperture and automatically adjusts its horizontal
+position after the hardware display envelope has remained stable for 25
+distinct presented emulated frames. The automatic correction is limited to
+eight lo-res pixels each way; blank frames retain the last position, and
+small display windows do not pull the aperture toward individual objects.
+It can bring slightly off-centre artwork, such as the CD32 boot logo, into
+view without zooming out. Manual H/V centring remains available as a trim;
+the combined horizontal correction is limited to the manual control's
+16-pixel travel. The menu's *Video Settings -> Framing* switches between
+TV, Smart and Full overscan live. TV remains the default.
+
+Smart framing follows display geometry, not software identity or pixel
+colour. A fixed aperture can still crop a large overscan display, and
+deliberate effects in its newly exposed margin may become visible. Use TV
+for a fixed crop, or Full overscan to inspect the entire captured field.
 
 `tv_h_centre` / `tv_v_centre` nudge where the TV presentation centres the
 picture on the glass -- the H-CENTER/V-CENTER controls a real monitor
@@ -881,6 +907,28 @@ presets render over the cropped area. Programmable multisync modes (such as
 DblPAL or 31 kHz displays) are also cropped based on their active display
 windows. Autocrop is automatically suspended when using monitor bezels or RTG
 modes. The menu's *Video Settings -> Autocrop* option toggles it at runtime.
+
+For an automatic crop with the largest integer fit, use:
+
+```toml
+[display]
+overscan = "smart"
+autocrop = true
+scaling = "integer"
+```
+
+Smart autocrop selects directly from the unmasked raster, before the TV
+aperture clips its edges. It includes the full detected display window,
+including artwork outside the usual TV view. PAL/NTSC pixel aspect comes
+from the scan rather than from the crop dimensions. For a 320x200 display
+on a 1920x1080 surface with the status bar hidden, PAL fits at 5x; NTSC uses
+the existing per-axis 4:5 fit. Larger title screens reduce the scale to fit
+their complete detected display. No picture lines are discarded to reach a
+larger multiplier. The detector uses fetched raster lines and programmed
+display spans; black pixels inside those spans remain picture content.
+This is automatic framing rather than per-game overscaling presets.
+Captures retain the configured aperture and centring, as with ordinary
+autocrop. Monitor bezels and RTG modes suspend autocrop.
 
 `deinterlace` controls how interlaced (LACE) displays are presented. On
 (the default), a motion-adaptive deinterlacer weaves the two fields into a
@@ -1073,6 +1121,23 @@ whole menu, rows and text together. It is a start-up preference:
 value, `--menu-scale` sets it on the command line, and the launcher's A/V &
 Emu page (Display category) has a *Menu size* picker for the same.
 
+`window_scale` multiplies the normal window width and height in logical host
+pixels: `2` opens at twice the normal size on both standard and HiDPI displays.
+It accepts 0.5 through 4.0, including fractional values such as 1.5, and
+defaults to 1. The window keeps this multiple when its canvas changes, such
+as when hiding the status bar, until manually resized. The host may limit
+the requested size to the available desktop area. Screenshots and headless
+captures keep their usual resolution.
+
+`maximized` opens a normal, decorated window filling the available desktop
+area, keeping the title bar and desktop taskbar visible where the platform
+provides them. `--maximized` selects this mode from a build pipeline:
+
+```sh
+copperline --run build/hello --window-scale 2
+copperline --run build/hello --maximized
+```
+
 `full_screen` opens the window fullscreen at start (borderless), and
 `status_bar` chooses whether the status bar starts visible. Both are start-up
 preferences; the runtime toggles -- `Cmd+F` / `Alt+F` for fullscreen and
@@ -1081,7 +1146,51 @@ still flip either live without changing the saved value. On the command line
 `--full-screen` / `--windowed` set the fullscreen state and `--show-status-bar` /
 `--hide-status-bar` set the status bar; the launcher's A/V & Emu page (Display
 category) has *Start fullscreen* and *Status bar* toggles for the same. Left
-unset they keep the defaults: windowed, status bar shown.
+unset they keep the defaults: windowed, status bar shown. `--windowed` also
+clears maximization; the last of `--full-screen`, `--maximized`, and
+`--windowed` wins. In a config that enables both `full_screen` and
+`maximized`, fullscreen takes precedence. Canvas changes leave a maximized
+window at its desktop size; restoring it resumes the normal canvas sizing.
+
+`monitor` chooses the host display for the main window. The launcher's
+*Host monitor* picker is in A/V & Emu, Display. It shows the connected
+displays with their names and resolutions; Run applies the choice and Save
+retains it. Monitor selection also applies when entering fullscreen later.
+The *Window position* field on that page accepts `X, Y`; emptying it restores
+automatic placement. Coordinates are logical pixels from the chosen display's
+top-left corner, including negative offsets. With `monitor = "auto"`, a
+specified position uses the primary display. Without a position, a selected
+display centres the window; `auto` leaves placement to the host. Fullscreen
+and maximized windows ignore the coordinates.
+
+```sh
+copperline --list-monitors
+copperline --monitor 2 --full-screen
+copperline --monitor "External display" --maximized
+copperline --monitor 2 --window-position 100 80
+```
+
+The default, `"auto"`, leaves placement to the host and enters fullscreen on
+the window's current monitor. `"primary"` selects the primary display when
+the host reports one. Numbers start at 1 and refer to `--list-monitors`;
+their ordering can change when displays are connected or disconnected.
+Names match exactly. `"name:primary"` or `"name:2"` selects a display literally
+named `primary` or `2`. The launcher saves unique names with this prefix,
+using numbers for unnamed displays or duplicate names. An unavailable
+display, ambiguous name or unreported primary display logs a warning and
+falls back to automatic placement without changing the saved preference.
+
+Windows, macOS and X11 can place normal and maximized windows on the selected
+display. On Wayland, the compositor controls ordinary window placement;
+Copperline can request fullscreen on a selected display, subject to the
+compositor's policy. Wayland does not report a primary monitor, so use a
+name or number there. Window positions are also compositor controlled on
+Wayland. Headless captures ignore monitor selection and position, and
+`--list-monitors` loads no ROM or machine configuration.
+
+Saved auto-launch configurations use these window preferences too. Changing
+`window_scale` by running a configuration from Debug applies the new size when
+returning to Play, leaving the inspector workspace at its current size.
 
 Rendering completed frames uses a worker thread by default so emulation can
 advance while the previous frame is painted. The worker is an implementation
@@ -1285,6 +1394,7 @@ port2 = "joystick"        # same values except gamepad-mouse; default "cd32" on 
 joystick = "gamepad"      # "gamepad" (default) or "keyboard"
 mouse_sensitivity = 50    # host mouse speed 0-100 (50 default = 1:1)
 mouse_capture = "click"   # when to grab the mouse: click | auto | manual
+middle_click_release = false # middle click releases capture instead of reaching the guest
 autofire_hz = 0           # pulse a held fire button at this rate; 0 = off
 ```
 
@@ -1407,6 +1517,12 @@ decides when that grab is taken:
 an explicit release is never undone automatically. Opening a panel or tool
 window borrows the cursor and hands the capture back when the last one
 closes.
+
+Set `middle_click_release = true` to release capture with the middle mouse
+button. This is off by default, so middle click reaches the guest as usual.
+While captured, the release click is consumed and any held guest mouse
+buttons are released. An uncaptured middle click keeps its usual behavior.
+The launcher's *Input* tab has the same *Middle to release* setting.
 
 Uncaptured, host cursor motion over the display still drives the emulated
 mouse in every mode; this setting only decides when the grab is taken, not
@@ -1846,6 +1962,18 @@ WHDLoad saves, a volume needing validation) gets the write-protect error.
 A delta CHD (one made against a parent image) is refused; flatten it with
 chdman first.
 
+A **VHD** attaches too: the Microsoft Virtual Hard Disk container WinUAE
+creates hardfiles in (and Windows Disk Management, Virtual PC, VirtualBox
+and `qemu-img` write). It is recognised by content, like the forms above,
+and both kinds of hardfile work inside it. A **fixed** VHD is a raw image
+with a 512-byte footer on the end; the footer is not part of the disk the
+guest sees. A **dynamic** VHD only holds the parts of the disk that have
+been written: the rest reads as zeros, and the file grows a block (2 MiB,
+usually) at a time as the guest writes somewhere new. Either way the
+guest's writes go back into the `.vhd`, as they do for an HDF, so the
+image stays usable in WinUAE. A differencing VHD (one holding only the
+changes to a parent image) is refused; merge it into its parent first.
+
 A path may also name a **host directory**: its tree is built into an
 in-memory volume at startup (volume name = directory name, files and
 subdirectories included; entries whose names cannot exist on an Amiga
@@ -1998,7 +2126,11 @@ drives**. `controller` picks which one:
   carries `scsi.device` and autoboots on Kickstart 1.3 and newer. Omit
   `rom` to use Copperline's bundled clean-room open ROM, which uses PIO for
   control commands and 24-bit DMAC transfers with safe bounce buffers for
-  inaccessible or unaligned memory. This also sidesteps the stock
+  inaccessible or unaligned memory. Bounce buffers prefer DMA-capable
+  24-bit Fast RAM, including controller RAM, and fall back to Chip RAM.
+  Bounced disk reads use two buffers to overlap DMA with copying; scarce
+  memory automatically selects smaller or single-buffer transfers. This
+  also sidesteps the stock
   A600/A1200 `scsi.device` only probing the IDE master. `[ide]` remains
   available, and both can be used at once.
 - `"a4091"`: a Commodore A4091 (NCR 53C710 SCSI-2) as a Zorro III
@@ -2027,7 +2159,8 @@ Each `unitN` accepts everything `[ide]` paths do: RDB images, bare
 partition hardfiles (a synthesized RDB advertises a bootable `DHn`
 partition, named after the SCSI ID), gzip-compressed hardfiles (`.hdz`),
 CHD hard-disk images (`.chd`, writes kept in the `.chd.wov` overlay),
-and host directories built into in-memory FFS/OFS volumes -- including the
+fixed and dynamic VHDs (`.vhd`), and host directories built into in-memory
+FFS/OFS volumes -- including the
 `{ path = "...", name = "...", bootpri = N, filesystem = "..." }` table
 form that overrides a directory mount's volume name, filesystem, and the
 synthesized partition's boot priority. The HDD activity LED covers SCSI
@@ -2079,7 +2212,7 @@ It takes up to **seven units** (0-6), each in the same bare-path/table drive
 form as `[ide]`/`[scsi]`/`[lide]`: RDB images, bare partition hardfiles (the
 synthesized RDB names the bootable partition `DH0`..`DH6` after the unit
 number), gzip-compressed hardfiles (`.hdz`), CHD hard-disk images (`.chd`,
-writes kept in the `.chd.wov` overlay), and host directories built into
+writes kept in the `.chd.wov` overlay), VHDs (`.vhd`), and host directories built into
 in-memory FFS/OFS volumes, including the
 `{ path = "...", name = "...", bootpri = N, filesystem = "..." }` table form
 described under `[ide]`. The images go through the same shared hardfile
@@ -2133,7 +2266,7 @@ one channel, no ROM banking. None of the three wire an interrupt line --
 `lide.device` is a purely polling driver.
 
 `drive0`..`drive3` take the same bare-path/table form as `[ide]`/`[scsi]`
-(RDB images, bare partition hardfiles, `.hdz`, `.chd`, host directories, and the
+(RDB images, bare partition hardfiles, `.hdz`, `.chd`, `.vhd`, host directories, and the
 `{ path = "...", name = "...", bootpri = N, filesystem = "..." }` table), one
 key per slot in (channel, master/slave) order: `drive0` and `drive1` are
 channel 0's master and slave, `drive2` and `drive3` are channel 1's

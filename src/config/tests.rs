@@ -8,6 +8,97 @@ fn parse_config(text: &str) -> Result<Config> {
     raw.try_into()
 }
 
+#[test]
+fn host_monitor_selectors_validate_and_round_trip() -> Result<()> {
+    assert_eq!(Config::default().monitor, HostMonitor::Auto);
+    for (text, expected) in [
+        ("auto", HostMonitor::Auto),
+        ("PRIMARY", HostMonitor::Primary),
+        ("2", HostMonitor::Index(2)),
+        (
+            "External display",
+            HostMonitor::Name("External display".into()),
+        ),
+        ("name:primary", HostMonitor::Name("primary".into())),
+        ("name:2", HostMonitor::Name("2".into())),
+    ] {
+        let parsed: HostMonitor = text.parse()?;
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.to_string().parse::<HostMonitor>()?, expected);
+        let cfg = parse_config(&format!("[display]\nmonitor = {text:?}\n"))?;
+        assert_eq!(cfg.monitor, expected);
+    }
+    for text in [
+        "",
+        " ",
+        "0",
+        "-1",
+        "name:",
+        "999999999999999999999999999999",
+    ] {
+        assert!(text.parse::<HostMonitor>().is_err(), "accepted {text:?}");
+        assert!(parse_config(&format!("[display]\nmonitor = {text:?}\n")).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn host_monitor_override_replaces_config_and_can_restore_auto() -> Result<()> {
+    let mut raw = RawConfig::parse("[display]\nmonitor = \"primary\"\n")?;
+    let overrides = ConfigOverrides {
+        monitor: Some("2".into()),
+        ..Default::default()
+    };
+    assert!(!overrides.is_empty());
+    overrides.apply_to(&mut raw);
+    assert_eq!(
+        Config::try_from(raw.clone())?.monitor,
+        HostMonitor::Index(2)
+    );
+    assert_eq!(
+        Config::try_from(RawConfig::parse(&raw.to_toml_string()?)?)?.monitor,
+        HostMonitor::Index(2)
+    );
+    ConfigOverrides {
+        monitor: Some("auto".into()),
+        ..Default::default()
+    }
+    .apply_to(&mut raw);
+    assert_eq!(Config::try_from(raw)?.monitor, HostMonitor::Auto);
+    Ok(())
+}
+
+#[test]
+fn window_position_round_trips_and_cli_override_replaces_it() -> Result<()> {
+    let mut raw = RawConfig::parse("[display]\nmonitor = \"2\"\nposition = [-40, 75]\n")?;
+    assert_eq!(
+        Config::try_from(raw.clone())?.window_position,
+        Some([-40, 75])
+    );
+    assert_eq!(
+        RawConfig::parse(&raw.to_toml_string()?)?.display.position,
+        Some(vec![-40, 75])
+    );
+    let overrides = ConfigOverrides {
+        window_position: Some([100, 80]),
+        ..Default::default()
+    };
+    assert!(!overrides.is_empty());
+    overrides.apply_to(&mut raw);
+    assert_eq!(Config::try_from(raw)?.window_position, Some([100, 80]));
+    for text in [
+        "position = [100]",
+        "position = [100, 80, 20]",
+        "position = [1.5, 2]",
+    ] {
+        assert!(
+            parse_config(&format!("[display]\n{text}\n")).is_err(),
+            "accepted {text}"
+        );
+    }
+    Ok(())
+}
+
 /// The player startup layers its settings file over the manifest's
 /// defaults: what the overlay carries wins, what it omits keeps the
 /// base, so a partial or hand-edited file still behaves.
@@ -884,6 +975,15 @@ fn mouse_capture_defaults_to_click_and_parses_its_modes() -> Result<()> {
 }
 
 #[test]
+fn middle_click_release_defaults_off_and_parses_a_boolean() -> Result<()> {
+    assert!(!parse_config("")?.middle_click_release);
+    assert!(!parse_config("[input]\nmiddle_click_release = false\n")?.middle_click_release);
+    assert!(parse_config("[input]\nmiddle_click_release = true\n")?.middle_click_release);
+    assert!(parse_config("[input]\nmiddle_click_release = \"true\"\n").is_err());
+    Ok(())
+}
+
+#[test]
 fn mouse_capture_cli_override_sets_the_mode() -> Result<()> {
     let overrides = ConfigOverrides {
         mouse_capture: Some("auto".to_string()),
@@ -1089,6 +1189,7 @@ fn display_fullscreen_and_status_bar_default_and_parse() -> Result<()> {
     // Defaults: windowed, status bar shown.
     let cfg = parse_config("")?;
     assert!(!cfg.full_screen);
+    assert!(!cfg.maximized);
     assert!(cfg.status_bar);
 
     let cfg = parse_config("[display]\nfull_screen = true\nstatus_bar = false\n")?;
@@ -1108,6 +1209,51 @@ fn display_fullscreen_and_status_bar_default_and_parse() -> Result<()> {
 }
 
 #[test]
+fn display_maximized_keeps_scale_and_overrides() -> Result<()> {
+    let cfg = parse_config("[display]\nmaximized = true\nwindow_scale = 2\n")?;
+    assert!(cfg.maximized);
+    assert!(!cfg.full_screen);
+    assert_eq!(cfg.window_scale, 2.0);
+    let overrides = ConfigOverrides {
+        full_screen: Some(false),
+        maximized: Some(true),
+        ..Default::default()
+    };
+    let mut raw = RawConfig::parse("[display]\nfull_screen = true\n")?;
+    overrides.apply_to(&mut raw);
+    let cfg = Config::try_from(raw)?;
+    assert!(cfg.maximized);
+    assert!(!cfg.full_screen);
+    Ok(())
+}
+
+#[test]
+fn display_window_scale_validates_and_cli_overrides_file() -> Result<()> {
+    assert_eq!(parse_config("")?.window_scale, 1.0);
+    for value in [0.5, 1.0, 1.5, 2.0, 4.0] {
+        assert_eq!(
+            parse_config(&format!("[display]\nwindow_scale = {value}\n"))?.window_scale,
+            value
+        );
+    }
+    for value in ["0", "-1", "0.49", "4.01", "nan", "inf", "-inf"] {
+        assert!(
+            parse_config(&format!("[display]\nwindow_scale = {value}\n")).is_err(),
+            "accepted {value}"
+        );
+    }
+    let overrides = ConfigOverrides {
+        window_scale: Some(2.0),
+        ..Default::default()
+    };
+    assert!(!overrides.is_empty());
+    let mut raw = RawConfig::parse("[display]\nwindow_scale = 1.5\n")?;
+    overrides.apply_to(&mut raw);
+    assert_eq!(Config::try_from(raw)?.window_scale, 2.0);
+    Ok(())
+}
+
+#[test]
 fn display_overscan_parses_and_defaults_to_tv() -> Result<()> {
     assert_eq!(parse_config("")?.overscan, Overscan::Tv);
     let cfg = parse_config(
@@ -1117,6 +1263,10 @@ fn display_overscan_parses_and_defaults_to_tv() -> Result<()> {
             "#,
     )?;
     assert_eq!(cfg.overscan, Overscan::Full);
+    assert_eq!(
+        parse_config("[display]\noverscan = \"Smart\"")?.overscan,
+        Overscan::Smart
+    );
     assert!(parse_config("[display]\noverscan = \"crop\"").is_err());
     Ok(())
 }

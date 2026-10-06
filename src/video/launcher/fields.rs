@@ -630,6 +630,8 @@ pub enum LauncherField {
     Vsync,
     MenuScale,
     StartFullscreen,
+    HostMonitor,
+    WindowPosition,
     ShowStatusBar,
     FloppySounds,
     FloppyVolume,
@@ -644,6 +646,7 @@ pub enum LauncherField {
     Joystick,
     MouseSensitivity,
     MouseCapture,
+    MiddleClickRelease,
     Port1Device,
     Port2Device,
 }
@@ -1246,8 +1249,10 @@ pub(super) const VIDEO_ROWS: [Row; 10] = [
 ];
 
 // The host window and its furniture, as distinct from the picture inside it.
-pub(super) const DISPLAY_ROWS: [Row; 5] = [
+pub(super) const DISPLAY_ROWS: [Row; 7] = [
     row(F::StartFullscreen, "Start fullscreen", Cycle),
+    row(F::HostMonitor, "Host monitor", Cycle),
+    row(F::WindowPosition, "Window position", RowKind::Text),
     row(F::ShowStatusBar, "Status bar", Cycle),
     row(F::PerfOverlay, "Perf overlay", Cycle),
     row(F::Vsync, "VSync", Cycle),
@@ -1381,12 +1386,13 @@ pub(super) const INTERNET_NETPLAY_ROWS: [Row; 12] = [
     row(F::NetplayCopySpectatorCode, "", RowKind::Action),
 ];
 
-pub(super) const INPUT_ROWS: [Row; 5] = [
+pub(super) const INPUT_ROWS: [Row; 6] = [
     row(F::Port1Device, "Port 1", Cycle),
     row(F::Port2Device, "Port 2", Cycle),
     row(F::Joystick, "Joystick input", Cycle),
     row(F::MouseSensitivity, "Mouse sensitivity", Cycle),
     row(F::MouseCapture, "Mouse capture", Cycle),
+    row(F::MiddleClickRelease, "Middle to release", Cycle),
 ];
 
 /// The rows shown on a tab, top to bottom. Most tabs are fixed and borrow their
@@ -1662,6 +1668,6 @@ pub(super) const Z3_PRESETS: [usize; 8] = [
     512 * 1024 * 1024,
     1024 * 1024 * 1024,
 ];
-pub(super) const OVERSCANS: [Overscan; 2] = [Overscan::Tv, Overscan::Full];
+pub(super) const OVERSCANS: [Overscan; 3] = Overscan::ALL;
 pub(super) const PIXEL_ASPECTS: [PixelAspect; 2] = [PixelAspect::Tv, PixelAspect::Square];
 pub(super) const TINTS: [Tint; 5] = [Tint::None, Tint::Bw, Tint::Green, Tint::Amber, Tint::Sepia];

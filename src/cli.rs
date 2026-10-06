@@ -58,6 +58,8 @@ pub struct CliArgs {
     /// occurrence is captured, and the run ends once the last one has
     /// fired.
     pub screenshot_after: Vec<(f32, PathBuf)>,
+    /// Save screenshots and expectations as cropped original field pixels.
+    pub native_screenshots: bool,
     /// `--expect-screenshot SECS PATH [TOLERANCE]`: capture the frame at
     /// SECS exactly as `--screenshot-after` would and compare it with the
     /// PNG at PATH (src/expect.rs). Repeatable; a failed comparison makes
@@ -202,6 +204,8 @@ pub struct CliArgs {
     pub list_serial_ports: bool,
     /// `--list-audio-devices`: print the host audio output devices and exit.
     pub list_audio_devices: bool,
+    /// --list-monitors: print host displays and exit before loading assets.
+    pub list_monitors: bool,
     /// `--list-net-interfaces`: print adapters usable for bridging and exit.
     pub list_net_interfaces: bool,
     pub list_disks: bool,
@@ -429,6 +433,7 @@ where
     let mut coverage: Option<PathBuf> = None;
     let mut coverage_source_map: Vec<(String, String)> = Vec::new();
     let mut screenshot_after: Vec<(f32, PathBuf)> = Vec::new();
+    let mut native_screenshots = false;
     let mut expect_screenshot: Vec<ExpectShotSpec> = Vec::new();
     let mut save_state_after: Vec<(f32, PathBuf)> = Vec::new();
     let mut gif_after: Vec<(f32, PathBuf)> = Vec::new();
@@ -473,6 +478,7 @@ where
     let mut list_midi = false;
     let mut list_serial_ports = false;
     let mut list_audio_devices = false;
+    let mut list_monitors = false;
     let mut list_net_interfaces = false;
     let mut list_disks = false;
     // Only the hosts with a privileged half of their own ever fill this in;
@@ -494,6 +500,7 @@ where
             "--list-midi" => {
                 list_midi = true;
             }
+            "--list-monitors" => list_monitors = true,
             "--list-audio-devices" => {
                 list_audio_devices = true;
             }
@@ -668,9 +675,48 @@ where
             }
             "--full-screen" => {
                 overrides.full_screen = Some(true);
+                overrides.maximized = Some(false);
             }
             "--windowed" => {
                 overrides.full_screen = Some(false);
+                overrides.maximized = Some(false);
+            }
+            "--monitor" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--monitor requires a selector"))?;
+                if value.starts_with("--") {
+                    bail!("--monitor requires a selector before {value}");
+                }
+                let monitor: copperline::config::HostMonitor = value.parse()?;
+                overrides.monitor = Some(monitor.to_string());
+            }
+            "--window-position" => {
+                let mut coordinate = |axis| -> Result<i32> {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--window-position requires X and Y coordinates"))?;
+                    value.parse::<i32>().map_err(|_| {
+                        anyhow!("--window-position {axis} must be a signed integer, got {value:?}")
+                    })
+                };
+                overrides.window_position = Some([coordinate("X")?, coordinate("Y")?]);
+            }
+            "--maximized" => {
+                overrides.full_screen = Some(false);
+                overrides.maximized = Some(true);
+            }
+            "--window-scale" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--window-scale requires a multiplier (0.5 to 4.0)"))?;
+                let scale: f64 = value
+                    .parse()
+                    .map_err(|_| anyhow!("--window-scale requires a multiplier (0.5 to 4.0)"))?;
+                if !(0.5..=4.0).contains(&scale) {
+                    bail!("--window-scale must be between 0.5 and 4.0, got {value}");
+                }
+                overrides.window_scale = Some(scale);
             }
             "--show-status-bar" => {
                 overrides.status_bar = Some(true);
@@ -1268,6 +1314,7 @@ where
                     hold_ms,
                 });
             }
+            "--native-screenshots" => native_screenshots = true,
             "--screenshot-after" => {
                 const USAGE: &str = "--screenshot-after requires SECS PATH";
                 let secs: f32 =
@@ -1826,6 +1873,7 @@ where
         coverage,
         coverage_source_map,
         screenshot_after,
+        native_screenshots,
         expect_screenshot,
         save_state_after,
         gif_after,
@@ -1863,6 +1911,7 @@ where
         list_midi,
         list_serial_ports,
         list_audio_devices,
+        list_monitors,
         list_net_interfaces,
         list_disks,
         host_disk_broker,
@@ -2033,6 +2082,7 @@ fn print_help() {
          \x20                            (0 = off, the default; windowed sessions only)\n  \
          \x20                            (--model/--cpu/etc. override the config file or defaults)\n  \
          --screenshot-after SECS PATH   save a PNG to PATH after SECS emulated seconds, then exit\n  \
+         --native-screenshots           screenshots/expectations use cropped 1:1 field pixels\n  \
          --expect-screenshot SECS PATH [TOLERANCE]\n  \
          \x20                            capture the frame at SECS like --screenshot-after and\n  \
          \x20                            compare it with the PNG at PATH; TOLERANCE is a fraction\n  \
@@ -2131,7 +2181,12 @@ fn print_help() {
          \x20                            \"master\", \"source\", \"channel\" (combinable)\n  \
          --profile-live-audio SECS      run a no-window Paula-to-cpal profile workload;\n  \
          \x20                            combine with COPPERLINE_AUDIO_PROFILE=1 for counters\n  \
-         --full-screen / --windowed     open fullscreen / windowed at start (default: windowed)\n  \
+         --full-screen / --windowed     open borderless fullscreen / windowed at start\n  \
+         --maximized                   open a bordered, maximized window with taskbar visible\n  \
+         --monitor SELECTOR            host monitor: auto, primary, 1-based number, or name\n  \
+         --window-position X Y         window top-left, logical pixels from host monitor\n  \
+         --list-monitors               list host monitors and exit\n  \
+         --window-scale SCALE          initial window size multiplier: 0.5-4.0 (default: 1)\n  \
          --show-status-bar / --hide-status-bar  status bar at start (default: shown)\n  \
          --perf-overlay                 show the performance overlay at start\n  \
          \x20                            (Cmd/Alt+P toggles it live)\n  \

@@ -41,6 +41,7 @@ boolean_settings! {
     Deinterlace => deinterlace,
     PerfOverlay => perf_overlay,
     Vsync => vsync,
+    MiddleClickRelease => middle_click_release,
     Mt32Panel => mt32_panel,
     #[cfg(feature = "midi")]
     SerialTelnet => serial_telnet,
@@ -57,6 +58,47 @@ boolean_settings! {
 }
 
 impl MachineSetup {
+    pub(crate) fn set_host_monitors(
+        &mut self,
+        monitors: Vec<(crate::config::HostMonitor, String)>,
+    ) {
+        self.host_monitors = monitors;
+    }
+
+    fn host_monitor_options(&self) -> Vec<crate::config::HostMonitor> {
+        use crate::config::HostMonitor;
+        let mut options = vec![HostMonitor::Auto, HostMonitor::Primary];
+        options.extend(
+            self.host_monitors
+                .iter()
+                .map(|(monitor, _)| monitor.clone()),
+        );
+        // Preserve a loaded numeric/name preference, even if currently unplugged.
+        if !options.contains(&self.host_monitor) {
+            options.push(self.host_monitor.clone());
+        }
+        options
+    }
+
+    fn host_monitor_label(&self) -> String {
+        use crate::config::HostMonitor;
+        match &self.host_monitor {
+            HostMonitor::Auto => "Auto".to_string(),
+            HostMonitor::Primary => "Primary".to_string(),
+            HostMonitor::Index(number) => number
+                .checked_sub(1)
+                .and_then(|index| self.host_monitors.get(index))
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| self.host_monitor.to_string()),
+            selection => self
+                .host_monitors
+                .iter()
+                .find(|(monitor, _)| monitor == selection)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| selection.to_string()),
+        }
+    }
+
     pub fn toggle_value(&self, field: LauncherField) -> bool {
         if let Some(value) = self.boolean_value(field) {
             return value;
@@ -113,16 +155,18 @@ impl MachineSetup {
                     format!("{:.0} s", self.cd_insert_delay)
                 }
             }
-            F::Overscan => match self.overscan {
-                Overscan::Tv => "TV".to_string(),
-                Overscan::Full => "Full".to_string(),
-            },
+            F::Overscan => self.overscan.label().to_string(),
             F::PixelAspect => match self.pixel_aspect {
                 PixelAspect::Tv => "TV (4:3)".to_string(),
                 PixelAspect::Square => "Square".to_string(),
             },
             F::Scaling => self.scaling.label().to_string(),
             F::Tint => self.tint.menu_label().to_string(),
+            F::HostMonitor => self.host_monitor_label(),
+            F::WindowPosition => self
+                .window_position
+                .map(|[x, y]| format!("{x}, {y}"))
+                .unwrap_or_else(|| "Auto".to_string()),
             F::Bezel => self.bezel.menu_label().to_string(),
             F::MenuScale => self.menu_scale.menu_label().to_string(),
             F::Mt32Lcd => self.mt32_lcd.menu_label().to_string(),
@@ -492,6 +536,19 @@ impl MachineSetup {
             return;
         }
         match field {
+            F::HostMonitor => {
+                let options = self.host_monitor_options();
+                let index = options
+                    .iter()
+                    .position(|m| *m == self.host_monitor)
+                    .unwrap_or(0);
+                let next = if forward {
+                    (index + 1) % options.len()
+                } else {
+                    (index + options.len() - 1) % options.len()
+                };
+                self.host_monitor = options[next].clone();
+            }
             F::WhdloadMachine => {
                 use crate::config::WhdloadMachine as M;
                 self.whdload_machine = match self.whdload_machine {

@@ -7,7 +7,9 @@ system requirements, installation, building from source, and initial setup.
 ## System requirements
 
 - **Rust (source builds only):** 1.95 or newer; CI uses the stable toolchain.
-- **Supported operating systems:** macOS, Linux, and Windows.
+- **Supported operating systems:** macOS 14.2 (Sonoma) or newer, Linux, and
+  Windows. The macOS floor applies to source builds as well as the pre-built
+  application: the audio backend uses Core Audio APIs introduced in 14.2.
 - **Graphics backend:** Metal on macOS, Direct3D 12 or Vulkan on Windows, and
   Vulkan on Linux (see [](#vulkan-is-required-on-linux)).
 - **Linux build dependencies:** `sudo dnf install alsa-lib-devel systemd-devel gcc`
@@ -179,6 +181,7 @@ features to keep; the [FluxBridge](fluxbridge.md), [MT-32](mt32.md), and
 | `dap` | yes | The [Debug Adapter Protocol](../debugger/dap.md) adapter and the guest debug-information reader. |
 | `import-uae-bin` | yes | The [`copperline-import-uae`](import-uae.md) converter. |
 | `game-library` | yes | The launcher's [WHDLoad](whdload.md) Library page and its OpenRetro sync. |
+| `update-check` | yes | The About panel's [Check for updates](ui.md#and-last) button, which asks GitHub for the latest release only when pressed. |
 | `mhi` | yes | The MHI MPEG audio decoder board. |
 | `cd-mp3` | yes | MP3 audio tracks in CD cue sheets. |
 | `cd32-fmv` | yes | The CD32 Full Motion Video module. |

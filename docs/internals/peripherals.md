@@ -239,9 +239,20 @@ cycles are not yet arbitrated against the CPU (TODO in `a2091.rs`).
 The bundled ROM's driver runs inquiry, sense, and mode commands with
 asynchronous PIO. Sector transfers use the DMAC when the buffer address and
 length are even and the whole buffer lies below 16 MiB; other transfers are
-bounced through a chip RAM buffer. A DMA transfer programs the ACR, starts
+bounced through DMA-capable 24-bit Fast RAM, falling back to Chip RAM. On
+Kickstart 1.3 the ROM reserves suitable free Fast RAM ranges with `AllocAbs`;
+on newer Exec versions it requests `MEMF_FAST | MEMF_24BITDMA`.
+
+Bounced disk reads alternate two buffers of up to 64 KiB. The driver starts
+the next WD33C93/DMAC command before copying the previous completed buffer,
+and drains that command before reusing its buffer. Memory pressure selects
+a single buffer or smaller whole-sector chunks. SCSI-direct commands retain
+their CDB and use one bounce buffer. On a read error, `io_Actual` includes only
+chunks already copied to the caller; DMA is stopped before buffers are freed.
+A DMA transfer programs the ACR, starts
 the DMAC, and completes through a shared `INTB_PORTS` interrupt server that
-queues command-complete and disconnect status pairs.
+captures command completion. The command tail drains disconnect status with
+interrupts gated.
 
 ### A4091 (`a4091.rs`)
 
@@ -281,7 +292,7 @@ raw HDF images, bare partition hardfiles wrapped in a synthesized RDB
 (bootable `DHn` named after the unit), gzip-compressed hardfiles (`.hdz`,
 sniffed by gzip magic and unpacked by `gzip.rs` into memory at open time
 because deflate has no random access, which is what makes their writes
-session-only), CHD hard-disk images (below), and host directories built
+session-only), CHD and VHD hard-disk images (below), and host directories built
 into in-memory FFS or OFS volumes by
 `dirfs.rs` (FFS by default; `filesystem = "ofs"` on the drive picks OFS,
 the one every Kickstart from 1.2 onward can read with no guest-side
@@ -400,6 +411,49 @@ old one, so a restore that fails partway leaves the previous sidecar
 intact rather than a half-written disk. A resumed run sees the disk as it
 was when the state was taken -- unlike an HDF, whose file contents are deliberately not
 part of the state (`docs/internals/savestate.md`).
+
+#### VHD images (`harddrive/vhd.rs`)
+
+Microsoft's Virtual Hard Disk container, which WinUAE creates and attaches
+hardfiles in (as do Windows Disk Management, Virtual PC, VirtualBox and
+`qemu-img -f vpc`), is recognised by its 512-byte `conectix` footer --
+sniffed by content after the gzip and CHD checks, so a VHD named `.hdf`
+opens as one and a raw image named `.vhd` opens raw. The footer's disk
+type picks the layout:
+
+- **Fixed** (type 2): the sectors from offset 0, then the footer. The
+  disk is everything in front of the footer; the footer itself is neither
+  readable nor writable as a sector, so a bare partition inside still
+  comes to a whole number of cylinders and gets its synthesized RDB.
+- **Dynamic** (type 3): a footer copy at 0, a `cxsparse` header, and a
+  block allocation table of big-endian sector numbers (`0xFFFFFFFF` for a
+  block not yet in the file), each block a sector bitmap padded to 512
+  bytes followed by the block's data (2 MiB by default). An unallocated
+  block reads as zeros and an all-zero write to one is dropped. The first
+  other write appends the block where the footer was -- bitmap all ones,
+  data zeroed, as qemu and WinUAE append one -- then writes the footer
+  after it, and only then points the BAT entry at it, so a write cut off
+  part way leaves the disk reading as it did. Reads ignore the bitmap (as
+  qemu and WinUAE do); a write into a block another tool appended with its
+  bit clear sets the bit, since Windows reads a clear bit as zeros. A file
+  whose trailing footer was lost that way still opens from the copy at 0,
+  and the next block goes past whatever was left behind.
+- **Differencing** (type 4) is refused with a pointer to merging it into
+  its parent; the parent is named by a Windows path.
+
+The header is validated before anything is sized from it: the disk at most
+2 TiB, the block size a power of two up to 256 MiB, the table no larger
+than 4 Mi entries and inside the file, and no allocated block overlapping
+the footer copy, header or table. Footer and header checksums are checked
+but a mismatch only warns. Guest writes go straight into the file, so a
+save state reopens a VHD by path exactly as it does an HDF, and a netplay
+session copy reads the virtual disk whole into memory. As with an HDF the
+file is the authority: a block's place never changes once it has one, so a
+handle reads again any BAT entry it last saw unallocated and takes the
+append position from the file's current end, and reads and sets a bitmap
+byte on the file rather than from a cached copy. Two handles on one image
+-- a save state reopened beside the machine that took it -- therefore see
+each other's writes and never append over each other.
 
 ## lide.device-compatible Zorro II IDE (`ide_zorro.rs`)
 
@@ -722,7 +776,27 @@ provides a compatible ABI at `$F0FF60` (see
   directory). Unhandled functions return 0. The exit latch is host-side and,
   like the warp latch, is not carried by a save state.
 - **State serialization**: Trap state, resource registries, and overlay lists
-  travel in the `UAEL` save-state chunk.
+  travel in the `UAEL` save-state chunk. The memory-write debug-port queue and
+  partial-word latch travel with them; older chunks default to an empty queue.
+
+The same `UaeLib` instance serves WinUAE's write-only printf ports at `$BFFF00`
+(arguments) and `$BFFF04` (format pointer), implemented in
+`uaelib/debug_port.rs`. The CPU bus decodes these writes after real RAM/ROM
+and before the CIA windows, preserving the ordinary unmapped-write timing.
+Reads and neighbouring addresses keep their normal hardware decode. Word
+transfers within one instruction are assembled in either order; a provisional
+high-word argument is replaced by the completed longword. The instruction-fetch
+boundary clears the partial-word latch so a standalone word cannot combine with
+the next instruction's store. A format pointer triggers only after a longword
+completes. This also works when a CDTV extended ROM covers the trap.
+
+The formatter uses bounded guest RAM/ROM reads and formats Amiga 16/32-bit
+integers in Rust, with no host variadic calls or I/O reads. It holds at most
+32 arguments and limits format/output to 4096 bytes. Completed messages use
+the function-86 echo, bounded console mirror, and `event.debug` queue, including
+the existing suppression of speculative run-ahead output. Reset clears the
+argument queue and partial-word latch. See
+[Memory-mapped debug output](../guide/run.md#winuae-debug-port) for the guest ABI.
 
 ## Freezer cartridge (`cartridge.rs`)
 

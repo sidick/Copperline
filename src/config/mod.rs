@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
 mod about;
+mod monitor;
 mod raw;
 mod resolve;
 #[cfg(test)]
@@ -19,6 +20,7 @@ mod tests;
 mod validate;
 
 pub use about::*;
+pub use monitor::HostMonitor;
 pub use raw::*;
 pub use resolve::*;
 pub use validate::*;
@@ -433,10 +435,21 @@ pub struct Config {
     pub tint: Tint,
     /// How large the pop-up menu is drawn (`[display] menu_scale`).
     pub menu_scale: MenuScale,
+    /// Initial window width and height as a multiple of the presentation
+    /// canvas (`[display] window_scale` / `--window-scale`, 0.5 to 4.0).
+    pub window_scale: f64,
     /// Open the window in fullscreen at start (`[display] full_screen`, or
     /// `--full-screen` / `--windowed`). The `Cmd+F` / `Alt+F` toggle flips it
     /// live without affecting this start-up value.
     pub full_screen: bool,
+    /// Open a maximized, decorated window, retaining the desktop taskbar
+    /// (`[display] maximized` / `--maximized`). Fullscreen takes precedence.
+    pub maximized: bool,
+    /// Host monitor for window placement and fullscreen ([display] monitor).
+    pub monitor: HostMonitor,
+    /// Initial top-left window position in logical pixels relative to the
+    /// selected host monitor (`[display] position` / `--window-position`).
+    pub window_position: Option<[i32; 2]>,
     /// Show the status bar at start (`[display] status_bar`, or
     /// `--show-status-bar` / `--hide-status-bar`). `Cmd+Shift+F` /
     /// `Alt+Shift+F` toggles it live.
@@ -458,6 +471,9 @@ pub struct Config {
     /// historical click-the-display behaviour; `auto` grabs on focus, which
     /// suits a fullscreen session where no host cursor is wanted.
     pub mouse_capture: MouseCapture,
+    /// Release a captured host mouse with middle click (`[input]
+    /// middle_click_release`). Off by default, so middle click reaches the guest.
+    pub middle_click_release: bool,
     /// `[input] autofire_hz`: how fast a held fire button is pulsed, or 0 for
     /// off (the default). A host input convenience, not machine state -- the
     /// emulated port sees an ordinary button being pressed and released.
@@ -488,7 +504,7 @@ pub struct Config {
 }
 
 /// How much of the overscan field the window presents. The
-/// `COPPERLINE_OVERSCAN` env var (full/tv) overrides the config for one
+/// `COPPERLINE_OVERSCAN` env var (full/tv/smart) overrides the config for one
 /// run (the image-regression harness pins "full" so its baselines keep
 /// the whole field).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -503,6 +519,33 @@ pub enum Overscan {
     /// does this mode. The default.
     #[default]
     Tv,
+    /// Keep the TV aperture, automatically correcting small horizontal
+    /// offsets after the hardware display envelope has remained stable.
+    Smart,
+}
+
+impl Overscan {
+    pub const ALL: [Self; 3] = [Self::Tv, Self::Smart, Self::Full];
+
+    pub const fn is_tv(self) -> bool {
+        matches!(self, Self::Tv | Self::Smart)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tv => "tv",
+            Self::Smart => "smart",
+            Self::Full => "full",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tv => "TV",
+            Self::Smart => "Smart",
+            Self::Full => "Full overscan",
+        }
+    }
 }
 
 /// TV-presentation centring (`[display] tv_h_centre` / `tv_v_centre`),
@@ -1547,7 +1590,8 @@ pub struct Emulation {
     pub warp_until: Option<f64>,
     /// The WinUAE-compatible uaelib trap at $F0FF60 (`crate::uaelib`):
     /// guest programs toggle warp, log debug text and register resources
-    /// through it. On by default; `uaelib = false` leaves $F0FF60 floating.
+    /// through it. Also enables printf-style writes at $BFFF00/$BFFF04.
+    /// On by default; `uaelib = false` disables both interfaces.
     pub uaelib: bool,
     /// Permit uaelib function 88's `debug_load` / `debug_save` helpers to
     /// access files below the `--run` program directory. Off by default: the
@@ -2720,11 +2764,16 @@ impl Default for Config {
             hidpi_texture: true,
             tint: Tint::None,
             menu_scale: MenuScale::Normal,
+            window_scale: 1.0,
             full_screen: false,
+            maximized: false,
+            monitor: HostMonitor::Auto,
+            window_position: None,
             status_bar: true,
             joystick_input_mode: JoystickInputMode::Gamepad,
             mouse_sensitivity: 50,
             mouse_capture: MouseCapture::Click,
+            middle_click_release: false,
             autofire_hz: 0,
             port_devices: [PortDevice::Mouse, PortDevice::Joystick],
             parallel_joysticks: [false; 2],
@@ -3026,6 +3075,15 @@ pub struct ConfigOverrides {
     /// Open fullscreen at start (`--full-screen` / `--windowed`). Same as
     /// `[display] full_screen`.
     pub full_screen: Option<bool>,
+    /// Start maximized with window decorations (`--maximized`).
+    pub maximized: Option<bool>,
+    /// Host display selector (--monitor).
+    pub monitor: Option<String>,
+    /// Initial window position (`--window-position X Y`).
+    pub window_position: Option<[i32; 2]>,
+    /// Initial window size multiplier (`--window-scale`). Same as
+    /// `[display] window_scale`.
+    pub window_scale: Option<f64>,
     /// Show the status bar at start (`--show-status-bar` /
     /// `--hide-status-bar`). Same as `[display] status_bar`.
     pub status_bar: Option<bool>,
@@ -3129,6 +3187,10 @@ impl ConfigOverrides {
             && self.hostsocket_net.is_none()
             && self.hostsocket_interface.is_none()
             && self.full_screen.is_none()
+            && self.maximized.is_none()
+            && self.monitor.is_none()
+            && self.window_position.is_none()
+            && self.window_scale.is_none()
             && self.status_bar.is_none()
             && self.perf_overlay.is_none()
             && self.menu_scale.is_none()
@@ -3411,6 +3473,18 @@ impl ConfigOverrides {
         }
         if let Some(full_screen) = self.full_screen {
             raw.display.full_screen = Some(full_screen);
+        }
+        if let Some(monitor) = &self.monitor {
+            raw.display.monitor = Some(monitor.clone());
+        }
+        if let Some(position) = self.window_position {
+            raw.display.position = Some(position.to_vec());
+        }
+        if let Some(maximized) = self.maximized {
+            raw.display.maximized = Some(maximized);
+        }
+        if let Some(window_scale) = self.window_scale {
+            raw.display.window_scale = Some(window_scale);
         }
         if let Some(status_bar) = self.status_bar {
             raw.display.status_bar = Some(status_bar);
