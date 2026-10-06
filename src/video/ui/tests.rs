@@ -314,6 +314,67 @@ fn the_rom_tab_draws_its_identification_line_under_the_path_row() {
     );
 }
 
+#[test]
+fn middle_click_release_has_cycle_controls_and_greys_out_without_a_mouse() {
+    use super::super::window::{texture_height, texture_width};
+
+    let field = LauncherField::MiddleClickRelease;
+    let mut state = LauncherState::new(launcher::MachineSetup::default());
+    state.tab = LauncherTab::Input;
+    let rect = panel_rect(&Panel::Launcher(Box::new(state.clone())));
+    let index = state
+        .rows()
+        .iter()
+        .position(|row| row.field == field)
+        .unwrap();
+    let y = launcher_row_y(rect, index);
+    let (prev, _, next) = launcher_cycle_rects(rect, y);
+    let controls = [(prev, false), (next, true)];
+    for (button, forward) in controls {
+        assert_eq!(
+            launcher_control_at(rect, &state, (button.x as i32 + 1, button.y as i32 + 1)),
+            Some(UiControl::LauncherCycle { field, forward })
+        );
+    }
+
+    // A saved Enabled value still becomes dimmed and inert without a mouse.
+    state.setup.cycle(field, true);
+    state.setup.cycle(LauncherField::Port1Device, false);
+    assert_eq!(state.setup.disabled_reason(field), Some("No mouse"));
+    for (button, _) in controls {
+        assert_eq!(
+            launcher_control_at(rect, &state, (button.x as i32 + 1, button.y as i32 + 1)),
+            None
+        );
+    }
+    let ui = UiState {
+        panel: Some(Panel::Launcher(Box::new(state))),
+        ..Default::default()
+    };
+    let (w, h) = (texture_width(1), texture_height(1));
+    let mut frame = vec![0u8; w * h * 4];
+    draw(&mut frame, 1, &ui, None, None);
+    let pixels = (y..y + LAUNCH_ROW_H).flat_map(|y| {
+        (launcher_control_x(rect)..rect.x + rect.w - LAUNCH_MARGIN).map(move |x| (y * w + x) * 4)
+    });
+    let mut dimmed_text = false;
+    for at in pixels {
+        let pixel = &frame[at..at + 4];
+        dimmed_text |= pixel == PANEL_TEXT_DIM.to_le_bytes();
+        assert_ne!(
+            pixel,
+            BUTTON_TEXT.to_le_bytes(),
+            "an active button is drawn"
+        );
+        assert_ne!(
+            pixel,
+            PANEL_TEXT_HILIGHT.to_le_bytes(),
+            "an active value is drawn"
+        );
+    }
+    assert!(dimmed_text, "the disabled reason is drawn in dimmed text");
+}
+
 /// The launcher panel is a fixed box with no row scrolling, so a tab's
 /// rows have to fit between the content top (below the nav row on pages
 /// that have one) and the status line at the bottom. Nothing may reach
@@ -421,6 +482,89 @@ fn every_launcher_tab_row_fits_inside_the_panel() {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+/// A greyed row that explains itself draws its reason as free text from the
+/// control column's left edge ([`GreyedAs::Reason`]), with no box to clip it
+/// and no truncation on the way out -- unlike the dimmed-value kinds, which
+/// pass theirs through `truncate_to_width`. So the string itself is the
+/// limit: one too long for the column runs off the panel's right edge.
+/// Writing one fails here rather than in a screenshot.
+#[test]
+fn every_greyed_reason_fits_the_column() {
+    let rect = panel_rect(&Panel::Launcher(Box::new(LauncherState::new(
+        launcher::MachineSetup::default(),
+    ))));
+    // Where the text starts, and the margin it must stop short of.
+    let room = (rect.x + rect.w - LAUNCH_MARGIN) - launcher_control_x(rect);
+    // Every model, so the rows each machine greys are all walked: a
+    // machine without IDE, a machine without a CD drive, and the CPU every
+    // profile brings with it (greying the FPU/cache/Zorro III rows the
+    // 68000 profiles cannot have). On each, the whole SCSI controller
+    // cycle too -- the boot-ROM rows are hidden outright while there is no
+    // controller, so a fitted-but-unsuitable one is the only state that
+    // puts their reasons on a page to be measured ("Zorro boards only" for
+    // the A3000's motherboard SCSI, "A2091 only" for the split-EPROM row).
+    for (model, controller_steps) in launcher::MODELS
+        .into_iter()
+        .flat_map(|m| (0..4).map(move |c| (m, c)))
+    {
+        let mut setup = launcher::MachineSetup::default();
+        setup.select_model(Some(model));
+        for _ in 0..controller_steps {
+            setup.cycle(LauncherField::ScsiController, true);
+        }
+        // The strip tabs, plus the sub-pages reached from a nav row: the
+        // CD page is one of them, and its rows are among the few that
+        // explain themselves this way.
+        let off_strip = [
+            LauncherTab::IoParallel,
+            LauncherTab::IoNetworking,
+            LauncherTab::IoAudio,
+            LauncherTab::Cd,
+            LauncherTab::HostFs,
+            LauncherTab::Whdload,
+            LauncherTab::Lide,
+            LauncherTab::Copperhf,
+            LauncherTab::Sf2000Sd,
+            LauncherTab::AvVideo,
+            LauncherTab::AvDisplay,
+            LauncherTab::AvEmulation,
+            LauncherTab::AvPaths,
+        ];
+        for &tab in launcher::TABS.iter().chain(off_strip.iter()) {
+            for r in launcher::rows(
+                tab,
+                crate::config::ParallelDevice::None,
+                crate::config::SerialMode::Off,
+                false,
+                false,
+            )
+            .iter()
+            {
+                // Only what the page actually draws: the draw path filters
+                // the row list the same way, so a row this machine leaves
+                // off has no reason on screen to overflow anything. Holding
+                // a hidden row's text to the column's width would fail a
+                // wording that cannot be seen.
+                if !setup.row_on_page(tab, r.field) {
+                    continue;
+                }
+                let Some(reason) = setup.disabled_reason(r.field) else {
+                    continue;
+                };
+                if greyed_presentation(r, &setup) != GreyedAs::Reason {
+                    continue;
+                }
+                let width = font::text_width(reason, 1);
+                assert!(
+                    width <= room,
+                    "{model:?} (+{controller_steps} scsi) {tab:?} {:?}: reason {reason:?} is {width} wide, past the {room} the column has",
+                    r.label
+                );
             }
         }
     }
@@ -1050,6 +1194,31 @@ fn panel_close_button_hit_tests() {
     assert_eq!(ui.control_at((0, 0)), None);
 }
 
+/// The About panel's update button sits in its footer, under the water,
+/// and answers there; the rest of the footer is panel body.
+#[cfg(feature = "update-check")]
+#[test]
+fn the_about_update_button_hit_tests_in_the_footer() {
+    let ui = UiState {
+        menu_open: false,
+        menu_rows: Vec::new(),
+        menu_nav: menu::MenuNav::default(),
+        panel: Some(Panel::About),
+    };
+    let rect = panel_rect(ui.panel.as_ref().unwrap());
+    let button = about_update_button_rect(rect);
+    assert!(button.y >= rect.y + rect.h - ABOUT_FOOTER_H - 8);
+    assert!(button.x + button.w <= rect.x + rect.w && button.y + button.h <= rect.y + rect.h);
+    let centre = (
+        (button.x + button.w / 2) as i32,
+        (button.y + button.h / 2) as i32,
+    );
+    assert_eq!(ui.control_at(centre), Some(UiControl::AboutUpdate));
+    // Beside it, where the status line is drawn: nothing to press.
+    let status = ((rect.x + 20) as i32, centre.1);
+    assert_eq!(ui.control_at(status), Some(UiControl::PanelBody));
+}
+
 /// Clicking a serial address box opens *that* edit, not the Create Image
 /// one the free-text widget was first built for.
 #[cfg(feature = "midi")]
@@ -1135,6 +1304,35 @@ fn fixed_ram_pattern_box_hit_tests_to_its_own_edit() {
     assert_eq!(
         ui.control_at((box_rect.x as i32 + 4, box_rect.y as i32 + 4)),
         Some(UiControl::LauncherRamPatternEdit)
+    );
+}
+
+#[test]
+fn window_position_box_hit_tests_to_its_own_edit() {
+    let mut state = LauncherState::new(launcher::MachineSetup::default());
+    state.tab = LauncherTab::AvDisplay;
+    let index = launcher::rows(
+        state.tab,
+        state.setup.parallel_device(),
+        state.setup.serial_mode(),
+        state.setup.midi_out_is_mt32(),
+        state.setup.midi_out_is_csynth(),
+    )
+    .iter()
+    .position(|r| r.field == LauncherField::WindowPosition)
+    .unwrap();
+    let ui = UiState {
+        menu_open: false,
+        menu_rows: Vec::new(),
+        menu_nav: menu::MenuNav::default(),
+        panel: Some(Panel::Launcher(Box::new(state))),
+    };
+    let rect = panel_rect(ui.panel.as_ref().unwrap());
+    let row_y = launcher_row_y(rect, index) + launcher_nav_block_h(LauncherTab::AvDisplay);
+    let box_rect = launcher_text_rect(rect, row_y, LauncherField::WindowPosition);
+    assert_eq!(
+        ui.control_at((box_rect.x as i32 + 4, box_rect.y as i32 + 4)),
+        Some(UiControl::LauncherWindowPositionEdit)
     );
 }
 
@@ -1987,6 +2185,13 @@ fn panels_render_into_their_rects() {
         // Deep into the entrance so the snapshot shows the settled page.
         elapsed_ms: 60_000,
         machine_fitted: true,
+        // As a session that has not asked finds it.
+        update: Some(crate::video::about::UpdateFooter {
+            status: "Asks GitHub whether a newer release is out".to_string(),
+            tone: crate::video::about::FooterTone::Quiet,
+            button: "Check for updates",
+            enabled: true,
+        }),
     });
     draw(&mut frame, scale, &ui, None, Some(&data));
     assert!(panel_has_title_bar(&frame, ui.panel.as_ref().unwrap()));
@@ -2004,6 +2209,7 @@ fn panels_render_into_their_rects() {
             machine_lines: vec![crate::config::ABOUT_PLACEHOLDER_LINE.to_string()],
             elapsed_ms,
             machine_fitted: false,
+            update: None,
         });
         draw(&mut frame, scale, &ui, None, Some(&data));
         frame
@@ -2021,7 +2227,7 @@ fn panels_render_into_their_rects() {
         region_differs(&mid, &opened, slot0, slot0 + 24, title_y, title_y + 24),
         "title's first letter should have settled by mid-entrance"
     );
-    let base = rect.y + rect.h - 8;
+    let base = rect.y + rect.h - 8 - ABOUT_FOOTER_H;
     assert!(
         region_differs(&mid, &opened, rect.x, rect.x + rect.w / 4, base - 8, base),
         "wave columns should have arrived on the left by mid-entrance"
@@ -3631,6 +3837,7 @@ fn panels_render_into_their_rects() {
         pcmcia_slot: false,
         pcmcia_card: None,
         pixel_aspect: PixelAspect::Tv,
+        overscan: crate::config::Overscan::Tv,
         scaling: crate::config::DisplayScaling::Smooth,
         autocrop: false,
         tv_centre: crate::config::TvCentre::default(),

@@ -23,6 +23,7 @@ impl App {
             state.setup.refresh_host_disks();
         }
         self.ui.panel = Some(Panel::Launcher(Box::new(state)));
+        self.refresh_launcher_monitors();
         // Every open starts on System, wherever the focus was standing
         // before -- on the status bar, or on the page this one replaced.
         // The first page is where the eye starts, so it is where the
@@ -173,7 +174,7 @@ impl App {
                 | LauncherField::LideDrive1
                 | LauncherField::LideDrive2
                 | LauncherField::LideDrive3 => dialog
-                    .filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                    .filter("Hard disk images", crate::harddrive::IMAGE_EXTENSIONS)
                     .filter("CD images", &["cue", "iso", "nrg", "chd"]),
                 // copperhf.device serves hard disks only -- no ATAPI/SCSI-CDROM
                 // emulation behind it (`copperhf_drive_image` rejects a CD
@@ -186,15 +187,15 @@ impl App {
                 | LauncherField::CopperhfUnit4
                 | LauncherField::CopperhfUnit5
                 | LauncherField::CopperhfUnit6 => {
-                    dialog.filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                    dialog.filter("Hard disk images", crate::harddrive::IMAGE_EXTENSIONS)
                 }
                 // The SF2000 SD card controller is hard disks only too --
                 // it speaks the SD card command set, not ATAPI/SCSI-CDROM
                 // (see `copperhf_drive_image`, reused for `[sf2000sd] card`).
                 LauncherField::Sf2000SdCard => {
-                    dialog.filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"])
+                    dialog.filter("Hard disk images", crate::harddrive::IMAGE_EXTENSIONS)
                 }
-                _ => dialog.filter("Hard disk images", &["hdf", "hdz", "img", "bin", "chd"]),
+                _ => dialog.filter("Hard disk images", crate::harddrive::IMAGE_EXTENSIONS),
             }
         };
         self.pick_path(dialog.directory(start_dir), move |app, picked| {
@@ -908,15 +909,13 @@ impl App {
             ImageToMake::Hard(state.workshop.hard_spec())
         };
 
-        let (kind, ext) = if floppy {
-            ("Amiga floppy image", vec!["adf"])
+        let (kind, ext): (_, &[&str]) = if floppy {
+            ("Amiga floppy image", &["adf"])
         } else {
-            // The same bytes either way: .hdf is what emulators look for,
-            // .img what a card writer expects, so both are offered.
-            ("Amiga hard disk image", vec!["hdf", "img", "chd"])
+            ("Amiga hard disk image", crate::diskimage::HARD_EXTENSIONS)
         };
         let dialog = PickRequest::save("Create disk image")
-            .filter(kind, &ext)
+            .filter(kind, ext)
             .file_name(suggested);
         self.pick_path(dialog, move |app, picked| {
             if let Some(path) = picked {
@@ -1097,6 +1096,7 @@ impl App {
                 )));
             }
         }
+        self.refresh_launcher_monitors();
         if run_at_once {
             self.run_honors_power_on = true;
             self.launcher_run();
@@ -1516,15 +1516,60 @@ impl App {
         // Apply the configured start-up window state; the runtime toggles
         // (Cmd+F, Cmd+Shift+F) take over from here. Reuse the toggles so the
         // surface/window resize stays in one place.
+        // Auto-launch runs before resumed creates the window, so retain the
+        // selected modes for creation as well as updating an existing window.
+        self.start_fullscreen = cfg.full_screen;
+        self.start_maximized = cfg.maximized && !cfg.full_screen;
+        self.host_monitor = cfg.monitor.clone();
+        self.window_position = cfg.window_position;
+        let position = monitors::effective_window_position(
+            cfg.window_position,
+            cfg.full_screen,
+            cfg.maximized,
+        );
+        let selected_monitor = self.selected_host_monitor();
+        if selected_monitor.is_some() || position.is_some() {
+            self.clear_saved_play_position();
+        }
         let is_fullscreen = self
             .render
             .as_ref()
             .map(|r| r.window.fullscreen().is_some());
         if is_fullscreen == Some(!cfg.full_screen) {
             self.toggle_fullscreen();
+        } else if is_fullscreen == Some(true) && cfg.full_screen {
+            // A new configuration can change the monitor while staying fullscreen.
+            if let Some(r) = &self.render {
+                r.window
+                    .set_fullscreen(Some(Fullscreen::Borderless(selected_monitor.clone())));
+            }
         }
         if crate::video::status_bar_hidden() == cfg.status_bar {
             self.toggle_status_bar();
+        }
+        if self.window_scale != cfg.window_scale {
+            self.window_scale = cfg.window_scale;
+            self.window_manually_sized = false;
+            if self.debug_layout_active
+                || cfg.full_screen
+                || cfg.maximized
+                || self
+                    .render
+                    .as_ref()
+                    .is_some_and(|r| r.window.fullscreen().is_some() || r.window.is_maximized())
+            {
+                self.pending_canvas_follow = Some(CanvasFollow::Snap);
+            } else {
+                self.snap_window_to_canvas();
+            }
+        }
+        if let Some(r) = self.render.as_ref() {
+            if !cfg.full_screen {
+                if let Some(monitor) = self.placement_monitor(position).as_ref() {
+                    monitors::place_window(&r.window, monitor, position);
+                }
+            }
+            r.window.set_maximized(cfg.maximized && !cfg.full_screen);
         }
         self.warp_speed = cfg.emulation.warp_speed;
         // Reset the host joystick source to the new machine's configured
@@ -1532,6 +1577,8 @@ impl App {
         self.joystick_input_mode = cfg.joystick_input_mode;
         self.set_mouse_sensitivity(cfg.mouse_sensitivity);
         self.mouse_capture = cfg.mouse_capture;
+        self.middle_click_release = cfg.middle_click_release;
+        self.middle_click_release_held = false;
         self.autofire_hz = cfg.autofire_hz;
         self.run_ahead_frames = cfg
             .emulation

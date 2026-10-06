@@ -5,6 +5,38 @@
 use super::*;
 
 impl App {
+    /// Smart autocrop selects from the unmasked raster, before the fixed TV
+    /// aperture can discard artwork. Captures retain their configured view.
+    pub(super) fn window_tv_aperture_rows(&self) -> Option<usize> {
+        self.window_tv_aperture_rows_for(crate::video::autocrop())
+    }
+
+    fn window_tv_aperture_rows_for(&self, autocrop: bool) -> Option<usize> {
+        self.present_tv_aperture_rows
+            .filter(|_| !(self.overscan == Overscan::Smart && autocrop && !self.bezel.is_on()))
+    }
+
+    pub(super) fn refresh_tv_centre(&mut self) {
+        let centre = self
+            .presentation_latch
+            .tv_centre(self.overscan, self.tv_centre);
+        if centre != self.present_tv_centre {
+            self.present_tv_centre = centre;
+            self.main_presentation_dirty = true;
+        }
+    }
+
+    pub(super) fn apply_overscan(&mut self, overscan: Overscan) {
+        if self.overscan == overscan {
+            return;
+        }
+        self.overscan = overscan;
+        self.reset_render_pipeline();
+        self.render_emulated_frame_if_needed();
+        self.show_osd(format!("Framing: {}", overscan.label()));
+        self.request_redraw();
+    }
+
     /// Re-plan the presentation after the canvas height changed, and resize
     /// every buffer that indexes by it. False when the texture could not be
     /// resized, in which case the caller has to put its flag back: the draw
@@ -75,6 +107,9 @@ impl App {
     /// common way in, the window manager resizing the window a moment before
     /// the event reaches us (issue #362, upstream parasyte/pixels#460).
     pub(super) fn resync_surface_size(&mut self) {
+        // Some platforms deliver the restore resize before clearing their
+        // maximized state. Settle deferred sizing on the next redraw too.
+        self.follow_restored_canvas();
         let Some(r) = self.render.as_ref() else {
             return;
         };
@@ -84,14 +119,36 @@ impl App {
         self.apply_surface_size(size);
     }
 
-    /// Size the window to the presentation canvas, unless it is fullscreen: the
-    /// request resizes nothing there and instead shrinks the drawable into a
+    /// Pay a deferred canvas change once the host has restored the window.
+    /// A resize event may arrive while the host still reports maximization,
+    /// so both resize handling and the redraw path call this.
+    fn follow_restored_canvas(&mut self) -> bool {
+        if self.debug_layout_active
+            || self
+                .render
+                .as_ref()
+                .is_none_or(|r| r.window.fullscreen().is_some() || r.window.is_maximized())
+        {
+            return false;
+        }
+        let Some(follow) = self.pending_canvas_follow.take() else {
+            return false;
+        };
+        match follow {
+            CanvasFollow::Snap => self.snap_window_to_canvas(),
+            CanvasFollow::Nudge(delta) => self.nudge_window_height(delta),
+        }
+        true
+    }
+
+    /// Size the window to its configured canvas multiple, unless fullscreen,
+    /// maximized, or owned by Debug. A fullscreen request resizes nothing there
+    /// and instead shrinks the drawable into a
     /// corner (macOS and Windows; Linux window managers ignore it), so leave the
     /// display-sized surface alone and let the presentation scale into it.
     ///
-    /// Only the two things that change the canvas height -- the pixel aspect
-    /// and the status bar -- call this, and only for a window still at the old
-    /// canvas size. Nothing else may take a window the user has sized.
+    /// Canvas changes and a newly configured startup scale call this. A canvas
+    /// change may only take a window still following its configured multiple.
     ///
     /// `request_inner_size` is only asynchronous when it returns `None`. Wayland
     /// applies the resize client-side and returns the new size with no `Resized`
@@ -101,10 +158,14 @@ impl App {
         let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
             return;
         };
-        if window.fullscreen().is_some() {
+        if self.debug_layout_active || window.fullscreen().is_some() || window.is_maximized() {
             return;
         }
-        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
+        let canvas_height = window_present_height();
+        // A shorter canvas may otherwise be clamped to the minimum from
+        // before a status-bar or pixel-aspect change, especially at 0.5x.
+        window.set_min_inner_size(Some(canvas_window_size(canvas_height, 0.5)));
+        let size = canvas_window_size(canvas_height, self.window_scale);
         if let Some(applied) = window.request_inner_size(size) {
             self.apply_surface_size(applied);
             // This backend applied the request synchronously, so no Resized
@@ -117,13 +178,13 @@ impl App {
     }
 
     /// Follow a canvas-height change with the window, or arrange to when
-    /// fullscreen gives the window back.
+    /// fullscreen or maximization gives the window back.
     ///
     /// `was_canvas_sized` is the verdict taken before the change and
     /// `canvas_before` the canvas height it was taken at. Three cases:
     ///
     /// - The window was the canvas's: put it on the new canvas size.
-    /// - Fullscreen is holding it: nothing can be resized now, and on the
+    /// - Fullscreen or maximization is holding it: nothing can be resized now, and on the
     ///   way out the window returns at the size the *old* canvas gave it.
     ///   Remember what is owed and take it when the window comes back.
     /// - The window is the user's own size: their size is not ours to
@@ -143,12 +204,12 @@ impl App {
             return;
         }
         let delta = window_present_height() as i32 - canvas_before as i32;
-        let fullscreen = self
+        let desktop_sized = self
             .render
             .as_ref()
-            .is_some_and(|r| r.window.fullscreen().is_some());
-        if fullscreen {
-            // A second change while still fullscreen adds to the first.
+            .is_some_and(|r| r.window.fullscreen().is_some() || r.window.is_maximized());
+        if desktop_sized {
+            // A second change while still desktop-sized adds to the first.
             self.pending_canvas_follow = Some(if self.window_manually_sized {
                 let owed = match self.pending_canvas_follow {
                     Some(CanvasFollow::Nudge(d)) => d,
@@ -174,7 +235,7 @@ impl App {
         let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
             return;
         };
-        if window.fullscreen().is_some() {
+        if window.fullscreen().is_some() || window.is_maximized() {
             return;
         }
         let scale = window.scale_factor();
@@ -182,6 +243,7 @@ impl App {
         let logical_w = f64::from(size.width) / scale;
         let logical_h = f64::from(size.height) / scale;
         let want = (logical_h + f64::from(delta)).max(1.0);
+        window.set_min_inner_size(Some(canvas_window_size(window_present_height(), 0.5)));
         if let Some(applied) = window.request_inner_size(LogicalSize::new(logical_w, want)) {
             // Applied client-side, with no Resized event to follow.
             self.apply_surface_size(applied);
@@ -201,25 +263,22 @@ impl App {
         }
         // Read what is needed and let the borrow go: a drag delivers these
         // continuously, so this takes nothing it has to hold on to.
-        let Some((fullscreen, scale)) = self
-            .render
-            .as_ref()
-            .map(|r| (r.window.fullscreen().is_some(), r.window.scale_factor()))
-        else {
+        let Some((desktop_sized, scale)) = self.render.as_ref().map(|r| {
+            (
+                r.window.fullscreen().is_some() || r.window.is_maximized(),
+                r.window.scale_factor(),
+            )
+        }) else {
             return;
         };
-        // Fullscreen sizes the window itself; leave the standing verdict.
-        if fullscreen {
+        // Fullscreen and maximization size the window; keep its ownership.
+        if desktop_sized {
             return;
         }
-        // The window is back from fullscreen with a canvas change owing:
+        // The window is restored with a canvas change owing:
         // this size is the old canvas's, not a drag. Settle up instead of
         // classifying it, or the stale size is what gets remembered.
-        if let Some(follow) = self.pending_canvas_follow.take() {
-            match follow {
-                CanvasFollow::Snap => self.snap_window_to_canvas(),
-                CanvasFollow::Nudge(delta) => self.nudge_window_height(delta),
-            }
+        if self.follow_restored_canvas() {
             return;
         }
         let logical_w = f64::from(size.width) / scale;
@@ -230,6 +289,7 @@ impl App {
             logical_w,
             logical_h,
             window_present_height(),
+            self.window_scale,
         ) {
             self.window_manually_sized = false;
             return;
@@ -238,14 +298,14 @@ impl App {
     }
 
     /// Whether the main window still belongs to the canvas rather than to the
-    /// user -- i.e. it has not been manually resized (fullscreen counts as
-    /// resized). Lets a canvas change snap an untouched window to the new
+    /// user -- i.e. it has not been manually resized (fullscreen and
+    /// maximization defer sizing). Lets a canvas change snap an untouched window to the new
     /// size while leaving a resized one alone.
     pub(super) fn window_is_canvas_sized(&self) -> bool {
         let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
             return false;
         };
-        if window.fullscreen().is_some() {
+        if window.fullscreen().is_some() || window.is_maximized() {
             return false;
         }
         !self.window_manually_sized
@@ -619,7 +679,11 @@ impl App {
         // pairs for a per-line factor to step by half a row: it keeps
         // the uniform multiple of the square canvas, so only the tv
         // canvas of a standard scan asks for the glass shape.
-        let par = if per_axis && !self.present_programmable {
+        let native_crop = self.overscan == Overscan::Smart && autocrop;
+        let mut par = if (per_axis || native_crop)
+            && !self.present_programmable
+            && crate::video::pixel_aspect() == crate::config::PixelAspect::Tv
+        {
             glass_par(
                 self.overscan,
                 self.present_tv_aperture_rows,
@@ -628,15 +692,26 @@ impl App {
         } else {
             (1, 1)
         };
+        // A smooth TV canvas already resampled the whole woven field onto
+        // its shorter canvas. Compensate that row map while retaining the
+        // scan's pixel aspect; a crop's own dimensions never define its PAR.
+        if native_crop && !crate::video::square_canvas() && !self.present_programmable {
+            par.0 *= present_height() as u32;
+            par.1 *= self.present_rows.max(1) as u32;
+        }
         let full = (0, 0, FB_WIDTH, present_height());
         if self.ui.active() {
-            return Some(DisplaySrc { rect: full, par });
+            return Some(DisplaySrc {
+                rect: full,
+                par,
+                horizontal_repeat: 1,
+            });
         }
         // What the per-axis draw shows with nothing tighter to show: the
         // aperture the tv canvas fills its glass with, not the pads
         // around it. (The full-overscan canvas is its own aperture.)
-        let base = match self.present_tv_aperture_rows {
-            Some(rows) if per_axis && self.overscan == Overscan::Tv => aperture_canvas_rect(rows),
+        let base = match self.window_tv_aperture_rows_for(autocrop) {
+            Some(rows) if per_axis && self.overscan.is_tv() => aperture_canvas_rect(rows),
             _ => full,
         };
         let rect = if autocrop {
@@ -647,8 +722,8 @@ impl App {
                         self.present_rows,
                         self.present_width,
                         self.overscan,
-                        self.tv_centre,
-                        self.present_tv_aperture_rows,
+                        self.present_tv_centre,
+                        self.window_tv_aperture_rows_for(autocrop),
                         present_height(),
                     )
                 })
@@ -656,7 +731,15 @@ impl App {
         } else {
             base
         };
-        Some(DisplaySrc { rect, par })
+        Some(DisplaySrc {
+            rect,
+            par,
+            horizontal_repeat: if native_crop && crate::video::square_canvas() {
+                self.present_horizontal_repeat
+            } else {
+                1
+            },
+        })
     }
 
     /// Switch the autocrop presentation live. Purely a scaler-pass
@@ -690,6 +773,7 @@ impl App {
         centre.h = (centre.h + dh).clamp(-TV_H_CENTRE_RANGE, TV_H_CENTRE_RANGE);
         centre.v = (centre.v + dv).clamp(-TV_V_CENTRE_RANGE, TV_V_CENTRE_RANGE);
         let centre = *centre;
+        self.refresh_tv_centre();
         self.show_osd(format!("Centring: H {:+}, V {:+}", centre.h, centre.v));
         self.main_presentation_dirty = true;
         self.request_redraw();
@@ -797,6 +881,7 @@ impl App {
         self.last_rendered_emulated_frame = None;
         self.last_submitted_render_frame = None;
         self.presentation_latch.reset();
+        self.refresh_tv_centre();
         self.autocrop_latch.reset();
         self.present_content_rect = None;
         self.last_main_redraw_state = None;
@@ -828,6 +913,21 @@ impl App {
             result.present_width,
         );
         let smoothed = self.autocrop_latch.resolve(result.content_rect);
+        self.present_placement = Some(result.placement);
+        if result.content_rect.is_some()
+            && self.present_horizontal_repeat != result.horizontal_repeat
+        {
+            self.present_horizontal_repeat = result.horizontal_repeat;
+            self.main_presentation_dirty = true;
+        }
+        if self.overscan == Overscan::Smart {
+            self.presentation_latch.resolve_smart_centre(
+                result.content_rect,
+                result.emulated_frame,
+                result.programmable,
+            );
+            self.refresh_tv_centre();
+        }
         if smoothed != self.present_content_rect {
             self.present_content_rect = smoothed;
             self.main_presentation_dirty = true;
@@ -1002,6 +1102,7 @@ impl App {
             // buffer instead of producing the first returning chipset frame.
             self.render_generation = self.render_generation.wrapping_add(1);
             self.presentation_latch.reset();
+            self.refresh_tv_centre();
             self.autocrop_latch.reset();
             self.present_content_rect = None;
         }
@@ -1085,6 +1186,30 @@ impl App {
             &mut next_present_fb,
         );
         self.reset_autocrop_latch_across_scan_change(geometry.programmable, rows, width);
+        if field_content.is_some() {
+            let repeat = if self.overscan == Overscan::Smart && !geometry.programmable {
+                content_horizontal_repeat(
+                    &next_present_fb,
+                    width,
+                    rows,
+                    field_content.and_then(|rect| placement.content_rect(rect, rows)),
+                )
+            } else {
+                1
+            };
+            if repeat != self.present_horizontal_repeat {
+                self.present_horizontal_repeat = repeat;
+                self.main_presentation_dirty = true;
+            }
+        }
+        if self.overscan == Overscan::Smart {
+            self.presentation_latch.resolve_smart_centre(
+                field_content.and_then(|rect| placement.content_rect(rect, rows)),
+                emulated_frame,
+                geometry.programmable,
+            );
+            self.refresh_tv_centre();
+        }
         let smoothed = self
             .autocrop_latch
             .resolve(field_content.and_then(|rect| placement.content_rect(rect, rows)));

@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn host_monitor_picker_preserves_saved_and_disconnected_choices() {
+    use crate::config::HostMonitor;
+    let raw = RawConfig::parse("[display]\nmonitor = \"2\"\n").unwrap();
+    let mut setup = MachineSetup::from_raw(&raw).unwrap();
+    setup.set_host_monitors(vec![(
+        HostMonitor::Name("External".into()),
+        "1: External (1920x1080)".into(),
+    )]);
+    assert_eq!(setup.to_raw().display.monitor.as_deref(), Some("2"));
+    setup.select_model(Some(MachineModel::A1200));
+    assert_eq!(setup.to_raw().display.monitor.as_deref(), Some("2"));
+    setup.cycle(F::HostMonitor, true);
+    assert_eq!(setup.value_label(F::HostMonitor), "Auto");
+    assert_eq!(setup.to_raw().display.monitor, None);
+    setup.cycle(F::HostMonitor, true);
+    assert_eq!(setup.value_label(F::HostMonitor), "Primary");
+    setup.cycle(F::HostMonitor, true);
+    assert_eq!(setup.value_label(F::HostMonitor), "1: External (1920x1080)");
+    let saved = setup.to_raw();
+    assert_eq!(saved.display.monitor.as_deref(), Some("name:External"));
+    let mut reloaded = MachineSetup::from_raw(&saved).unwrap();
+    assert_eq!(reloaded.to_raw().display.monitor, saved.display.monitor);
+    reloaded.cycle(F::HostMonitor, false);
+    assert_eq!(reloaded.value_label(F::HostMonitor), "Primary");
+}
+
+#[test]
+fn window_position_text_box_validates_saves_and_can_restore_auto() {
+    let raw = RawConfig::parse("[display]\nposition = [-40, 75]\n").unwrap();
+    let mut state = LauncherState::new(MachineSetup::from_raw(&raw).unwrap());
+    assert_eq!(state.setup.value_label(F::WindowPosition), "-40, 75");
+    assert_eq!(state.setup.to_raw().display.position, Some(vec![-40, 75]));
+
+    state.begin_edit_window_position();
+    state.edit_buffer = "100, 80".to_string();
+    state.edit_commit();
+    assert_eq!(
+        state.setup.build_config().unwrap().window_position,
+        Some([100, 80])
+    );
+    state.begin_edit_window_position();
+    state.edit_buffer = "100, nope".to_string();
+    state.edit_commit();
+    assert_eq!(state.editing(), Some(EditTarget::WindowPosition));
+    assert_eq!(state.setup.window_position, Some([100, 80]));
+    state.edit_buffer.clear();
+    state.edit_commit();
+    assert_eq!(state.setup.value_label(F::WindowPosition), "Auto");
+    assert_eq!(state.setup.to_raw().display.position, None);
+}
+
+#[test]
 fn run_ahead_frames_survives_the_config_screen_round_trip() {
     let raw: RawConfig = toml::from_str("[emulation]\nrun_ahead_frames = 2\n").unwrap();
     let setup = MachineSetup::from_raw(&raw).unwrap();
@@ -2173,6 +2225,17 @@ fn the_mt32_rom_pair_and_panel_round_trip_through_raw() {
 }
 
 #[test]
+fn window_scale_round_trips_through_launcher_config() {
+    let raw = RawConfig::parse("[display]\nwindow_scale = 2\nmaximized = true\n").unwrap();
+    let setup = MachineSetup::from_raw(&raw).unwrap();
+    let saved = setup.to_raw();
+    assert_eq!(saved.display.window_scale, Some(2.0));
+    assert_eq!(saved.display.maximized, Some(true));
+    assert_eq!(setup.build_config().unwrap().window_scale, 2.0);
+    assert_eq!(MachineSetup::default().to_raw().display.window_scale, None);
+}
+
+#[test]
 fn menu_scale_round_trips_through_raw() {
     let mut s = MachineSetup::default();
     // 1x is the baseline, so nothing is written for it. The launcher has
@@ -2287,6 +2350,44 @@ fn mouse_capture_round_trips_through_raw() {
         s.build_config().expect("valid config").mouse_capture,
         MouseCapture::Manual
     );
+}
+
+#[test]
+fn middle_click_release_round_trips_through_the_gui_and_toml() {
+    let field = LauncherField::MiddleClickRelease;
+    let mut s = MachineSetup::default();
+    assert!(!s.toggle_value(field));
+    assert_eq!(s.value_label(field), "Disabled");
+    assert_eq!(s.to_raw().input.middle_click_release, None);
+    s.cycle(field, true);
+    assert!(s.toggle_value(field));
+    assert_eq!(s.value_label(field), "Enabled");
+    let raw = s.to_raw();
+    assert_eq!(raw.input.middle_click_release, Some(true));
+    let toml = toml::to_string(&raw).expect("serialize");
+    let loaded: RawConfig = toml::from_str(&toml).expect("parse");
+    let mut reloaded = MachineSetup::from_raw(&loaded).expect("valid config");
+    assert!(reloaded.toggle_value(field));
+    assert!(
+        reloaded
+            .build_config()
+            .expect("valid config")
+            .middle_click_release
+    );
+    reloaded.cycle(field, false);
+    assert_eq!(reloaded.value_label(field), "Disabled");
+    assert!(
+        !reloaded
+            .build_config()
+            .expect("valid config")
+            .middle_click_release
+    );
+    assert_eq!(reloaded.to_raw().input.middle_click_release, None);
+
+    s.port_devices = [PortDevice::Joystick, PortDevice::Joystick];
+    assert_eq!(s.disabled_reason(field), Some("No mouse"));
+    s.port_devices[1] = PortDevice::Mouse;
+    assert_eq!(s.disabled_reason(field), None);
 }
 
 #[test]

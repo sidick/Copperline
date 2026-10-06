@@ -327,6 +327,11 @@ impl MachineSetup {
             menu_scale: cfg.menu_scale,
             tint: cfg.tint,
             start_fullscreen: cfg.full_screen,
+            start_maximized: cfg.maximized,
+            host_monitor: cfg.monitor.clone(),
+            host_monitors: Vec::new(),
+            window_position: cfg.window_position,
+            window_scale: cfg.window_scale,
             show_status_bar: cfg.status_bar,
             floppy_sounds: cfg.audio.floppy_sounds,
             floppy_volume: cfg.audio.floppy_sounds_volume,
@@ -344,6 +349,7 @@ impl MachineSetup {
             joystick_input_mode: cfg.joystick_input_mode,
             mouse_sensitivity: cfg.mouse_sensitivity,
             mouse_capture: cfg.mouse_capture,
+            middle_click_release: cfg.middle_click_release,
             port_devices: cfg.port_devices,
             zorro_boards: raw
                 .zorro
@@ -840,6 +846,18 @@ impl MachineSetup {
         if self.start_fullscreen != base.full_screen {
             raw.display.full_screen = Some(self.start_fullscreen);
         }
+        if self.host_monitor != base.monitor {
+            raw.display.monitor = Some(self.host_monitor.to_string());
+        }
+        if self.window_position != base.window_position {
+            raw.display.position = self.window_position.map(|position| position.to_vec());
+        }
+        if self.start_maximized != base.maximized {
+            raw.display.maximized = Some(self.start_maximized);
+        }
+        if self.window_scale != base.window_scale {
+            raw.display.window_scale = Some(self.window_scale);
+        }
         if self.show_status_bar != base.status_bar {
             raw.display.status_bar = Some(self.show_status_bar);
         }
@@ -893,6 +911,9 @@ impl MachineSetup {
         }
         if self.mouse_capture != base.mouse_capture {
             raw.input.mouse_capture = Some(self.mouse_capture.label().to_string());
+        }
+        if self.middle_click_release != base.middle_click_release {
+            raw.input.middle_click_release = Some(self.middle_click_release);
         }
         // Per port against the profile baseline, so a CD32 keeps its pad
         // implicit and a stock machine emits no port keys at all.

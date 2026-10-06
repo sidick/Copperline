@@ -937,6 +937,14 @@ pub struct MachineSetup {
     tint: Tint,
     /// Open fullscreen at start ([display] full_screen).
     start_fullscreen: bool,
+    /// Open maximized ([display] maximized), retained from TOML.
+    start_maximized: bool,
+    host_monitor: crate::config::HostMonitor,
+    host_monitors: Vec<(crate::config::HostMonitor, String)>,
+    /// Initial window placement retained when loading and saving a config.
+    window_position: Option<[i32; 2]>,
+    /// Initial window size ([display] window_scale), retained from TOML.
+    window_scale: f64,
     /// Show the status bar at start ([display] status_bar).
     show_status_bar: bool,
     floppy_sounds: bool,
@@ -962,6 +970,7 @@ pub struct MachineSetup {
     joystick_input_mode: JoystickInputMode,
     mouse_sensitivity: u8,
     mouse_capture: MouseCapture,
+    middle_click_release: bool,
     port_devices: [PortDevice; 2],
     // Extra Zorro boards (metadata path + plugin config schema/overrides)
     zorro_boards: Vec<ZorroBoardSetup>,
@@ -1193,6 +1202,8 @@ impl MachineSetup {
         self.csynth_mt32_mode = base.serial.coppersynth_mt32_mode.clone();
         self.csynth_panel = base.serial.coppersynth_panel;
         self.start_fullscreen = base.full_screen;
+        self.start_maximized = base.maximized;
+        self.window_scale = base.window_scale;
         self.show_status_bar = base.status_bar;
         self.floppy_sounds = base.audio.floppy_sounds;
         self.floppy_volume = base.audio.floppy_sounds_volume;
@@ -1209,6 +1220,7 @@ impl MachineSetup {
         self.joystick_input_mode = base.joystick_input_mode;
         self.mouse_sensitivity = base.mouse_sensitivity;
         self.mouse_capture = base.mouse_capture;
+        self.middle_click_release = base.middle_click_release;
         self.port_devices = base.port_devices;
         let profile_drives = connected_floppy_bays(&base.floppy_connected);
         self.floppy_drives = profile_drives.max(self.occupied_floppy_bays());
@@ -1407,7 +1419,15 @@ impl MachineSetup {
                     },
                 )
             }
-            F::IdeMaster | F::IdeSlave => reason(self.has_ide(), "needs A600/A1200/A4000 or Lide"),
+            // These two bays are the *motherboard's* IDE channel, so the
+            // machine is the whole enable condition. A Lide board carries
+            // drives of its own, in its own fields on its own page -- a
+            // pointer to where those live, not a second way to enable these:
+            // naming it in the condition read as one, and these rows never
+            // enable for a Lide board however it is configured.
+            F::IdeMaster | F::IdeSlave => {
+                reason(self.has_ide(), "needs A600/A1200/A4000; Lide has its own")
+            }
             // The ROM and drives belong to the fitted controller, and with
             // none the rows are hidden outright (`row_hidden`), so only a
             // fitted-but-unsuitable controller is ever explained here: the
@@ -1422,8 +1442,14 @@ impl MachineSetup {
                 self.scsi_controller == Some(ScsiController::A2091),
                 "A2091 only",
             ),
+            // `[cd] image` feeds the machine's *built-in* drive and nothing
+            // else, so CDTV/CD32 is the whole enable condition. A CD-ROM on
+            // SCSI/IDE/Lide is a drive slot holding a CD image, which these
+            // rows never reach: listing those buses in the condition read as
+            // an enable condition they are not, so the clause after the
+            // semicolon points at where that is done instead.
             F::CdImage | F::CdInsertDelay => {
-                reason(self.has_cd(), "needs CDTV/CD32 (or SCSI/IDE/Lide)")
+                reason(self.has_cd(), "needs CDTV/CD32; on a bus, use a drive slot")
             }
             F::Cd32Nvram => reason(self.model == Some(MachineModel::Cd32), "CD32 only"),
             F::FmvRom => reason(self.model == Some(MachineModel::Cd32), "CD32 only"),
@@ -1544,8 +1570,8 @@ impl MachineSetup {
                     reason(self.audio_channel_mode != ChannelMode::Mono, "mono")
                 }
             }
-            // Neither mouse row does anything unless a port holds a mouse.
-            F::MouseSensitivity | F::MouseCapture => {
+            // Mouse preferences need a mouse on either port.
+            F::MouseSensitivity | F::MouseCapture | F::MiddleClickRelease => {
                 reason(self.port_devices.iter().any(|d| d.is_mouse()), "No mouse")
             }
             _ => None,
@@ -3311,6 +3337,8 @@ pub enum EditTarget {
     SerialPort(LauncherField),
     /// The fixed 16-bit RAM power-on word on the Memory page.
     RamPattern,
+    /// Logical X and Y offsets from the host monitor's top-left corner.
+    WindowPosition,
     /// A session endpoint or shared game code.
     Netplay(LauncherField),
 }
@@ -4886,6 +4914,7 @@ impl LauncherState {
                 | EditTarget::SerialPort(f)
             ) if f == field
         ) || field == F::RamPattern && self.editing == Some(EditTarget::RamPattern)
+            || field == F::WindowPosition && self.editing == Some(EditTarget::WindowPosition)
     }
 
     /// The filesystem a Create Image row is about: the floppy page's or the
@@ -5232,6 +5261,17 @@ impl LauncherState {
         self.status = None;
     }
 
+    pub fn begin_edit_window_position(&mut self) {
+        self.edit_buffer = self
+            .setup
+            .window_position
+            .map(|[x, y]| format!("{x}, {y}"))
+            .unwrap_or_default();
+        self.editing = Some(EditTarget::WindowPosition);
+        self.edit_caret = Caret::end_of(&self.edit_buffer);
+        self.status = None;
+    }
+
     pub fn new(setup: MachineSetup) -> Self {
         let mut setup = setup;
         // Read the host devices as the screen opens so the pickers show what is
@@ -5502,6 +5542,12 @@ impl LauncherState {
         {
             return;
         }
+        if target == EditTarget::WindowPosition
+            && (self.edit_buffer.len() >= 26
+                || !(c.is_ascii_digit() || matches!(c, '-' | ',' | ' ')))
+        {
+            return;
+        }
         // A boot priority is a signed integer: digits, and a leading minus.
         if let EditTarget::DriveBootpri(_) = target {
             let minus_ok =
@@ -5739,6 +5785,32 @@ impl LauncherState {
                 self.edit_buffer.clear();
                 return;
             }
+            EditTarget::WindowPosition => {
+                let typed = self.edit_buffer.trim();
+                let position = if typed.is_empty() {
+                    None
+                } else {
+                    let parts: Vec<_> = typed.split(',').map(str::trim).collect();
+                    match parts.as_slice() {
+                        [x, y] => match (x.parse::<i32>(), y.parse::<i32>()) {
+                            (Ok(x), Ok(y)) => Some([x, y]),
+                            _ => {
+                                self.status =
+                                    Some(StatusMessage::err("Enter X, Y as signed integers"));
+                                return;
+                            }
+                        },
+                        _ => {
+                            self.status = Some(StatusMessage::err("Enter X, Y as signed integers"));
+                            return;
+                        }
+                    }
+                };
+                self.setup.window_position = position;
+                self.editing = None;
+                self.edit_buffer.clear();
+                return;
+            }
             EditTarget::BoardOption { .. } => {}
         }
         self.editing = None;
@@ -5754,7 +5826,8 @@ impl LauncherState {
             | EditTarget::NewImageText(_)
             | EditTarget::SerialHost(_)
             | EditTarget::SerialPort(_)
-            | EditTarget::RamPattern => {}
+            | EditTarget::RamPattern
+            | EditTarget::WindowPosition => {}
         }
     }
 
@@ -6417,10 +6490,7 @@ fn video_name(video: VideoStandard) -> &'static str {
 }
 
 fn overscan_name(overscan: Overscan) -> &'static str {
-    match overscan {
-        Overscan::Tv => "tv",
-        Overscan::Full => "full",
-    }
+    overscan.as_str()
 }
 
 pub(crate) fn pixel_aspect_name(aspect: PixelAspect) -> &'static str {

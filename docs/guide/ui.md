@@ -187,6 +187,9 @@ left to right it holds:
   flip between gamepad-only and keyboard joystick emulation; see
   [](#controller-ports).
 - **Volume slider**: drag, or scroll the mouse wheel over it for 5% steps.
+  Clicking the speaker beside it mutes; clicking it again restores the
+  volume it muted from. Moving the slider while muted unmutes at the new
+  level.
 - **Hamburger menu button**: opens the pop-up menu (below).
 - **Camera button**: saves a screenshot (same as `Cmd+S` on macOS or
   `Alt+S` on Linux/Windows).
@@ -309,8 +312,8 @@ Disk images can be dropped anywhere on the emulator window:
   [WHDLoad booter](whdload.md), keeping any explicit machine choices.
   Dropped on the configuration screen they fill the **WHDLoad** page's
   game field instead; that screen refuses every other kind of drop.
-- **Hard disk images and Kickstart ROMs** (`.hdf`, `.hdz`, `.img`, a
-  hard-disk `.chd`, `.rom`) are not accepted as drops. Configure hard disks
+- **Hard disk images and Kickstart ROMs** (`.hdf`, `.hdz`, `.vhd`, `.img`,
+  a hard-disk `.chd`, `.rom`) are not accepted as drops. Configure hard disks
   in the machine configuration screen. To replace a running machine's ROM
   and cold-reset it, use **Load Kickstart ROM...** from the menu.
 
@@ -438,6 +441,12 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
 ### Video Settings
 
 - **Menu Size**: 1x or 2x, described above.
+- **Framing**: **TV** keeps the fixed monitor aperture (the default);
+  **Smart** corrects small horizontal display offsets after the hardware
+  envelope stays stable, with at most eight lo-res pixels of automatic
+  adjustment; **Full overscan** shows the entire captured raster. Blank
+  frames hold the previous Smart position. Manual centring adds a trim.
+  Screenshots and frame dumps follow the selected framing.
 - **Pixel Aspect**: **TV (4:3)**, the CRT pixel aspect (the default; PAL
   lo-res pixels slightly wider than tall, as a real TV shows them), or
   **Square** (a 320x256 screen is an exact 640x512, handy for pixel-exact
@@ -467,6 +476,9 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   multisync modes, and is suspended while a monitor bezel is drawn or an RTG
   mode is shown. The start-up value is `[display] autocrop` (see
   [Configuration](configuration.md)).
+  In Smart framing, autocrop selects from the unmasked raster before the
+  TV aperture clips artwork. Integer scaling fits the complete detected
+  display; PAL/NTSC pixel aspect stays tied to the scan.
 - **Screen Centring**: nudge where the TV picture sits on the glass, the
   H-CENTER/V-CENTER controls a real monitor carried on its front.
   **Picture Left/Right** step one lo-res pixel (up to 16 each way),
@@ -678,6 +690,21 @@ boot-time cards, SRAM cards, real card readers, and the fast-RAM rule.
   Copperline's contributors and Patreon sponsors (see `CREDITS.md`).
   Builds made from an untagged git commit append the short commit ID to
   the version shown in the window title and About panel.
+
+  The panel's **Check for updates** button asks GitHub which Copperline
+  release is the latest and compares it with the running version. If a
+  newer release is out, the line beside the button names it and the
+  button becomes **Open release page**, which opens that release's notes
+  and downloads in your browser (or, if no browser will open, puts the
+  page's address on the clipboard). Pre-release ordering follows semantic
+  versioning, so `1.0.0` counts as newer than `1.0.0-rc.1`; a build from an
+  untagged commit is compared by its version alone. Copperline never checks
+  on its own: nothing is sent until the button is pressed, and the
+  answer is forgotten when Copperline quits. The request is a plain HTTPS
+  `GET` to `api.github.com` whose only identifying detail is the
+  `Copperline/<version>` user agent. GitHub limits how often one network
+  address may ask, so a check repeated many times in an hour may be told
+  to wait. Builds without the `update-check` feature have no button.
 - **Quit** (also `Cmd+Q` / `Alt+Q`): exits Copperline. It is the last row
   so that a [controller or keyboard walking the
   menu](#keyboard-and-controller-navigation) finds it at the foot, with
@@ -785,7 +812,8 @@ The layout is:
     - **Create Image...**: makes new ADF and HDF images (see
       [below](#create-image)).
   - *Input*: the controller device in each game port, the joystick input
-    source, the mouse sensitivity, and when the host mouse is captured (see
+    source, the mouse sensitivity, when the host mouse is captured, and
+    whether middle click releases it (see
     [](#controller-ports)).
   - *Netplay*: rollback netplay over the internet or a direct IP
     connection -- players, seat, invitation or addresses, input delay,
@@ -838,8 +866,10 @@ The layout is:
     - **Video** -- the emulated picture: monitor bezel style, overscan,
       pixel aspect, scaling, autocrop, deinterlace, screen tint, phosphor,
       CRT shader and shader strength.
-    - **Display** -- the host window: start fullscreen, status bar, perf
-      overlay, VSync, and menu size.
+    - **Display** -- the host window: start fullscreen, host monitor and
+      window position, status bar, perf overlay, VSync, and menu size. The
+      position box accepts `X, Y` offsets from the chosen monitor; clear it
+      for automatic placement.
     - **Emulation**: power on at startup; run on startup (`[emulation]
       auto_launch`, which runs an opened configuration at once); realtime
       priority; pacing budget; warp speed; warp boot and its storage-idle
@@ -876,9 +906,17 @@ The layout is:
   Kickstart from 1.2 onward can read with no guest-side setup). A setting
   that does not apply to the chosen machine is greyed and shows why in
   place of its control -- "needs 32-bit CPU" for Zorro III and accelerator
-  RAM, "needs 68020+" for the FPU, "needs A600/A1200/A4000 or Lide" for
-  IDE. On a 24-bit CPU the RTG card list simply leaves out the Zorro III
-  cards.
+  RAM, "needs 68020+" for the FPU. On a 24-bit CPU the RTG card list
+  simply leaves out the Zorro III cards. What a greyed row names is that
+  row's own enable condition; where the same thing can be had another way,
+  a clause after a semicolon says where rather than naming it as a second
+  condition the row would turn on for. So the IDE bays read
+  "needs A600/A1200/A4000; Lide has its own" -- they are the motherboard
+  channel alone, and a Lide board carries drives of its own on the *Lide*
+  sub-page -- and the CD rows read
+  "needs CDTV/CD32; on a bus, use a drive slot", `[cd] image` feeding the
+  built-in CDTV/CD32 drive alone while a CD-ROM on SCSI/IDE/Lide is a
+  drive slot holding a CD image.
 - **Boot Priority sub-page** (from *Storage*). One row per hard-disk drive,
   under **Drive** / **Priority** / **Status** columns, setting the `de_BootPri`
   written into the partition Copperline synthesizes in front of a bare hardfile
@@ -947,6 +985,10 @@ is saved to a configuration file.
 **Save...** opens a file dialog, then writes the image. The status line
 reports progress and the finished size; the write runs in the background,
 so the window stays responsive while a large image is written.
+
+A hard disk image is saved as `.hdf` or `.img`, which hold the same bytes.
+The page does not write CHD, and refuses a name ending in `.chd`; make a
+CHD from the finished image with `chdman createhd`.
 
 #### Floppy Disk
 
@@ -1033,6 +1075,22 @@ and greyed alongside either.
 
 `Dir cache` needs Kickstart 3.0, `International` needs 2.0, and `Long
 names` needs a filesystem no Kickstart provides.
+
+(native-screenshots)=
+## Saving native screenshots
+
+Choose **Recording → Save Native Screenshot (1:1)** to save the active
+playfield at its original pixel size, without the TV border, aspect
+correction, filtering, phosphor persistence or tint. Black pixels inside the
+playfield are kept. RTG screens save at the board's native resolution.
+Interlaced chipset screens save the current field, without blending or
+weaving another field into it.
+
+Starting Copperline with `--native-screenshots` also makes the camera button
+and `Cmd+S` / `Alt+S` use this capture. See [native headless captures](headless.md#capturing-screenshots)
+for resolution and crop details.
+
+Screenshots save to the [screenshots folder](#where-files-go).
 
 (recording-video)=
 ## Recording video
@@ -1130,6 +1188,9 @@ state. `Cmd+Shift+L` / `Alt+Shift+L` (or "Load State...") opens the
 [browser below](#load-state-browser) to restore one; the machine continues
 from exactly the saved point, byte-for-byte -- the core is deterministic,
 so a resumed run is indistinguishable from one that was never interrupted.
+Your audio output settings (the volume slider, mono/stereo, stereo
+separation, and the filter override) are not part of the machine: loading
+a state or rewinding keeps whatever they are set to now.
 
 Every state also carries a small card about itself, written ahead of the
 machine so it can be read without loading anything: a thumbnail of the
@@ -1328,6 +1389,11 @@ focus and on entering fullscreen, so no host cursor is ever loose over
 the display, and `manual` grabs only on the shortcut, leaving display
 clicks to go straight to the Amiga. See
 [Mouse capture](configuration.md#mouse-capture).
+
+Enable *Middle to release* on the launcher's *Input* tab, or set
+`[input] middle_click_release = true`, to release capture with the middle
+mouse button. It defaults to off, so middle click reaches the guest.
+When enabled, the click that releases capture is consumed.
 
 A USB gamepad drives the emulated digital joystick on whichever port one is
 plugged into: directions through JOYxDAT, fire through /FIRx, and a second

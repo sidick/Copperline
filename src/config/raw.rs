@@ -324,7 +324,7 @@ impl RawBezel {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawDisplay {
-    /// "tv" (default, mask deep overscan like a CRT bezel) or "full".
+    /// "tv" (default), "smart" (bounded automatic centring), or "full".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) overscan: Option<String>,
     /// Horizontal centring of the TV presentation in lo-res pixels,
@@ -387,9 +387,21 @@ pub(crate) struct RawDisplay {
     /// Size of the pop-up menu: "1x" (default) or "2x".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) menu_scale: Option<String>,
+    /// Initial logical window size multiplier (0.5 to 4.0, default 1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window_scale: Option<f64>,
     /// Open fullscreen at start (default false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) full_screen: Option<bool>,
+    /// Open maximized with window decorations (default false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) maximized: Option<bool>,
+    /// Host display: auto, primary, a one-based number, or an exact name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) monitor: Option<String>,
+    /// Top-left window position [X, Y] in logical pixels relative to the host monitor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position: Option<Vec<i32>>,
     /// Show the status bar at start (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status_bar: Option<bool>,
@@ -574,6 +586,9 @@ pub(crate) struct RawInput {
     /// "manual".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mouse_capture: Option<String>,
+    /// Release mouse capture with middle click; defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) middle_click_release: Option<bool>,
     /// Autofire rate in Hz for the fire button, or 0 (the default) for off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) autofire_hz: Option<u8>,
@@ -1258,7 +1273,8 @@ pub(crate) struct RawEmulation {
     pub(crate) warp_until: Option<f64>,
     /// The WinUAE-compatible uaelib trap at $F0FF60 (default true): guest
     /// programs toggle warp, log debug text and register resources through
-    /// it. Set false for a machine with nothing at $F0FF60.
+    /// it. Also enables printf-style writes at $BFFF00/$BFFF04. Set false
+    /// to disable both the trap and debug ports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) uaelib: Option<bool>,
     /// Allow the uaelib `debug_load` / `debug_save` commands to access files

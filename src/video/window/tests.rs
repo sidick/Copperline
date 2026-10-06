@@ -20,17 +20,17 @@ use super::{
     standard_window_top_row, status_with_latched_fdd_track, take_integral_mouse_delta,
     texture_height, texture_width, tint_display_rows, tint_lut, tint_rows_in_place,
     track_counter_digit_rect, track_counter_layout, tv_aperture_source_row,
-    tv_centre_source_offset, tv_source_h_bounds, volume_percent_from_pos, volume_slider_track_rect,
-    BarControl, DriveBar, JoystickInputMode, MediaBar, PresentationLatch, StatusBarView,
-    ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT,
-    AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON,
-    CD_TRACK_SEGMENT_OFF, CD_TRACK_SEGMENT_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL,
-    FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON,
-    POWER_LED_BRIGHT, POWER_LED_DIM, POWER_LED_OFF, STANDARD_PAL_VISIBLE_LINES,
-    STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON,
-    TUBE_NTSC_PRESENT_HEIGHT, TUBE_PAL_PRESENT_HEIGHT, TV_CAPTURED_SOURCE_X, TV_CAPTURED_WIDTH,
-    TV_LIVE_PAD_X, TV_NTSC_PRESENT_HEIGHT, TV_PAL_PRESENT_HEIGHT, TV_PRESENT_SOURCE_Y, VOLUME_FILL,
-    VOLUME_GLYPH_X,
+    tv_centre_source_offset, tv_source_h_bounds, volume_mute_hit_rect, volume_percent_from_pos,
+    volume_slider_knob_rect, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
+    MediaBar, PresentationLatch, StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT,
+    AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH,
+    BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON, CD_TRACK_SEGMENT_OFF,
+    CD_TRACK_SEGMENT_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON,
+    HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_BRIGHT, POWER_LED_DIM,
+    POWER_LED_OFF, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG,
+    TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, TUBE_NTSC_PRESENT_HEIGHT, TUBE_PAL_PRESENT_HEIGHT,
+    TV_CAPTURED_SOURCE_X, TV_CAPTURED_WIDTH, TV_LIVE_PAD_X, TV_NTSC_PRESENT_HEIGHT,
+    TV_PAL_PRESENT_HEIGHT, TV_PRESENT_SOURCE_Y, VOLUME_FILL, VOLUME_GLYPH_X,
 };
 use crate::audio::{AudioSink, NullSink};
 use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
@@ -1176,6 +1176,145 @@ fn choosing_a_setting_leaves_the_menu_open_and_shows_it_took() {
 }
 
 #[test]
+fn smart_framing_reuses_the_capture_and_pointer_aperture() {
+    let mut app = test_app();
+    app.apply_overscan(Overscan::Smart);
+    let envelope = crate::video::bitplane::ContentRect {
+        x0: 0,
+        x1: 714,
+        y0: 2,
+        y1: 568,
+    };
+    for frame in 1..=25 {
+        app.presentation_latch
+            .resolve_smart_centre(Some(envelope), frame, false);
+    }
+    app.refresh_tv_centre();
+    assert_eq!(app.present_tv_centre.h, 8);
+    app.present_placement = Some(crate::video::present_common::FieldPlacement::standard(
+        crate::video::FB_HEIGHT,
+        0x2C,
+        0,
+    ));
+    let image = app.capture_present_image();
+    let reference = super::render_present_frame(
+        &app.present_fb,
+        app.present_rows,
+        app.present_width,
+        Overscan::Tv,
+        crate::config::TvCentre { h: 8, v: 0 },
+        app.present_tv_aperture_rows,
+    );
+    assert_eq!(image.pixels, reference.pixels);
+    assert_eq!(image.width, reference.width);
+    assert_eq!(image.height, reference.height);
+    let (sx, sy) = super::canvas_source_point(
+        0,
+        100,
+        app.present_rows,
+        app.present_width,
+        Overscan::Tv,
+        crate::config::TvCentre { h: 8, v: 0 },
+        app.present_tv_aperture_rows,
+        present_height(),
+    )
+    .unwrap();
+    assert_eq!(
+        app.canvas_to_field_pixel(0, 100),
+        app.present_placement
+            .unwrap()
+            .field_point(sx, sy, app.present_rows)
+    );
+    app.apply_overscan(Overscan::Tv);
+    assert_eq!(app.present_tv_centre, app.tv_centre);
+}
+
+#[test]
+fn smart_autocrop_preserves_content_outside_the_fixed_aperture() {
+    let mut app = test_app();
+    app.overscan = Overscan::Smart;
+    app.present_content_rect = Some(crate::video::bitplane::ContentRect {
+        x0: 0,
+        x1: 714,
+        y0: 2,
+        y1: 566,
+    });
+    let raw = app.display_canvas_src_for(true, true).unwrap();
+    assert_eq!((raw.rect.0, raw.rect.2), (0, 714));
+    // Switching autocrop off restores the bounded TV view; captures keep
+    // that aperture in either case, rather than inheriting the window crop.
+    let fixed = app.display_canvas_src_for(true, false).unwrap();
+    assert_eq!(
+        fixed.rect,
+        super::aperture_canvas_rect(TV_PAL_PRESENT_HEIGHT)
+    );
+    let capture = app.capture_present_image();
+    assert_eq!(capture.height, TV_PAL_PRESENT_HEIGHT as u32);
+    assert_eq!(capture.width, FB_WIDTH as u32);
+}
+
+#[test]
+fn native_screenshots_follow_playfield_resolution_without_tv_borders() {
+    for (mode, width) in [(0x1200, 320), (0x9200, 640), (0x1204, 320)] {
+        let mut app = test_app();
+        let bus = app.emu.bus_mut();
+        bus.custom_write(0x08E, 2, 0x2C81);
+        bus.custom_write(0x090, 2, 0x2CC1);
+        bus.custom_write(0x092, 2, 0x0038);
+        bus.custom_write(0x094, 2, 0x00D0);
+        bus.custom_write(0x100, 2, mode);
+        bus.custom_write(0x096, 2, 0x8300);
+        // Capture a completed field whose frame-start snapshot includes
+        // the programmed mode, rather than the reset-time blank raster.
+        app.emu.step_video_frame().unwrap();
+        app.emu.step_video_frame().unwrap();
+        app.set_native_screenshots(true);
+        let image = app.capture_present_image();
+        assert_eq!(
+            (image.width, image.height),
+            (width, 256),
+            "mode {mode:#06x}"
+        );
+        assert_eq!(image.pixels.len(), width as usize * 256);
+    }
+}
+
+#[test]
+fn native_screenshot_sprite_pitch_distinguishes_ecs_from_aga() {
+    use crate::chipset::agnus::AgnusRevision;
+    for (revision, width) in [
+        (AgnusRevision::Ecs8372Rev4, 640),
+        (AgnusRevision::Ecs8375, 640),
+        (AgnusRevision::AgaAlice, 1280),
+    ] {
+        let mut app = test_app();
+        let bus = app.emu.bus_mut();
+        bus.set_agnus_revision(revision);
+        for (offset, value) in [
+            (0x08E, 0x2C81),
+            (0x090, 0x2CC1),
+            (0x092, 0x0038),
+            (0x094, 0x00D0),
+            (0x100, 0x1201),
+            (0x106, 0x00C0),
+            (0x096, 0x8300),
+        ] {
+            bus.custom_write(offset, 2, value);
+        }
+        app.emu.step_video_frame().unwrap();
+        app.emu.step_video_frame().unwrap();
+        assert_eq!(app.emu.bus().frame_render_base().bplcon3 & 0xC0, 0xC0);
+        app.set_native_screenshots(true);
+        let image = app.capture_present_image();
+        assert_eq!(
+            (image.width, image.height),
+            (width, 256),
+            "revision {revision:?}"
+        );
+    }
+}
+
+#[test]
 fn choosing_a_window_closes_the_menu_behind_it() {
     let mut app = test_app();
     app.activate_bar_control(super::BarControl::Menu);
@@ -1316,6 +1455,156 @@ fn hot_plug_drops_scripted_joy_ownership_so_the_new_device_sticks() {
 }
 
 #[test]
+fn middle_click_releases_capture_and_held_guest_buttons_in_every_mode() {
+    use winit::event::MouseButton;
+    for mode in [
+        crate::config::MouseCapture::Click,
+        crate::config::MouseCapture::Auto,
+        crate::config::MouseCapture::Manual,
+    ] {
+        let mut app = test_app();
+        app.mouse_capture = mode;
+        app.middle_click_release = true;
+        app.mouse_captured = true;
+        app.capture_suspended_by_ui = true;
+        for index in 0..3 {
+            app.emu.bus_mut().input.set_mouse_button(0, index, true);
+        }
+        assert!(app.handle_middle_click_release(MouseButton::Middle, ElementState::Pressed));
+        assert!(!app.mouse_captured);
+        assert!(!app.capture_suspended_by_ui);
+        let port = &app.emu.bus().input.ports[0];
+        assert!(!port.fire && !port.button2 && !port.button3);
+        assert!(app.handle_middle_click_release(MouseButton::Middle, ElementState::Released));
+        assert!(!app.middle_click_release_held);
+        // A fresh uncaptured click follows the ordinary input/capture path.
+        assert!(!app.handle_middle_click_release(MouseButton::Middle, ElementState::Pressed));
+    }
+}
+
+#[test]
+fn middle_click_reaches_normal_dispatch_by_default() {
+    use winit::event::MouseButton;
+    let mut app = test_app();
+    app.mouse_captured = true;
+    assert!(!app.middle_click_release);
+    assert!(!app.handle_middle_click_release(MouseButton::Middle, ElementState::Pressed));
+    assert!(!app.handle_middle_click_release(MouseButton::Middle, ElementState::Released));
+    assert!(app.mouse_captured);
+    app.middle_click_release = true;
+    assert!(!app.handle_middle_click_release(MouseButton::Left, ElementState::Pressed));
+    assert!(!app.handle_middle_click_release(MouseButton::Right, ElementState::Pressed));
+    assert!(app.mouse_captured);
+}
+
+#[test]
+fn middle_click_release_gui_control_toggles_the_saved_setting() {
+    use crate::video::launcher::LauncherField;
+    let mut app = test_app();
+    app.open_launcher();
+    app.activate_ui_control(UiControl::LauncherCycle {
+        field: LauncherField::MiddleClickRelease,
+        forward: true,
+    });
+    assert!(
+        app.launcher_state()
+            .unwrap()
+            .setup
+            .build_config()
+            .unwrap()
+            .middle_click_release
+    );
+    app.activate_ui_control(UiControl::LauncherCycle {
+        field: LauncherField::MiddleClickRelease,
+        forward: false,
+    });
+    assert!(
+        !app.launcher_state()
+            .unwrap()
+            .setup
+            .build_config()
+            .unwrap()
+            .middle_click_release
+    );
+}
+
+#[test]
+fn middle_click_release_in_debug_returns_input_to_the_workspace() {
+    use winit::event::MouseButton;
+    let mut app = test_app();
+    app.middle_click_release = true;
+    app.debug_layout_active = true;
+    app.debug_guest_input = true;
+    app.mouse_captured = true;
+    app.handle_amiga_key_event(0x20, true);
+    assert!(app.handle_middle_click_release(MouseButton::Middle, ElementState::Pressed));
+    assert!(!app.mouse_captured);
+    assert!(!app.debug_guest_input);
+    assert!(!app.held_rawkeys[0x20]);
+}
+
+#[test]
+fn middle_click_release_in_netplay_clears_local_buttons_without_changing_the_bus(
+) -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            let mut app = test_app();
+            app.emu
+                .bus_mut()
+                .rtc
+                .set_seed(Some(crate::netplay::RTC_SEED), false);
+            app.emu.bus_mut().paula.serial = Box::new(crate::serial::NullSerialSink);
+            let mut cfg = crate::config::Config::try_from(crate::config::RawConfig::default())?;
+            cfg.serial.mode = crate::config::SerialMode::Off;
+            let options = crate::netplay::Options {
+                bind: "127.0.0.1:0".parse()?,
+                peers: vec!["127.0.0.1:19732".parse()?],
+                player: 0,
+                players: 2,
+                session: [7; 16],
+                input_delay: 0,
+                rollback_frames: 8,
+                spectators: 0,
+            };
+            let session = crate::netplay::Session::new(options, &mut app.emu, &cfg)?;
+            app.attach_netplay(session);
+            app.middle_click_release = true;
+            app.mouse_captured = true;
+            for index in 0..3 {
+                app.netplay_input.held.set_mouse_button(index, true);
+            }
+            let before = app.emu.netplay_snapshot()?;
+            assert!(app.handle_middle_click_release(
+                winit::event::MouseButton::Middle,
+                ElementState::Pressed,
+            ));
+            assert!(!app.mouse_captured);
+            assert_eq!(app.netplay_input.held.mouse_buttons, 0);
+            assert_eq!(app.emu.netplay_snapshot()?, before);
+            Ok(())
+        })?
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn middle_click_release_is_installed_when_a_machine_is_started() {
+    for enabled in [true, false] {
+        let mut raw = crate::config::RawConfig::default();
+        raw.input.middle_click_release = Some(enabled);
+        let cfg = crate::config::Config::try_from(raw.clone()).expect("config");
+        let mut app = test_app();
+        app.middle_click_release = !enabled;
+        app.middle_click_release_held = true;
+        let emu = test_emulator(Box::new(NullSink), crate::config::CpuModel::M68000, &[]);
+        app.run_machine(emu, &cfg, raw);
+        assert_eq!(app.middle_click_release, enabled);
+        assert!(!app.middle_click_release_held);
+    }
+}
+
+#[test]
 fn mouse_capture_is_refused_with_no_mouse_on_either_port() {
     use crate::bus::PortDevice;
     let mut app = test_app();
@@ -1396,8 +1685,8 @@ fn a_tool_panel_hands_the_mouse_capture_back_when_it_closes() {
 
     app.close_tool_panel(ToolPanelKind::Debugger);
     assert!(
-        !app.capture_suspended_by_ui,
-        "and handed it back on the way out"
+        app.capture_suspended_by_ui,
+        "a windowless fixture cannot re-grab, so the loan remains outstanding"
     );
 }
 
@@ -1417,8 +1706,8 @@ fn the_capture_stays_suspended_while_another_panel_wants_the_cursor() {
 
     app.close_tool_panel(ToolPanelKind::FrameAnalyzer);
     assert!(
-        !app.capture_suspended_by_ui,
-        "the last panel out returns the capture"
+        app.capture_suspended_by_ui,
+        "the last panel permits a re-grab, but the fixture has no window"
     );
 }
 
@@ -1459,12 +1748,12 @@ fn a_capture_loan_outlives_a_panel_that_closed_while_unfocused() {
         "the loan survives a close that could not repay it"
     );
 
-    // The Focused(true) that follows is what actually repays it.
+    // Focus gain retries, but this fixture has no window to grab.
     app.main_window_focused = true;
     app.restore_mouse_capture_after_ui();
     assert!(
-        !app.capture_suspended_by_ui,
-        "and is discharged once the window can take the grab"
+        app.capture_suspended_by_ui,
+        "the loan is discharged only when a grab succeeds"
     );
 }
 
@@ -2276,23 +2565,57 @@ fn canvas_sized_check_tolerates_rounding_but_not_a_resize() {
     assert!(logical_size_is_canvas(
         FB_WIDTH as f64,
         canvas_h as f64,
-        canvas_h
+        canvas_h,
+        1.0
     ));
     assert!(logical_size_is_canvas(
         FB_WIDTH as f64 + 1.0,
         canvas_h as f64 - 1.0,
-        canvas_h
+        canvas_h,
+        1.0
     ));
     // A real resize in either dimension does not.
     assert!(!logical_size_is_canvas(
         FB_WIDTH as f64 + 40.0,
         canvas_h as f64,
-        canvas_h
+        canvas_h,
+        1.0
     ));
     assert!(!logical_size_is_canvas(
         FB_WIDTH as f64,
         canvas_h as f64 + 40.0,
-        canvas_h
+        canvas_h,
+        1.0
+    ));
+}
+
+#[test]
+fn scaled_canvas_size_keeps_ownership_when_height_changes() {
+    use super::{canvas_window_size, logical_size_is_canvas};
+
+    let with_bar = canvas_window_size(600, 2.0);
+    let without_bar = canvas_window_size(540, 2.0);
+    assert_eq!(with_bar.width, (FB_WIDTH * 2) as f64);
+    assert_eq!(with_bar.height, 1200.0);
+    assert_eq!(without_bar.width, with_bar.width);
+    assert_eq!(with_bar.height - without_bar.height, 120.0);
+    assert!(logical_size_is_canvas(
+        with_bar.width + 1.0,
+        with_bar.height - 1.0,
+        600,
+        2.0,
+    ));
+    assert!(!logical_size_is_canvas(
+        with_bar.width,
+        with_bar.height,
+        600,
+        1.0,
+    ));
+    assert!(!logical_size_is_canvas(
+        with_bar.width + 40.0,
+        with_bar.height,
+        600,
+        2.0,
     ));
 }
 
@@ -2308,7 +2631,8 @@ fn asynchronous_canvas_snap_owns_the_platform_clamped_resize_once() {
         now,
         640.0,
         480.0,
-        600
+        600,
+        2.0
     ));
     assert!(deadline.is_none(), "the asynchronous response is consumed");
 
@@ -2319,7 +2643,8 @@ fn asynchronous_canvas_snap_owns_the_platform_clamped_resize_once() {
         now,
         640.0,
         480.0,
-        600
+        600,
+        2.0
     ));
 }
 
@@ -2335,7 +2660,8 @@ fn ignored_canvas_snap_expires_before_a_later_user_resize() {
         now + Duration::from_millis(1),
         640.0,
         480.0,
-        600
+        600,
+        2.0
     ));
     assert!(deadline.is_none(), "the expired request is discarded");
 }
@@ -3134,6 +3460,75 @@ fn status_bar_draws_volume_control_and_maps_pointer_position() {
         pixel(&frame, track.x + track.w / 4, track.y + track.h / 2, scale),
         VOLUME_FILL.to_le_bytes()
     );
+
+    // The speaker cone, not just its sound arcs, is the mute button.
+    let cone = ((VOLUME_GLYPH_X + 6) as i32, (track.y + track.h / 2) as i32);
+    let layout = bar_layout(&MediaBar {
+        drives: Default::default(),
+        cd: None,
+    });
+    assert_eq!(control_at(cone, &layout), Some(BarControl::Volume));
+    assert!(volume_mute_hit_rect().contains(cone));
+    // The mute area ends before the knob at 0% begins.
+    let mute = volume_mute_hit_rect();
+    assert!(mute.x + mute.w <= volume_slider_knob_rect(0).x);
+}
+
+#[test]
+fn speaker_click_mutes_and_restores_the_volume() {
+    let mut app = test_app();
+    let track = volume_slider_track_rect();
+    let at = |percent: usize| {
+        (
+            (track.x + (track.w - 1) * percent / 100) as i32,
+            track.y as i32,
+        )
+    };
+    let volume = |app: &super::App| app.emu.bus().output_volume_percent();
+
+    app.set_output_volume_from_pos(at(60));
+    let high = volume(&app);
+    assert!(high > 0);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 0);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), high);
+
+    // A slider click while muted unmutes to where it landed, and the next
+    // mute saves that value instead.
+    app.toggle_output_mute();
+    app.set_output_volume_from_pos(at(30));
+    let low = volume(&app);
+    assert!(low > 0 && low != high);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 0);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), low);
+}
+
+#[test]
+fn speaker_click_follows_volume_changed_outside_the_app() {
+    let mut app = test_app();
+    let volume = |app: &super::App| app.emu.bus().output_volume_percent();
+
+    // A state load while muted brings the volume back: the next click
+    // mutes rather than restoring the stale saved value.
+    app.emu.bus_mut().set_output_volume_percent(40);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 0);
+    app.emu.bus_mut().set_output_volume_percent(80);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 0);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 80);
+
+    // Slider dragged to 0%: the click has nothing to restore and comes
+    // back at full volume.
+    let track = volume_slider_track_rect();
+    app.set_output_volume_from_pos((track.x as i32, track.y as i32));
+    assert_eq!(volume(&app), 0);
+    app.toggle_output_mute();
+    assert_eq!(volume(&app), 100);
 }
 
 #[test]
@@ -4419,10 +4814,15 @@ fn test_app_with_audio_cpu_and_program(
         crate::config::Tint::None,
         false,
         false,
+        crate::config::HostMonitor::Auto,
+        None,
+        1.0,
+        false,
         crate::config::WarpSpeed::Max,
         crate::config::JoystickInputMode::Gamepad,
         50,
         crate::config::MouseCapture::Click,
+        false,
         vec!["Machine: test".to_string()],
         crate::config::RawConfig::default(),
         None,
@@ -4536,10 +4936,15 @@ fn test_app_with_copperhf_units(units: &[(usize, PathBuf)]) -> super::App {
         crate::config::Tint::None,
         false,
         false,
+        crate::config::HostMonitor::Auto,
+        None,
+        1.0,
+        false,
         crate::config::WarpSpeed::Max,
         crate::config::JoystickInputMode::Gamepad,
         50,
         crate::config::MouseCapture::Click,
+        false,
         vec!["Machine: test".to_string()],
         raw,
         None,
@@ -5167,6 +5572,49 @@ fn auto_launch_runs_only_when_the_config_asks() {
         !app.run_honors_power_on,
         "the one-shot intent must not leak into a later manual Run"
     );
+}
+
+#[test]
+fn automatic_run_retains_window_modes_and_host_monitor_before_window_creation() {
+    // Auto-launch replaces the placeholder before resumed creates a host
+    // window. Both mode fields must describe that new configuration.
+    for (fullscreen, maximized) in [(false, true), (true, false), (true, true), (false, false)] {
+        let mut raw = crate::config::RawConfig::default();
+        raw.display.full_screen = Some(fullscreen);
+        raw.display.maximized = Some(maximized);
+        raw.display.window_scale = Some(2.0);
+        raw.display.monitor = Some("2".into());
+        let cfg = crate::config::Config::try_from(raw.clone()).expect("config");
+        let mut app = test_app();
+        app.run_honors_power_on = true;
+        let emu = test_emulator(Box::new(NullSink), crate::config::CpuModel::M68000, &[]);
+        app.run_machine(emu, &cfg, raw);
+        assert!(app.render.is_none());
+        assert_eq!(app.start_fullscreen, fullscreen);
+        assert_eq!(app.start_maximized, maximized && !fullscreen);
+        assert_eq!(app.host_monitor, crate::config::HostMonitor::Index(2));
+        assert_eq!(app.window_scale, 2.0);
+    }
+}
+
+#[test]
+fn running_a_new_window_scale_in_debug_defers_canvas_sizing() {
+    let mut raw = crate::config::RawConfig::default();
+    raw.display.window_scale = Some(2.0);
+    let cfg = crate::config::Config::try_from(raw.clone()).expect("config");
+    let mut app = test_app();
+    app.enter_debug_workspace();
+    let emu = test_emulator(Box::new(NullSink), crate::config::CpuModel::M68000, &[]);
+    app.run_machine(emu, &cfg, raw);
+    assert!(app.debug_layout_active, "Run must keep the workspace open");
+    assert_eq!(app.window_scale, 2.0);
+    assert_eq!(app.pending_canvas_follow, Some(super::CanvasFollow::Snap));
+    app.resync_surface_size();
+    assert_eq!(app.pending_canvas_follow, Some(super::CanvasFollow::Snap));
+    app.leave_debug_workspace();
+    assert!(!app.debug_layout_active);
+    // The deferred request survives until a host window is available in Play.
+    assert_eq!(app.pending_canvas_follow, Some(super::CanvasFollow::Snap));
 }
 
 #[test]
@@ -8077,6 +8525,8 @@ fn dropped_media_classifies_by_extension() {
     let _ = std::fs::remove_file(&chd);
     assert_eq!(kind("disk.hdf"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("disk.HDZ"), DroppedMediaKind::HardDisk);
+    // A WinUAE VHD, which used to go to the floppy bay.
+    assert_eq!(kind("Disk.VHD"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("disk.img"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("kick31.rom"), DroppedMediaKind::Rom);
     // Every shape a WHDLoad package comes in, since the launcher and the
@@ -10011,7 +10461,11 @@ fn autocrop_latch_grows_fast_and_shrinks_only_when_stable() {
 #[test]
 fn display_src_layout_refits_the_multiple_against_the_rect() {
     use super::scaler::ScaleFilter::{Nearest, SharpBilinear};
-    let crop = |rect| super::DisplaySrc { rect, par: (1, 1) };
+    let crop = |rect| super::DisplaySrc {
+        rect,
+        par: (1, 1),
+        horizontal_repeat: 1,
+    };
     let game = (38, 69, 640, 400);
     // A 200-line lo-res game (400 woven rows, 640 canvas px wide) on a
     // 2000x1200 surface, above a pre-sized 100-row chrome band (the
@@ -10318,6 +10772,7 @@ fn per_axis_layout_draws_the_rect_at_its_factors() {
     let src = super::DisplaySrc {
         rect: (38, 71, 640, 400),
         par: ntsc,
+        horizontal_repeat: 1,
     };
     let layout = super::display_src_layout((1920, 1036), true, src, None);
     assert_eq!(layout.factors, Some((2, 5)));
@@ -11852,6 +12307,7 @@ pub(super) mod uaelib_insights {
         let mut app = test_app();
         fit_uaelib(&mut app);
         app.open_console();
+        app.debug_snapshot_dirty.set(false);
         let mask = app.emu.machine.ui_addr_mask();
         {
             let bus = app.emu.bus_mut();
@@ -11870,34 +12326,164 @@ pub(super) mod uaelib_insights {
         assert!(!app.service_uaelib(), "a log line changes no pacing");
         let panel = app.console_panel.as_ref().unwrap();
         assert_eq!(panel.output.back().map(String::as_str), Some("DBG: hello"));
+        assert!(app.debug_snapshot_dirty.get());
     }
 
     #[test]
-    fn guest_debug_lines_while_the_console_is_closed_are_discarded() {
+    fn guest_mmio_debug_lines_refresh_an_open_console() {
+        let program = [
+            0x23FC, 0x0016, 0xA020, 0x00BF, 0xFF00, // chip-RAM value
+            0x23FC, 0x0016, 0xA020, 0x00BF, 0xFF00, // same value for hex
+            0x23FC, 0x0000, 0x2000, 0x00BF, 0xFF04, // format pointer
+            0x60FE,
+        ];
+        for paused in [true, false] {
+            let mut app = super::test_app_with_audio_cpu_and_program(
+                Box::new(crate::audio::NullSink),
+                crate::config::CpuModel::M68000,
+                &program,
+            );
+            fit_uaelib(&mut app);
+            let format = b"Output value: %ld ($%lx)\n\0";
+            app.emu.bus_mut().mem.chip_ram[0x2000..0x2000 + format.len()].copy_from_slice(format);
+            app.open_console();
+            app.paused = paused;
+            // The workspace has already presented and cached its console.
+            // Both a debugger step and ordinary frame execution must surface
+            // new logs without waiting for another UI interaction or timer.
+            app.debug_snapshot_dirty.set(false);
+            if paused {
+                app.emu.debug_step_instructions(3).unwrap();
+            } else {
+                app.emu.step_frame().unwrap();
+            }
+            assert_eq!(app.paused, paused);
+            assert!(!app.service_uaelib());
+            assert_eq!(
+                app.console_panel
+                    .as_ref()
+                    .unwrap()
+                    .output
+                    .back()
+                    .map(String::as_str),
+                Some("DBG: Output value: 1482784 ($16a020)")
+            );
+            assert!(
+                app.debug_snapshot_dirty.get(),
+                "delivering guest output must refresh the cached console UI: paused={paused}"
+            );
+            // An empty poll should leave a freshly presented console cached.
+            app.debug_snapshot_dirty.set(false);
+            assert!(!app.service_uaelib());
+            assert!(!app.debug_snapshot_dirty.get());
+        }
+    }
+
+    fn emit_guest_debug_line(app: &mut App, text: &str) {
+        let mask = app.emu.machine.ui_addr_mask();
+        let bus = app.emu.bus_mut();
+        bus.mem.chip_ram[0x2000..0x2000 + text.len()].copy_from_slice(text.as_bytes());
+        bus.mem.chip_ram[0x2000 + text.len()] = 0;
+        let mem = &mut bus.mem;
+        let lib = bus.uaelib.as_mut().unwrap();
+        lib.call(
+            crate::uaelib::FN_DEBUG_LOG,
+            [0x2000, 0, 0, 0, 0],
+            mem,
+            mask,
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn guest_debug_lines_survive_console_open_close_and_clear() {
         let mut app = test_app();
         fit_uaelib(&mut app);
-        let mask = app.emu.machine.ui_addr_mask();
-        {
-            let bus = app.emu.bus_mut();
-            bus.mem.chip_ram[0x2000..0x2006].copy_from_slice(b"early\0");
-            let mem = &mut bus.mem;
-            let lib = bus.uaelib.as_mut().unwrap();
-            lib.call(
-                crate::uaelib::FN_DEBUG_LOG,
-                [0x2000, 0, 0, 0, 0],
-                mem,
-                mask,
-                0,
-                0,
-            );
-        }
+        emit_guest_debug_line(&mut app, "early");
+        app.service_uaelib();
+        // Opening also drains anything the guest logged since the last frame.
+        emit_guest_debug_line(&mut app, "pending");
+        app.open_console();
+        assert_eq!(
+            app.console_panel
+                .as_ref()
+                .unwrap()
+                .output
+                .back()
+                .map(String::as_str),
+            Some("DBG: pending")
+        );
+        assert!(app
+            .console_panel
+            .as_ref()
+            .unwrap()
+            .output
+            .contains(&"DBG: early".into()));
+
+        app.close_tool_panel(super::ToolPanelKind::Console);
+        emit_guest_debug_line(&mut app, "later");
         app.service_uaelib();
         app.open_console();
-        app.service_uaelib();
+        let lines: Vec<&str> = app
+            .console_panel
+            .as_ref()
+            .unwrap()
+            .output
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(lines[1..], ["DBG: early", "DBG: pending", "DBG: later"]);
+
+        emit_guest_debug_line(&mut app, "queued before clear");
+        app.console_panel.as_mut().unwrap().input = "CLEAR".into();
+        app.console_submit();
+        assert!(app.console_backlog.is_empty());
+        assert!(app.console_panel.as_ref().unwrap().output.is_empty());
+        app.close_tool_panel(super::ToolPanelKind::Console);
+        app.open_console();
+        assert!(!app
+            .console_panel
+            .as_ref()
+            .unwrap()
+            .output
+            .iter()
+            .any(|line| line.starts_with("DBG:")));
+    }
+
+    #[test]
+    fn closed_console_guest_backlog_keeps_only_the_latest_500_lines() {
+        let mut app = test_app();
+        fit_uaelib(&mut app);
+        for i in 0..crate::video::ui::CONSOLE_SCROLLBACK_LINES + 3 {
+            emit_guest_debug_line(&mut app, &format!("line {i}"));
+            app.service_uaelib();
+        }
+        assert_eq!(
+            app.console_backlog.len(),
+            crate::video::ui::CONSOLE_SCROLLBACK_LINES
+        );
+        assert_eq!(
+            app.console_backlog.front().map(String::as_str),
+            Some("DBG: line 3")
+        );
+        assert_eq!(
+            app.console_backlog.back().map(String::as_str),
+            Some("DBG: line 502")
+        );
+        app.open_console();
         let panel = app.console_panel.as_ref().unwrap();
-        assert!(
-            !panel.output.iter().any(|line| line.starts_with("DBG:")),
-            "lines from before the pane opened are not replayed"
+        assert_eq!(
+            panel.output.len(),
+            crate::video::ui::CONSOLE_SCROLLBACK_LINES
+        );
+        assert_eq!(
+            panel.output.front().map(String::as_str),
+            Some("DBG: line 3")
+        );
+        assert_eq!(
+            panel.output.back().map(String::as_str),
+            Some("DBG: line 502")
         );
     }
 

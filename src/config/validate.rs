@@ -414,6 +414,26 @@ impl TryFrom<RawConfig> for Config {
             Some(s) => parse_menu_scale(s)?,
         };
         let full_screen = raw.display.full_screen.unwrap_or(defaults.full_screen);
+        let maximized = raw.display.maximized.unwrap_or(defaults.maximized);
+        let monitor = raw
+            .display
+            .monitor
+            .as_deref()
+            .map(str::parse::<HostMonitor>)
+            .transpose()
+            .context("[display] monitor")?
+            .unwrap_or_default();
+        let window_position = match raw.display.position.as_deref() {
+            None => None,
+            Some([x, y]) => Some([*x, *y]),
+            Some(_) => bail!("[display] position must contain exactly X and Y"),
+        };
+        let window_scale = raw.display.window_scale.unwrap_or(defaults.window_scale);
+        if !(0.5..=4.0).contains(&window_scale) {
+            errors.push(anyhow!(
+                "[display] window_scale must be between 0.5 and 4.0, got {window_scale}"
+            ));
+        }
         let status_bar = raw.display.status_bar.unwrap_or(defaults.status_bar);
         let joystick_input_mode = match raw.input.joystick.as_deref() {
             None => defaults.joystick_input_mode,
@@ -431,6 +451,10 @@ impl TryFrom<RawConfig> for Config {
             None => defaults.mouse_capture,
             Some(s) => parse_mouse_capture(s)?,
         };
+        let middle_click_release = raw
+            .input
+            .middle_click_release
+            .unwrap_or(defaults.middle_click_release);
         // An implausibly fast autofire is a typo, not a preference: at more
         // than ~30 Hz the pulse is shorter than the frame the guest samples
         // it on, so the button would read as noise or as never pressed.
@@ -1485,11 +1509,16 @@ impl TryFrom<RawConfig> for Config {
             hidpi_texture,
             tint,
             menu_scale,
+            window_scale,
             full_screen,
+            maximized,
+            monitor,
+            window_position,
             status_bar,
             joystick_input_mode,
             mouse_sensitivity,
             mouse_capture,
+            middle_click_release,
             autofire_hz,
             port_devices,
             parallel_joysticks,
@@ -1593,7 +1622,8 @@ pub(crate) fn parse_overscan(s: &str) -> Result<Overscan> {
     match s.trim().to_ascii_lowercase().as_str() {
         "full" => Ok(Overscan::Full),
         "tv" => Ok(Overscan::Tv),
-        other => bail!("[display] overscan must be \"full\" or \"tv\", got \"{other}\""),
+        "smart" => Ok(Overscan::Smart),
+        other => bail!("[display] overscan must be \"tv\", \"smart\" or \"full\", got \"{other}\""),
     }
 }
 

@@ -447,12 +447,14 @@ const VOLUME_SLIDER_Y: usize = STATUS_CONTROL_Y + 7;
 // The slider is as wide as the slot between the media controls and the menu
 // button leaves once the two icon toggles below have taken their 24 pixels
 // each: the bar has one free run of x, and every control on it competes for
-// the same worst case (four floppies plus a CD, ending at x=372).
-const VOLUME_SLIDER_W: usize = 48;
+// the same worst case (four floppies plus a CD, ending at x=372), less the
+// breathing room between the speaker glyph and the knob at 0%.
+const VOLUME_SLIDER_W: usize = 44;
 const VOLUME_SLIDER_H: usize = 8;
 const VOLUME_KNOB_W: usize = 8;
 const VOLUME_KNOB_H: usize = 16;
-const VOLUME_GLYPH_X: usize = VOLUME_SLIDER_X - 16;
+const VOLUME_GLYPH_X: usize = VOLUME_SLIDER_X - 20;
+const VOLUME_GLYPH_W: usize = 13;
 // Joystick input-source and on-screen-keyboard toggles: compact icon buttons
 // just left of the volume glyph, in the otherwise-free slot before the
 // right-hand control cluster. The widest media layout (four floppies plus a
@@ -556,17 +558,30 @@ fn last_bezel_style(style: BezelStyle) -> BezelStyle {
     }
 }
 
-/// Whether a window's logical inner size equals the presentation canvas
-/// (FB_WIDTH x `canvas_height`) within a small rounding tolerance -- i.e. the
-/// user has not manually resized it.
-fn logical_size_is_canvas(logical_w: f64, logical_h: f64, canvas_height: usize) -> bool {
-    (logical_w - FB_WIDTH as f64).abs() < 2.0 && (logical_h - canvas_height as f64).abs() < 2.0
+/// Requested logical size, independent of the monitor's DPI factor.
+fn canvas_window_size(canvas_height: usize, window_scale: f64) -> LogicalSize<f64> {
+    LogicalSize::new(
+        FB_WIDTH as f64 * window_scale,
+        canvas_height as f64 * window_scale,
+    )
+}
+
+/// Whether the window still matches its configured canvas multiple, within
+/// a small rounding tolerance, rather than a size chosen by dragging it.
+fn logical_size_is_canvas(
+    logical_w: f64,
+    logical_h: f64,
+    canvas_height: usize,
+    window_scale: f64,
+) -> bool {
+    let size = canvas_window_size(canvas_height, window_scale);
+    (logical_w - size.width).abs() < 2.0 && (logical_h - size.height).abs() < 2.0
 }
 
 const CANVAS_SNAP_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a canvas change still owes the window, when it could not be paid
-/// at the time: fullscreen was holding the window and nothing could be
+/// at the time: fullscreen or maximization was holding the window and nothing could be
 /// resized.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum CanvasFollow {
@@ -588,11 +603,12 @@ fn resize_is_canvas_owned(
     logical_w: f64,
     logical_h: f64,
     canvas_height: usize,
+    window_scale: f64,
 ) -> bool {
     snap_request_deadline
         .take()
         .is_some_and(|deadline| now <= deadline)
-        || logical_size_is_canvas(logical_w, logical_h, canvas_height)
+        || logical_size_is_canvas(logical_w, logical_h, canvas_height, window_scale)
 }
 
 /// Host mouse speed multiplier for a 0-100 sensitivity. Exponential so 50 is
@@ -1082,6 +1098,7 @@ pub struct App {
     /// Pixels per `present_fb` row: FB_WIDTH classically, twice that for
     /// a 35 ns super-hi-res canvas.
     present_width: usize,
+    present_horizontal_repeat: usize,
     /// TV-aperture crop rows for the presented frame when it is a standard
     /// 15 kHz scan with the standard horizontal window (None otherwise);
     /// applied by the present copy under `Overscan::Tv`.
@@ -1133,6 +1150,8 @@ pub struct App {
     /// The debugger console: a GDB-flavoured command line in its own tool
     /// window, so it can sit beside the debugger and Frame Analyzer.
     console_panel: Option<ui::ConsolePanel>,
+    /// Recent guest debug lines, retained across console open/close cycles.
+    console_backlog: std::collections::VecDeque<String>,
     /// Beam-space render of the analyzer trace's frame for the picture
     /// underlay: unlike `fb`, no presentation recentring or TV masking is
     /// applied, so its pixels line up with the DMA trace's beam grid.
@@ -1175,6 +1194,7 @@ pub struct App {
     /// ends once the last of them has been saved.
     auto_shot: Vec<(f32, PathBuf)>,
     pending_auto_shot: Vec<(f32, PathBuf)>,
+    native_screenshots: bool,
     /// `--expect-screenshot` checks, armed like `auto_shot` (deadline
     /// order) and captured through the same frame path.
     auto_expect: Vec<crate::expect::ExpectShotSpec>,
@@ -1295,12 +1315,15 @@ pub struct App {
     /// from the current size so a snap the platform clamped or rounded does
     /// not read as the user's own drag and disable future snaps.
     window_manually_sized: bool,
+    /// Configured logical canvas multiple, retained while the window follows
+    /// canvas changes. A manual resize takes ownership as usual.
+    window_scale: f64,
     /// Deadline for the asynchronous response to the last canvas snap, so a
     /// platform-clamped result is not counted as the user's resize. Bounded
     /// because a window manager may ignore the request entirely.
     snap_request_deadline: Option<Instant>,
     /// A canvas change that could not size the window because it was
-    /// fullscreen, waiting for the window to come back.
+    /// fullscreen or maximized, waiting for the window to come back.
     pending_canvas_follow: Option<CanvasFollow>,
     cursor_pos: Option<(i32, i32)>,
     last_display_cursor_pos: Option<(i32, i32)>,
@@ -1313,6 +1336,10 @@ pub struct App {
     /// pixel.
     last_cursor_phys: Option<winit::dpi::PhysicalPosition<f64>>,
     volume_dragging: bool,
+    /// The volume the speaker glyph muted from; clicking it at 0% restores
+    /// this, or full volume when there is nothing to restore. Slider and
+    /// keyboard volume changes forget it.
+    volume_before_mute: Option<u8>,
     /// A scroll arrow held down: which control, and when its next repeat is
     /// due. A click moves one row and lets go; keeping the button down
     /// starts the list running after a pause, the way a held key does. Any
@@ -1418,6 +1445,9 @@ pub struct App {
     /// the menu steps change the live value without affecting the
     /// configured start-up one.
     tv_centre: crate::config::TvCentre,
+    /// Manual trim plus the latched Smart correction. Every picture and
+    /// input mapping consumes this same resolved position.
+    present_tv_centre: crate::config::TvCentre,
     /// Window shader pass in effect ([display] shader). Presentation only:
     /// screenshots, frame dumps and recordings never go through it.
     crt_shader_kind: crate::config::ShaderKind,
@@ -1459,6 +1489,9 @@ pub struct App {
     /// full_screen). Applied once in `resumed`; the runtime toggle takes over
     /// after that.
     start_fullscreen: bool,
+    start_maximized: bool,
+    host_monitor: crate::config::HostMonitor,
+    window_position: Option<[i32; 2]>,
     /// Host USB gamepad reader (pure-Rust, no SDL2), mapped to the emulated
     /// port-2 digital joystick via a per-pad calibration. A no-op when no
     /// input backend is available (e.g. headless CI) or the pad is not yet
@@ -1500,6 +1533,10 @@ pub struct App {
     /// click, automatically whenever the window holds the focus, or only on
     /// the Cmd/Alt+G shortcut.
     mouse_capture: crate::config::MouseCapture,
+    /// Middle click releases capture instead of reaching the guest.
+    middle_click_release: bool,
+    /// Consume the matching lift after a middle click released capture.
+    middle_click_release_held: bool,
     /// Whether the "press Cmd/Alt+G to release" hint has been shown for an
     /// automatic capture yet. Auto mode grabs on every focus gain, and a
     /// message on each one would be noise; the operator only needs telling
@@ -1597,6 +1634,10 @@ pub struct App {
     about_redraw_at: Instant,
     /// Emulated-machine summary lines for the About window.
     about_machine_lines: Vec<String>,
+    /// The About panel's update check, for the session: not asked until
+    /// its button is pressed.
+    #[cfg(feature = "update-check")]
+    update_check: app_update::UpdateCheck,
     /// Raw config of the running (or last-applied) machine, so the "Machine
     /// Configuration..." menu item reopens the launcher showing the current
     /// settings.
@@ -2316,6 +2357,8 @@ struct RenderWorkerResult {
     presentation_fb: Vec<u32>,
     present_rows: usize,
     present_width: usize,
+    placement: FieldPlacement,
+    horizontal_repeat: usize,
     /// The frame's aperture classification; the App resolves it through
     /// its `PresentationLatch` when the result lands, so border-only
     /// frames keep the previous geometry.
@@ -2630,11 +2673,16 @@ impl App {
         vsync: bool,
         tint: crate::config::Tint,
         start_fullscreen: bool,
+        start_maximized: bool,
+        host_monitor: crate::config::HostMonitor,
+        window_position: Option<[i32; 2]>,
+        window_scale: f64,
         hide_status_bar: bool,
         warp_speed: WarpSpeed,
         joystick_input_mode: JoystickInputMode,
         mouse_sensitivity: u8,
         mouse_capture: crate::config::MouseCapture,
+        middle_click_release: bool,
         about_machine_lines: Vec<String>,
         machine_config: RawConfig,
         runahead_machine_block: Option<&'static str>,
@@ -2723,6 +2771,7 @@ impl App {
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
             present_width: FB_WIDTH,
+            present_horizontal_repeat: 1,
             rtg_fb: Vec::new(),
             rtg_present_dims: None,
             present_tv_aperture_rows: Some(TV_PAL_PRESENT_HEIGHT),
@@ -2744,6 +2793,7 @@ impl App {
             debugger_panel: None,
             frame_analyzer_panel: None,
             console_panel: None,
+            console_backlog: std::collections::VecDeque::new(),
             analyzer_underlay_fb: std::rc::Rc::new(Vec::new()),
             analyzer_underlay_rows: 0,
             analyzer_underlay_width: FB_WIDTH,
@@ -2759,6 +2809,7 @@ impl App {
             paused: false,
             auto_shot: Vec::new(),
             pending_auto_shot: screenshot_after,
+            native_screenshots: false,
             auto_expect: Vec::new(),
             pending_auto_expect: Vec::new(),
             verdict: crate::verdict::RunVerdict::default(),
@@ -2811,12 +2862,14 @@ impl App {
             main_window_focused: false,
             clipboard_next_poll: None,
             window_manually_sized: false,
+            window_scale,
             snap_request_deadline: None,
             pending_canvas_follow: None,
             cursor_pos: None,
             last_display_cursor_pos: None,
             last_cursor_phys: None,
             volume_dragging: false,
+            volume_before_mute: None,
             scroll_hold: None,
             cycle_hold: None,
             nav: crate::video::nav::Nav::default(),
@@ -2852,6 +2905,7 @@ impl App {
             hcenter: hcenter_enabled(),
             overscan,
             tv_centre,
+            present_tv_centre: tv_centre,
             crt_shader_kind: shader.kind(),
             custom_shader_path: match &shader {
                 crate::config::ShaderMode::Custom(path) => Some(path.clone()),
@@ -2867,6 +2921,9 @@ impl App {
             tint,
             tint_lut: tint_lut(tint),
             start_fullscreen,
+            start_maximized,
+            host_monitor,
+            window_position,
             gamepad: crate::gamepad::GamepadReader::new(),
             gamepad_available: [false; 4],
             gamepad_quit_hold: None,
@@ -2881,6 +2938,8 @@ impl App {
             mouse_sensitivity,
             mouse_sensitivity_factor: mouse_sensitivity_factor(mouse_sensitivity),
             mouse_capture,
+            middle_click_release,
+            middle_click_release_held: false,
             auto_capture_hint_shown: false,
             warp_speed,
             rewind_budget_mb,
@@ -2917,6 +2976,8 @@ impl App {
             about_opened_at: Instant::now(),
             about_redraw_at: Instant::now(),
             about_machine_lines,
+            #[cfg(feature = "update-check")]
+            update_check: app_update::UpdateCheck::Idle,
             machine_config,
             paused_before_debugger: false,
             paused_before_analyzer: false,
@@ -3151,8 +3212,8 @@ impl App {
             self.present_rows,
             self.present_width,
             self.overscan,
-            self.tv_centre,
-            self.present_tv_aperture_rows,
+            self.present_tv_centre,
+            self.window_tv_aperture_rows(),
             present_height(),
         )?;
         placement.field_point(sx, sy, self.present_rows)
@@ -3830,6 +3891,11 @@ impl App {
         self.pending_auto_expect = specs;
     }
 
+    /// Use original field pixels for screenshots and expectations.
+    pub fn set_native_screenshots(&mut self, native: bool) {
+        self.native_screenshots = native;
+    }
+
     /// `--exit-on-return`: end the run when the `--run` program's return
     /// code appears in `marker`, and exit with that code.
     pub fn set_exit_on_return(&mut self, marker: PathBuf) {
@@ -4387,7 +4453,7 @@ impl ApplicationHandler for App {
         // Keep the internal overscan field buffer, but present it with
         // the configured pixel aspect: a standard 4:3 Amiga display by
         // default, or square pixels ([display] pixel_aspect = "square").
-        let size = LogicalSize::new(FB_WIDTH as f64, window_present_height() as f64);
+        let size = canvas_window_size(window_present_height(), self.window_scale);
         // Headless capture (screenshot / frame dump) renders into the
         // framebuffer for the saved PNG but has no interactive viewer, so
         // create the window hidden: it avoids flashing an empty window on
@@ -4398,18 +4464,40 @@ impl ApplicationHandler for App {
             || self.pending_frame_dump.is_some();
         // Start fullscreen only for an interactive window ([display] full_screen
         // / --full-screen); a headless capture window stays hidden and windowed.
-        let fullscreen =
-            (self.start_fullscreen && !headless_capture).then(|| Fullscreen::Borderless(None));
-        let attrs = WindowAttributes::default()
+        let monitors: Vec<_> = event_loop.available_monitors().collect();
+        let selected_monitor = if headless_capture {
+            None
+        } else {
+            monitors::resolve(&self.host_monitor, &monitors, event_loop.primary_monitor())
+        };
+        let position = monitors::effective_window_position(
+            self.window_position,
+            self.start_fullscreen || headless_capture,
+            self.start_maximized,
+        );
+        let placement_monitor = selected_monitor.clone().or_else(|| {
+            if monitors::auto_position_uses_primary(&self.host_monitor, position) {
+                event_loop.primary_monitor()
+            } else {
+                None
+            }
+        });
+        let fullscreen = (self.start_fullscreen && !headless_capture)
+            .then(|| Fullscreen::Borderless(selected_monitor.clone()));
+        let mut attrs = WindowAttributes::default()
             .with_title(window_title())
             .with_window_icon(copperline_window_icon())
             .with_visible(!headless_capture)
             .with_fullscreen(fullscreen)
+            .with_maximized(self.start_maximized && !self.start_fullscreen && !headless_capture)
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(
                 FB_WIDTH as f64 / 2.0,
                 window_present_height() as f64 / 2.0,
             ));
+        if let Some(monitor) = &placement_monitor {
+            attrs = attrs.with_position(monitors::initial_position(monitor, size, position));
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -4418,6 +4506,9 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        if selected_monitor.is_some() && !self.start_fullscreen {
+            monitors::windowed_placement_supported(&window);
+        }
         // winit's with_window_icon above does nothing for the macOS dock; set
         // the application icon explicitly now that NSApplication exists.
         #[cfg(target_os = "macos")]
@@ -4518,6 +4609,10 @@ impl ApplicationHandler for App {
             minimized: false,
             surface_size: (inner.width.max(1), inner.height.max(1)),
         });
+        self.refresh_launcher_monitors();
+        // The first resize is the platform's response to our initial size,
+        // including any clamp to the available desktop area.
+        self.snap_request_deadline = Some(Instant::now() + CANVAS_SNAP_RESPONSE_TIMEOUT);
         // After the window exists, so the overlay has somewhere to be drawn.
         if let Some(msg) = shader_error {
             self.show_osd(format!("CRT shader: off (custom failed: {msg})"));
@@ -4558,6 +4653,11 @@ impl ApplicationHandler for App {
             .is_some_and(|render| render.window.id() != window_id)
         {
             return;
+        }
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if self.handle_middle_click_release(*button, *state) {
+                return;
+            }
         }
         if self.route_debug_workspace_event(&event) {
             return;
@@ -4992,6 +5092,7 @@ impl ApplicationHandler for App {
                 } else {
                     self.volume_dragging = false;
                     self.analyzer_dragging = false;
+                    self.middle_click_release_held = false;
                     self.set_mouse_captured(false);
                     // The button that was holding a keycap will lift over
                     // some other window, where no MouseInput reaches us.
@@ -5166,8 +5267,12 @@ impl ApplicationHandler for App {
                                     self.nav.follow_pointer(crate::video::nav::NavTarget::Bar(
                                         BarControl::Volume,
                                     ));
-                                    self.volume_dragging = true;
-                                    self.set_output_volume_from_pos(pos);
+                                    if volume_mute_hit_rect().contains(pos) {
+                                        self.toggle_output_mute();
+                                    } else {
+                                        self.volume_dragging = true;
+                                        self.set_output_volume_from_pos(pos);
+                                    }
                                 }
                                 Some(control) => {
                                     self.nav
@@ -5269,6 +5374,7 @@ impl ApplicationHandler for App {
                 // keeps hover and click hit-testing aligned with the
                 // pixels this frame actually shows.
                 let display_src = self.display_canvas_src();
+                let window_aperture_rows = self.window_tv_aperture_rows();
                 if let (Some(phys), Some(r)) = (self.last_cursor_phys, self.render.as_ref()) {
                     self.cursor_pos = main_cursor_position(r, display_src, phys);
                 }
@@ -5467,13 +5573,12 @@ impl ApplicationHandler for App {
                                 frame,
                                 texture_scale,
                                 self.overscan,
-                                self.tv_centre,
+                                self.present_tv_centre,
                                 // The TV aperture is a chipset crop rect. An RTG
                                 // frame fills the buffer on its own terms, so
                                 // applying it here would show a sub-rect of the
                                 // board's screen.
-                                self.present_tv_aperture_rows
-                                    .filter(|_| self.rtg_present_dims.is_none()),
+                                window_aperture_rows.filter(|_| self.rtg_present_dims.is_none()),
                                 // A drawn bezel shows the tube aperture. Keyed to
                                 // the style alone, not bezel_active: an open
                                 // overlay suspends the bezel *pass*, and the
@@ -5666,9 +5771,9 @@ impl ApplicationHandler for App {
                             let scanlines = crt_scanline_count(
                                 self.present_rows,
                                 present_height(),
-                                self.present_tv_aperture_rows
+                                window_aperture_rows
                                     .filter(|_| {
-                                        self.overscan == Overscan::Tv
+                                        self.overscan.is_tv()
                                             && self.rtg_present_dims.is_none()
                                             && self.present_width == FB_WIDTH
                                     })
@@ -5726,8 +5831,8 @@ impl ApplicationHandler for App {
                                 self.present_width,
                                 texture_scale,
                                 self.overscan,
-                                self.tv_centre,
-                                self.present_tv_aperture_rows,
+                                self.present_tv_centre,
+                                window_aperture_rows,
                                 self.bezel.is_on(),
                             );
                             if let Some(display) = draws.first_mut() {
@@ -5898,6 +6003,11 @@ impl ApplicationHandler for App {
         self.poll_login();
         #[cfg(feature = "game-library")]
         self.poll_library_scan();
+        // The About panel's update check. The panel keeps the loop awake
+        // while it is up; closed, nothing shows the answer, so whenever
+        // the loop next wakes is soon enough to collect it.
+        #[cfg(feature = "update-check")]
+        self.poll_update_check();
         self.repeat_held_scroll();
         self.repeat_held_cycle();
         #[cfg(feature = "game-library")]
@@ -6344,7 +6454,7 @@ fn classify_dropped_media(path: &std::path::Path) -> DroppedMediaKind {
     match ext.as_deref() {
         Some("chd") if crate::harddrive::chd::is_hard_disk_chd(path) => DroppedMediaKind::HardDisk,
         Some("cue") | Some("iso") | Some("nrg") | Some("chd") => DroppedMediaKind::Cd,
-        Some("hdf") | Some("hdz") | Some("img") => DroppedMediaKind::HardDisk,
+        Some("hdf") | Some("hdz") | Some("vhd") | Some("img") => DroppedMediaKind::HardDisk,
         Some("rom") => DroppedMediaKind::Rom,
         // Every shape `package` accepts, or a dropped zip would be taken
         // for a disk image and handed to the floppy bay.
@@ -6571,6 +6681,7 @@ fn decode_embedded_png(bytes: &[u8]) -> Result<EmbeddedRgbaImage> {
 
 impl App {
     fn set_output_volume_from_pos(&mut self, pos: (i32, i32)) {
+        self.volume_before_mute = None;
         self.emu
             .bus_mut()
             .set_output_volume_percent(volume_percent_from_pos(pos));
@@ -6578,7 +6689,26 @@ impl App {
     }
 
     fn adjust_output_volume(&mut self, delta: i16) {
+        self.volume_before_mute = None;
         self.emu.bus_mut().adjust_output_volume_percent(delta);
+        self.request_redraw();
+    }
+
+    fn toggle_output_mute(&mut self) {
+        let bus = self.emu.bus_mut();
+        let current = bus.output_volume_percent();
+        // Decided from the live volume, not the saved one: a state load,
+        // rewind or new machine can change it behind App's back.
+        let percent = if current == 0 {
+            match self.volume_before_mute.take() {
+                Some(saved) if saved > 0 => saved,
+                _ => 100,
+            }
+        } else {
+            self.volume_before_mute = Some(current);
+            0
+        };
+        bus.set_output_volume_percent(percent);
         self.request_redraw();
     }
 
@@ -6727,6 +6857,7 @@ impl App {
         raw.display.bezel = Some(crate::config::RawBezel::Named(self.bezel.label().into()));
         raw.display.tv_h_centre = Some(self.tv_centre.h);
         raw.display.tv_v_centre = Some(self.tv_centre.v);
+        raw.display.overscan = Some(self.overscan.as_str().to_string());
         raw.display.full_screen = Some(
             self.render
                 .as_ref()
@@ -6844,6 +6975,8 @@ impl App {
                 }
             }
             UiControl::CalSave => self.save_calibration(),
+            #[cfg(feature = "update-check")]
+            UiControl::AboutUpdate => self.about_update_pressed(),
             UiControl::DebugTab(tab) => {
                 if let Some(panel) = self.debugger_panel.as_mut() {
                     panel.tab = tab;
@@ -6972,6 +7105,9 @@ impl App {
                 }
             }
             UiControl::LauncherCycle { field, forward } => {
+                if field == LauncherField::HostMonitor {
+                    self.refresh_launcher_monitors();
+                }
                 if let Some(state) = self.launcher_state_mut() {
                     // Reaching for another control ends the typing, the way
                     // Enter does: what is in the box counts. A value the
@@ -7054,6 +7190,14 @@ impl App {
                     state.edit_commit();
                     if state.editing().is_none() {
                         state.begin_edit_ram_pattern();
+                    }
+                }
+            }
+            UiControl::LauncherWindowPositionEdit => {
+                if let Some(state) = self.launcher_state_mut() {
+                    state.edit_commit();
+                    if state.editing().is_none() {
+                        state.begin_edit_window_position();
                     }
                 }
             }
@@ -7539,6 +7683,8 @@ mod app_menus;
 mod app_nav;
 mod app_netplay;
 mod app_states;
+#[cfg(feature = "update-check")]
+mod app_update;
 use app_nav::{cycle_hold_delay, PadNav};
 use native_dialog::PickRequest;
 mod adapter;
@@ -7556,9 +7702,11 @@ mod egui_debugger;
 mod gdb;
 mod host_input;
 mod kbdpanel;
+mod monitors;
 #[cfg(feature = "mt32")]
 mod mt32panel;
 mod native_dialog;
+pub use monitors::print_monitors;
 mod present;
 mod presenter;
 mod rtg_texture;

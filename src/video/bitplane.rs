@@ -4280,6 +4280,49 @@ impl RenderInput {
         )
     }
 
+    /// Finest programmed playfield/sprite pitch for an unfiltered capture.
+    pub(crate) fn native_canvas_scale(&self) -> usize {
+        // ECS accepts SPRES=11 but keeps its 70 ns serializer; only Lisa
+        // emits 35 ns sprite samples (sprite_pixel_repeat_subpixels).
+        let sprite_shres = self.render_base.agnus_revision == AgnusRevision::AgaAlice
+            && (self.render_base.bplcon3 & BPLCON3_SPRES_MASK == BPLCON3_SPRES_SHRES
+                || self.frame_render_events.iter().any(|event| {
+                    event.offset & 0x01FE == 0x106
+                        && event.value & BPLCON3_SPRES_MASK == BPLCON3_SPRES_SHRES
+                }));
+        if canvas_scale_for(true, self.render_base.bplcon0, &self.frame_render_events) == 2
+            || sprite_shres
+        {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub(crate) fn native_horizontal_repeat(&self) -> usize {
+        let hires = self.render_base.bplcon0 & 0x8000 != 0
+            || matches!(
+                self.render_base.bplcon3 & BPLCON3_SPRES_MASK,
+                BPLCON3_SPRES_HIRES | BPLCON3_SPRES_SHRES
+            )
+            || self
+                .frame_render_events
+                .iter()
+                .any(|event| match event.offset & 0x01FE {
+                    0x100 => event.value & 0x8000 != 0,
+                    0x106 => matches!(
+                        event.value & BPLCON3_SPRES_MASK,
+                        BPLCON3_SPRES_HIRES | BPLCON3_SPRES_SHRES
+                    ),
+                    _ => false,
+                });
+        if self.native_canvas_scale() == 2 || hires {
+            1
+        } else {
+            2
+        }
+    }
+
     /// Drop large shared frame snapshots once a render has completed while
     /// keeping this bundle's reusable event/sprite allocations. Releasing the
     /// RAM reference before the next beam-frame wrap lets the capture side
@@ -4676,13 +4719,22 @@ pub(super) fn active_debug_sprite_mask() -> u8 {
 /// renderer's own comparator mapping, so a caller cannot drift out of
 /// step with where the pixels actually land.
 pub fn sprite_framebuffer_origin(bus: &Bus, sprite: usize) -> Option<(i32, i32)> {
-    let top = bus
+    let base = bus.frame_render_base();
+    let geometry = bus.frame_geometry();
+    let timeline = crate::bus::SpriteDmaMatchTimeline::new(base.fmode, bus.frame_render_events());
+    let (top, hstart) = bus
         .frame_captured_sprite_lines()
         .iter()
         .filter(|line| line.sprite == sprite)
-        .min_by_key(|line| line.beam_y)?;
-    let base = bus.frame_render_base();
-    let geometry = bus.frame_geometry();
+        .filter_map(|line| {
+            timeline
+                .match_hstarts(line)
+                .into_iter()
+                .flatten()
+                .find(|&hstart| timeline.armed_at(line, hstart))
+                .map(|hstart| (line, hstart))
+        })
+        .min_by_key(|(line, hstart)| (line.beam_y, *hstart))?;
     // The comparator origin shift render_from_input installs for the
     // running scan; see ACTIVE_CANVAS_SHIFT_H.
     let shift = if geometry.programmable {
@@ -4690,7 +4742,6 @@ pub fn sprite_framebuffer_origin(bus: &Bus, sprite: usize) -> Option<(i32, i32)>
     } else {
         0
     };
-    let hstart = crate::bus::sprite_hstart_for_fmode(top.hstart, base.fmode);
     let x = (hstart + crate::bus::SPRITE_OUTPUT_DELAY_LORES - DIW_HSTART_FB0 + shift) * 2
         + i32::from(top.hsub_70ns && base.bplcon0 & BPLCON0_SHRES != 0);
     // Logical sprite coordinates live in the hi-res pitch domain; the
@@ -4733,18 +4784,25 @@ pub fn framebuffer_beam_position(bus: &Bus, x: i32, y: i32) -> Option<(u32, u32)
 }
 
 pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
-    render_from_input_impl(input, fb, false)
+    render_from_input_impl(input, fb, false, false)
+}
+
+/// Side-effect-free screenshot render at the finest canvas pitch, including
+/// standard-scan SHRES pixels that the normal presentation blends in pairs.
+pub(crate) fn render_native_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
+    render_from_input_impl(input, fb, false, true)
 }
 
 #[doc(hidden)]
 pub fn render_from_input_tracking_reuse(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
-    render_from_input_impl(input, fb, true)
+    render_from_input_impl(input, fb, true, false)
 }
 
 fn render_from_input_impl(
     input: &RenderInput,
     fb: &mut [u32],
     track_read_dependencies: bool,
+    native_canvas: bool,
 ) -> RenderResult {
     thread_local! {
         static RENDER_SCRATCH: std::cell::RefCell<RenderScratch> =
@@ -4752,7 +4810,13 @@ fn render_from_input_impl(
     }
     RENDER_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        render_from_input_with_scratch(input, fb, track_read_dependencies, &mut scratch)
+        render_from_input_with_scratch(
+            input,
+            fb,
+            track_read_dependencies,
+            native_canvas,
+            &mut scratch,
+        )
     })
 }
 
@@ -4760,6 +4824,7 @@ fn render_from_input_with_scratch(
     input: &RenderInput,
     fb: &mut [u32],
     track_read_dependencies: bool,
+    native_canvas: bool,
     scratch: &mut RenderScratch,
 ) -> RenderResult {
     let render_started = render_timing_start();
@@ -4771,7 +4836,11 @@ fn render_from_input_with_scratch(
             0
         })
     });
-    let canvas_scale = input.canvas_scale();
+    let canvas_scale = if native_canvas {
+        input.native_canvas_scale()
+    } else {
+        input.canvas_scale()
+    };
     ACTIVE_CANVAS_SCALE.with(|scale| scale.set(canvas_scale));
     let out_w = FB_WIDTH * canvas_scale;
     let mut render_timing = VideoRenderFrameTiming::default();
@@ -4905,8 +4974,11 @@ fn render_from_input_with_scratch(
     // A SPRxCTL write between a fetch slot and that channel's HSTART disarms
     // Denise before the serializer ever loads the fetched words, so those
     // captured lines are not displayed at all.
-    let armed_captured_sprite_lines =
-        retain_armed_captured_sprite_lines(&input.captured_sprite_lines, render_events);
+    let sprite_timeline = crate::bus::SpriteDmaMatchTimeline::new(state.fmode, render_events);
+    let armed_captured_sprite_lines = retain_armed_captured_sprite_lines_with_timeline(
+        &input.captured_sprite_lines,
+        &sprite_timeline,
+    );
     if input.sprite_dma_observed {
         let dma_seeded_lines = manual_sprite_lines_from_captured_dma_reuse(
             &state,
@@ -5634,6 +5706,7 @@ fn render_from_input_with_scratch(
         sprite_dma_observed,
         Some(&manual_sprite_lines),
         visible_line0,
+        &sprite_timeline,
     );
     render_timing.sprite_nanos = render_timing_elapsed(sprite_started);
     maybe_log_frame_pixel_samples(
