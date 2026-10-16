@@ -286,15 +286,19 @@ struct ReplayContext {
     ring: Vec<u8>,
 }
 
-const RING_BUF_SIZE: usize = 1 << 20; // 1 MiB: comfortably larger than any M1 trace's ring usage.
+/// Absolute ceiling on one context's cumulative replayed ring-command
+/// bytes -- an untrusted or corrupted trace's `ring_tail` fields can't
+/// drive an unbounded allocation, mirroring [`MAX_FLAT_MEMORY_SIZE`]'s
+/// same role for `APER`/`BLOB` sections.
+const MAX_REPLAY_RING_SIZE: usize = 256 * 1024 * 1024;
 
 /// Absolute ceiling on distinct ring contexts a single replay creates --
-/// each gets its own `RING_BUF_SIZE` (1 MiB) buffer up front, so an
-/// untrusted or corrupted trace naming many distinct (and individually
-/// tiny) `RING` sections' `context` values could otherwise drive an
-/// unbounded allocation from a small file. No real hardware or
-/// spec-legal implementation needs anywhere near this many concurrent
-/// contexts (Copperline's own board fixes `CONTEXT_COUNT` at 4).
+/// each gets its own growable ring buffer and `Context`, so an untrusted
+/// or corrupted trace naming many distinct `RING` sections' `context`
+/// values could otherwise drive unbounded allocation from a small file.
+/// No real hardware or spec-legal implementation needs anywhere near
+/// this many concurrent contexts (Copperline's own board fixes
+/// `CONTEXT_COUNT` at 4).
 const MAX_REPLAY_CONTEXTS: usize = 256;
 
 /// Replays every section of `bytes` against a fresh set of contexts and a
@@ -336,19 +340,42 @@ fn replay(
                 }
                 let entry = contexts.entry(r.context).or_insert_with(|| ReplayContext {
                     ctx: Context::new(Limits::default()),
-                    ring: vec![0u8; RING_BUF_SIZE],
+                    ring: Vec::new(),
                 });
                 // The bytes this RING section carries are exactly what the
                 // guest appended before writing `ring_tail`; place them at
                 // the ring's previous tail, matching the doorbell sequence
-                // `trace.rs`'s module doc comment describes.
+                // `trace.rs`'s module doc comment describes. The replay
+                // buffer is logically infinite (never wraps, unlike the
+                // real circular ring a live capture draws from -- see
+                // `C3dBoard`'s trace-capture doc comment) and grows on
+                // demand here, the same bounded-growth shape
+                // `FlatMemory::put` already uses for `APER`/`BLOB`
+                // sections, rather than a fixed pre-allocation: a long
+                // live-captured session's cumulative ring-command bytes
+                // (not its much larger texture/vertex payloads, which
+                // travel as `BLOB` sections into `FlatMemory` instead)
+                // has no size this tool can assume in advance.
                 let prev_tail = entry.ctx.ring_tail as usize;
                 let end = prev_tail + r.bytes.len();
-                if end > entry.ring.len() {
+                if end > MAX_REPLAY_RING_SIZE {
                     return Err(format!(
-                        "context {} RING section overflows the {}-byte replay ring buffer",
-                        r.context, RING_BUF_SIZE
+                        "context {} RING section exceeds the {MAX_REPLAY_RING_SIZE:#x}-byte replay ring bound",
+                        r.context
                     ));
+                }
+                // `+ 4`: `RingCursor::new` reserves one word to tell a
+                // full ring from an empty one (real `head`/`tail`
+                // circular-buffer semantics, `ring.rs`'s own doc comment
+                // on `new` vs `new_linear`) -- sized to `end` exactly,
+                // `occupied == ring.len()` on every context's first
+                // `RING` section (nothing consumed yet, the whole buffer
+                // freshly committed) would misreport `E_RING_OVERRUN`.
+                // The spare word is never addressed by any command this
+                // section's own `ring_tail` permits, so leaving it
+                // zeroed is fine.
+                if entry.ring.len() < end + 4 {
+                    entry.ring.resize(end + 4, 0);
                 }
                 entry.ring[prev_tail..end].copy_from_slice(r.bytes);
 

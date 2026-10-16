@@ -2732,6 +2732,10 @@ for the register model.
 [c3d]
 enabled = true
 # mask_caps = ["transform", "multitexture"]   # conformance testing only
+# trace = "quake-session.c3dtrace"            # default path for c3d.trace_start
+# trace_enabled = true                        # start capturing at boot
+# trace_rolling_bytes = 10_485_760             # bound the boot-time capture in memory
+# trace_trigger_texture = 42                   # defer the boot-time capture until this texture binds
 ```
 
 Fits a virtual fixed-function 3D accelerator board on the Zorro chain,
@@ -2752,9 +2756,37 @@ build. A masked bit behaves exactly like a device built without it: it
 reads clear, its opcodes are rejected, and dependent limit registers
 (`MAX_LIGHTS` and friends under `"transform"`, `MAX_TEXTURE_UNITS` under
 `"multitexture"`) report accordingly. Leave it unset for normal use.
-Board size, context count, timing preset and trace capture are not yet
-configuration knobs -- Copperline fits one fixed 32 MiB Zorro III window
-with 4 contexts. The device specification is
+Board size, context count and timing preset are not yet configuration
+knobs -- Copperline fits one fixed 32 MiB Zorro III window with 4
+contexts.
+
+`trace`/`trace_enabled` arm a live command-stream capture to a file
+`copperline-c3d-trace info`/`run`/`compare` can load directly -- useful
+for debugging a real guest driver (a game, a GL demo) without a live
+interactive session every time (see [](../internals/c3d), "Trace
+capture"). `trace` alone just sets the *default* path the control
+protocol's `c3d.trace_start` falls back to when called with no `path`
+of its own; set `trace_enabled = true` too to actually start capturing
+immediately at boot (to `trace` if set, else a timestamped file in the
+`[paths]` traces directory) -- boot, play normally, quit, and the whole
+session lands in that file with no control-protocol interaction at all.
+Leave both unset for normal use; a capture costs nothing when no
+`c3d.trace_start` ever arms one.
+
+`trace_rolling_bytes` bounds that boot-time capture in memory instead of
+streaming unbounded straight to `trace`'s file -- oldest doorbells
+evicted first, nothing written to disk until a `c3d.trace_snapshot`/
+`trace_stop` control call -- the fix for "a long real session's capture
+grows without limit". `trace_trigger_texture` instead defers the
+boot-time capture until that texture id is bound (`TEX_BIND`) on any
+context, rather than starting immediately, for when the problem
+texture's id is already known but its exact timing in a fresh run isn't.
+Both combine with `trace_rolling_bytes`/`trace`: a trigger that fires
+arms exactly the capture (bounded or not, to whichever path) `trace_enabled`
+alone would have started immediately. See [](../internals/c3d), "Trace
+capture" for the full mechanism and `c3d.trace_start`'s own
+`rolling_bytes`/`trigger_texture` control-protocol equivalents. The
+device specification is
 published separately from Copperline's own docs; see [](../internals/c3d)
 for Copperline's implementation notes and where to find it, and
 [](../zorro) for the autoconfig identity.

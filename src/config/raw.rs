@@ -1078,6 +1078,38 @@ pub(crate) struct RawC3d {
     /// dependent limit registers report accordingly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mask_caps: Option<Vec<String>>,
+    /// Host file for a live command-stream capture
+    /// (`docs/internals/c3d.md`'s "Trace capture",
+    /// `super::super::c3d::board::C3dBoard::trace_start`). Only
+    /// establishes the *default path* the `c3d.trace_start` control
+    /// method falls back to when called with no explicit path of its
+    /// own -- set `trace_enabled` too to actually start capturing at
+    /// boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trace: Option<String>,
+    /// Start a live command-stream capture immediately at boot, to
+    /// `trace` if set or else a timestamped file in the `[paths]` traces
+    /// directory. Absent/false: no capture starts until a
+    /// `c3d.trace_start` control call arms one explicitly. Combines with
+    /// `trace_rolling_bytes`/`trace_trigger_texture` below exactly like
+    /// `c3d.trace_start`'s own `rolling_bytes`/`trigger_texture`
+    /// parameters do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trace_enabled: Option<bool>,
+    /// Bound `trace_enabled`'s boot-time capture to this many bytes in
+    /// memory (oldest doorbells evicted first) instead of streaming
+    /// unbounded straight to `trace`'s path -- see
+    /// `super::super::c3d::board::C3dBoard::trace_start`'s
+    /// `rolling_bytes` doc comment. Ignored without `trace_enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trace_rolling_bytes: Option<u64>,
+    /// Defer `trace_enabled`'s boot-time capture until this texture id
+    /// is bound (`TEX_BIND`) on any context, instead of starting
+    /// immediately -- see
+    /// `super::super::c3d::board::C3dBoard::trace_arm_on_texture_bind`.
+    /// Ignored without `trace_enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trace_trigger_texture: Option<u32>,
 }
 
 /// `[hostsocket]` bundled bsdsocket.library board: a host-side TCP/IP stack

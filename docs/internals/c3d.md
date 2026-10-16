@@ -40,10 +40,12 @@ project's spec-first loop exists to surface.
 - **Feature and configuration.** The board is behind the `c3d` cargo
   feature and a `[c3d]` table (`src/c3d/board.rs`,
   `docs/guide/configuration.md`'s `[c3d]` section): `enabled` fits the
-  board, and `mask_caps` is the spec's conformance switch (forces named
-  `CAPS0` bits clear). `size`, `contexts`, `timing` and `trace` are not
-  yet configuration knobs -- the board fits one fixed 32 MiB Zorro III
-  window with 4 contexts. `enabled` is also a System-tab row in the GUI
+  board, `mask_caps` is the spec's conformance switch (forces named
+  `CAPS0` bits clear), and `trace`/`trace_enabled` arm a live
+  command-stream capture (this chapter's "Trace capture" note below).
+  `size`, `contexts` and `timing` are not yet configuration knobs -- the
+  board fits one fixed 32 MiB Zorro III window with 4 contexts.
+  `enabled` is also a System-tab row in the GUI
   launcher (`src/video/launcher/fields.rs`'s `F::C3d`, a `c3d`-build-only
   toggle passed through unconditionally otherwise, the same pattern
   `F::Mhi` uses); `mask_caps` is config-file/CLI only, being a
@@ -196,6 +198,21 @@ project's spec-first loop exists to surface.
   approximation, carried through unchanged to unit 1). `CAPS0`
   advertises `CAP_MULTITEXTURE` (see "Capability honesty" above), so
   this is guest-reachable.
+- **`TEX_PALETTE` / indexed textures.** `I8` and `I8_INDEXED`
+  (`TEXFMT_SUPPORTED` bits 8 and 9) are both advertised, so `TEX_PALETTE`
+  is a real opcode rather than `E_BAD_OPCODE` -- both are spec-optional
+  (see "Implementation order" below for why the first client doesn't
+  need either), but the opcode's own contract ("nothing indexed ever
+  stored") is exactly a per-texel expansion `render.rs` already had the
+  machinery for: a bound palette turns an `I8` `TEX_IMAGE`/`TEX_SUBIMAGE`
+  upload's index bytes into looked-up RGBA8 at upload time, with no
+  per-sample cost and no new GPU state (the palette itself is host-side
+  bookkeeping, keyed by texture id, independent of the GPU texture
+  object so it survives a `TEX_IMAGE`-triggered recreate and can be
+  bound before the texture object exists at all). An index past a
+  shorter-than-256-entry palette decodes to transparent black rather
+  than erroring, matching the spec's "undefined, not an error" stance on
+  out-of-range indices.
 - **GL-space `DRAW_ARRAYS`/`DRAW_ELEMENTS`.** `src/c3d/render.rs`
   combines the window-space array/indexed-array vertex-fetch machinery
   with the GL-space (`CAP_TRANSFORM`) position-transform path: array and
@@ -408,6 +425,65 @@ project's spec-first loop exists to surface.
   plain data; `wgpu` objects are rebuilt on restore (the renderer field
   itself is `#[serde(skip)]` and recreated lazily on the next doorbell
   that needs it). No GPU handle is ever in a state.
-- **Capture and debugger panel.** Not built yet. `[c3d] trace = path`
-  and a debugger panel are M6 items in the proposal's own milestone
-  table; nothing in M2 depends on either.
+- **Trace capture.** `C3dBoard` (`trace_start`/`trace_stop`/`trace_status`,
+  `src/c3d/board.rs`) writes a live session to the same `super::trace`
+  container (`C3DT`/`RING`/`BLOB` sections) the M1 trace runner and
+  `copperline-c3d-trace` already read -- a captured session is a real
+  trace, loadable and replayable with no further tooling. Two interfaces
+  share the one mechanism: `[c3d] trace = "path"` sets the *default*
+  path a bare `c3d.trace_start` control call falls back to (an explicit
+  `path` argument always wins); `[c3d] trace_enabled = true` starts a
+  capture immediately at boot, to `trace` if set or else a timestamped
+  file in the `[paths]` traces directory, so "boot, play for a while,
+  quit normally" alone produces a file with no control-protocol
+  interaction at all -- the primary use case this exists for (debugging
+  a real guest driver without a live interactive session every time).
+  Every doorbell writes `BLOB` sections for the refs it actually
+  resolved (ahead of its own `RING` section, matching the container's
+  "materialised... before the `RING` section that references them"
+  contract) then one `RING` section for the `[old_head, new_tail)` span
+  the guest appended -- `TraceCapture::drop` best-effort-flushes the
+  file on the way out (mirroring `VideoRecorder`'s own `Drop`,
+  `src/recorder.rs`), so quitting without an explicit `trace_stop`
+  still leaves a loadable trace. A `RING` section's own `ring_tail`
+  field is **not** the live board's circular offset: the container's
+  replay model (`copperline-c3d-trace`) treats a context's ring as an
+  ever-growing linear buffer, so the board tracks one monotonic logical
+  tail per context and translates into that numbering as it writes --
+  the captured bytes are identical either way, only their addressing
+  differs. A debugger panel surfacing capture state live in the window
+  is still not built; nothing here depends on it.
+- **Bounded (rolling) capture and a bind trigger.** An unbounded capture
+  of a long real session (a full Quake run, say) grows without limit, so
+  `trace_start`/`[c3d] trace`'s `rolling_bytes` parameter instead arms a
+  `RollingCapture`: doorbells accumulate in an in-memory
+  `VecDeque<DoorbellRecord>`, oldest evicted first once the buffered
+  bytes exceed the budget (a single record larger than the whole budget
+  is kept anyway, rather than leaving the ring permanently empty), and
+  nothing touches disk until `trace_snapshot`/`trace_stop` replays
+  whatever is currently buffered through a fresh `TraceWriter` -- the
+  same "rolling last N" tradeoff `gifclip.rs`'s `ClipRing` makes for the
+  window's Save Clip as GIF feature, just bounded by bytes here instead
+  of emulated time, since no clock reference reaches the doorbell path
+  (`C3dBoard::doorbell` takes a raw `DeviceHost`, not one). A
+  `c3d.trace_snapshot` control call (or a config-file-armed capture's
+  own periodic use of it) grabs what's in the ring right now without
+  stopping the roll -- "grab the last few seconds right after noticing a
+  bug on screen" is the use case. `trace_stop` always leaves a file on
+  disk either way (replaying the buffer first for a rolling capture),
+  matching the unbounded mode's own guarantee.
+
+  Separately, `trace_arm_on_texture_bind`/`[c3d] trace_trigger_texture`/
+  `c3d.trace_start`'s `trigger_texture` parameter defer a start (bounded
+  or not) until a given texture id is bound (`TEX_BIND`) on any context,
+  instead of starting immediately -- useful when the problem texture's
+  id is already known from an earlier run but its exact timing in a
+  fresh one isn't. `TEX_BIND` is pure state-machine bookkeeping with no
+  `RenderOp` of its own, so there is no render-op stream to hook: the
+  trigger is checked once per doorbell, after `submit_with` has applied
+  it, by asking the context's own `texture_units` whether any of them
+  now name the target id -- cheap, and a no-op on every doorbell while
+  no trigger is armed. The triggering doorbell itself is never captured
+  (the capture starts from the next one): by the time the trigger check
+  runs, the doorbell that caused it has already been processed under the
+  "not yet capturing" state the whole request was made under.

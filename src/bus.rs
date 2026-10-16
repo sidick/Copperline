@@ -5902,6 +5902,16 @@ impl Bus {
         })
     }
 
+    /// The C3D 3D accelerator board, when one is configured (`[c3d]
+    /// enabled`), for the CCP `c3d.trace_*` live capture methods.
+    #[cfg(feature = "c3d")]
+    pub fn c3d_board_mut(&mut self) -> Option<&mut crate::c3d::board::C3dBoard> {
+        self.devices.iter_mut().find_map(|dev| match dev {
+            crate::zorro_device::BoardDevice::C3d(board) => Some(board.as_mut()),
+            _ => None,
+        })
+    }
+
     /// Immutable CD32 FMV genlock/video snapshot for the native renderer.
     /// The decoded pixel storage is shared, so taking one for the render
     /// worker is constant-time.

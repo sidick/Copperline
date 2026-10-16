@@ -972,6 +972,13 @@ impl TryFrom<RawConfig> for Config {
             }
             mask
         };
+        let c3d_trace = raw.c3d.trace.as_ref().map(PathBuf::from);
+        let c3d_trace_enabled = raw.c3d.trace_enabled.unwrap_or(false);
+        if raw.c3d.trace_rolling_bytes == Some(0) {
+            bail!("[c3d] trace_rolling_bytes must be at least 1");
+        }
+        let c3d_trace_rolling_bytes = raw.c3d.trace_rolling_bytes;
+        let c3d_trace_trigger_texture = raw.c3d.trace_trigger_texture;
 
         // `[recording]`: the clip ring is bounded in time (and by a byte
         // budget in gifclip.rs); the rate caps at the field rate.
@@ -1486,6 +1493,10 @@ impl TryFrom<RawConfig> for Config {
             mhi,
             c3d,
             c3d_mask_caps,
+            c3d_trace,
+            c3d_trace_enabled,
+            c3d_trace_rolling_bytes,
+            c3d_trace_trigger_texture,
             hostsocket_net,
             hostsocket_transport,
             rtg,

@@ -133,7 +133,11 @@ use super::proto;
 use super::render::{MemLoc, Memory, Renderer};
 use super::ring::DeviceConfig;
 use super::state;
+use super::trace::TraceWriter;
 use crate::zorro_device::{DeviceHost, ZorroDevice};
+use std::fs::File;
+use std::io::{self, BufWriter};
+use std::path::PathBuf;
 
 /// Context register pages start here, one [`CONTEXT_PAGE_SIZE`]-byte page
 /// per context (`docs/internals/c3d.md`, "Context register pages").
@@ -320,6 +324,285 @@ pub struct C3dBoard {
     renderer: Option<Renderer>,
     #[serde(skip)]
     renderer_failed: bool,
+
+    /// A live `c3d.trace_start`/`trace_stop` capture, when armed -- see
+    /// [`TraceCapture`]'s own doc comment for the file this produces and
+    /// why it cannot survive a save state the same way `renderer` cannot:
+    /// an open `File` has no serializable representation, so a captured
+    /// session silently stops (rather than writing a truncated,
+    /// unreadable trace tail) across a save/restore, the same tradeoff
+    /// `renderer`/`pending_dma` already make for the same reason.
+    #[serde(skip)]
+    capture: Option<CaptureMode>,
+    /// `[c3d] trace`'s configured default path -- what `trace_start`
+    /// falls back to when called with `None` (a `c3d.trace_start` with
+    /// no explicit `path` of its own, or `[c3d] trace_enabled`'s
+    /// boot-time auto-start). An ordinary `PathBuf`, unlike `capture`
+    /// itself, so it serializes with everything else here.
+    configured_trace_path: Option<PathBuf>,
+    /// `[c3d] trace_trigger_texture`/`c3d.trace_start`'s `trigger_texture`
+    /// param, armed-but-not-yet-fired: see [`PendingTrigger`]'s own doc
+    /// comment. Not serialized for the same reason `capture` is not --
+    /// nothing live to resume waiting for across a save state.
+    #[serde(skip)]
+    pending_trigger: Option<PendingTrigger>,
+}
+
+/// Either shape a `c3d.trace_start`-armed capture can take: streaming
+/// straight to disk (the original, unbounded M3 shape) or bounded in
+/// memory until a snapshot (added once real sessions showed the former
+/// grows without limit -- see [`RollingCapture`]'s own doc comment).
+enum CaptureMode {
+    Direct(TraceCapture),
+    Rolling(RollingCapture),
+}
+
+/// A live `c3d.trace_start`-armed capture: every doorbell this board
+/// handles while armed is written to `writer` as `BLOB*` sections (the
+/// refs it resolved) followed by one `RING` section
+/// ([`C3dBoard::record_doorbell`]), producing a file
+/// `copperline-c3d-trace info`/`run`/`compare` can load directly -- the
+/// same container the M1 trace runner builds, just filled from a real
+/// session instead of hand-written in code. This is the M3 "trace
+/// capture" deliverable's actual point: debugging a real driver (e.g. a
+/// guest running real 3D software) without a live interactive session
+/// every time.
+struct TraceCapture {
+    writer: TraceWriter<BufWriter<File>>,
+    path: PathBuf,
+    /// One monotonic logical tail per context -- see
+    /// `C3dBoard::try_record_doorbell`'s doc comment for why this is not
+    /// simply the live board's own circular `RING_TAIL`.
+    logical_tail: std::collections::HashMap<usize, u32>,
+    rings: u64,
+    blobs: u64,
+    /// Total payload bytes written across every `RING`/`BLOB` section
+    /// (not counting each section's own tag/length/address prefix) --
+    /// a rough progress figure for `c3d.trace_status`, not an exact file
+    /// size.
+    bytes: u64,
+}
+
+impl Drop for TraceCapture {
+    /// Best-effort finalize so quitting a session with `[c3d]
+    /// trace_enabled` still leaves a loadable trace, mirroring
+    /// `VideoRecorder`'s own same-shaped `Drop` (`src/recorder.rs`) --
+    /// the primary use case this exists for is exactly "boot with
+    /// `[c3d] trace` set, play for a while, quit normally", with no
+    /// explicit `c3d.trace_stop` call ever in the picture.
+    /// `c3d.trace_stop` itself also flushes before dropping its own
+    /// `TraceCapture`, so this runs twice on that path -- harmless, a
+    /// flush on an already-flushed writer is a no-op.
+    fn drop(&mut self) {
+        if let Err(e) = self.writer.flush() {
+            log::warn!(
+                "c3d: trace capture {} failed to flush on drop: {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// A snapshot of a live capture's progress -- the reply
+/// `c3d.trace_start`/`trace_stop`/`trace_status` all share.
+pub struct TraceCaptureStatus {
+    pub path: PathBuf,
+    pub rings: u64,
+    pub blobs: u64,
+    pub bytes: u64,
+    /// Whether this status describes a [`RollingCapture`] rather than a
+    /// [`TraceCapture`] -- when true, `rings`/`blobs`/`bytes` describe
+    /// what is currently *buffered* (not yet written to `path`) rather
+    /// than what has actually been written there; a
+    /// `c3d.trace_snapshot`/`trace_stop` call is what makes `path` real.
+    pub rolling: bool,
+    /// Rolling only: the byte budget `rolling`'s buffer is bounded to.
+    pub rolling_byte_budget: Option<usize>,
+}
+
+impl TraceCaptureStatus {
+    fn direct(cap: &TraceCapture) -> Self {
+        TraceCaptureStatus {
+            path: cap.path.clone(),
+            rings: cap.rings,
+            blobs: cap.blobs,
+            bytes: cap.bytes,
+            rolling: false,
+            rolling_byte_budget: None,
+        }
+    }
+}
+
+/// One doorbell's captured payload, held in memory for
+/// [`RollingCapture`] -- the same content [`C3dBoard::try_record_doorbell`]
+/// writes straight to a [`TraceWriter`] for `Direct` mode, buffered here
+/// instead so older doorbells can be evicted before ever reaching disk.
+struct DoorbellRecord {
+    context: u32,
+    ring_tail: u32,
+    ring_bytes: Vec<u8>,
+    blobs: Vec<(u32, u32, Vec<u8>)>,
+    /// `ring_bytes.len()` plus every blob's payload length, cached at
+    /// push time so eviction accounting (`RollingCapture::push`) is O(1)
+    /// per record instead of re-summing the blob list on every push.
+    bytes: usize,
+}
+
+/// A `c3d.trace_start`-with-`rolling_bytes`-armed capture: doorbells
+/// accumulate in `records`, oldest evicted first once `bytes` exceeds
+/// `byte_budget`, and nothing touches disk until
+/// [`C3dBoard::trace_snapshot`] or [`C3dBoard::trace_stop`] replays the
+/// currently-buffered records through a fresh [`TraceWriter`]
+/// ([`Self::write_to`]). The tradeoff is the opposite of `Direct`
+/// (`TraceCapture`): bounded memory instead of an ever-growing file, at
+/// the cost of only ever holding "the last `byte_budget` or so" rather
+/// than the whole session -- `ClipRing`'s own "rolling last N seconds"
+/// tradeoff (`src/gifclip.rs`), just bounded by bytes here rather than
+/// emulated time, since no emulated-time reference reaches the doorbell
+/// path this reads from (`C3dBoard::doorbell` takes a raw `DeviceHost`,
+/// not a clock).
+struct RollingCapture {
+    caps0: u32,
+    path: PathBuf,
+    records: std::collections::VecDeque<DoorbellRecord>,
+    bytes: usize,
+    byte_budget: usize,
+    /// Per-context monotonic logical tail, the same bookkeeping
+    /// `TraceCapture::logical_tail` does and for the same reason (see
+    /// `C3dBoard::try_record_doorbell`'s doc comment) -- kept separately
+    /// per mode rather than shared, since a mode switch
+    /// (`c3d.trace_start` replacing a running capture with the other
+    /// kind) starts both the buffer and the logical numbering fresh.
+    logical_tail: std::collections::HashMap<usize, u32>,
+}
+
+impl RollingCapture {
+    fn new(caps0: u32, path: PathBuf, byte_budget: usize) -> Self {
+        RollingCapture {
+            caps0,
+            path,
+            records: std::collections::VecDeque::new(),
+            bytes: 0,
+            byte_budget,
+            logical_tail: std::collections::HashMap::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        context: u32,
+        ring_tail: u32,
+        ring_bytes: Vec<u8>,
+        blobs: Vec<(u32, u32, Vec<u8>)>,
+    ) {
+        let bytes = ring_bytes.len() + blobs.iter().map(|(_, _, d)| d.len()).sum::<usize>();
+        self.bytes += bytes;
+        self.records.push_back(DoorbellRecord {
+            context,
+            ring_tail,
+            ring_bytes,
+            blobs,
+            bytes,
+        });
+        // A single record larger than the whole budget still gets kept
+        // (evicting it would leave the ring permanently empty for every
+        // doorbell after); only records *beyond* the newest are dropped
+        // to make room.
+        while self.bytes > self.byte_budget && self.records.len() > 1 {
+            let Some(oldest) = self.records.pop_front() else {
+                break;
+            };
+            self.bytes -= oldest.bytes;
+        }
+    }
+
+    /// A status snapshot of what is currently buffered (not what was
+    /// last written to disk -- `records`/`bytes` describe the live
+    /// ring). O(records), not cached: bounded by `byte_budget` so this
+    /// never iterates more than a capture's own configured ceiling,
+    /// cheap enough for an on-demand `c3d.trace_status` reply.
+    fn status(&self) -> TraceCaptureStatus {
+        let blobs = self.records.iter().map(|r| r.blobs.len() as u64).sum();
+        TraceCaptureStatus {
+            path: self.path.clone(),
+            rings: self.records.len() as u64,
+            blobs,
+            bytes: self.bytes as u64,
+            rolling: true,
+            rolling_byte_budget: Some(self.byte_budget),
+        }
+    }
+
+    /// Replay every currently-buffered record through a fresh
+    /// `TraceWriter` at `path`, in original order -- the file a
+    /// `c3d.trace_snapshot`/`trace_stop` call produces. Does not touch
+    /// `self.records`: a snapshot does not stop the roll.
+    fn write_to(&self, path: &std::path::Path) -> io::Result<TraceCaptureStatus> {
+        crate::paths::ensure_parent(path)?;
+        let file = File::create(path)?;
+        let mut writer = TraceWriter::new(BufWriter::new(file));
+        writer.header(proto::PROTOCOL_VERSION, self.caps0)?;
+        let (mut rings, mut blobs, mut bytes) = (0u64, 0u64, 0u64);
+        for record in &self.records {
+            for (space, address, data) in &record.blobs {
+                writer.blob(*space, *address, data)?;
+                blobs += 1;
+                bytes += data.len() as u64;
+            }
+            writer.ring(record.context, record.ring_tail, &record.ring_bytes)?;
+            rings += 1;
+            bytes += record.ring_bytes.len() as u64;
+        }
+        writer.flush()?;
+        Ok(TraceCaptureStatus {
+            path: path.to_path_buf(),
+            rings,
+            blobs,
+            bytes,
+            rolling: true,
+            rolling_byte_budget: Some(self.byte_budget),
+        })
+    }
+}
+
+/// A `c3d.trace_start`-with-`trigger_texture`-armed-but-not-yet-running
+/// capture: nothing is buffered or written until texture `texture_id` is
+/// bound (`TEX_BIND`) on any context, at which point
+/// [`C3dBoard::check_trace_trigger`] resolves this into an ordinary
+/// `trace_start` call with the `path`/`rolling_bytes` this was armed
+/// with. `TEX_BIND` is pure state-machine bookkeeping with no
+/// [`RenderOp`] of its own, so there is no render-op stream to hook --
+/// the cheapest signal is asking each context's own `texture_units`
+/// whether any of them now names the target id, checked once per
+/// doorbell after `submit_with` has applied it.
+struct PendingTrigger {
+    texture_id: u32,
+    path: Option<PathBuf>,
+    rolling_bytes: Option<u64>,
+}
+
+/// The `[old_head, new_tail)` span of `ring` the guest appended this
+/// doorbell, unwrapped into one flat byte vector -- wrapping once if the
+/// span crosses the circular buffer's physical end, matching
+/// `RingCursor`'s own `occupied` computation (`ring.rs`) for the same
+/// head/tail pair. `% len` defends against a guest-supplied
+/// `old_head`/`new_tail` that strayed outside `[0, len)` before decode
+/// had a chance to reject it -- a diagnostic capture must never panic on
+/// input the board itself merely logs and moves on from.
+fn appended_ring_bytes(ring: &[u8], old_head: u32, new_tail: u32) -> Vec<u8> {
+    let len = ring.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let head = old_head as usize % len;
+    let tail = new_tail as usize % len;
+    if tail >= head {
+        ring[head..tail].to_vec()
+    } else {
+        let mut v = ring[head..].to_vec();
+        v.extend_from_slice(&ring[..tail]);
+        v
+    }
 }
 
 impl C3dBoard {
@@ -351,6 +634,9 @@ impl C3dBoard {
             pending_dma: Vec::new(),
             renderer: None,
             renderer_failed: false,
+            capture: None,
+            configured_trace_path: None,
+            pending_trigger: None,
         }
     }
 
@@ -427,7 +713,7 @@ impl C3dBoard {
                     1
                 }
             }
-            MAX_TEXTURES => 256,
+            MAX_TEXTURES => self.device_config().max_textures,
             MAX_SURFACES => 16,
             // Transform-tier limits report the same values every
             // per-context `state::Limits::default()` actually enforces
@@ -574,6 +860,12 @@ impl C3dBoard {
             return;
         }
         self.activity = true;
+        // `ring_head` as it stands *before* `submit_with` below moves it:
+        // the start of whatever the guest appended since its last
+        // doorbell, for `record_doorbell`'s capture of exactly that span
+        // (`TraceCapture`'s doc comment). Irrelevant, and not read again,
+        // when no capture is armed.
+        let old_head = self.contexts[n].ctx.ring_head;
 
         let ring_base = self.contexts[n].ctx.ring_base;
         let ring_size_reg = self.contexts[n].ctx.ring_size;
@@ -627,8 +919,17 @@ impl C3dBoard {
         // `submit_with` below needs `&mut` access to) and `host`, which is
         // already a separate parameter.
         let aperture = &self.aperture;
+        // Tee for a live trace capture: every ref this doorbell actually
+        // resolves, `CALL` buffers here and ordinary by-reference op
+        // payloads (textures, vertex/index arrays, palettes...) via
+        // `ApertureMemory` below, collected locally and only touching
+        // `self.capture` once both are done -- `self.contexts` needs
+        // `&mut` for `submit_with` right below, so this closure (like the
+        // one it replaces) must not borrow `self` itself.
+        let capturing = self.capture.is_some();
+        let mut captured_blobs: Vec<(u32, u32, Vec<u8>)> = Vec::new();
         let mut fetch_call_buffer = |r: proto::Ref| -> Option<Vec<u8>> {
-            Some(match r.space {
+            let bytes = match r.space {
                 proto::RefSpace::Aperture => {
                     let start = r.address as usize;
                     let end = start.saturating_add(r.length as usize).min(aperture.len());
@@ -643,7 +944,15 @@ impl C3dBoard {
                     host.dma_read(r.address, &mut buf);
                     buf
                 }
-            })
+            };
+            if capturing && !bytes.is_empty() {
+                let space = match r.space {
+                    proto::RefSpace::Aperture => 0,
+                    proto::RefSpace::Guest => 1,
+                };
+                captured_blobs.push((space, r.address, bytes.clone()));
+            }
+            Some(bytes)
         };
         let mut call_storage: Vec<Vec<u8>> = Vec::new();
         self.contexts[n].ctx.submit_with(
@@ -654,6 +963,7 @@ impl C3dBoard {
             &mut call_storage,
             &mut fetch_call_buffer,
         );
+        self.check_trace_trigger(n);
 
         if !ops.is_empty() {
             let queued_before = self.pending_dma.len();
@@ -666,6 +976,7 @@ impl C3dBoard {
                     pending_dma: &mut self.pending_dma,
                     host,
                     guest_scratch: Vec::new(),
+                    capture: capturing.then_some(&mut captured_blobs),
                 };
                 let errors = renderer.execute(&ops, state, &mut mem);
                 for e in &errors {
@@ -700,7 +1011,270 @@ impl C3dBoard {
                 }
             }
         }
+        if capturing {
+            self.record_doorbell(n, old_head, new_tail, &ring_bytes, captured_blobs);
+        }
         self.update_irq_status(n);
+    }
+
+    /// `[c3d] trace`'s resolved default path, if the config set one --
+    /// what `trace_start(None, None)` falls back to.
+    pub fn set_configured_trace_path(&mut self, path: PathBuf) {
+        self.configured_trace_path = Some(path);
+    }
+
+    /// Arm a live trace capture, replacing any capture already running
+    /// (matching `ui_wave_start`'s own "replace, don't refuse" stance for
+    /// a file-backed diagnostic) and disarming any pending trigger (a
+    /// fresh explicit start wins over a trigger armed earlier). `path`
+    /// wins outright when given; `None` falls back to `[c3d] trace`'s
+    /// configured default (`self.configured_trace_path`, set once at
+    /// boot by `set_configured_trace_path`) and only then to a
+    /// timestamped file in the `[paths]` traces directory
+    /// ([`crate::paths::c3d_trace_file`]) -- the same fallback chain
+    /// `[c3d] trace_enabled`'s boot-time auto-start
+    /// (`emulator::build_machine`) and a bare `c3d.trace_start` with no
+    /// `path` argument both resolve through.
+    ///
+    /// `rolling_bytes`: `None` streams straight to `path` immediately,
+    /// unbounded (`Direct`, the original M3 shape -- `path` is created
+    /// and the `C3DT` header written right here). `Some(budget)` instead
+    /// arms a bounded in-memory [`RollingCapture`] ([`CaptureMode`]'s own
+    /// doc comment) -- `path` is resolved and remembered but nothing is
+    /// created on disk until [`Self::trace_snapshot`]/[`Self::trace_stop`]
+    /// replays the buffered records through it. Both modes write the
+    /// `C3DT` header against this board's *actual* capability mask
+    /// (`self.caps0`, not the [`CAPS0`] constant -- a capture taken under
+    /// `[c3d] mask_caps` must replay against that reduced set, not
+    /// whatever the board could do unmasked) and the protocol version it
+    /// implements, so a later `copperline-c3d-trace run`/`compare` knows
+    /// up front whether it can even attempt replay.
+    pub fn trace_start(
+        &mut self,
+        path: Option<PathBuf>,
+        rolling_bytes: Option<u64>,
+    ) -> io::Result<()> {
+        self.pending_trigger = None;
+        let path = path
+            .or_else(|| self.configured_trace_path.clone())
+            .unwrap_or_else(crate::paths::c3d_trace_file);
+        self.capture = Some(match rolling_bytes {
+            None => {
+                crate::paths::ensure_parent(&path)?;
+                let file = File::create(&path)?;
+                let mut writer = TraceWriter::new(BufWriter::new(file));
+                writer.header(proto::PROTOCOL_VERSION, self.caps0)?;
+                CaptureMode::Direct(TraceCapture {
+                    writer,
+                    path,
+                    logical_tail: std::collections::HashMap::new(),
+                    rings: 0,
+                    blobs: 0,
+                    bytes: 0,
+                })
+            }
+            Some(budget) => {
+                CaptureMode::Rolling(RollingCapture::new(self.caps0, path, budget as usize))
+            }
+        });
+        Ok(())
+    }
+
+    /// Stop and finalise the capture, if one is running, returning its
+    /// final status. For `Direct`, `cap` dropping at the end of this
+    /// function flushes the underlying file via `TraceCapture`'s own
+    /// `Drop` impl (reading the status fields first rather than
+    /// partially moving them out of `cap`, which `Drop` forbids), so the
+    /// result is immediately safe to hand to `copperline-c3d-trace`. For
+    /// `Rolling`, this is the same replay [`Self::trace_snapshot`] does
+    /// -- "stop" always leaves a file on disk, matching `Direct`'s own
+    /// guarantee, rather than silently discarding whatever was still
+    /// buffered.
+    pub fn trace_stop(&mut self) -> Option<TraceCaptureStatus> {
+        match self.capture.take()? {
+            CaptureMode::Direct(cap) => Some(TraceCaptureStatus::direct(&cap)),
+            CaptureMode::Rolling(roll) => match roll.write_to(&roll.path.clone()) {
+                Ok(status) => Some(status),
+                Err(e) => {
+                    log::warn!(
+                        "c3d: rolling trace capture {} failed to finalise on stop: {e}",
+                        roll.path.display()
+                    );
+                    None
+                }
+            },
+        }
+    }
+
+    /// Replay a [`RollingCapture`]'s currently-buffered records to disk
+    /// without stopping the roll -- the "grab what's in the ring right
+    /// now" operation `c3d.trace_snapshot` exists for, e.g. right after
+    /// noticing a bug on screen. `path` defaults to the capture's own
+    /// resolved path the same way `trace_start`'s own fallback chain
+    /// does (so repeated snapshots with no `path` argument overwrite the
+    /// same file unless the caller wants otherwise). For a `Direct`
+    /// capture this just flushes the already-open file and reports its
+    /// current progress -- there is nothing bounded to snapshot, but the
+    /// call is still meaningful rather than an error. `None` means no
+    /// capture is armed at all.
+    pub fn trace_snapshot(
+        &mut self,
+        path: Option<PathBuf>,
+    ) -> io::Result<Option<TraceCaptureStatus>> {
+        let Some(mode) = self.capture.as_mut() else {
+            return Ok(None);
+        };
+        match mode {
+            CaptureMode::Direct(cap) => {
+                cap.writer.flush()?;
+                Ok(Some(TraceCaptureStatus::direct(cap)))
+            }
+            CaptureMode::Rolling(roll) => {
+                let target = path.unwrap_or_else(|| roll.path.clone());
+                Ok(Some(roll.write_to(&target)?))
+            }
+        }
+    }
+
+    /// The running capture's progress, if one is armed -- for `Rolling`,
+    /// what is currently *buffered* ([`RollingCapture::status`]), not
+    /// what was last written to disk (nothing may have been snapshotted
+    /// yet at all).
+    pub fn trace_status(&self) -> Option<TraceCaptureStatus> {
+        self.capture.as_ref().map(|mode| match mode {
+            CaptureMode::Direct(cap) => TraceCaptureStatus::direct(cap),
+            CaptureMode::Rolling(roll) => roll.status(),
+        })
+    }
+
+    /// Arm a trigger: no capture starts (buffered or on disk) until
+    /// texture `texture_id` is bound on any context, at which point this
+    /// resolves into an ordinary [`Self::trace_start`] call with `path`/
+    /// `rolling_bytes`. Replaces any trigger armed earlier; does not
+    /// touch a capture already running (matching `trace_start`'s own
+    /// "an explicit start always wins" stance -- arming a trigger while
+    /// already capturing just means "and also do this if it stops and
+    /// you want to re-trigger", not "stop now").
+    pub fn trace_arm_on_texture_bind(
+        &mut self,
+        texture_id: u32,
+        path: Option<PathBuf>,
+        rolling_bytes: Option<u64>,
+    ) {
+        self.pending_trigger = Some(PendingTrigger {
+            texture_id,
+            path,
+            rolling_bytes,
+        });
+    }
+
+    /// The texture id a `c3d.trace_start`/`[c3d] trace_trigger_texture`
+    /// trigger is still waiting on, if one is armed and hasn't fired.
+    pub fn trace_trigger_pending(&self) -> Option<u32> {
+        self.pending_trigger.as_ref().map(|t| t.texture_id)
+    }
+
+    /// Checked once per doorbell on context `n`, after `submit_with` has
+    /// applied its commands to `state` -- see [`PendingTrigger`]'s doc
+    /// comment for why this is a state scan rather than a hook on the
+    /// render-op stream. A no-op whenever no trigger is armed (the
+    /// common case), so this costs nothing on an ordinary doorbell.
+    fn check_trace_trigger(&mut self, n: usize) {
+        let Some(trigger) = &self.pending_trigger else {
+            return;
+        };
+        let Some(ctx) = self.contexts.get(n) else {
+            return;
+        };
+        let fired = ctx
+            .ctx
+            .state
+            .texture_units
+            .iter()
+            .any(|u| u.bound_texture == trigger.texture_id);
+        if !fired {
+            return;
+        }
+        // `.unwrap()` is safe: `trigger` above borrowed `Some(..)` from
+        // the same `self.pending_trigger` this `.take()` reads.
+        let trigger = self.pending_trigger.take().unwrap();
+        if let Err(e) = self.trace_start(trigger.path, trigger.rolling_bytes) {
+            log::warn!(
+                "c3d: trace trigger fired (texture {}) but failed to start capture: {e}",
+                trigger.texture_id
+            );
+        }
+    }
+
+    /// Flush one doorbell's capture: `BLOB` sections for every ref
+    /// `blobs` names (ahead of the `RING` section they belong to, per
+    /// `trace.rs`'s "materialised... before the `RING` section that
+    /// references them" contract), then one `RING` section for the
+    /// `[old_head, new_tail)` span of `ring_bytes` the guest just
+    /// appended -- or, for a `Rolling` capture, the same content pushed
+    /// into its in-memory ring instead of written straight to a file. A
+    /// write failure (disk full, say -- `Rolling` can only fail this way
+    /// at an eventual snapshot/stop, never here, since nothing touches
+    /// disk per doorbell) disarms the capture rather than panicking or
+    /// silently losing the rest of the session -- matching
+    /// `ensure_renderer`'s "no GPU adapter" stance: a diagnostic
+    /// capability degrading gracefully, not a guest-visible failure.
+    fn record_doorbell(
+        &mut self,
+        n: usize,
+        old_head: u32,
+        new_tail: u32,
+        ring_bytes: &[u8],
+        blobs: Vec<(u32, u32, Vec<u8>)>,
+    ) {
+        if let Err(e) = self.try_record_doorbell(n, old_head, new_tail, ring_bytes, blobs) {
+            log::warn!("c3d: trace capture write failed, stopping capture: {e}");
+            self.capture = None;
+        }
+    }
+
+    fn try_record_doorbell(
+        &mut self,
+        n: usize,
+        old_head: u32,
+        new_tail: u32,
+        ring_bytes: &[u8],
+        blobs: Vec<(u32, u32, Vec<u8>)>,
+    ) -> io::Result<()> {
+        let Some(mode) = self.capture.as_mut() else {
+            return Ok(());
+        };
+        // `ring_tail` recorded below is **not** the live board's own
+        // circular offset: `copperline-c3d-trace`'s replay model treats
+        // a context's ring as an ever-growing linear buffer that never
+        // wraps (`TraceCapture`'s doc comment), so this tracks one
+        // monotonic logical tail per context and translates the real
+        // (circular) span into that flat numbering -- the bytes
+        // themselves are identical either way, only the offsets they are
+        // addressed by differ.
+        let appended = appended_ring_bytes(ring_bytes, old_head, new_tail);
+        match mode {
+            CaptureMode::Direct(cap) => {
+                for (space, address, data) in &blobs {
+                    cap.writer.blob(*space, *address, data)?;
+                    cap.blobs += 1;
+                    cap.bytes += data.len() as u64;
+                }
+                let old_logical = *cap.logical_tail.get(&n).unwrap_or(&0);
+                let new_logical = old_logical + appended.len() as u32;
+                cap.writer.ring(n as u32, new_logical, &appended)?;
+                cap.logical_tail.insert(n, new_logical);
+                cap.rings += 1;
+                cap.bytes += appended.len() as u64;
+            }
+            CaptureMode::Rolling(roll) => {
+                let old_logical = *roll.logical_tail.get(&n).unwrap_or(&0);
+                let new_logical = old_logical + appended.len() as u32;
+                roll.push(n as u32, new_logical, appended, blobs);
+                roll.logical_tail.insert(n, new_logical);
+            }
+        }
+        Ok(())
     }
 
     /// Reads `len` bytes at aperture offset `addr` (already resolved to
@@ -780,6 +1354,13 @@ struct ApertureMemory<'a, 'h> {
     /// contents are irrelevant since every read resizes and refills it
     /// before returning a slice into it.
     guest_scratch: Vec<u8>,
+    /// Tee for a live trace capture: every successful read, appended as
+    /// `(space, address, bytes)` -- `0`/`1` matching `TraceWriter::blob`'s
+    /// own space flag -- so [`C3dBoard::record_doorbell`] can write them
+    /// as `BLOB` sections ahead of this doorbell's own `RING` section.
+    /// `None` when no capture is armed, the common case, so an
+    /// uncaptured session pays only the one `is_some()` check per read.
+    capture: Option<&'a mut Vec<(u32, u32, Vec<u8>)>>,
 }
 
 impl ApertureMemory<'_, '_> {
@@ -795,6 +1376,9 @@ impl Memory for ApertureMemory<'_, '_> {
         match loc {
             MemLoc::Aperture(addr) => {
                 let r = self.range(addr, len)?;
+                if let Some(cap) = self.capture.as_deref_mut() {
+                    cap.push((0, addr, self.aperture[r.clone()].to_vec()));
+                }
                 Some(&self.aperture[r])
             }
             // CAP_GUESTMEM: pull the bytes straight from guest memory.
@@ -806,6 +1390,9 @@ impl Memory for ApertureMemory<'_, '_> {
             MemLoc::Guest(addr) => {
                 self.guest_scratch.resize(len, 0);
                 self.host.dma_read(addr, &mut self.guest_scratch);
+                if let Some(cap) = self.capture.as_deref_mut() {
+                    cap.push((1, addr, self.guest_scratch[..len].to_vec()));
+                }
                 Some(&self.guest_scratch[..len])
             }
         }
@@ -1489,10 +2076,11 @@ mod tests {
         }
 
         // Outer ring: one CALL to the buffer above.
-        let mut ring_cmds = Vec::<u32>::new();
-        ring_cmds.push(opcode_len(proto::OP_CALL, 3));
-        ring_cmds.push(BUFFER_APERTURE_REL); // ref address (aperture space)
-        ring_cmds.push(buf_bytes.len() as u32); // ref length, space bit 31 clear
+        let ring_cmds = [
+            opcode_len(proto::OP_CALL, 3),
+            BUFFER_APERTURE_REL,    // ref address (aperture space)
+            buf_bytes.len() as u32, // ref length, space bit 31 clear
+        ];
         let ring_bytes: Vec<u8> = ring_cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
         let ring_off = b.aperture_offset + RING_BASE_APERTURE_REL;
         for (i, b_) in ring_bytes.iter().enumerate() {
@@ -2005,5 +2593,465 @@ mod tests {
             0,
             "the aperture's garbage FENCE id=99 must not have been decoded and completed"
         );
+    }
+
+    #[test]
+    fn appended_ring_bytes_unwraps_a_span_that_crosses_the_physical_end() {
+        let ring: Vec<u8> = (0u8..16).collect();
+        // No wrap: [4, 10).
+        assert_eq!(appended_ring_bytes(&ring, 4, 10), &ring[4..10]);
+        // Wraps once: [12, 16) then [0, 3).
+        let wrapped = appended_ring_bytes(&ring, 12, 3);
+        assert_eq!(wrapped, [12, 13, 14, 15, 0, 1, 2]);
+        // Guest-controlled offsets past the buffer's own length must not
+        // panic (`% len`, not a direct index).
+        assert_eq!(
+            appended_ring_bytes(&ring, 1000, 1003),
+            appended_ring_bytes(&ring, 8, 11)
+        );
+        assert!(appended_ring_bytes(&[], 0, 5).is_empty());
+    }
+
+    #[test]
+    fn trace_start_stop_status_track_an_armed_captures_lifecycle() {
+        let mut b = board();
+        assert!(b.trace_status().is_none(), "nothing armed yet");
+        assert!(
+            b.trace_stop().is_none(),
+            "stopping with nothing armed is a no-op, not an error"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-lifecycle-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        b.trace_start(Some(path.clone()), None)
+            .expect("arm a capture");
+        let status = b.trace_status().expect("armed");
+        assert_eq!(status.path, path);
+        assert_eq!((status.rings, status.blobs, status.bytes), (0, 0, 0));
+
+        // Starting again replaces the first capture outright (matching
+        // `ui_wave_start`'s own stance), rather than erroring.
+        let path2 = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-lifecycle-test-2-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path2);
+        b.trace_start(Some(path2.clone()), None)
+            .expect("replace the capture");
+        assert_eq!(b.trace_status().unwrap().path, path2);
+
+        let stopped = b.trace_stop().expect("was armed");
+        assert_eq!(stopped.path, path2);
+        assert!(b.trace_status().is_none(), "disarmed");
+        assert!(path2.exists(), "the file was actually created");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn trace_start_with_no_path_falls_back_to_the_configured_default_then_a_timestamped_file() {
+        let mut b = board();
+        // No `set_configured_trace_path` call: falls all the way back to
+        // `crate::paths::c3d_trace_file`'s timestamped default.
+        b.trace_start(None, None)
+            .expect("arm with the timestamped default");
+        let default_path = b.trace_stop().expect("was armed").path;
+        assert!(
+            default_path
+                .to_string_lossy()
+                .contains("copperline-c3d-trace-"),
+            "should use the timestamped default name: {default_path:?}"
+        );
+        let _ = std::fs::remove_file(&default_path);
+
+        let configured = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-configured-default-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&configured);
+        b.set_configured_trace_path(configured.clone());
+        b.trace_start(None, None)
+            .expect("arm with the configured default");
+        assert_eq!(b.trace_status().unwrap().path, configured);
+
+        // An explicit path still wins over the configured default.
+        let explicit = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-explicit-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&explicit);
+        b.trace_start(Some(explicit.clone()), None)
+            .expect("arm with an explicit path");
+        assert_eq!(b.trace_status().unwrap().path, explicit);
+        b.trace_stop();
+
+        let _ = std::fs::remove_file(&configured);
+        let _ = std::fs::remove_file(&explicit);
+    }
+
+    /// The driver-facing proof this capability exists for: a captured
+    /// session's `RING` section decodes back into the *exact* `Command`
+    /// sequence the guest sent, in order -- so a state-setting opcode
+    /// immediately preceding a draw (`ACTIVE_UNIT`, `TEX_BIND`,
+    /// `ENABLE`/`DISABLE`, `TEX_ENV`...) is directly inspectable from the
+    /// trace file alone, with no live session, via
+    /// `crate::c3d::ring::decode_all` over a `TraceReader`-read `RING`
+    /// section's bytes -- exactly what `copperline-c3d-trace`'s own
+    /// `replay` already does internally, just surfaced here as a decode
+    /// rather than a render.
+    #[test]
+    fn trace_capture_records_the_exact_command_order_a_doorbell_decoded() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        let path = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-order-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        b.trace_start(Some(path.clone()), None)
+            .expect("arm capture");
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+        let cmds: Vec<u32> = vec![
+            opcode_len(proto::OP_ACTIVE_UNIT, 2),
+            1,
+            opcode_len(proto::OP_MATRIX_MODE, 2),
+            1, // an arbitrary legal MatrixMode value
+            opcode_len(proto::OP_LOAD_IDENTITY, 1),
+            opcode_len(proto::OP_FENCE, 2),
+            7,
+        ];
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+
+        let ring_window_off = b.aperture_offset;
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(ring_window_off + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "well-formed stream"
+        );
+
+        let status = b.trace_stop().expect("capture was armed");
+        assert_eq!(status.rings, 1);
+
+        let file_bytes = std::fs::read(&path).expect("read capture file");
+        let _ = std::fs::remove_file(&path);
+
+        let mut captured: Option<(u32, u32, Vec<u8>)> = None;
+        for section in crate::c3d::trace::TraceReader::new(&file_bytes) {
+            if let crate::c3d::trace::Section::Ring(r) = section.expect("well-formed trace") {
+                captured = Some((r.context, r.ring_tail, r.bytes.to_vec()));
+            }
+        }
+        let (context, ring_tail, ring_bytes) = captured.expect("exactly one RING section");
+        assert_eq!(context, 0, "the first context slot");
+        assert_eq!(ring_tail, bytes.len() as u32);
+        assert_eq!(
+            ring_bytes, bytes,
+            "captured bytes match exactly what the guest appended"
+        );
+
+        // `RingCursor` indexes `[0, ring_tail)` into the *real, full-size*
+        // ring (head/tail are absolute offsets into it, same as
+        // `copperline-c3d-trace`'s own `replay()` places a captured span
+        // at its growable replay buffer's previous tail rather than
+        // decoding it as a standalone buffer) -- place the captured span
+        // at the start of a buffer as large as the live ring was, not
+        // one sized to the span alone.
+        let mut replay_ring = vec![0u8; 0x1000];
+        replay_ring[..ring_bytes.len()].copy_from_slice(&ring_bytes);
+        let (steps, _) = crate::c3d::ring::decode_all(
+            &replay_ring,
+            0,
+            ring_bytes.len() as u32,
+            b.device_config(),
+        );
+        assert_eq!(
+            steps.len(),
+            4,
+            "ACTIVE_UNIT, MATRIX_MODE, LOAD_IDENTITY, FENCE"
+        );
+        assert!(matches!(
+            steps[0],
+            crate::c3d::ring::Step::Command(proto::Command::ActiveUnit { unit: 1 })
+        ));
+        assert!(matches!(
+            steps[1],
+            crate::c3d::ring::Step::Command(proto::Command::MatrixMode { .. })
+        ));
+        assert!(matches!(
+            steps[2],
+            crate::c3d::ring::Step::Command(proto::Command::LoadIdentity)
+        ));
+        assert!(matches!(
+            steps[3],
+            crate::c3d::ring::Step::Command(proto::Command::Fence { id: 7 })
+        ));
+    }
+
+    fn setup_ring_context(b: &mut C3dBoard, h: &mut DeviceHost) {
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            h,
+        );
+    }
+
+    /// Appends `cmds` at the ring's current `*tail` and rings the
+    /// doorbell -- one more doorbell each call, unlike
+    /// `trace_capture_records_the_exact_command_order_a_doorbell_decoded`'s
+    /// single big one, which is what the rolling-eviction and trigger
+    /// tests below need.
+    fn submit_doorbell(b: &mut C3dBoard, h: &mut DeviceHost, tail: &mut u32, cmds: &[u32]) {
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_window_off = b.aperture_offset;
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(ring_window_off + *tail + i as u32, 1, *byte as u32, h);
+        }
+        *tail += bytes.len() as u32;
+        b.write(CONTEXT_PAGE_BASE + creg::RING_TAIL, 4, *tail, h);
+    }
+
+    fn fence_cmd(id: u32) -> Vec<u32> {
+        vec![((proto::OP_FENCE as u32) << 16) | 2, id]
+    }
+
+    /// Decodes a captured `RING` section's bytes directly as a
+    /// standalone command stream -- valid regardless of the section's
+    /// own (possibly non-zero, possibly eviction-discontiguous) logical
+    /// `ring_tail`, since a `RingCursor` only ever cares about the slice
+    /// it is actually given. `RingCursor::new_linear` (the same
+    /// constructor a `CALL`ed buffer decodes with), not `new`/
+    /// `decode_all`: `new`'s circular "one word short of a full ring"
+    /// framing exists only for a *live* ring whose head/tail chase each
+    /// other, which does not apply to an already-extracted, immutable
+    /// byte span -- using it here would spuriously reject a span that
+    /// happens to fill its own slice exactly (every `bytes.len()` this
+    /// function is ever called with, in fact: a captured span is never
+    /// padded).
+    fn decode_ring_commands(bytes: &[u8], config: DeviceConfig) -> Vec<proto::Command<'_>> {
+        let mut cursor = crate::c3d::ring::RingCursor::new_linear(bytes, config);
+        let mut out = Vec::new();
+        while let Some(step) = cursor.step() {
+            if let crate::c3d::ring::Step::Command(c) = step {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rolling_capture_evicts_the_oldest_doorbell_once_the_byte_budget_is_exceeded() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context(&mut b, &mut h);
+
+        // Each doorbell below is one FENCE command: 8 bytes of ring
+        // content, no refs, so the budget bounds purely by ring size --
+        // easy to reason about exactly. Budget 20: doorbells 1+2 fit
+        // (16 <= 20); doorbell 3 pushes it to 24 > 20, evicting doorbell
+        // 1 (fence id 1) and leaving 16 bytes (fence ids 2, 3).
+        b.trace_start(None, Some(20))
+            .expect("arm a rolling capture");
+        let mut tail = 0u32;
+        for id in 1u32..=3 {
+            submit_doorbell(&mut b, &mut h, &mut tail, &fence_cmd(id));
+        }
+
+        let status = b.trace_status().expect("still rolling");
+        assert!(status.rolling);
+        assert_eq!(status.rolling_byte_budget, Some(20));
+        assert_eq!(
+            status.rings, 2,
+            "the first doorbell (unit 1) should have been evicted"
+        );
+        assert_eq!(status.bytes, 16);
+
+        let path = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-rolling-eviction-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        b.trace_snapshot(Some(path.clone()))
+            .expect("snapshot")
+            .expect("was armed");
+        let file_bytes = std::fs::read(&path).expect("read capture file");
+        let _ = std::fs::remove_file(&path);
+
+        let config = b.device_config();
+        let mut ids_seen = Vec::new();
+        for section in crate::c3d::trace::TraceReader::new(&file_bytes) {
+            if let crate::c3d::trace::Section::Ring(r) = section.expect("well-formed trace") {
+                for cmd in decode_ring_commands(r.bytes, config) {
+                    if let proto::Command::Fence { id } = cmd {
+                        ids_seen.push(id);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            ids_seen,
+            vec![2, 3],
+            "only the two most recent doorbells should have survived eviction"
+        );
+    }
+
+    #[test]
+    fn a_single_doorbell_larger_than_the_byte_budget_is_kept_anyway() {
+        // Evicting it would leave the ring permanently empty for every
+        // doorbell after -- `RollingCapture::push`'s own
+        // `records.len() > 1` guard.
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context(&mut b, &mut h);
+
+        b.trace_start(None, Some(1)).expect("arm a rolling capture");
+        let mut tail = 0u32;
+        submit_doorbell(&mut b, &mut h, &mut tail, &fence_cmd(1));
+
+        let status = b.trace_status().expect("still rolling");
+        assert_eq!(
+            status.rings, 1,
+            "the one oversized record is kept, not dropped"
+        );
+        assert_eq!(status.bytes, 8);
+    }
+
+    #[test]
+    fn trace_snapshot_replays_the_buffer_without_stopping_the_roll() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context(&mut b, &mut h);
+
+        let path = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-rolling-snapshot-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        b.trace_start(Some(path.clone()), Some(1024))
+            .expect("arm a rolling capture");
+        assert!(
+            !path.exists(),
+            "rolling mode must not touch disk until a snapshot"
+        );
+
+        let mut tail = 0u32;
+        submit_doorbell(&mut b, &mut h, &mut tail, &fence_cmd(1));
+
+        let status = b
+            .trace_snapshot(None)
+            .expect("snapshot call succeeds")
+            .expect("was armed");
+        assert_eq!(status.rings, 1);
+        assert!(
+            path.exists(),
+            "snapshot with no path falls back to the configured one"
+        );
+
+        submit_doorbell(&mut b, &mut h, &mut tail, &fence_cmd(2));
+        assert_eq!(
+            b.trace_status().expect("still rolling").rings,
+            2,
+            "the roll continues after a snapshot"
+        );
+
+        let status2 = b
+            .trace_snapshot(None)
+            .expect("second snapshot")
+            .expect("still armed");
+        assert_eq!(
+            status2.rings, 2,
+            "the second snapshot includes both doorbells"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The driver-facing proof this capability exists for: a capture
+    /// does not need a precisely-timed manual `c3d.trace_start` -- it
+    /// can be armed ahead of time and left to fire itself exactly when
+    /// the texture of interest first appears.
+    #[test]
+    fn trace_arm_on_texture_bind_defers_the_capture_until_that_texture_binds() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context(&mut b, &mut h);
+
+        let path = std::env::temp_dir().join(format!(
+            "copperline-c3d-trace-trigger-test-{}.c3dtrace",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        b.trace_arm_on_texture_bind(42, Some(path.clone()), None);
+        assert_eq!(b.trace_trigger_pending(), Some(42));
+        assert!(b.trace_status().is_none(), "armed but not yet capturing");
+
+        let tex_create = |id: u32| vec![((proto::OP_TEX_CREATE as u32) << 16) | 2, id];
+        let tex_bind = |unit: u32, id: u32| vec![((proto::OP_TEX_BIND as u32) << 16) | 3, unit, id];
+
+        let mut tail = 0u32;
+        // Doorbell 1: bind a different texture -- must not fire.
+        let mut cmds = tex_create(7);
+        cmds.extend(tex_bind(0, 7));
+        submit_doorbell(&mut b, &mut h, &mut tail, &cmds);
+        assert!(
+            b.trace_status().is_none(),
+            "an unrelated texture bind must not fire the trigger"
+        );
+        assert_eq!(b.trace_trigger_pending(), Some(42));
+
+        // Doorbell 2: create and bind texture 42 -- fires the trigger.
+        // The triggering doorbell itself is not captured; the capture
+        // starts from the *next* one (`check_trace_trigger`'s doc
+        // comment).
+        let mut cmds = tex_create(42);
+        cmds.extend(tex_bind(0, 42));
+        submit_doorbell(&mut b, &mut h, &mut tail, &cmds);
+        assert_eq!(b.trace_trigger_pending(), None, "trigger consumed");
+        let status = b.trace_status().expect("capture started");
+        assert_eq!(
+            status.rings, 0,
+            "the triggering doorbell itself is not captured"
+        );
+
+        // Doorbell 3: now captured.
+        submit_doorbell(&mut b, &mut h, &mut tail, &fence_cmd(1));
+        let status = b.trace_stop().expect("was capturing");
+        assert_eq!(
+            status.rings, 1,
+            "only the post-trigger doorbell was captured"
+        );
+        assert_eq!(status.path, path);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

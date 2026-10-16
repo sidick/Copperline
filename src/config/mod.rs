@@ -327,6 +327,22 @@ pub struct Config {
     /// raw config's capability names (see `RawC3d::mask_caps`). `0` when
     /// unset -- the full fitted capability set.
     pub c3d_mask_caps: u32,
+    /// `[c3d] trace`: the default path a `c3d.trace_start` control call
+    /// falls back to when it names none of its own. `None` means that
+    /// method falls all the way back to a timestamped file in the
+    /// `[paths]` traces directory.
+    pub c3d_trace: Option<PathBuf>,
+    /// `[c3d] trace_enabled`: start a live capture to `c3d_trace` (or the
+    /// timestamped default, if unset) immediately at boot.
+    pub c3d_trace_enabled: bool,
+    /// `[c3d] trace_rolling_bytes`: bound `c3d_trace_enabled`'s boot-time
+    /// capture in memory instead of streaming unbounded to disk. `None`
+    /// is the original unbounded behaviour.
+    pub c3d_trace_rolling_bytes: Option<u64>,
+    /// `[c3d] trace_trigger_texture`: defer `c3d_trace_enabled`'s
+    /// boot-time capture until this texture id is bound, instead of
+    /// starting immediately.
+    pub c3d_trace_trigger_texture: Option<u32>,
     /// HostSocket board backend (`[hostsocket] net`): when set, the bundled
     /// bsdsocket.library plugin board is fitted with this backend. The board
     /// itself travels in [`Config::wasm_boards`]; this field records the
@@ -2741,6 +2757,10 @@ impl Default for Config {
             mhi: false,
             c3d: false,
             c3d_mask_caps: 0,
+            c3d_trace: None,
+            c3d_trace_enabled: false,
+            c3d_trace_rolling_bytes: None,
+            c3d_trace_trigger_texture: None,
             hostsocket_net: None,
             hostsocket_transport: None,
             rtg: RtgCard::None,

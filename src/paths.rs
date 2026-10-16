@@ -482,6 +482,17 @@ pub fn trace_file() -> PathBuf {
     )
 }
 
+/// Default name for a live C3D command-stream capture (`c3d.trace_start`
+/// without a path), beside the instruction traces -- the container
+/// `copperline-c3d-trace` reads, not the instruction tracer's own `.txt`
+/// format despite the shared directory and naming shape.
+pub fn c3d_trace_file() -> PathBuf {
+    output(
+        |p, h| p.traces_dir(h),
+        format!("copperline-c3d-trace-{}.c3dtrace", epoch_stamp()),
+    )
+}
+
 /// A battery-backed RAM, under the configured directory -- unless one is
 /// already sitting where Copperline used to put it.
 ///

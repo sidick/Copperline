@@ -105,6 +105,137 @@ fn write_m2_config(cfg_path: &Path, mount: &Path) {
     .expect("write test config");
 }
 
+/// As [`write_m2_config`], plus `[c3d] trace_enabled = true` and
+/// `trace = trace_path` -- the primary live-capture interface
+/// (`docs/internals/c3d.md`'s "Trace capture"): boot with it set, run
+/// normally, quit, and the whole session's command stream lands at
+/// `trace_path` with no CCP interaction at all.
+fn write_m2_config_with_trace(cfg_path: &Path, mount: &Path, trace_path: &Path) {
+    std::fs::write(
+        cfg_path,
+        format!(
+            "rom = \"<bundled-aros>\"\n\n\
+             [machine]\n\
+             profile = \"A4000\"\n\n\
+             [c3d]\n\
+             enabled = true\n\
+             trace_enabled = true\n\
+             trace = '{}'\n\n\
+             [[filesys]]\n\
+             path = '{}'\n\
+             volume = \"C3DBOOT\"\n\
+             bootpri = 6\n",
+            trace_path.display(),
+            mount.display()
+        ),
+    )
+    .expect("write test config");
+}
+
+/// The M2 protocol test (`c3dtest`), boot-captured end to end via
+/// `[c3d] trace_enabled`/`trace` rather than driven live over the
+/// control protocol -- proving the primary interface
+/// `docs/internals/c3d.md`'s "Trace capture" describes: boot with it
+/// set, play normally, quit, and the resulting file is a real,
+/// independently loadable and replayable trace of the whole session.
+/// `write_m2_config`'s own `c3d_m2_board_probe_clear_and_readback`
+/// already proves `c3dtest` itself passes; this test's job is only the
+/// capture, not re-proving the protocol test.
+#[test]
+#[ignore = "runs the emulator and copperline-c3d-trace"]
+fn c3d_trace_enabled_captures_the_m2_session_to_a_replayable_file() {
+    let _guard = lock_emulator_tests();
+    let mount = scratch_dir("trace-mount");
+    stage_m2_mount(&mount, &repo_root().join("guest/c3d/test/c3dtest"));
+
+    let cfg_path = scratch_dir("trace-cfg").with_extension("toml");
+    let trace_path = scratch_dir("trace-capture").with_extension("c3dtrace");
+    let _ = std::fs::remove_file(&trace_path);
+    write_m2_config_with_trace(&cfg_path, &mount, &trace_path);
+
+    let shot = scratch_dir("trace-shot").with_extension("png");
+    let out = run_copperline(&[
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--noaudio",
+        "--screenshot-after",
+        "40",
+        shot.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "emulator run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        mount.join("done").is_file(),
+        "Startup-Sequence never reached its completion marker under {}",
+        mount.display()
+    );
+    assert!(
+        trace_path.is_file(),
+        "[c3d] trace_enabled did not produce a capture file at {}",
+        trace_path.display()
+    );
+    assert!(
+        std::fs::metadata(&trace_path).unwrap().len() > 12,
+        "capture file is no bigger than a bare C3DT header -- nothing was recorded"
+    );
+
+    // Independently loadable: `copperline-c3d-trace info` parses every
+    // section without this test reaching into `TraceReader` itself.
+    let info_bin = env!("CARGO_BIN_EXE_copperline-c3d-trace");
+    let info_out = Command::new(info_bin)
+        .args(["info", trace_path.to_str().unwrap()])
+        .output()
+        .expect("run copperline-c3d-trace info");
+    assert!(
+        info_out.status.success(),
+        "copperline-c3d-trace info failed: {}",
+        String::from_utf8_lossy(&info_out.stderr)
+    );
+    let info_text = String::from_utf8_lossy(&info_out.stdout);
+    assert!(
+        info_text.contains("RING:"),
+        "expected at least one RING section reported; info output:\n{info_text}"
+    );
+
+    // Independently replayable: `copperline-c3d-trace run` decodes and
+    // actually renders the captured session (not just parses the
+    // container), skipping cleanly rather than failing if this host has
+    // no GPU adapter at all -- the same "not an error" stance
+    // `Renderer::new`'s own tests take.
+    let run_out_dir = scratch_dir("trace-replay-out");
+    let _ = std::fs::remove_dir_all(&run_out_dir);
+    std::fs::create_dir_all(&run_out_dir).expect("create replay output dir");
+    let run_out = Command::new(info_bin)
+        .args([
+            "run",
+            trace_path.to_str().unwrap(),
+            "--out",
+            run_out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run copperline-c3d-trace run");
+    let run_stderr = String::from_utf8_lossy(&run_out.stderr);
+    if run_stderr.contains("no wgpu adapter") {
+        eprintln!("skipping replay-produces-a-frame check: no wgpu adapter available");
+        return;
+    }
+    assert!(
+        run_out.status.success(),
+        "copperline-c3d-trace run failed: {run_stderr}"
+    );
+    let frames: Vec<_> = std::fs::read_dir(&run_out_dir)
+        .expect("read replay output dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !frames.is_empty(),
+        "replaying the captured session produced no frames at all"
+    );
+}
+
 /// See this file's own doc comment.
 #[test]
 #[ignore = "runs the emulator"]

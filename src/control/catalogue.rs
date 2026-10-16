@@ -1088,6 +1088,88 @@ fn build() -> Vec<ToolDef> {
             no_params(),
             json!({}),
         ),
+        entry(
+            "c3d.trace_start",
+            "Arm a live C3D command-stream capture, replacing any already running capture or \
+             pending trigger: every doorbell the C3D board handles from now on is written to \
+             a trace file `copperline-c3d-trace info`/`run`/`compare` can load \
+             (docs/internals/c3d.md, \"Trace capture\"). Needs a build with the c3d feature \
+             and a `[c3d] enabled` board. Omit `path` to fall back to `[c3d] trace`'s \
+             configured default and then a timestamped file in the [paths] traces directory. \
+             Set `rolling_bytes` to bound the capture in memory instead (oldest doorbells \
+             evicted first, nothing written to `path` until `c3d.trace_snapshot`/`trace_stop`) \
+             -- for a session that runs far longer than you want to capture all of. Set \
+             `trigger_texture` to defer the start (rolling or not) until that texture id is \
+             bound on any context, instead of starting immediately; mutually exclusive with \
+             starting now, like naming an explicit `path` is mutually exclusive with falling \
+             back to the default.",
+            object(
+                vec![
+                    (
+                        "path",
+                        string(
+                            "Host .c3dtrace file (default: [c3d] trace, else a timestamped file)",
+                        ),
+                    ),
+                    (
+                        "rolling_bytes",
+                        uint(
+                            "Bound the capture to this many bytes in memory, evicting the \
+                             oldest doorbells first, instead of streaming unbounded straight \
+                             to `path`",
+                            Some(1),
+                            None,
+                        ),
+                    ),
+                    (
+                        "trigger_texture",
+                        uint(
+                            "Defer the start until this texture id is bound (TEX_BIND) on \
+                             any context, instead of starting now",
+                            Some(1),
+                            None,
+                        ),
+                    ),
+                ],
+                &[],
+            ),
+            json!({"path": "/tmp/quake.c3dtrace", "rolling_bytes": 10_485_760}),
+        ),
+        entry(
+            "c3d.trace_stop",
+            "Stop the C3D trace capture and finalise the file, reporting its final \
+             `path`, `rings`, `blobs` and `bytes` -- for a rolling capture, this replays \
+             whatever is currently buffered to `path` first, the same as a final \
+             `c3d.trace_snapshot`.",
+            no_params(),
+            json!({}),
+        ),
+        entry(
+            "c3d.trace_snapshot",
+            "Replay a rolling capture's currently-buffered records to disk without stopping \
+             the roll -- grab what's in the ring right now (e.g. right after noticing a bug \
+             on screen) and keep capturing. Omit `path` to reuse the capture's own resolved \
+             path, overwriting it. On a non-rolling (unbounded) capture this just flushes \
+             the already-open file and reports its progress so far; `path` is ignored in \
+             that case. `active: false` with no other fields means nothing is armed.",
+            object(
+                vec![(
+                    "path",
+                    string("Host .c3dtrace file (default: the capture's own resolved path)"),
+                )],
+                &[],
+            ),
+            json!({}),
+        ),
+        entry(
+            "c3d.trace_status",
+            "Report the C3D trace capture: `active` and, while running, its `path`, `rings`, \
+             `blobs` and `bytes` (buffered, not yet on disk, for a rolling capture -- see \
+             `rolling`/`rolling_byte_budget`). While inactive, `trigger_pending` reports an \
+             armed-but-not-yet-fired `trigger_texture`, if any.",
+            no_params(),
+            json!({}),
+        ),
         // Breakpoints
         entry(
             "break.add",

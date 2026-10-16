@@ -465,10 +465,9 @@ pub fn tex_wrap_to_address_mode(wrap: TexWrap) -> wgpu::AddressMode {
     }
 }
 
-/// `TEXTURE_MIN_FILTER`/`TEXTURE_MAG_FILTER`. The four mipmap modes are
-/// collapsed to their base filter -- M1 uploads level 0 only (mipmap
-/// generation is M3), so `min_filter`'s mipmap component has nothing to
-/// select between yet.
+/// `TEXTURE_MIN_FILTER`/`TEXTURE_MAG_FILTER`'s base (non-mipmap) filter.
+/// The four mipmap modes collapse to their base filter here; the mipmap
+/// component itself is [`tex_filter_mipmap_mode`].
 pub fn tex_filter_to_wgpu(filter: TexFilter) -> wgpu::FilterMode {
     match filter {
         TexFilter::Nearest | TexFilter::NearestMipmapNearest | TexFilter::NearestMipmapLinear => {
@@ -476,6 +475,22 @@ pub fn tex_filter_to_wgpu(filter: TexFilter) -> wgpu::FilterMode {
         }
         TexFilter::Linear | TexFilter::LinearMipmapNearest | TexFilter::LinearMipmapLinear => {
             wgpu::FilterMode::Linear
+        }
+    }
+}
+
+/// `TEXTURE_MIN_FILTER`'s mip-selection component: `None` for the two
+/// plain (non-mipmap) modes, which must sample level 0 only regardless
+/// of how many levels the bound texture object has; `Some` otherwise,
+/// naming how to blend between the two nearest levels.
+pub fn tex_filter_mipmap_mode(filter: TexFilter) -> Option<wgpu::MipmapFilterMode> {
+    match filter {
+        TexFilter::Nearest | TexFilter::Linear => None,
+        TexFilter::NearestMipmapNearest | TexFilter::LinearMipmapNearest => {
+            Some(wgpu::MipmapFilterMode::Nearest)
+        }
+        TexFilter::NearestMipmapLinear | TexFilter::LinearMipmapLinear => {
+            Some(wgpu::MipmapFilterMode::Linear)
         }
     }
 }
@@ -492,8 +507,13 @@ pub const INTERNAL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dept
 
 /// Converts one RGBA8 (straight, `0..255` per channel) pixel to the bytes
 /// of `fmt`, for [`RenderOp::SurfaceReadback`]. `Depth` is not a colour
-/// format and has no encoding here (`READ_PIXELS` -- which does read
-/// depth -- is deferred to M3).
+/// format and has no encoding here, and cannot in practice: a surface
+/// can never be *defined* with `format = Depth` (the spec reserves
+/// `DEPTH` to `READ_PIXELS`'s own closed format option, never
+/// `SURFACE_DEFINE`'s), so `SurfaceReadback`'s `def.format` -- sourced
+/// from the live surface's own declared format -- can never be `Depth`
+/// either. `READ_PIXELS` reads depth through its own path instead
+/// ([`Self::op_read_pixels`]), with no need for this function.
 pub fn encode_pixel(fmt: WireSurfaceFormat, rgba: [u8; 4]) -> Result<Vec<u8>, RenderError> {
     let mut buf = [0u8; 4];
     let n = encode_pixel_into(fmt, rgba, &mut buf)?;
@@ -751,14 +771,38 @@ pub fn convert_texel_to_rgba8(fmt: TexFormat, src: &[u8]) -> Option<[u8; 4]> {
             [0, 0, 0, src[0]]
         }
         TexFormat::I8 => {
-            // Unindexed (no palette bound in this milestone -- TEX_PALETTE
-            // is deferred): I8 is intensity, R=G=B=A=I, per the spec.
+            // Unindexed: I8 is intensity, R=G=B=A=I, per the spec. A
+            // palette-indexed I8 upload goes through
+            // `convert_texel_to_rgba8_with_palette` instead, which falls
+            // back to this exact arm when no palette is bound for the
+            // texture.
             if src.is_empty() {
                 return None;
             }
             [src[0], src[0], src[0], src[0]]
         }
     })
+}
+
+/// As [`convert_texel_to_rgba8`], except `TEX_PALETTE`'s contract
+/// overrides `I8`'s plain intensity meaning with palette lookup
+/// whenever a non-empty `palette` is bound: "with a palette bound, an
+/// I8 image is interpreted as indices into it". An index past the end
+/// of a shorter-than-256-entry palette has no guest-visible meaning
+/// (the spec leaves it undefined) and is not a reason to fail the whole
+/// upload, so it decodes to transparent black rather than erroring.
+/// Every other format ignores `palette` entirely, matching the spec's
+/// "an I8 image" wording -- no other format is ever indexed.
+fn convert_texel_to_rgba8_with_palette(
+    fmt: TexFormat,
+    src: &[u8],
+    palette: &[[u8; 4]],
+) -> Option<[u8; 4]> {
+    if fmt == TexFormat::I8 && !palette.is_empty() {
+        let index = *src.first()?;
+        return Some(palette.get(index as usize).copied().unwrap_or([0, 0, 0, 0]));
+    }
+    convert_texel_to_rgba8(fmt, src)
 }
 
 fn expand5(v: u16) -> u8 {
@@ -2301,14 +2345,21 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
             format!("if (!({op})) {{ discard; }}\n",)
         }
     };
-    let alpha_ref_decl = match (key.alpha_test.is_some(), key.textured1) {
-        (false, _) => "",
+    let alpha_ref_decl = match (key.alpha_test.is_some(), key.textured1, key.textured) {
+        (false, _, _) => "",
         // Unit 1's own layout (`bind_group_layout_textured2_alpha`) puts
         // `tex1`/`samp1` at bindings 2/3, so the alpha-ref uniform moves
-        // to binding 4; the single-unit layout keeps it at binding 2,
-        // unchanged from before multitexture existed.
-        (true, true) => "@group(0) @binding(4) var<uniform> alpha_ref: f32;\n",
-        (true, false) => "@group(0) @binding(2) var<uniform> alpha_ref: f32;\n",
+        // to binding 4; the single-unit textured layout keeps it at
+        // binding 2, unchanged from before multitexture existed.
+        // `ALPHA_TEST` is independent of texturing (GL allows alpha-
+        // testing an untextured, vertex-coloured draw), and `textured1`
+        // implies `textured` (`pipeline_key_from_state`'s doc comment),
+        // so an untextured draw can only land in the third arm:
+        // `bind_group_layout_alpha_only` has nothing else, so binding 0
+        // is free for the uniform alone.
+        (true, true, _) => "@group(0) @binding(4) var<uniform> alpha_ref: f32;\n",
+        (true, false, true) => "@group(0) @binding(2) var<uniform> alpha_ref: f32;\n",
+        (true, false, false) => "@group(0) @binding(0) var<uniform> alpha_ref: f32;\n",
     };
     // GL's real fixed-function order (texturing, then alpha test, then
     // fog) is followed here too, though it's only a correctness
@@ -2375,8 +2426,129 @@ struct GpuSurface {
 struct GpuTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Level 0's shape -- every other level's shape is derived from this
+    /// with [`mip_extent`], since that is exactly the formula `texture`
+    /// was created with ([`Renderer::define_texture_level`]).
     width: u32,
     height: u32,
+    mip_level_count: u32,
+}
+
+/// `TEXTURE_MIN_FILTER`/wrap/base-filter plus the mip-selection mode
+/// ([`tex_filter_mipmap_mode`]) a sampler was built from -- the cache key
+/// for [`Renderer::sampler`].
+type SamplerKey = (
+    wgpu::AddressMode,
+    wgpu::AddressMode,
+    wgpu::FilterMode,
+    Option<wgpu::MipmapFilterMode>,
+);
+
+/// A mip level's extent given its base (level 0) extent, per the
+/// standard `max(1, base >> level)` chain -- what wgpu itself computes
+/// for every level of a texture created with a given base size, so this
+/// must agree with it exactly for a `write_texture` at `level` to land
+/// in bounds. `checked_shr` rather than `>>` because `level` is
+/// guest-controlled and a shift amount at or past the type's bit width
+/// panics.
+fn mip_extent(base: u32, level: u32) -> u32 {
+    base.checked_shr(level).unwrap_or(0).max(1)
+}
+
+/// Decodes a `TEX_IMAGE`/`TEX_SUBIMAGE` wire payload (`format`, packed at
+/// `row_bytes` per guest row) to a tightly-packed `width`x`height` RGBA8
+/// buffer. `op_name` tags the error on a short memory read or a short
+/// per-texel decode. `palette` is the texture id's currently-bound
+/// `TEX_PALETTE` table (empty if none): expansion through it happens
+/// here, at upload time, once -- the spec's "nothing indexed ever
+/// stored" contract, matching the first client's own
+/// `GL_EXT_color_table` behaviour. A later palette rebind does not
+/// retroactively change pixels already uploaded this way.
+fn decode_wire_rgba8(
+    format: TexFormat,
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+    data: Ref,
+    mem: &mut dyn Memory,
+    op_name: &'static str,
+    palette: &[[u8; 4]],
+) -> Result<Vec<u8>, RenderError> {
+    let bpp = tex_format_bytes_per_pixel(format) as u32;
+    let needed = (row_bytes.max(bpp * width) as usize) * height as usize;
+    let loc = MemLoc::from_ref(data);
+    let src = mem
+        .read(loc, needed)
+        .ok_or_else(|| RenderError::BadMemory(format!("{op_name} ref at {loc:?}")))?;
+
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for row in 0..height {
+        let row_start = row as usize * row_bytes as usize;
+        for col in 0..width {
+            let texel_start = row_start + col as usize * bpp as usize;
+            let texel = src
+                .get(texel_start..)
+                .and_then(|s| convert_texel_to_rgba8_with_palette(format, s, palette))
+                .ok_or(RenderError::ShortPayload(op_name))?;
+            let out = ((row * width + col) * 4) as usize;
+            rgba[out..out + 4].copy_from_slice(&texel);
+        }
+    }
+    Ok(rgba)
+}
+
+/// Writes `data` (tightly packed RGBA8, `w`x`h`) into `texture` at
+/// `level`, clamped to that level's actual extent (`mip_extent` of the
+/// texture's own base size, read back off `texture` itself rather than
+/// threaded through as a parameter). This is the defensive boundary
+/// against a guest-supplied level/shape mismatch that would otherwise
+/// ask wgpu to write outside the mip's bounds -- a zero-sized `w`/`h` or
+/// a clamp down to a smaller rectangle both become a safe no-op/crop
+/// instead of a validation failure. Crops from `data`'s own top-left
+/// corner and repacks rows, since a narrower output width changes the
+/// tightly-packed row stride.
+fn write_level_rect(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    level: u32,
+    w: u32,
+    h: u32,
+    data: &[u8],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let out_w = w.min(mip_extent(texture.width(), level));
+    let out_h = h.min(mip_extent(texture.height(), level));
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
+    let mut packed = vec![0u8; (out_w * out_h * 4) as usize];
+    for row in 0..out_h {
+        let src = (row * w * 4) as usize;
+        let dst = (row * out_w * 4) as usize;
+        packed[dst..dst + (out_w * 4) as usize]
+            .copy_from_slice(&data[src..src + (out_w * 4) as usize]);
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(out_w * 4),
+            rows_per_image: Some(out_h),
+        },
+        wgpu::Extent3d {
+            width: out_w,
+            height: out_h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// The wgpu renderer. Owns its own headless device -- never a window's.
@@ -2385,10 +2557,15 @@ pub struct Renderer {
     adapter_info: wgpu::AdapterInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    sampler_cache: HashMap<(wgpu::AddressMode, wgpu::AddressMode, wgpu::FilterMode), wgpu::Sampler>,
+    sampler_cache: HashMap<SamplerKey, wgpu::Sampler>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     bind_group_layout_textured: wgpu::BindGroupLayout,
     bind_group_layout_textured_alpha: wgpu::BindGroupLayout,
+    /// `ALPHA_TEST` is independent of texturing (GL lets a client alpha-
+    /// test an untextured, vertex-coloured draw), so this is the shape
+    /// for that combination: the alpha-ref uniform alone, at binding 0,
+    /// with no texture/sampler at all.
+    bind_group_layout_alpha_only: wgpu::BindGroupLayout,
     /// Two-unit multitexture (`CAP_MULTITEXTURE`): unit 0's texture+sampler
     /// at bindings 0/1, unit 1's at bindings 2/3 -- used only when both
     /// units are active (`PipelineKey::textured1`); a single active unit
@@ -2403,6 +2580,14 @@ pub struct Renderer {
     bind_group_layout_clear_rect: wgpu::BindGroupLayout,
     surfaces: HashMap<u32, GpuSurface>,
     textures: HashMap<u32, GpuTexture>,
+    /// `TEX_PALETTE`'s bound RGBA8 colour tables, by texture id --
+    /// independent of `textures` (a palette can be bound before the
+    /// texture object itself exists on the GPU side, i.e. before its
+    /// first `TEX_IMAGE`) and outlives any single GPU texture recreate.
+    /// Consulted only when expanding an `I8` upload
+    /// ([`decode_wire_rgba8`]); a missing or empty entry means I8 keeps
+    /// its plain intensity meaning.
+    palettes: HashMap<u32, Vec<[u8; 4]>>,
     clear_rect_pipelines: HashMap<ClearRectPipelineKey, wgpu::RenderPipeline>,
     /// Whether this device's adapter advertised `POLYGON_MODE_LINE`/
     /// `POLYGON_MODE_POINT` -- computed once from the adapter's own
@@ -2598,6 +2783,20 @@ impl Renderer {
                     },
                 ],
             });
+        let bind_group_layout_alpha_only =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d alpha-test-only bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         // Two-unit multitexture: unit 0's texture+sampler at bindings 0/1
         // (same shape as `bind_group_layout_textured` above), unit 1's at
@@ -2680,11 +2879,13 @@ impl Renderer {
             pipelines: HashMap::new(),
             bind_group_layout_textured,
             bind_group_layout_textured_alpha,
+            bind_group_layout_alpha_only,
             bind_group_layout_textured2,
             bind_group_layout_textured2_alpha,
             bind_group_layout_clear_rect,
             surfaces: HashMap::new(),
             textures: HashMap::new(),
+            palettes: HashMap::new(),
             clear_rect_pipelines: HashMap::new(),
             polygon_mode_line_supported,
             polygon_mode_point_supported,
@@ -2770,13 +2971,19 @@ impl Renderer {
             .expect("just inserted or present"))
     }
 
+    /// `mipmap` is the mip-selection half of `TEXTURE_MIN_FILTER`
+    /// ([`tex_filter_mipmap_mode`]): `None` for the two non-mipmap modes,
+    /// which must sample level 0 only even when the bound texture object
+    /// has more levels -- wgpu has no "ignore the mips" switch, so this
+    /// pairs a `None` with `lod_max_clamp: 0.0` to get the same effect.
     fn sampler(
         &mut self,
         wrap_s: wgpu::AddressMode,
         wrap_t: wgpu::AddressMode,
         filter: wgpu::FilterMode,
+        mipmap: Option<wgpu::MipmapFilterMode>,
     ) -> &wgpu::Sampler {
-        let key = (wrap_s, wrap_t, filter);
+        let key = (wrap_s, wrap_t, filter, mipmap);
         self.sampler_cache.entry(key).or_insert_with(|| {
             self.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("c3d sampler"),
@@ -2785,7 +2992,9 @@ impl Renderer {
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
                 mag_filter: filter,
                 min_filter: filter,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                mipmap_filter: mipmap.unwrap_or(wgpu::MipmapFilterMode::Nearest),
+                lod_min_clamp: 0.0,
+                lod_max_clamp: if mipmap.is_some() { 32.0 } else { 0.0 },
                 ..Default::default()
             })
         })
@@ -2823,6 +3032,11 @@ impl Renderer {
             Some(&self.bind_group_layout_textured_alpha)
         } else if key.textured {
             Some(&self.bind_group_layout_textured)
+        } else if key.alpha_test.is_some() {
+            // Untextured but still alpha-tested (GL allows this: the
+            // test runs against the vertex colour's alpha) -- the
+            // alpha-ref uniform alone, no texture/sampler.
+            Some(&self.bind_group_layout_alpha_only)
         } else {
             None
         };
@@ -3342,7 +3556,9 @@ impl Renderer {
             } => {
                 self.op_tex_copy_subimage(*id, *level, *xoff, *yoff, *x, *y, *width, *height, state)
             }
-            RenderOp::TexPalette { .. } => Err(RenderError::Unimplemented("TEX_PALETTE (M3)")),
+            RenderOp::TexPalette { id, entries, data } => {
+                self.op_tex_palette(*id, *entries, *data, mem)
+            }
             RenderOp::ReadPixels {
                 x,
                 y,
@@ -3996,12 +4212,13 @@ impl Renderer {
                 TexWrap::Repeat,
                 TexFilter::Linear,
             ));
-            let k = (
+            let k: SamplerKey = (
                 tex_wrap_to_address_mode(ws),
                 tex_wrap_to_address_mode(wt),
                 tex_filter_to_wgpu(min),
+                tex_filter_mipmap_mode(min),
             );
-            self.sampler(k.0, k.1, k.2);
+            self.sampler(k.0, k.1, k.2, k.3);
             Some(k)
         } else {
             None
@@ -4017,12 +4234,13 @@ impl Renderer {
                 TexWrap::Repeat,
                 TexFilter::Linear,
             ));
-            let k = (
+            let k: SamplerKey = (
                 tex_wrap_to_address_mode(ws),
                 tex_wrap_to_address_mode(wt),
                 tex_filter_to_wgpu(min),
+                tex_filter_mipmap_mode(min),
             );
-            self.sampler(k.0, k.1, k.2);
+            self.sampler(k.0, k.1, k.2, k.3);
             Some(k)
         } else {
             None
@@ -4139,6 +4357,28 @@ impl Renderer {
                     ],
                 }))
             }
+        } else if key.alpha_test.is_some() {
+            // Untextured but alpha-tested: the alpha-ref uniform alone,
+            // at binding 0 of `bind_group_layout_alpha_only` (see
+            // `fragment_shader_source`'s `alpha_ref_decl` and
+            // `build_pipeline`'s layout selection -- all three must
+            // agree on this shape).
+            let alpha_ref_bytes = state.raster.alpha_ref.to_le_bytes();
+            let alpha_ref = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("c3d alpha ref"),
+                    contents: &alpha_ref_bytes,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("c3d alpha-only bind group"),
+                layout: &self.bind_group_layout_alpha_only,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: alpha_ref.as_entire_binding(),
+                }],
+            }))
         } else {
             None
         };
@@ -4198,71 +4438,18 @@ impl Renderer {
         data: Ref,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        if level != 0 {
-            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
-        }
-        let bpp = tex_format_bytes_per_pixel(format) as u32;
-        let needed = (row_bytes.max(bpp * width) as usize) * height as usize;
-        let loc = MemLoc::from_ref(data);
-        let src = mem
-            .read(loc, needed)
-            .ok_or_else(|| RenderError::BadMemory(format!("TEX_IMAGE ref at {loc:?}")))?;
-
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-        for row in 0..height {
-            let row_start = row as usize * row_bytes as usize;
-            for col in 0..width {
-                let texel_start = row_start + col as usize * bpp as usize;
-                let texel = src
-                    .get(texel_start..)
-                    .and_then(|s| convert_texel_to_rgba8(format, s))
-                    .ok_or(RenderError::ShortPayload("TEX_IMAGE texel"))?;
-                let out = ((row * width + col) * 4) as usize;
-                rgba[out..out + 4].copy_from_slice(&texel);
-            }
-        }
-
-        let size = wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("c3d texture"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            size,
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.textures.insert(
-            id,
-            GpuTexture {
-                texture,
-                view,
-                width,
-                height,
-            },
-        );
-        Ok(())
+        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let rgba = decode_wire_rgba8(
+            format,
+            width,
+            height,
+            row_bytes,
+            data,
+            mem,
+            "TEX_IMAGE",
+            palette,
+        )?;
+        self.define_texture_level(id, level, width, height, &rgba)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4279,42 +4466,35 @@ impl Renderer {
         data: Ref,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        if level != 0 {
-            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
-        }
         let Some(existing) = self.textures.get(&id) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
-        if x + width > existing.width || y + height > existing.height {
+        if level >= existing.mip_level_count {
+            return Err(RenderError::UnknownObject("texture level", level));
+        }
+        let level_w = mip_extent(existing.width, level);
+        let level_h = mip_extent(existing.height, level);
+        if x + width > level_w || y + height > level_h {
             return Err(RenderError::ShortPayload("TEX_SUBIMAGE rectangle"));
         }
 
-        let bpp = tex_format_bytes_per_pixel(format) as u32;
-        let needed = (row_bytes.max(bpp * width) as usize) * height as usize;
-        let loc = MemLoc::from_ref(data);
-        let src = mem
-            .read(loc, needed)
-            .ok_or_else(|| RenderError::BadMemory(format!("TEX_SUBIMAGE ref at {loc:?}")))?;
-
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-        for row in 0..height {
-            let row_start = row as usize * row_bytes as usize;
-            for col in 0..width {
-                let texel_start = row_start + col as usize * bpp as usize;
-                let texel = src
-                    .get(texel_start..)
-                    .and_then(|s| convert_texel_to_rgba8(format, s))
-                    .ok_or(RenderError::ShortPayload("TEX_SUBIMAGE texel"))?;
-                let out = ((row * width + col) * 4) as usize;
-                rgba[out..out + 4].copy_from_slice(&texel);
-            }
-        }
+        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let rgba = decode_wire_rgba8(
+            format,
+            width,
+            height,
+            row_bytes,
+            data,
+            mem,
+            "TEX_SUBIMAGE",
+            palette,
+        )?;
 
         let texture = &self.textures[&id].texture;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
-                mip_level: 0,
+                mip_level: level,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -4333,17 +4513,166 @@ impl Renderer {
         Ok(())
     }
 
-    /// `TEX_COPY_IMAGE` (`glCopyTexImage2D`): defines a fresh level 0 from
-    /// the draw surface's rectangle with a GPU-side texture-to-texture
-    /// copy -- no guest round trip, no CPU readback. The draw surface's
-    /// internal colour format is already [`INTERNAL_COLOR_FORMAT`], the
-    /// same format every texture object is stored in, so this is a
-    /// straight copy with no conversion step; `format` names only the
-    /// *wire* layout `TEX_IMAGE`/`TEX_SUBIMAGE` would decode from guest
-    /// bytes; it has no guest bytes to decode here, so it goes unused
-    /// (the spec permits a device to store at higher precision than a
-    /// requested format -- "Texture formats" -- which is what every
-    /// texture object already does).
+    /// `TEX_PALETTE`: binds (or, at `entries == 0`, unbinds) texture
+    /// `id`'s RGBA8 colour table. Only ever reached when
+    /// `TEXFMT_SUPPORTED` bit 9 (`I8_INDEXED`) is advertised -- `ring.rs`
+    /// rejects the opcode with `E_BAD_OPCODE` at decode time otherwise --
+    /// and `entries` is already `<= 256` by the same decode-time check,
+    /// so there is no limit to enforce here. Pure bookkeeping: no GPU
+    /// work happens until an `I8` `TEX_IMAGE`/`TEX_SUBIMAGE` actually
+    /// expands through this table (`decode_wire_rgba8`'s `palette`
+    /// parameter), per the spec's "nothing indexed ever stored"
+    /// contract.
+    fn op_tex_palette(
+        &mut self,
+        id: u32,
+        entries: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        if entries == 0 {
+            self.palettes.remove(&id);
+            return Ok(());
+        }
+        let loc = MemLoc::from_ref(data);
+        let needed = entries as usize * 4;
+        let src = mem
+            .read(loc, needed)
+            .ok_or_else(|| RenderError::BadMemory(format!("TEX_PALETTE ref at {loc:?}")))?;
+        let palette: Vec<[u8; 4]> = src
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+        self.palettes.insert(id, palette);
+        Ok(())
+    }
+
+    /// Common tail of [`Self::op_tex_image`] and the slow path of
+    /// [`Self::op_tex_copy_image`]: sets level `level`'s pixel data to
+    /// `rgba` (tightly packed RGBA8, `width`x`height`) and (re)builds the
+    /// GPU texture object to cover it.
+    ///
+    /// wgpu fixes a texture's `mip_level_count` at creation time, so
+    /// defining a level this object didn't already have room for means
+    /// recreating the whole thing: every other already-defined level is
+    /// first read back from the outgoing GPU texture into CPU memory
+    /// ([`Self::copy_texture_rect_to_cpu`]) and re-uploaded alongside the
+    /// new one. A guest that only ever defines level 0 (everything before
+    /// M3) never pays this: the loop below has nothing else to read back,
+    /// since `existing.mip_level_count` is always 1 in that case.
+    fn define_texture_level(
+        &mut self,
+        id: u32,
+        level: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        // Level 0's shape is the texture's base size; a guest defining a
+        // higher level before level 0 (not something any real driver
+        // does) gets that level's own shape taken as the base instead,
+        // which at least cannot crash -- see `mip_extent`'s use below.
+        let existing = self.textures.get(&id);
+        let (base_w, base_h) = match existing {
+            Some(tex) if level != 0 => (tex.width, tex.height),
+            _ => (width, height),
+        };
+        let size = wgpu::Extent3d {
+            width: base_w.max(1),
+            height: base_h.max(1),
+            depth_or_array_layers: 1,
+        };
+        // The level count only ever grows across calls -- redefining an
+        // already-covered level (e.g. level 1 again, after level 2 has
+        // also been defined) must not shrink the object and drop the
+        // other levels it already carries. Guest-controlled `level` can
+        // also be arbitrarily large; clamp to what this size can
+        // actually hold so a hostile or buggy `TEX_IMAGE
+        // level=0xffffffff` cannot demand an unbounded `mip_level_count`
+        // from wgpu.
+        let existing_mip_count = existing.map_or(0, |tex| tex.mip_level_count);
+        let mip_level_count = existing_mip_count
+            .max(level + 1)
+            .min(size.max_mips(wgpu::TextureDimension::D2));
+        let write_level = level.min(mip_level_count - 1);
+
+        let mut carried = Vec::new();
+        if let Some(tex) = existing {
+            for lvl in 0..tex.mip_level_count.min(mip_level_count) {
+                if lvl == write_level {
+                    continue;
+                }
+                // Size this *read* against `tex`'s own base dims, not
+                // `base_w`/`base_h` -- those name the *new* object's
+                // base, which can differ from `tex`'s when `level == 0`
+                // redefines the base size while higher levels from the
+                // old size still linger (not standard usage, but not an
+                // error either; see the comment above). `tex.texture`
+                // is still the old object, so its own levels are still
+                // sized from its own old base, regardless of what the
+                // new base will be -- using the new base here asked
+                // wgpu to read past the old texture's actual bounds.
+                let w = mip_extent(tex.width, lvl);
+                let h = mip_extent(tex.height, lvl);
+                let data = self.copy_texture_rect_to_cpu(&tex.texture, lvl, 0, 0, w, h)?;
+                carried.push((lvl, w, h, data));
+            }
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("c3d texture"),
+            size,
+            mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: INTERNAL_COLOR_FORMAT,
+            // COPY_SRC alongside the usual TEXTURE_BINDING|COPY_DST: a
+            // texture with more than one level may need reading back by
+            // a *later* call to this function, to carry its other levels
+            // forward across the next recreate (the loop above does
+            // exactly that to `tex.texture` for whichever texture object
+            // already existed before this call).
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        for (lvl, w, h, data) in &carried {
+            write_level_rect(&self.queue, &texture, *lvl, *w, *h, data);
+        }
+        write_level_rect(&self.queue, &texture, write_level, width, height, rgba);
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.textures.insert(
+            id,
+            GpuTexture {
+                texture,
+                view,
+                width: base_w,
+                height: base_h,
+                mip_level_count,
+            },
+        );
+        Ok(())
+    }
+
+    /// `TEX_COPY_IMAGE` (`glCopyTexImage2D`): defines level `level` from
+    /// the draw surface's rectangle. The common case -- a texture's very
+    /// first level, which is always level 0 for a real driver -- takes a
+    /// GPU-side texture-to-texture copy with no CPU round trip at all, as
+    /// before mip levels existed. Anything that needs the object to carry
+    /// more than one level (this call defining a second or later level,
+    /// or defining a non-zero level first) goes through
+    /// [`Self::define_texture_level`] instead, which must read every
+    /// other level back to the CPU to recreate the object -- wgpu cannot
+    /// retarget an existing texture at a level count it wasn't created
+    /// with. The draw surface's internal colour format is already
+    /// [`INTERNAL_COLOR_FORMAT`], the same format every texture object is
+    /// stored in, so neither path needs a conversion step; `format` names
+    /// only the *wire* layout `TEX_IMAGE`/`TEX_SUBIMAGE` would decode
+    /// from guest bytes, and goes unused here (the spec permits a device
+    /// to store at higher precision than a requested format -- "Texture
+    /// formats" -- which is what every texture object already does).
     fn op_tex_copy_image(
         &mut self,
         id: u32,
@@ -4354,79 +4683,82 @@ impl Renderer {
         height: u32,
         state: &State,
     ) -> Result<(), RenderError> {
-        if level != 0 {
-            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
-        }
         let surface_id = state.draw_surface();
         let def = *state
             .surface(surface_id)
             .ok_or(RenderError::UnknownObject("surface", surface_id))?;
         let color = self.ensure_surface(surface_id, &def)?.color.clone();
 
-        let size = wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("c3d texture (TEX_COPY_IMAGE)"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: INTERNAL_COLOR_FORMAT,
-            // COPY_SRC alongside the usual TEXTURE_BINDING|COPY_DST: a
-            // render-to-texture result is a natural source for a later
-            // `TEX_COPY_SUBIMAGE`-into-another-texture or mip-generation
-            // step, unlike a `TEX_IMAGE` upload from guest bytes.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("c3d tex-copy-image encoder"),
+        if level == 0 && !self.textures.contains_key(&id) {
+            let size = wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("c3d texture (TEX_COPY_IMAGE)"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: INTERNAL_COLOR_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
             });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &color,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            size,
-        );
-        self.queue.submit(Some(encoder.finish()));
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.textures.insert(
-            id,
-            GpuTexture {
-                texture,
-                view,
-                width,
-                height,
-            },
-        );
-        Ok(())
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("c3d tex-copy-image encoder"),
+                });
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                size,
+            );
+            self.queue.submit(Some(encoder.finish()));
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.textures.insert(
+                id,
+                GpuTexture {
+                    texture,
+                    view,
+                    width,
+                    height,
+                    mip_level_count: 1,
+                },
+            );
+            return Ok(());
+        }
+
+        let rgba = self.copy_texture_rect_to_cpu(&color, 0, x, y, width, height)?;
+        self.define_texture_level(id, level, width, height, &rgba)
     }
 
     /// `TEX_COPY_SUBIMAGE` (`glCopyTexSubImage2D`): the in-place mirror of
     /// [`Self::op_tex_copy_image`] -- same GPU-side copy, but into an
     /// existing level's `(xoff, yoff)` rather than creating a new texture.
-    /// The destination rectangle is checked against the *existing* level's
-    /// own dimensions here, exactly as [`Self::op_tex_subimage`] already
-    /// does for `TEX_SUBIMAGE`, since dispatch only ever validated the
-    /// *source* rectangle against the live draw surface.
+    /// Never needs a recreate (the level's shape and the object's
+    /// `mip_level_count` are unchanged), so, unlike `op_tex_copy_image`,
+    /// there is only the one GPU-to-GPU path regardless of which level
+    /// this targets. The destination rectangle is checked against the
+    /// *targeted* level's own dimensions here, exactly as
+    /// [`Self::op_tex_subimage`] already does for `TEX_SUBIMAGE`, since
+    /// dispatch only ever validated the *source* rectangle against the
+    /// live draw surface.
     #[allow(clippy::too_many_arguments)]
     fn op_tex_copy_subimage(
         &mut self,
@@ -4440,13 +4772,15 @@ impl Renderer {
         height: u32,
         state: &State,
     ) -> Result<(), RenderError> {
-        if level != 0 {
-            return Err(RenderError::Unimplemented("mipmap levels above 0 (M3)"));
-        }
         let Some(existing) = self.textures.get(&id) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
-        if xoff + width > existing.width || yoff + height > existing.height {
+        if level >= existing.mip_level_count {
+            return Err(RenderError::UnknownObject("texture level", level));
+        }
+        let level_w = mip_extent(existing.width, level);
+        let level_h = mip_extent(existing.height, level);
+        if xoff + width > level_w || yoff + height > level_h {
             return Err(RenderError::ShortPayload("TEX_COPY_SUBIMAGE rectangle"));
         }
 
@@ -4471,7 +4805,7 @@ impl Renderer {
             },
             wgpu::TexelCopyTextureInfo {
                 texture: dest,
-                mip_level: 0,
+                mip_level: level,
                 origin: wgpu::Origin3d {
                     x: xoff,
                     y: yoff,
@@ -4745,13 +5079,33 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copies a colour texture's whole contents to a CPU-side RGBA8
-    /// buffer, blocking on the map. Used by [`Self::op_surface_readback`]
-    /// and by callers (the trace runner, `selftest`) that want to inspect
-    /// or golden-compare a rendered surface directly.
+    /// Copies a colour texture's whole contents (level 0, from the
+    /// origin) to a CPU-side RGBA8 buffer, blocking on the map. Used by
+    /// [`Self::op_surface_readback`] and by callers (the trace runner,
+    /// `selftest`) that want to inspect or golden-compare a rendered
+    /// surface directly. [`Self::copy_texture_rect_to_cpu`] is the
+    /// general form this delegates to.
     pub fn copy_texture_to_cpu(
         &self,
         texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        self.copy_texture_rect_to_cpu(texture, 0, 0, 0, width, height)
+    }
+
+    /// The general form of [`Self::copy_texture_to_cpu`]: an arbitrary
+    /// mip level and origin, used by [`Self::define_texture_level`] (to
+    /// preserve a texture object's other levels across a recreate) and
+    /// by [`Self::op_tex_copy_image`]/[`Self::op_tex_copy_subimage`]'s
+    /// slow paths (to pull a rectangle off the draw surface into the CPU
+    /// level cache a recreate needs).
+    fn copy_texture_rect_to_cpu(
+        &self,
+        texture: &wgpu::Texture,
+        mip_level: u32,
+        x: u32,
+        y: u32,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
@@ -4775,8 +5129,8 @@ impl Renderer {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                mip_level,
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
@@ -4924,6 +5278,39 @@ mod tests {
         // Scales correctly with a non-unit w (still pre-perspective-divide).
         assert_eq!(gl_clip_z_to_wgpu(-2.0, 2.0), 0.0);
         assert_eq!(gl_clip_z_to_wgpu(2.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn mip_extent_halves_with_a_floor_of_one_and_never_panics_on_a_huge_level() {
+        assert_eq!(mip_extent(64, 0), 64);
+        assert_eq!(mip_extent(64, 1), 32);
+        assert_eq!(mip_extent(64, 6), 1);
+        assert_eq!(mip_extent(64, 7), 1);
+        // `level` is guest-controlled; a shift amount at or past the
+        // type's bit width must not panic (`checked_shr`, not `>>`).
+        assert_eq!(mip_extent(64, 1000), 1);
+    }
+
+    #[test]
+    fn tex_filter_mipmap_mode_is_none_only_for_the_two_plain_filters() {
+        assert_eq!(tex_filter_mipmap_mode(TexFilter::Nearest), None);
+        assert_eq!(tex_filter_mipmap_mode(TexFilter::Linear), None);
+        assert_eq!(
+            tex_filter_mipmap_mode(TexFilter::NearestMipmapNearest),
+            Some(wgpu::MipmapFilterMode::Nearest)
+        );
+        assert_eq!(
+            tex_filter_mipmap_mode(TexFilter::LinearMipmapNearest),
+            Some(wgpu::MipmapFilterMode::Nearest)
+        );
+        assert_eq!(
+            tex_filter_mipmap_mode(TexFilter::NearestMipmapLinear),
+            Some(wgpu::MipmapFilterMode::Linear)
+        );
+        assert_eq!(
+            tex_filter_mipmap_mode(TexFilter::LinearMipmapLinear),
+            Some(wgpu::MipmapFilterMode::Linear)
+        );
     }
 
     #[test]
@@ -5841,15 +6228,16 @@ mod tests {
     /// The bug `SURFACE_UPLOAD`'s own implementation would otherwise have
     /// repeated: a rectangle away from the surface's origin, and a
     /// surface whose `stride_bytes` carries padding past `width * bpp`,
-    /// both need each row placed at `address + (y + row) * stride_bytes
-    /// + x * bpp` in backing memory -- never the readback rectangle's own
-    /// tightly-packed offset, which is only ever a row's *length*. This
-    /// clears a padded, wider-than-tall surface to a known colour, reads
-    /// back a 2x2 rectangle away from the origin, and checks the bytes
-    /// landed at the correct strided offset -- with the padding bytes
-    /// (and everything outside the rectangle) left exactly as they
-    /// started, proving this does not merely "work" by writing more than
-    /// it should.
+    /// both need each row placed at
+    /// `address + (y + row) * stride_bytes + x * bpp` in backing memory
+    /// -- never the readback rectangle's own tightly-packed offset,
+    /// which is only ever a row's *length*. This clears a padded,
+    /// wider-than-tall surface to a known colour, reads back a 2x2
+    /// rectangle away from the origin, and checks the bytes landed at
+    /// the correct strided offset -- with the padding bytes (and
+    /// everything outside the rectangle) left exactly as they started,
+    /// proving this does not merely "work" by writing more than it
+    /// should.
     #[test]
     fn a_surface_readback_of_a_subrectangle_lands_at_the_correct_strided_offset() {
         let mut renderer = match Renderer::new() {
@@ -6470,6 +6858,624 @@ mod tests {
         }
     }
 
+    /// `TEX_IMAGE` for level 1 on top of an already-defined level 0 must
+    /// grow the object to two mip levels and leave both readable --
+    /// level 0 still red, level 1 its own solid green, not level 0's
+    /// colour (which would mean the recreate silently dropped or
+    /// overwrote the wrong level).
+    #[test]
+    fn tex_image_defines_a_second_mip_level_without_disturbing_the_first() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(65536);
+        let level0 = [255u8, 0, 0, 255].repeat(4 * 4);
+        let level1 = [0u8, 255, 0, 255].repeat(2 * 2);
+        mem.write(MemLoc::Aperture(0), &level0);
+        mem.write(MemLoc::Aperture(1024), &level1);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 4,
+                    height: 4,
+                    row_bytes: 16,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 64,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 1,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 2,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: 1024,
+                        space: RefSpace::Aperture,
+                        length: 16,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        assert_eq!(tex.mip_level_count, 2);
+        let lvl0 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 4, 4)
+            .unwrap();
+        assert_eq!(&lvl0[..4], [255, 0, 0, 255], "level 0 should stay red");
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 2, 2)
+            .unwrap();
+        assert_eq!(
+            &lvl1[..4],
+            [0, 255, 0, 255],
+            "level 1 should be its own green"
+        );
+
+        // Redefining level 0 again must not shrink the object back down
+        // and drop level 1 -- the easy mistake with a recreate-on-every-
+        // write design (`Renderer::define_texture_level`'s whole point
+        // is to guard against exactly this).
+        let errs = renderer.execute(
+            &[RenderOp::TexImage {
+                id: 1,
+                level: 0,
+                format: TexFormat::Rgba8,
+                width: 4,
+                height: 4,
+                row_bytes: 16,
+                data: Ref {
+                    address: 0,
+                    space: RefSpace::Aperture,
+                    length: 64,
+                },
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let tex = renderer.textures.get(&1).unwrap();
+        assert_eq!(
+            tex.mip_level_count, 2,
+            "redefining level 0 must not shrink the object and drop level 1"
+        );
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 2, 2)
+            .unwrap();
+        assert_eq!(
+            &lvl1[..4],
+            [0, 255, 0, 255],
+            "level 1 should have survived the level-0 redefine"
+        );
+    }
+
+    /// Redefining level 0 at a *different* size than before, while a
+    /// higher level from the old size still exists, must not crash.
+    /// `define_texture_level`'s carry-forward loop reads the old levels
+    /// back off the *old* texture object before recreating it, and that
+    /// read has to be sized against the old object's own base
+    /// (`tex.width`/`tex.height`), not the new target's -- using the new
+    /// (larger) base to size a read off the old (smaller) texture asks
+    /// wgpu to copy past the old texture's real bounds, which wgpu
+    /// treats as a fatal validation error by default (a hard process
+    /// abort, not a catchable `RenderError`).
+    #[test]
+    fn redefining_level_0_at_a_different_size_does_not_crash_reading_back_old_levels() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(65536);
+        let level0_old = [255u8, 0, 0, 255].repeat(4 * 4); // 4x4 red
+        let level1 = [0u8, 255, 0, 255].repeat(2 * 2); // 2x2 green
+        let level0_new = [0u8, 0, 255, 255].repeat(8 * 8); // 8x8 blue
+        mem.write(MemLoc::Aperture(0), &level0_old);
+        mem.write(MemLoc::Aperture(1024), &level1);
+        mem.write(MemLoc::Aperture(2048), &level0_new);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 4,
+                    height: 4,
+                    row_bytes: 16,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 64,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 1,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 2,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: 1024,
+                        space: RefSpace::Aperture,
+                        length: 16,
+                    },
+                },
+                // Redefine level 0 bigger than before -- old level 1
+                // (sized from the old 4x4 base) must be read back
+                // against its own real size, not the new 8x8 base's.
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 8,
+                    height: 8,
+                    row_bytes: 32,
+                    data: Ref {
+                        address: 2048,
+                        space: RefSpace::Aperture,
+                        length: 256,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let tex = renderer.textures.get(&1).unwrap();
+        let lvl0 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 8, 8)
+            .unwrap();
+        assert_eq!(
+            &lvl0[..4],
+            [0, 0, 255, 255],
+            "level 0 should be the new blue"
+        );
+    }
+
+    /// `TEX_SUBIMAGE` against a non-zero level patches that level in
+    /// place and must be bounds-checked against *that level's* own
+    /// shape, not level 0's -- a 2x2 level 1 rejects a rect that would
+    /// fit level 0's 4x4.
+    #[test]
+    fn tex_subimage_targets_a_non_zero_level_and_is_bounds_checked_against_it() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(65536);
+        let level0 = [0u8, 0, 0, 255].repeat(4 * 4);
+        let level1 = [0u8, 0, 0, 255].repeat(2 * 2);
+        mem.write(MemLoc::Aperture(0), &level0);
+        mem.write(MemLoc::Aperture(1024), &level1);
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 4,
+                    height: 4,
+                    row_bytes: 16,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 64,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 1,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 2,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: 1024,
+                        space: RefSpace::Aperture,
+                        length: 16,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // A 2x2 rect at (1,1) is out of bounds for level 1's own 2x2
+        // shape (it would fit level 0's 4x4 fine), so this must be
+        // rejected, not silently clamped or written out of bounds.
+        let errs = renderer.execute(
+            &[RenderOp::TexSubImage {
+                id: 1,
+                level: 1,
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+                format: TexFormat::Rgba8,
+                row_bytes: 8,
+                data: Ref {
+                    address: 1024,
+                    space: RefSpace::Aperture,
+                    length: 16,
+                },
+            }],
+            &state,
+            &mut mem,
+        );
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0], RenderError::ShortPayload(_)));
+
+        // The whole of level 1, at (0,0), fits and must patch it to
+        // white without disturbing level 0.
+        let white = [255u8, 255, 255, 255].repeat(2 * 2);
+        mem.write(MemLoc::Aperture(2048), &white);
+        let errs = renderer.execute(
+            &[RenderOp::TexSubImage {
+                id: 1,
+                level: 1,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                format: TexFormat::Rgba8,
+                row_bytes: 8,
+                data: Ref {
+                    address: 2048,
+                    space: RefSpace::Aperture,
+                    length: 16,
+                },
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let tex = renderer.textures.get(&1).unwrap();
+        let lvl0 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 4, 4)
+            .unwrap();
+        assert_eq!(&lvl0[..4], [0, 0, 0, 255], "level 0 untouched");
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 2, 2)
+            .unwrap();
+        for (i, px) in lvl1.chunks(4).enumerate() {
+            assert_eq!(
+                px,
+                [255, 255, 255, 255],
+                "level 1 texel {i} should be white"
+            );
+        }
+    }
+
+    /// `TEX_COPY_IMAGE` for a second level on an already-existing
+    /// texture must take the slow (CPU-readback) path and still
+    /// preserve level 0 -- the fast GPU-to-GPU path only applies to a
+    /// texture's very first level.
+    #[test]
+    fn tex_copy_image_defines_a_second_level_via_the_slow_path() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut state = State::new(state::Limits::default());
+        two_tone_surface(
+            &mut renderer,
+            &mut state,
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        );
+        let mut mem = TestMemory::new(65536);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexCopyImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    x: 0,
+                    y: 0,
+                    width: 16,
+                    height: 8,
+                },
+                // Level 1 of a 16x8 base texture is 8x4 (`mip_extent`) --
+                // copy from the blue bottom half at that size, a
+                // conformant mip chain rather than exercising the
+                // defensive oversized-write clamp in `write_level_rect`.
+                RenderOp::TexCopyImage {
+                    id: 1,
+                    level: 1,
+                    format: TexFormat::Rgba8,
+                    x: 0,
+                    y: 8,
+                    width: 8,
+                    height: 4,
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        assert_eq!(tex.mip_level_count, 2);
+        let lvl0 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 16, 8)
+            .unwrap();
+        assert_eq!(
+            &lvl0[..4],
+            [255, 0, 0, 255],
+            "level 0 should stay the red top half"
+        );
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 8, 4)
+            .unwrap();
+        assert_eq!(
+            &lvl1[..4],
+            [0, 0, 255, 255],
+            "level 1 should be the blue bottom half"
+        );
+    }
+
+    /// `TEX_PALETTE` must expand a bound palette's entries into an `I8`
+    /// upload's indices at upload time: index 0 and index 1 of a
+    /// two-colour palette land as that colour's RGBA8, not as `I8`'s
+    /// plain intensity meaning (which would make every non-zero index
+    /// look identical regardless of which colour it names).
+    #[test]
+    fn tex_palette_expands_an_i8_uploads_indices_through_the_bound_colours() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(65536);
+
+        // Palette: index 0 = red, index 1 = green.
+        mem.write(MemLoc::Aperture(0), &[255u8, 0, 0, 255, 0, 255, 0, 255]);
+        // A 2x1 I8 image: index 1 then index 0.
+        mem.write(MemLoc::Aperture(1024), &[1u8, 0]);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexPalette {
+                    id: 1,
+                    entries: 2,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 8,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::I8,
+                    width: 2,
+                    height: 1,
+                    row_bytes: 2,
+                    data: Ref {
+                        address: 1024,
+                        space: RefSpace::Aperture,
+                        length: 2,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        let rgba = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 2, 1)
+            .unwrap();
+        assert_eq!(
+            &rgba[..4],
+            [0, 255, 0, 255],
+            "index 1 should be the palette's green"
+        );
+        assert_eq!(
+            &rgba[4..8],
+            [255, 0, 0, 255],
+            "index 0 should be the palette's red"
+        );
+    }
+
+    /// Unbinding a palette (`TEX_PALETTE` with `entries = 0`) must
+    /// revert a *subsequent* `I8` upload to its plain intensity meaning
+    /// -- `decode_wire_rgba8` consults the palette fresh on every
+    /// upload, so this is a live switch, not a one-time choice baked in
+    /// at `TEX_CREATE`.
+    #[test]
+    fn tex_palette_unbind_reverts_a_later_i8_upload_to_plain_intensity() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let state = State::new(state::Limits::default());
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(0), &[0u8, 255, 0, 255]); // palette index 0 = green
+        mem.write(MemLoc::Aperture(1024), &[0u8]); // one I8 texel: index/intensity 0
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexPalette {
+                    id: 1,
+                    entries: 1,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 4,
+                    },
+                },
+                RenderOp::TexPalette {
+                    id: 1,
+                    entries: 0, // unbind
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 0,
+                    },
+                },
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::I8,
+                    width: 1,
+                    height: 1,
+                    row_bytes: 1,
+                    data: Ref {
+                        address: 1024,
+                        space: RefSpace::Aperture,
+                        length: 1,
+                    },
+                },
+            ],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        let rgba = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 1, 1)
+            .unwrap();
+        assert_eq!(
+            &rgba[..4],
+            [0, 0, 0, 0],
+            "intensity 0 is R=G=B=A=0, not the unbound palette's leftover green"
+        );
+    }
+
+    /// `ALPHA_TEST` is independent of texturing -- GL still runs it
+    /// against the vertex colour's own alpha when no texture is bound at
+    /// all. This is a real combination (not merely a defensive guard):
+    /// `build_pipeline`'s layout selection, `fragment_shader_source`'s
+    /// `alpha_ref_decl`, and the per-draw bind-group construction all
+    /// have to agree on using `bind_group_layout_alpha_only` for it, or
+    /// `create_render_pipeline` panics with a binding/layout mismatch
+    /// (the alpha-ref uniform the shader declares has nowhere to live).
+    /// Draws two covering triangles with `GL_GREATER`/`alpha_ref = 0.5`:
+    /// one above the reference (must land), one at or below it (must be
+    /// discarded, leaving the clear colour).
+    #[test]
+    fn alpha_test_against_vertex_colour_alone_neither_panics_nor_mis_discards() {
+        let draw_with_alpha = |alpha: f32| -> Option<[u8; 4]> {
+            let mut renderer = match Renderer::new() {
+                Ok(r) => r,
+                Err(RenderError::NoAdapter) => {
+                    eprintln!("skipping: no wgpu adapter available");
+                    return None;
+                }
+                Err(e) => panic!("unexpected renderer error: {e}"),
+            };
+            let mut state = State::new(state::Limits::default());
+            state.surface_define(
+                1,
+                Surface {
+                    width: 16,
+                    height: 16,
+                    stride_bytes: 64,
+                    format: WireSurfaceFormat::A8r8g8b8,
+                    backing: state::Backing::Aperture(0),
+                },
+            );
+            state.set_draw_surface(1);
+            state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+            state.set_current_color(1.0, 1.0, 1.0, alpha);
+            state.enable(state::Capability::AlphaTest);
+            state.set_alpha_func(state::CompareFunc::Greater, 0.5);
+
+            let tri = [(-16.0f32, -16.0f32), (-16.0, 48.0), (48.0, -16.0)];
+            let mut verts = Vec::new();
+            for (x, y) in tri {
+                for w in [x, y, 0.5f32, 1.0f32] {
+                    verts.extend_from_slice(&w.to_bits().to_be_bytes());
+                }
+            }
+            let mut mem = TestMemory::new(65536);
+            let errs = renderer.execute(
+                &[
+                    RenderOp::Clear {
+                        mask: proto::CLEAR_MASK_COLOR,
+                    },
+                    RenderOp::Draw {
+                        prim: PrimitiveType::Triangles,
+                        format: VertexFormat(0),
+                        count: 3,
+                        window_space: true,
+                        vertices: DrawVertices::Inline(&verts),
+                    },
+                ],
+                &state,
+                &mut mem,
+            );
+            assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+            let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+            let (row, col) = (8usize, 8usize);
+            let px = &pixels[(row * 16 + col) * 4..][..4];
+            Some([px[0], px[1], px[2], px[3]])
+        };
+
+        let Some(above_ref) = draw_with_alpha(0.75) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            above_ref,
+            [255, 255, 255, 191], // alpha test discards/keeps; it never clamps alpha to 1.0
+            "alpha 0.75 > ref 0.5 should pass GL_GREATER and land: {above_ref:?}"
+        );
+
+        let Some(below_ref) = draw_with_alpha(0.25) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            below_ref,
+            [0, 0, 0, 255],
+            "alpha 0.25 <= ref 0.5 should fail GL_GREATER and stay the clear colour: {below_ref:?}"
+        );
+    }
+
     /// Draws a single fully-covering triangle at window-space `rhw` (so
     /// fog distance -- `1 / rhw` when the format carries no `FOGCOORD` --
     /// is under the caller's control) with `Capability::Fog` enabled, and
@@ -6802,14 +7808,16 @@ mod tests {
         };
 
         // Inside the viewport: coloured white.
-        let inside = &pixels[(8 * 16 + 8) * 4..][..4];
+        let (row, col) = (8usize, 8usize);
+        let inside = &pixels[(row * 16 + col) * 4..][..4];
         assert_eq!(
             &inside[..3],
             &[255, 255, 255],
             "(8, 8) is inside VIEWPORT(4, 4, 8, 8) and should be coloured: {inside:?}"
         );
         // Outside the viewport (top-left corner): still the clear colour.
-        let outside = &pixels[(1 * 16 + 1) * 4..][..4];
+        let (row, col) = (1usize, 1usize);
+        let outside = &pixels[(row * 16 + col) * 4..][..4];
         assert_eq!(
             &outside[..3],
             &[0, 0, 0],

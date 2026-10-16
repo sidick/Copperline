@@ -1441,7 +1441,7 @@ mod tests {
     fn a_draw_with_no_bound_surface_is_e_no_surface_and_emits_no_draw_op() {
         let mut ctx = context();
         let draw = cmd(OP_DRAW_INLINE_WIN, &[4, 0, 0]); // count 0, no vertices
-        let ring = ring_of(&[draw.clone()]);
+        let ring = ring_of(std::slice::from_ref(&draw));
         let mut out = Vec::new();
         ctx.submit(&ring, draw.len() as u32, &config(), &mut out);
         assert!(out.is_empty());
@@ -1600,7 +1600,7 @@ mod tests {
         let mut ctx = context();
         // TEX_IMAGE: id, level, format, width, height, row_bytes, ref(2).
         let tex_image = cmd(OP_TEX_IMAGE, &[1, 0, 0, 4, 4, 16, 0, 16]);
-        let ring = ring_of(&[tex_image.clone()]);
+        let ring = ring_of(std::slice::from_ref(&tex_image));
         let mut out = Vec::new();
         ctx.submit(&ring, tex_image.len() as u32, &config(), &mut out);
         assert!(out.is_empty());
@@ -1782,7 +1782,7 @@ mod tests {
     fn query_of_an_unknown_target_raises_gl_invalid_enum() {
         let mut ctx = context();
         let query = cmd(OP_QUERY, &[0xFFFF, 0, 16]);
-        let ring = ring_of(&[query.clone()]);
+        let ring = ring_of(std::slice::from_ref(&query));
         let mut out = Vec::new();
         ctx.submit(&ring, query.len() as u32, &config(), &mut out);
         assert!(out.is_empty());

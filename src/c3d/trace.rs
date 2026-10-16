@@ -650,6 +650,13 @@ impl<W: Write> TraceWriter<W> {
     pub fn into_inner(self) -> W {
         self.inner
     }
+
+    /// Flushes the underlying writer without consuming it -- for a
+    /// best-effort finalize on drop, where `into_inner`'s `self` cannot
+    /// be moved out of a `&mut self` destructor.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(test)]

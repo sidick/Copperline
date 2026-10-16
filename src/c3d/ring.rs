@@ -151,7 +151,11 @@ impl Default for DeviceConfig {
     /// Copperline's chosen values, at or above every spec-stated minimum;
     /// `max_texture_units` matches `state::Limits::default()`'s two units
     /// (the first client's two-unit multitexture target). `texfmt_supported`
-    /// covers the spec's required minimum set (`RGBA8`..`A8`, bits 0-7);
+    /// covers the spec's required minimum set (`RGBA8`..`A8`, bits 0-7)
+    /// plus the two optional `I8`/`I8_INDEXED` bits (8, 9): `render.rs`
+    /// expands a palette-indexed `I8` upload to RGBA8 at upload time
+    /// (`TEX_PALETTE`'s "nothing indexed ever stored" contract), so
+    /// advertising it costs nothing already implemented elsewhere.
     /// `surffmt_supported` covers the required minimum (`R5G6B5`,
     /// `R5G6B5_LE` since spec draft 0.18, `A8R8G8B8`) plus the other
     /// chunky formats Copperline's surfaces also accept, including
@@ -169,14 +173,16 @@ impl Default for DeviceConfig {
             surface_guestaddr: true,
             aperture_size: proto::APERTURE_SIZE_DEFAULT,
             max_texture_units: 2,
-            max_textures: 256,
+            max_textures: 2048,
             max_surfaces: 16,
             max_lights: 8,
             max_clip_planes: 6,
             max_texture_size: 1024,
             max_surface_width: 1024,
             max_surface_height: 768,
-            texfmt_supported: 0xFF, // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
+            texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
+                | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
+                | (1 << 9), // I8_INDEXED: TEX_PALETTE itself
             surffmt_supported: (1 << 1) // R5G6B5
                 | (1 << 2) // R5G6B5_LE -- mandatory floor since spec draft 0.18
                 | (1 << 3) // R5G5B5
@@ -1849,7 +1855,7 @@ mod tests {
         for (opcode, length) in cases {
             let words = vec![header(opcode, length); 1]
                 .into_iter()
-                .chain(std::iter::repeat(0).take(length as usize - 1))
+                .chain(std::iter::repeat_n(0, length as usize - 1))
                 .collect::<Vec<_>>();
             let ring = ring_with(4096, 0, &words);
             let step = decode_one_with(&ring, 0, length as u32 * 4, c);
@@ -1889,9 +1895,7 @@ mod tests {
             format.0,
             1,
         ];
-        for _ in 0..vertex_words {
-            words.push(0);
-        }
+        words.extend(std::iter::repeat_n(0, vertex_words as usize));
         let ring = ring_with(4096, 0, &words);
         let step = decode_one(&ring, 0, correct_length * 4);
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
@@ -1998,9 +2002,7 @@ mod tests {
                 format.0,
                 1,
             ];
-            for _ in 0..vertex_words {
-                words.push(0);
-            }
+            words.extend(std::iter::repeat_n(0, vertex_words as usize));
             let ring = ring_with(4096, 0, &words);
             let step = decode_one(&ring, 0, correct_length * 4);
             assert!(
@@ -2285,10 +2287,12 @@ mod tests {
 
     #[test]
     fn tex_palette_is_bad_opcode_without_texfmt_supported_bit_9() {
-        // Otherwise entirely well-formed -- Copperline's own default
-        // config (TEXFMT_SUPPORTED bits 0-7 only) doesn't set I8_INDEXED,
-        // so the opcode itself doesn't exist per the spec, exactly like
-        // an unknown opcode or a missing-tier one.
+        // Otherwise entirely well-formed -- a reduced config without
+        // I8_INDEXED (unlike Copperline's own default, which advertises
+        // it) means the opcode itself doesn't exist per the spec,
+        // exactly like an unknown opcode or a missing-tier one.
+        let mut c = DeviceConfig::default();
+        c.texfmt_supported &= !(1 << proto::TextureFormat::I8Indexed as u32);
         let words = [
             header(OP_TEX_PALETTE, 5),
             1,   // id
@@ -2297,7 +2301,7 @@ mod tests {
             1024, // ref length: 256 RGBA8 entries
         ];
         let ring = ring_with(4096, 0, &words);
-        let step = decode_one(&ring, 0, 20);
+        let step = decode_one_with(&ring, 0, 20, c);
         assert_eq!(step, err(ErrorCode::BadOpcode, 0, false));
     }
 
@@ -2757,9 +2761,7 @@ mod tests {
             format.0,
             count,
         ];
-        for _ in 0..count * vertex_words {
-            words.push(0);
-        }
+        words.extend(std::iter::repeat_n(0, (count * vertex_words) as usize));
         let ring = ring_with(4096, 0, &words);
         let total_bytes = correct_length * 4;
         let step = decode_one(&ring, 0, total_bytes);
@@ -2827,9 +2829,7 @@ mod tests {
             format.0,
             count,
         ];
-        for _ in 0..count * vertex_words {
-            words.push(0);
-        }
+        words.extend(std::iter::repeat_n(0, (count * vertex_words) as usize));
         let ring = ring_with(4096, 0, &words);
         let step = decode_one(&ring, 0, correct_length * 4);
         assert!(matches!(step, Step::Command(Command::DrawInlineWin { .. })));
@@ -2980,9 +2980,7 @@ mod tests {
                 format.0,
                 count,
             ];
-            for _ in 0..pos_words {
-                words.push(0);
-            }
+            words.extend(std::iter::repeat_n(0, pos_words as usize));
             let ring = ring_with(4096, 0, &words);
             let step = decode_one(&ring, 0, correct_length * 4);
             assert!(
@@ -3023,9 +3021,7 @@ mod tests {
                 format.0,
                 count,
             ];
-            for _ in 0..vertex_words {
-                words.push(0);
-            }
+            words.extend(std::iter::repeat_n(0, vertex_words as usize));
             let ring = ring_with(4096, 0, &words);
             let step = decode_one(&ring, 0, correct_length * 4);
             assert!(
