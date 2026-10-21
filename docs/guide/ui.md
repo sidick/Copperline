@@ -45,7 +45,8 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 |---|---|---|
 | `Cmd+Q` | `Alt+Q` | Quit (also the [menu's](#and-last) last row; a [calibrated gamepad's](#gamepad-calibration) optional Quit hotkey, held, quits too) |
 | `Cmd+E` | `Alt+E` | Open / close the menu (also the status bar's hamburger button); releases a captured mouse |
-| `Cmd+S` | `Alt+S` | Save a screenshot (`copperline-screenshot-<YYYYMMDDHHmmSS>.png` in the [screenshots folder](#where-files-go); the on-screen confirmation overlay is not part of the saved image) |
+| `Cmd+Option+S` | `Ctrl+Alt+S` | Save a native screenshot at the original pixel size |
+| `Cmd+S` | `Alt+S` | Save the displayed picture with its current effects (`copperline-screenshot-<YYYYMMDDHHmmSS>.png` in the [screenshots folder](#where-files-go); the on-screen confirmation overlay is not part of the saved image) |
 | `Cmd+R` | `Alt+R` | Start / stop a video-with-audio recording (below) |
 | `Cmd+Shift+R` | `Alt+Shift+R` | Start / stop an input recording (below) |
 | `Cmd+Shift+V` | `Alt+Shift+V` | Paste as keystrokes: type the host clipboard's text on the emulated keyboard (also *Input Settings -> Paste as Keystrokes*) |
@@ -155,7 +156,9 @@ left to right it holds:
   SCSI CD-ROM unit, the CD LED shows CD-DA playback and the unit's data
   reads light the HDD LED with the rest of the SCSI bus. Small digital
   counters show the current floppy and CD tracks, in green and blue
-  respectively. A machine with only one kind of removable drive gets one
+  respectively. The floppy counter reads the track number, or with
+  *Video Settings -> Track Display -> Cyl.Side* the cylinder and side
+  (`40.1` is cylinder 40, upper side). A machine with only one kind of removable drive gets one
   full-size counter; a machine with both gets two vertically stacked
   counters, and a zero-floppy CDTV/CD32 does not show an empty FDD
   counter. When a built-in CD controller and an expansion CD-ROM are both
@@ -262,6 +265,7 @@ menu's font size (it follows *Menu Size*), refreshed twice a second:
 | `audio 148 ms` | Live audio output lead -- the cushion that absorbs host scheduling hiccups (steady state is about 150 ms) |
 | `xrun 0` | Audio underrun frames per second: the audible symptom of the host falling behind |
 | `slip 0` | Times the pacer reset its host-time target after exceeding the catch-up limit (for example, after a host stall), since the last guest reset |
+| `cpu 212 MHz` | Only under `[cpu] speed = "fastest"`: the JIT's current effective clock, which follows the host's headroom (see [Configuration](configuration.md)) |
 
 Copperline never skips frames to keep pace: when the host cannot sustain
 real time the machine slows down (fps and the speed factor fall below
@@ -271,8 +275,8 @@ the same point. Under Warp Speed the presentation shows one frame per
 burst, but every emulated frame is still computed.
 
 Like the transient message overlay, the readout is painted into the
-presentation only: screenshots, frame dumps, and recordings never include
-it. While a video recording is running the block steps below the `REC`
+presentation only. Interactive screenshots include it; scheduled screenshots,
+frame dumps, and recordings exclude it. While a video recording is running the block steps below the `REC`
 badge. `COPPERLINE_PERF_OVERLAY=1|0` overrides the config for a single
 run, and `--perf-overlay` shows it from the command line; the launcher's
 *Perf overlay* row (*A/V & Emu*, *Display*) makes it stick. The same
@@ -288,21 +292,23 @@ until `debug_clear` removes them. Their coordinates are in a virtual 768x576
 space mapped across the active display area, so they follow the autocrop and
 scaling settings. The debug overlay is drawn beneath the host UI (status
 bar, OSD, performance overlay) and affects only live window presentation;
-screenshots, frame dumps, and video recordings exclude it. Disabling
+interactive screenshots include it, while scheduled screenshots, frame dumps,
+and video recordings exclude it. Disabling
 `[emulation] uaelib` removes the uaelib trap entirely.
 
 ## Drag and drop
 
 Disk images can be dropped anywhere on the emulator window:
 
-- **Floppy images** (ADF/ADZ/DMS/IPF/SCP, plain or gzip packed): with one
-  connected drive the disk is inserted immediately. With several, a drive
-  chooser opens over the display -- click a drive, press its position in
-  the list (`1`-`4`), or press `Esc` to cancel. Dropping several floppies
+- **Floppy images** (ADF/ADZ/DMS/IPF/SCP, plain or gzip packed, plus
+  ZIP-packed ADF): with one connected drive the disk is inserted
+  immediately. With several, a drive chooser opens over the display --
+  click a drive, press its position in the list (`1`-`4`), or press `Esc`
+  to cancel. Dropping several floppies
   at once queues them all as the target drive's swap playlist, exactly
-  like a multi-selection in the disk dialog. A dropped `.zip` is taken for
-  a WHDLoad package (below); load a zip-packed disk image through the
-  drive's disk button instead.
+  like a multi-selection in the disk dialog. A dropped `.zip` is checked
+  for a WHDLoad slave; without one, it is loaded as a floppy image, just
+  like selecting it through the drive's disk button.
 - **CD images** (`.cue`/`.iso`/`.nrg`/`.chd`) mount in the machine's CD drive
   (CDTV, CD32, or a SCSI CD-ROM unit), with the media-change notification.
   A `.chd` is read to see what it holds: one made with chdman's `createhd`
@@ -310,6 +316,8 @@ Disk images can be dropped anywhere on the emulator window:
 - **WHDLoad packages** (`.lha`, `.lzh`, `.zip`, or a bare `.slave`) reboot
   the machine straight into the game through the
   [WHDLoad booter](whdload.md), keeping any explicit machine choices.
+  A ZIP containing a `.slave` or `.slav` file takes this path even if it
+  also contains disk images.
   Dropped on the configuration screen they fill the **WHDLoad** page's
   game field instead; that screen refuses every other kind of drop.
 - **Hard disk images and Kickstart ROMs** (`.hdf`, `.hdz`, `.vhd`, `.img`,
@@ -336,9 +344,9 @@ The menu, with a category open beside it.
 
 The hamburger button at the right of the status bar opens the menu, as does
 `Cmd+E` / `Alt+E`. It grows upward from the status bar and dims the picture
-behind it, so the menu stays readable over a busy picture. The dimming is a
-window effect: it never appears in a screenshot, a frame dump, or a
-recording.
+behind it, so the menu stays readable over a busy picture. Interactive
+screenshots include the menu and its dimming. Scheduled screenshots, frame
+dumps and recordings exclude them.
 
 The top level holds the tools, then a category per area of the machine,
 then **Load Kickstart ROM...**, **Keyboard Shortcuts...**, **About...**,
@@ -363,6 +371,32 @@ Opening the menu also releases a captured mouse.
 **Menu Size** under *Video Settings* draws the whole menu at 1x or 2x. The
 start-up size is `[display] menu_scale`, `--menu-scale`, or *Menu size* on
 the launcher's A/V & Emu page (Display category).
+
+(menu-settings-persist)=
+### Settings the menu remembers
+
+A setting changed from the menu, its hotkey or the status bar is kept for
+the next launch: Copperline writes it into the
+[saved default](#machine-configuration-screen) configuration as soon as it
+changes, creating that file if there is none yet. This covers the controller
+ports, the joystick input mode, autofire, mouse sensitivity, rewind, run
+ahead, the warp limit, floppy speed, clipboard sharing, and the Video and
+Audio settings (framing, aspect, scaling, shader and strength, tint, bezel,
+screen centring, fullscreen, the status bar, the performance overlay, VSync,
+menu size, audio output and filter). Only the settings you change are
+written, so a value that comes from the machine profile -- the CD32 pad in a
+CD32's port 2, say -- is not copied into the default every machine starts
+from. The changes also show on the
+[machine configuration screen](#machine-configuration-screen) when it is
+opened during the session, so **Save As** and **Save default** include them.
+
+A session started from a file you named -- `--config`, or a
+`copperline.toml` in the working directory -- leaves that file alone, as does
+a `--factory` run: their menu changes last for the session, and the
+configuration screen's **Save As** keeps them. A machine started from the
+configuration screen writes to the saved default even when **Load...** brought
+another file in; the loaded file itself is never rewritten. Scheduled headless
+runs never write the default.
 
 The [Debug workspace](../debugger/window.md) puts the Amiga display beside the
 debugger, Frame Analyzer, and Console in the main window. Switch inspectors with
@@ -412,7 +446,8 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   releases the snapshots, which is where the memory goes; the budget and
   interval are `[emulation] rewind_budget_mb` and `rewind_interval_frames`,
   and `rewind = true` starts recording at launch (see
-  [Configuration](configuration.md)). It shares its substrate with the
+  [Configuration](configuration.md)); turning it on from the menu
+  [sets that for the next launch](#menu-settings-persist). It shares its substrate with the
   debugger's reverse controls, so the same determinism caveats apply -- see
   [](../debugger/reverse).
 - **Run Ahead**: input-latency reduction for play -- **Off**, or 1 to 4
@@ -471,8 +506,9 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   integer multiplier is recalculated for the cropped area. The status bar
   and overlay panels stay docked at the bottom of the window; opening a menu
   or panel temporarily expands the display to the full area so the controls
-  remain reachable. Autocrop affects the presentation only (captures always
-  use the full aperture). It works with the CRT shaders and programmable
+  remain reachable. Interactive screenshots follow the visible crop;
+  scheduled screenshots, frame dumps and recordings use the configured aperture.
+  It works with the CRT shaders and programmable
   multisync modes, and is suspended while a monitor bezel is drawn or an RTG
   mode is shown. The start-up value is `[display] autocrop` (see
   [Configuration](configuration.md)).
@@ -490,7 +526,8 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   real tube. It is a TV-aperture control, so it is greyed under
   `overscan = "full"`, which already shows everything. Unlike the shader
   and tint it is picture geometry, not a window effect: screenshots and
-  frame dumps follow it. Session-only; the start-up values are
+  frame dumps follow it. The menu
+  [remembers it](#menu-settings-persist); the start-up values are
   `[display] tv_h_centre` / `tv_v_centre`
   (see [Configuration](configuration.md)).
 - **CRT Shader**: the GPU tube-emulation pass over the picture --
@@ -498,12 +535,13 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   (an RGB phosphor shadow mask), **CRT (1084)** (both, plus a bowed tube face
   and a corner vignette), and **Custom**, greyed unless the config names a
   shader of your own, which is re-read from disk each time it is chosen.
-  The change is session-only: the start-up preset, the strength knob, and
-  how to write a custom shader are `[display] shader` and `shader_strength`
-  (see [Configuration](configuration.md)). The pass is a window effect only --
-  screenshots, frame dumps and recordings are never shader-processed -- and
-  it steps aside for the frames it cannot sensibly draw: while the menu or
-  any panel is open, under RTG, and in programmable multisync scan modes.
+  The menu [remembers the choice](#menu-settings-persist); the start-up
+  preset, the strength knob, and how to write a custom shader are
+  `[display] shader` and `shader_strength`
+  (see [Configuration](configuration.md)). Interactive screenshots include
+  the active pass; scheduled screenshots, frame dumps and recordings bypass
+  it. The pass steps aside while the menu or any panel is open, under RTG,
+  and in programmable multisync scan modes.
 - **Shader Strength**: how strongly the shader pass is applied, stepped
   10% at a time with **Stronger** / **Softer** (the category row shows the
   figure); greyed while the shader is off. The start-up strength is
@@ -511,15 +549,20 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
 - **Screen Tint**: the monochrome-monitor tint over the picture --
   **Colour** (full colour), **Black & white**, **Green** and **Amber** (the
   two classic monochrome phosphors), and **Sepia** -- the same looks as the
-  web frontend's *Screen* selector. Session-only, like the shader; the
+  web frontend's *Screen* selector. Remembered like the shader; the
   start-up tint is `[display] tint` (see [Configuration](configuration.md)).
-  A window effect only: captures stay untinted, the menu and the status bar
-  keep their colours, and RTG scanout is never tinted.
+  Interactive screenshots include the tint; scheduled screenshots, frame
+  dumps and recordings stay untinted. The menu and status bar keep their
+  colours, and RTG scanout is never tinted.
 - **Fullscreen** (also `Cmd+F` / `Alt+F`): borderless fullscreen on the
   window's current monitor. The picture keeps its aspect with black letterbox
   bars as needed, exactly as when resizing the window.
 - **Status Bar** (also `Cmd+Shift+F` / `Alt+Shift+F`): show or hide the
   status bar. Handy alongside fullscreen for a clean, chrome-free picture.
+- **Track Display**: what the status bar's floppy counter reads --
+  **Track** (the track number) or **Cyl.Side** (cylinder and side, `40.1`).
+  The start-up choice is `[display] track_display` (see
+  [Configuration](configuration.md)).
 - **Monitor Bezel**: which monitor front the picture sits inside instead
   of filling the window -- **Disabled**, **1084** (a two-tone cabinet with
   the tube sunk into its moulding, and the model badge, the Copperline name
@@ -529,16 +572,16 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   captured raster fills the glass edge to edge, border colour and all,
   so the opening's rounded corners crop into the overscan border the way
   a real tube's do, not into the picture. `Cmd+M` / `Alt+M` turns the
-  chosen front off and back on; it never changes which. Session-only; the
-  start-up value is `[display] bezel` (see
-  [Configuration](configuration.md)). A window effect only, like the
-  shader: screenshots, frame dumps and recordings never include it. A
+  chosen front off and back on; it never changes which. Remembered like
+  the shader; the start-up value is `[display] bezel` (see
+  [Configuration](configuration.md)). Interactive screenshots include the bezel.
+  Scheduled screenshots, frame dumps and recordings exclude it. A
   folder of PNG stickers can be drawn onto either front -- die-cut decals
   on the plastic, riding the same toggle -- via `[display] bezel_stickers`
   (no menu item; see [Configuration](configuration.md)).
 - **Performance** (also `Cmd+P` / `Alt+P`): show or hide the
-  [performance overlay](#performance-overlay). Session-only; the start-up
-  value is `[display] perf_overlay` (see
+  [performance overlay](#performance-overlay). Remembered like the other
+  Video settings; the start-up value is `[display] perf_overlay` (see
   [Configuration](configuration.md)).
 - **VSync**: synchronise presentation to the monitor's vertical blank
   (on by default). Turning it off requests presentation without waiting for
@@ -590,6 +633,20 @@ the guest. Overlay panels remain modal: their keys and clicks stay in the UI.
   [Direct launching](run.md)) can engage warp too. Each holds it
   independently and releases only its own; such a warp mutes live audio,
   the OSD names who asked, and one press of the shortcut ends them all.
+
+  Warp runs the guest's clock as fast as its CPU, so a key or mouse button
+  held for a tenth of a second would be held for seconds of emulated time:
+  the guest would repeat the key, and two clicks would land too far apart
+  to count as a double-click. While you hold down a key on the host
+  keyboard or a button on the guest's mouse, warp therefore yields to
+  real-time pacing, and keeps yielding for three quarters of a second after
+  you let go so the second click of a double-click lands in time. It picks
+  up again on its own; warp stays engaged throughout. Scheduled and
+  control-protocol input is timed in emulated time already and does not
+  slow warp down, so text pasted as keystrokes still types at warp speed.
+  For a Workbench that is fast while you use it, a faster CPU or the JIT
+  (`[cpu] jit`, 68020 and up) speeds the guest up while keeping its clock
+  real-time.
 - **Warp Limit** (also `Cmd+Shift+W` / `Alt+Shift+W`): how fast warp runs.
   With VSync enabled, emulating one frame per presented frame would cap
   warp at the host monitor's refresh rate (about 1.2x for 50 Hz PAL on a
@@ -689,7 +746,11 @@ boot-time cards, SRAM cards, real card readers, and the fast-RAM rule.
   [Configuration](configuration.md)) -- and credits, including
   Copperline's contributors and Patreon sponsors (see `CREDITS.md`).
   Builds made from an untagged git commit append the short commit ID to
-  the version shown in the window title and About panel.
+  the version shown in the About panel; the window title shows the plain
+  release version.
+  The desktop window title also shows the machine and boot ROM; its format can
+  be changed with `[display] title` in the configuration file.
+  On macOS, **About Copperline** in the application menu opens this same panel.
 
   The panel's **Check for updates** button asks GitHub which Copperline
   release is the latest and compares it with the running version. If a
@@ -862,12 +923,14 @@ The layout is:
     [](whdload.md)).
   - *A/V & Emu*: five pages switched on the top nav row, opening on Audio:
     - **Audio**: output device, channel mode, stereo separation, filter,
-      floppy sounds and their volume.
+      floppy sounds, their volume, and the floppy sound set (**Synthesized**
+      or a WinUAE-format sample set from the `Floppy Sounds` folder).
     - **Video** -- the emulated picture: monitor bezel style, overscan,
       pixel aspect, scaling, autocrop, deinterlace, screen tint, phosphor,
       CRT shader and shader strength.
     - **Display** -- the host window: start fullscreen, host monitor and
-      window position, status bar, perf overlay, VSync, and menu size. The
+      window position, status bar, track display, perf overlay, VSync, and
+      menu size. The
       position box accepts `X, Y` offsets from the chosen monitor; clear it
       for automatic placement.
     - **Emulation**: power on at startup; run on startup (`[emulation]
@@ -947,7 +1010,8 @@ The layout is:
   through a file dialog (a minimal file, only the settings that differ from
   the chosen profile's defaults, so it reads like the example configs);
   **Save default** saves the running configuration as the one Copperline
-  starts with: this screen opens showing it, and a run with no `--config`
+  starts with, including settings changed from the menu during the session:
+  this screen opens showing it, and a run with no `--config`
   and no `./copperline.toml` boots it (see [](configuration.md));
   `--factory` ignores it for one run. **Reset default** deletes that saved
   default after an "Are you sure?", returning Copperline to factory
@@ -1076,21 +1140,29 @@ and greyed alongside either.
 `Dir cache` needs Kickstart 3.0, `International` needs 2.0, and `Long
 names` needs a filesystem no Kickstart provides.
 
+## Saving screenshots
+
+The camera button and `Cmd+S` on macOS or `Alt+S` on Linux/Windows save the
+picture at its current displayed size, including the current crop, scaling,
+tint, CRT shader, monitor bezel and stickers. The status bar and surrounding
+window margins are excluded. Open menus and panels, their dimming, and any
+overlays within the picture are included. The save confirmation appears
+after capture.
+
 (native-screenshots)=
 ## Saving native screenshots
 
-Choose **Recording → Save Native Screenshot (1:1)** to save the active
-playfield at its original pixel size, without the TV border, aspect
-correction, filtering, phosphor persistence or tint. Black pixels inside the
-playfield are kept. RTG screens save at the board's native resolution.
-Interlaced chipset screens save the current field, without blending or
-weaving another field into it.
+Press `Cmd+Option+S` on macOS or `Ctrl+Alt+S` on Linux/Windows, or choose
+**Recording → Save Native Screenshot (1:1)**, to save the active playfield at
+its original pixel size, without the TV border, aspect correction, filtering,
+phosphor persistence or tint. Black pixels inside the playfield are kept.
+RTG screens save at the board's native resolution. Interlaced chipset screens
+save both fields woven at full height, so a 640×512 laced screen saves at
+640×512 (see [native headless captures](headless.md#capturing-screenshots)).
 
-Starting Copperline with `--native-screenshots` also makes the camera button
-and `Cmd+S` / `Alt+S` use this capture. See [native headless captures](headless.md#capturing-screenshots)
-for resolution and crop details.
-
-Screenshots save to the [screenshots folder](#where-files-go).
+`--native-screenshots` selects native scheduled captures and expectations.
+See [native headless captures](headless.md#capturing-screenshots) for resolution
+and crop details. Screenshots save to the [screenshots folder](#where-files-go).
 
 (recording-video)=
 ## Recording video
@@ -1382,6 +1454,18 @@ Uncaptured, host cursor motion over the display still drives the
 emulated mouse, and `[input] mouse_sensitivity` scales it the same way
 it scales captured motion. At the default setting the factor is 1.0 and
 the pointer tracks the host cursor one-for-one.
+
+The JOYxDAT counters are eight bits wide, and the guest works out how far
+the mouse moved from the difference between two reads, normally once a
+frame; 128 counts or more between reads wraps around and reads as motion
+the other way. A real Amiga mouse never turns its encoders that fast, but
+a modern high-resolution host mouse can (Linux/X11 reports raw device
+counts), so host motion reaches the counters at most 63 counts per axis
+per emulated frame -- over 3000 counts a second. Faster than that, one
+more frame's worth is carried and the rest is dropped, so the pointer
+stops when your hand does. If the pointer feels too fast or tops out,
+lower or raise `[input] mouse_sensitivity`. Scripted `--mouse-after`
+motion is applied exactly as given.
 
 `[input] mouse_capture` (`--mouse-capture`, the launcher's *Input* tab)
 changes when the grab is taken: `auto` grabs whenever the window has the

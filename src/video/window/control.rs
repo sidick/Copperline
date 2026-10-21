@@ -423,7 +423,12 @@ impl App {
                     tolerance,
                     max_frames,
                     |emu, action| {
-                        crate::control::session::inject_input(emu, &mut None, action);
+                        crate::control::session::inject_input(
+                            emu,
+                            &mut None,
+                            Default::default(),
+                            action,
+                        );
                     },
                 ) {
                     Ok(value) => proto::ok_line(&id, value),
@@ -548,6 +553,8 @@ impl App {
             }
             HostOp::SetPortDevice { port, device } => {
                 self.hot_plug_port_device(port as usize, device);
+                // A scripted port change is not a menu choice to save.
+                self.rebaseline_menu_settings();
                 self.show_osd(format!("Port {}: {}", port + 1, device.label()));
                 self.control_send(proto::ok_line(
                     &id,

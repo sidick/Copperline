@@ -142,20 +142,20 @@ pub struct CliArgs {
     /// per frame of recorded movement.
     pub mouse_after: Vec<(f32, i32, i32, u8)>,
     /// `--mouse-to-after SECS X Y [PORT]`: at SECS emulated seconds,
-    /// servo the guest pointer to presented-pixel (X, Y) -- the same
-    /// coordinates a screenshot is measured in -- by watching sprite 0
-    /// and correcting relative motion until it lands. PORT defaults to 1
-    /// (carried 0-based). See `src/pointer.rs` for why absolute pointer
-    /// positioning has to be closed-loop.
+    /// servo the guest pointer to pixel (X, Y) of a `--screenshot-after`
+    /// capture by watching sprite 0 and correcting relative motion until
+    /// it lands. PORT defaults to 1 (carried 0-based). See
+    /// `src/pointer.rs` for why absolute pointer positioning has to be
+    /// closed-loop.
     pub mouse_to_after: Vec<(f32, i32, i32, u8)>,
     /// `--pot-after SECS X Y [PORT]`: at SECS emulated seconds, set an
     /// analogue controller's stick/paddle position (each axis 0-255, the
     /// count POTxDAT latches). PORT defaults to 2 (carried 0-based).
     pub pot_after: Vec<(f32, u8, u8, u8)>,
     /// `--pen-after SECS X Y [PORT]`: at SECS emulated seconds, hold the
-    /// light pen over presented pixel (X, Y) -- the `--mouse-to-after`
-    /// coordinates -- or lift it off the glass with a negative
-    /// coordinate. PORT (carried 0-based) names the port the pen must be
+    /// light pen over pixel (X, Y) of a `--screenshot-after` capture --
+    /// the `--mouse-to-after` coordinates -- or lift it off the glass with
+    /// a negative coordinate. PORT (carried 0-based) names the port the pen must be
     /// in; `None` means whichever port has the pen.
     pub pen_after: Vec<(f32, i32, i32, Option<u8>)>,
     /// `--record-input PATH`: record every input event that reaches the
@@ -664,7 +664,10 @@ where
             }
             "--cpu" => {
                 overrides.cpu = Some(args.next().ok_or_else(|| {
-                    anyhow!("--cpu requires a model (68000/68EC020/68020/68030/68040/68060)")
+                    anyhow!(
+                        "--cpu requires a model (68000/68010/68EC020/68020/68EC030/68030/\
+                         68EC040/68040/68EC060/68060)"
+                    )
                 })?);
             }
             "--fpu" => {
@@ -758,6 +761,15 @@ where
             }
             "--jit" => {
                 overrides.cpu_jit = Some(true);
+            }
+            "--cpu-speed" => {
+                let speed = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--cpu-speed requires fixed or fastest"))?;
+                // Validate here for an immediate, flag-named error; the
+                // config validation repeats the check on the merged view.
+                crate::config::parse_cpu_speed(&speed).map_err(|e| anyhow!("--cpu-speed: {e}"))?;
+                overrides.cpu_speed = Some(speed);
             }
             "--no-jit" => {
                 overrides.cpu_jit = Some(false);
@@ -2010,11 +2022,16 @@ fn print_help() {
          \x20                              A1200, A3000, A4000, CDTV, CD32\n  \
          --chipset NAME                 chipset preset: OCS, ECS, or AGA\n  \
          --video STANDARD               video timing: PAL or NTSC\n  \
-         --cpu MODEL                    CPU: 68000, 68010, 68EC020, 68020, 68030, 68040, or 68060\n  \
+         --cpu MODEL                    CPU: 68000, 68010, 68EC020, 68020, 68030, 68040, or\n  \
+         \x20                              68060; 68EC030/68EC040/68EC060 drop the MMU (and\n  \
+         \x20                              the 040/060 FPU)\n  \
          --cpu-clock MHZ                CPU clock in MHz (default: the model's stock speed)\n  \
          --fpu / --no-fpu               fit / omit a 68881/68882 (68040/68060 on-die)\n  \
          --jit / --no-jit               fast batch/trace-JIT CPU execution (not cycle-exact,\n  \
          \x20                            like an accelerator card; default: off)\n  \
+         --cpu-speed fixed|fastest      JIT CPU speed: fixed runs at --cpu-clock; fastest\n  \
+         \x20                            adapts the clock to the host while paced (needs\n  \
+         \x20                            --jit; not reproducible; default: fixed)\n  \
          --clipboard / --no-clipboard   share the host clipboard with the guest's\n  \
          \x20                            clipboard.device; fits an extra autoconfig board,\n  \
          \x20                            so it is off unless asked for (default: off)\n  \

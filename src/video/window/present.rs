@@ -827,6 +827,18 @@ pub(super) fn display_src_layout(
 }
 
 impl PresentLayout {
+    /// Visible picture in physical surface pixels, excluding the chrome.
+    pub(super) fn picture_rect(&self) -> (u32, u32, u32, u32) {
+        let (x, y, w, h) = self.display_dst;
+        let picture_rows = self
+            .src_canvas
+            .3
+            .min(present_height().saturating_sub(self.src_canvas.1));
+        let picture_h =
+            (u64::from(h) * picture_rows as u64 / self.src_canvas.3.max(1) as u64) as u32;
+        (x, y, w, picture_h)
+    }
+
     /// The scaler-pass draws this layout amounts to. The classic layout
     /// is one whole-texture draw; a sub-rect layout samples the rect's
     /// uv sub-rect and adds the chrome band below it.
@@ -947,6 +959,47 @@ pub(super) fn surface_resize_for_draw(
     inner: PhysicalSize<u32>,
 ) -> Option<PhysicalSize<u32>> {
     ((inner.width, inner.height) != configured).then_some(inner)
+}
+
+/// Whether the present worker may acquire the surface for a job planned at
+/// `planned` (`PresentJob::surface`), given the host window's live size, or
+/// None where the worker cannot ask (`worker_live_size`).
+///
+/// The main thread re-syncs the surface before it plans a frame
+/// (`App::resync_surface_size`), but the worker acquires later, and on
+/// Windows the main thread pumps the modal size-move loop while the user
+/// drags: the window changes size under frames still queued. A Vulkan driver
+/// then reports the swapchain out of date, and `pixels` reconfigures from its
+/// stale size -- the same churn as issue #362, now on a thread the Resized
+/// event cannot reach, while the main thread waits in `PresentWorker::reclaim`
+/// to resize. The frame was drawn for the old geometry anyway, so it is
+/// dropped instead: the Resized behind the change reclaims the GPU side and
+/// reconfigures it on the main thread, and the next frame is planned for the
+/// new size.
+pub(super) fn worker_surface_current(planned: (u32, u32), live: Option<PhysicalSize<u32>>) -> bool {
+    live.is_none_or(|live| surface_resize_for_draw(planned, live).is_none())
+}
+
+/// Whether a present failed only because the surface was out of date: a
+/// resize landed between the size check and the acquire. `pixels` now gives
+/// up after one reconfigure (parasyte/pixels#462) rather than rebuilding the
+/// swapchain at its stale size forever; the frame is dropped, and the Resized
+/// event behind it reconfigures from the live size. Routine during a drag, so
+/// it is no error.
+pub(super) fn present_raced_a_resize(e: &pixels::Error) -> bool {
+    matches!(
+        e,
+        pixels::Error::GetSurface(pixels::GetSurfaceError::Outdated)
+    )
+}
+
+/// Log a failed present at the level it deserves (`present_raced_a_resize`).
+pub(super) fn log_present_error(e: &pixels::Error) {
+    if present_raced_a_resize(e) {
+        log::debug!("present dropped a frame for an out-of-date surface: {e}");
+    } else {
+        error!("pixels.render: {e}");
+    }
 }
 
 pub(super) fn window_present_mode(vsync: bool) -> pixels::wgpu::PresentMode {
@@ -1553,9 +1606,9 @@ pub(super) fn alpha_blit_rgba(
 // The [display] tint knob: a monochrome-monitor look over the window's
 // picture, matching the web front-end's screen filter. Presentation only,
 // like the CRT shader pass: it runs on the composited window frame after
-// the display copy, so screenshots, frame dumps, recordings and headless
-// runs stay untinted, and the status bar and UI overlays (drawn after it)
-// stay in colour.
+// the display copy. Interactive output screenshots include the tint;
+// scheduled screenshots, frame dumps, recordings and headless runs stay
+// untinted. The status bar and UI overlays (drawn after it) stay in colour.
 //
 // Every tint is a luma ramp: the pixel collapses to its luminance, which
 // indexes a 256-entry table of pre-tinted colours. The ramps reproduce the
@@ -1700,19 +1753,6 @@ pub(super) fn blend_rgba_over_opaque(dst: u32, sr: u32, sg: u32, sb: u32, sa: u3
     rgba(r, g, b)
 }
 
-/// Whether horizontal recentring is enabled. On unless COPPERLINE_HCENTER is
-/// set to a falsey value (0/false/off/no), so full-overscan presentation can
-/// show the standard display exactly as rendered when debugging alignment.
-pub(super) fn hcenter_enabled() -> bool {
-    match crate::envcfg::var("COPPERLINE_HCENTER") {
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => true,
-    }
-}
-
 /// Whether frames present from the present worker's thread
 /// (`COPPERLINE_THREADED_PRESENT`, default on).
 pub(super) fn threaded_present_enabled() -> bool {
@@ -1775,8 +1815,8 @@ pub(super) struct PresentImage<'a> {
     pub height: u32,
 }
 
-/// Save the presented frame as `--screenshot-after` and the host
-/// screenshot shortcut do: [`render_present_frame`] encoded as a PNG.
+/// Save the CPU presentation frame for a scheduled capture:
+/// [`render_present_frame`] encoded as a PNG.
 pub(super) fn save_present_frame(
     path: &std::path::Path,
     present_fb: &[u32],
@@ -1797,10 +1837,9 @@ pub(super) fn save_present_frame(
     screenshot::save(path, &image.pixels, image.width, image.height)
 }
 
-/// The presented frame exactly as a screenshot saves it, before PNG
-/// encoding: the one capture path behind `--screenshot-after`, the
-/// screenshot shortcut, and `--expect-screenshot`, so an expectation
-/// compares against precisely what a screenshot of the same frame holds.
+/// The CPU presentation frame before PNG encoding: the shared path behind
+/// `--screenshot-after` and `--expect-screenshot`, so an expectation
+/// compares against what a scheduled screenshot of the same frame holds.
 pub(super) fn render_present_frame(
     present_fb: &[u32],
     src_rows: usize,
@@ -1837,7 +1876,7 @@ pub(super) fn render_present_frame(
 /// The picture a capture shows -- the presentation buffer through the
 /// same crop, aperture and aspect geometry as the live window -- built
 /// into `out` (cleared and resized). Returns its width and height. Shared
-/// by screenshots, frame dumps and GIF clips so they all show one shape.
+/// by scheduled screenshots, frame dumps and GIF clips so they show one shape.
 pub(super) fn present_capture_frame(
     present_fb: &[u32],
     src_rows: usize,

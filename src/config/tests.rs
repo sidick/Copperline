@@ -110,6 +110,7 @@ fn player_settings_overlay_field_by_field() -> Result<()> {
 
     let overlay = RawConfig::parse(
         "[display]\nshader = \"scanlines\"\nfull_screen = false\nvsync = false\n\
+             overscan = \"smart\"\nautocrop = true\n\
              [input]\nport2 = \"cd32\"\n",
     )?;
     base.merge_player_settings(&overlay);
@@ -118,6 +119,12 @@ fn player_settings_overlay_field_by_field() -> Result<()> {
     assert_eq!(cfg.shader, ShaderMode::Scanlines, "overlay wins");
     assert!(!cfg.full_screen, "overlay wins");
     assert!(!cfg.vsync, "overlay wins");
+    assert_eq!(
+        cfg.overscan,
+        Overscan::Smart,
+        "the Framing choice is restored"
+    );
+    assert!(cfg.autocrop, "the Autocrop choice is restored");
     assert_eq!(cfg.bezel, BezelStyle::Model1084, "omitted keeps the base");
     assert_eq!(cfg.port_devices[1], crate::bus::PortDevice::Cd32Pad);
     assert_eq!(cfg.machine, Some(MachineModel::Cd32));
@@ -760,6 +767,7 @@ fn raw_config_serialize_round_trips() {
             dcache: None,
             unimplemented: None,
             jit: None,
+            speed: None,
         },
         memory: RawMemory {
             chip: Some("2M".to_string()),
@@ -1254,6 +1262,20 @@ fn display_window_scale_validates_and_cli_overrides_file() -> Result<()> {
 }
 
 #[test]
+fn display_title_template_validates_and_round_trips() -> Result<()> {
+    let raw = RawConfig::parse("[display]\ntitle = 'Dev {m}: {r} [{hash}]'\n")?;
+    let cfg = Config::try_from(raw.clone())?;
+    assert_eq!(cfg.window_title.as_deref(), Some("Dev {m}: {r} [{hash}]"));
+    let round_trip = RawConfig::parse(&raw.to_toml_string()?)?;
+    assert_eq!(round_trip.display.title, raw.display.title);
+    for title in ["{unknown}", "{rom", "", "bad\nline"] {
+        let raw = RawConfig::parse(&format!("[display]\ntitle = {title:?}\n"))?;
+        assert!(Config::try_from(raw).is_err(), "accepted {title:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn display_overscan_parses_and_defaults_to_tv() -> Result<()> {
     assert_eq!(parse_config("")?.overscan, Overscan::Tv);
     let cfg = parse_config(
@@ -1551,6 +1573,25 @@ fn display_menu_scale_rejects_an_unknown_size() {
     )
     .expect_err("unknown size");
     assert!(err.to_string().contains("menu_scale"), "{err}");
+}
+
+#[test]
+fn display_track_display_parses_and_defaults_to_track() -> Result<()> {
+    assert_eq!(parse_config("")?.track_display, TrackDisplay::Track);
+    let cfg = parse_config(
+        r#"
+            [display]
+            track_display = "cylinder"
+        "#,
+    )?;
+    assert_eq!(cfg.track_display, TrackDisplay::Cylinder);
+    assert_eq!(parse_track_display(" CYL.SIDE ")?, TrackDisplay::Cylinder);
+    for mode in TrackDisplay::MENU_ORDER {
+        assert_eq!(parse_track_display(mode.label())?, mode);
+    }
+    let err = parse_config("[display]\ntrack_display = \"sector\"\n").expect_err("unknown mode");
+    assert!(err.to_string().contains("track_display"), "{err}");
+    Ok(())
 }
 
 #[test]
@@ -2320,6 +2361,42 @@ fn cpu_68060_without_fpu_is_an_lc060() -> Result<()> {
     )?;
     assert_eq!(cfg.cpu, CpuModel::M68060);
     assert!(!cfg.fpu);
+    Ok(())
+}
+
+#[test]
+fn cpu_ec_parts_parse_without_an_mmu() -> Result<()> {
+    // The EC030/EC040/EC060 drop the paged MMU but keep their family's
+    // caches, stock clock and 32-bit bus; the 040/060 ones have no FPU.
+    for (name, model, mhz) in [
+        ("68EC030", CpuModel::M68EC030, 25.0),
+        ("68ec040", CpuModel::M68EC040, 25.0),
+        ("EC060", CpuModel::M68EC060, 50.0),
+    ] {
+        let cfg = parse_config(&format!(
+            "[cpu]\nmodel = \"{name}\"\n[memory]\nz3 = \"16M\""
+        ))?;
+        assert_eq!(cfg.cpu, model);
+        assert!(!model.has_mmu(), "{name}");
+        assert!(!cfg.fpu, "{name}: no FPU by default");
+        assert_eq!(cfg.cpu_clock_mhz, mhz, "{name}");
+        assert!(
+            cfg.cpu_icache && cfg.cpu_dcache,
+            "{name}: caches default on"
+        );
+        assert_eq!(cfg.z3_ram_bytes, 16 * 1024 * 1024, "{name}: 32-bit bus");
+    }
+    // The EC030 keeps the coprocessor interface for a 68881/68882...
+    let cfg = parse_config("[cpu]\nmodel = \"68EC030\"\nfpu = true")?;
+    assert!(cfg.fpu);
+    // ...the EC040/EC060 have neither an FPU nor the interface.
+    for name in ["68EC040", "68EC060"] {
+        let err = parse_config(&format!("[cpu]\nmodel = \"{name}\"\nfpu = true")).unwrap_err();
+        assert!(err.to_string().contains("no FPU"), "{name}: {err:#}");
+    }
+    // The EC060 keeps the 060's unimplemented-instruction traps.
+    let cfg = parse_config("[cpu]\nmodel = \"68EC060\"\nunimplemented = \"native\"")?;
+    assert_eq!(cfg.cpu_unimplemented, UnimplementedPolicy::Native);
     Ok(())
 }
 
@@ -4076,6 +4153,10 @@ fn recording_clip_settings_default_and_validate() -> Result<()> {
     let cfg = parse_config("[recording]\nclip_seconds = 0\nclip_fps = 0\n")?;
     assert_eq!(cfg.recording.clip_seconds, 0);
     assert_eq!(cfg.recording.clip_fps, 0);
+    // Retired screenshot preferences must not prevent existing configs loading.
+    let raw = RawConfig::parse("[recording]\nnative_screenshot_button = true\n")?;
+    Config::try_from(raw.clone())?;
+    assert!(!raw.to_toml_string()?.contains("native_screenshot_button"));
 
     let err = parse_config("[recording]\nclip_seconds = 500\n").unwrap_err();
     assert!(format!("{err:#}").contains("clip_seconds"), "{err:#}");
@@ -4333,6 +4414,78 @@ fn cpu_jit_parses_and_defaults_off() -> Result<()> {
             "#,
     )?;
     assert!(cfg.cpu_jit);
+    Ok(())
+}
+
+#[test]
+fn cpu_speed_defaults_fixed_and_fastest_needs_the_jit_on_a_68020_plus() -> Result<()> {
+    assert_eq!(parse_config("")?.cpu_speed, CpuSpeed::Fixed);
+    let cfg = parse_config(
+        r#"
+            [cpu]
+            model = "68030"
+            jit = true
+            speed = "fastest"
+            "#,
+    )?;
+    assert_eq!(cfg.cpu_speed, CpuSpeed::Fastest);
+    assert_eq!(
+        parse_config("[cpu]\nmodel = \"68030\"\njit = true\nspeed = \"Fixed\"\n")?.cpu_speed,
+        CpuSpeed::Fixed
+    );
+
+    // Without the JIT there is no adaptive clock: refused, not ignored.
+    let err = parse_config("[cpu]\nmodel = \"68030\"\nspeed = \"fastest\"\n").unwrap_err();
+    assert!(err.to_string().contains("[cpu] jit"), "{err:#}");
+    // The 68000/68010 never leave the precise core, JIT or not.
+    for model in ["68000", "68010"] {
+        let err = parse_config(&format!(
+            "[cpu]\nmodel = \"{model}\"\njit = true\nspeed = \"fastest\"\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("68020"), "{model}: {err:#}");
+    }
+    let err = parse_config("[cpu]\nspeed = \"max\"\n").unwrap_err();
+    assert!(err.to_string().contains("fastest"), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn cpu_speed_cli_override_matches_the_config_field() -> Result<()> {
+    let cfg = load_overrides(&ConfigOverrides {
+        cpu: Some("68030".to_string()),
+        cpu_jit: Some(true),
+        cpu_speed: Some("fastest".to_string()),
+        ..ConfigOverrides::default()
+    })?;
+    assert_eq!(cfg.cpu_speed, CpuSpeed::Fastest);
+    // --no-jit on a fastest config is the same refusal as the TOML.
+    assert!(load_overrides(&ConfigOverrides {
+        cpu: Some("68030".to_string()),
+        cpu_jit: Some(false),
+        cpu_speed: Some("fastest".to_string()),
+        ..ConfigOverrides::default()
+    })
+    .is_err());
+    Ok(())
+}
+
+#[test]
+fn fastest_cpu_speed_blocks_run_ahead() -> Result<()> {
+    let cfg = parse_config(
+        r#"
+            [cpu]
+            model = "68030"
+            jit = true
+            speed = "fastest"
+            [emulation]
+            run_ahead_frames = 2
+            "#,
+    )?;
+    assert_eq!(
+        cfg.runahead_machine_block_reason(),
+        Some("fastest CPU speed")
+    );
     Ok(())
 }
 

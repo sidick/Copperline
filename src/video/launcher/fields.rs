@@ -415,6 +415,7 @@ pub enum LauncherField {
     Icache,
     Dcache,
     Jit,
+    JitSpeed,
     // Memory
     ChipRam,
     FastRam,
@@ -633,8 +634,10 @@ pub enum LauncherField {
     HostMonitor,
     WindowPosition,
     ShowStatusBar,
+    TrackDisplay,
     FloppySounds,
     FloppyVolume,
+    FloppySoundSet,
     PowerOn,
     AutoLaunch,
     PacingBudget,
@@ -919,13 +922,14 @@ pub(super) const SYSTEM_ROWS: [Row; 8] = [
     row(F::Rtg, "RTG card", Cycle),
     row(F::Cartridge, "Freezer cartridge", Cycle),
 ];
-pub(super) const CPU_ROWS: [Row; 6] = [
+pub(super) const CPU_ROWS: [Row; 7] = [
     row(F::Cpu, "CPU", Cycle),
     row(F::Fpu, "FPU (68881/2)", Cycle),
     row(F::Clock, "Clock", Cycle),
     row(F::Icache, "Instruction cache", Cycle),
     row(F::Dcache, "Data cache", Cycle),
     row(F::Jit, "JIT accelerator", Cycle),
+    row(F::JitSpeed, "JIT speed", Cycle),
 ];
 pub(super) const MEMORY_ROWS: [Row; 8] = [
     row(F::ChipRam, "Chip RAM", Cycle),
@@ -1249,22 +1253,26 @@ pub(super) const VIDEO_ROWS: [Row; 10] = [
 ];
 
 // The host window and its furniture, as distinct from the picture inside it.
-pub(super) const DISPLAY_ROWS: [Row; 7] = [
+pub(super) const DISPLAY_ROWS: [Row; 8] = [
     row(F::StartFullscreen, "Start fullscreen", Cycle),
     row(F::HostMonitor, "Host monitor", Cycle),
     row(F::WindowPosition, "Window position", RowKind::Text),
     row(F::ShowStatusBar, "Status bar", Cycle),
+    row(F::TrackDisplay, "Track display", Cycle),
     row(F::PerfOverlay, "Perf overlay", Cycle),
     row(F::Vsync, "VSync", Cycle),
     row(F::MenuScale, "Menu size", Cycle),
 ];
-pub(super) const AUDIO_ROWS: [Row; 6] = [
+pub(super) const AUDIO_ROWS: [Row; 7] = [
     row(F::AudioDevice, "Audio output", Cycle),
     row(F::AudioChannelMode, "Channel mode", Cycle),
     row(F::AudioStereoSeparation, "Stereo separation", Cycle),
     row(F::AudioFilter, "Audio filter", Cycle),
     row(F::FloppySounds, "Floppy sounds", Cycle),
     row(F::FloppyVolume, "Floppy volume", Cycle),
+    // Synthesized, or a WinUAE-format sample set from the floppy sounds
+    // folder (`crate::paths::floppy_sounds_dir`).
+    row(F::FloppySoundSet, "Floppy sound set", Cycle),
 ];
 #[cfg(not(feature = "game-library"))]
 pub(super) const EMULATION_ROWS: [Row; 7] = [
@@ -1594,13 +1602,16 @@ pub(super) const DENISE_CHOICES: [Option<DeniseRevision>; 4] = [
     Some(DeniseRevision::AgaLisa),
 ];
 pub(super) const VIDEO_CHOICES: [VideoStandard; 2] = [VideoStandard::Pal, VideoStandard::Ntsc];
-pub(super) const CPUS: [CpuModel; 7] = [
+pub(super) const CPUS: [CpuModel; 10] = [
     CpuModel::M68000,
     CpuModel::M68010,
     CpuModel::M68EC020,
     CpuModel::M68020,
+    CpuModel::M68EC030,
     CpuModel::M68030,
+    CpuModel::M68EC040,
     CpuModel::M68040,
+    CpuModel::M68EC060,
     CpuModel::M68060,
 ];
 /// Storage-idle thresholds for the Warp boot row, in emulated seconds.

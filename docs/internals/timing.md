@@ -46,9 +46,9 @@ bitplane decision (step 5) is driven by the Agnus DDF sequencer flop model
 (`src/chipset/ddf_sequencer.rs`, walked per line by `src/bus/ddf_line.rs`):
 DDFSTRT and DDFSTOP are comparator *edges* that set/clear flip-flops, not a
 value range. A stop request drains through one final fetch unit (which
-applies the modulos per plane), the hardwired window ($18/$D8, HARDDIS
-relaxes the stop to $E0) gates starts and forces stops, and the flop state
-carries across line boundaries. Missed comparators therefore produce the
+applies the modulos per plane), the hardwired window ($18/$D8) gates
+starts and forces stops, and the flop state carries across line
+boundaries. Missed comparators therefore produce the
 hardware's "old stop" behaviours: a rewritten-too-late DDFSTOP lets the run
 continue to the hardware-stop drain, a DDFSTRT match past $D8 starts a run
 that wraps through horizontal blanking into the next line, and an
@@ -61,6 +61,14 @@ of the standard grid (its early words run through the left border). The
 renderer honours this through the captured run geometry: a below-$18 run
 origin keeps its raw fetch grid, and a line without a captured fetch
 paints nothing (vAmigaTS Agnus/DDF/DDF/oldhwstop3/4 A500 photos).
+
+The $D8 stop holds on Alice exactly as on an ECS Agnus. Either relaxes it
+to $E0 (the canvas edge) while BEAMCON0 selects HARDDIS or VARBEAMEN, or
+BPLCON0 selects SHRES or UHRES (WinUAE's `check_harddis` rule); OCS has no
+such controls. A lo-res $28/$E0 window therefore fetches 23 words per line
+on an A1200 as on an A500, and software whose modulo assumes that count
+displays straight (Pacmania's WHDLoad install; the `ddfprobe-agahwstop`
+golden probe).
 
 For a line with no mid-line sequencer writes, the walked fetch plan is
 keyed on the complete carried flop state, masked DDF registers, line
@@ -464,7 +472,11 @@ a two-sided slot-trace probe (`COPPERLINE_DIAG_BLT_SLOTS` in Copperline,
   internal D-hold flush and the BLTDONE cycle -- the final D write for
   USED programs, internal otherwise). DMACONR's BBUSY drops with the
   sequencer's final body cycle, BEFORE those terminal cycles: polling
-  loops see BBUSY clear two cycles before the last D word lands.
+  loops see BBUSY clear two cycles before the last D word lands. The
+  register file is published at that same point (pointers, BLTCDAT, and
+  a line blit's ASH/BSH/SIGN/accumulator), so the terminal cycles only
+  retire the queued D word and never write registers back over values
+  software has already programmed for its next blit.
   INTREQ.BLIT rises one colour clock after the BLTDONE cycle's FIRST
   attempt (vAmiga `scheduleIrqRel(BLIT, 1)` runs before the bus
   allocation check), so a bus-blocked final D write raises the interrupt
@@ -516,7 +528,7 @@ classification of writes while BBUSY is set:
 | `BLTAFWM`, `BLTALWM` | Deferred | First/last-word masks captured by the scheduled state at BLTSIZE. |
 | `BLT[ABCD]PTH/PTL` | Deferred | Pointer writes do not retarget the already-scheduled transfer. |
 | `BLT[ABCD]MOD` | Deferred | Modulos captured at BLTSIZE. |
-| `BLTBDAT` | Immediate, write-time shifter | The write runs the B barrel shifter with the BSH/DESC current at write time (unlike BLTADAT/BLTCDAT); USEB-off blits consume that latched hold word. The first B write after completion zeros the B old register; later writes shift through the latched B data. |
+| `BLTBDAT` | Immediate, write-time shifter | The write runs the B barrel shifter with the BSH/DESC current at write time (unlike BLTADAT/BLTCDAT); USEB-off blits consume that latched hold word. The first B write after the previous blit drops BBUSY zeros the B old register; later writes shift through the latched B data. |
 | `BLTSIZE` | Deferred restart | A second start strobe drains the current blit first, then starts the replacement from the post-completion pointer state. |
 | `DMACON.DMAEN/BLTEN` | Immediate | Gate blitter bus grants immediately; clearing leaves BBUSY set and preserves the pending blit until re-enabled. |
 | `DMACON.BLTPRI` | Immediate | Bus arbitration observes the priority bit directly. |
@@ -525,6 +537,19 @@ No covered mid-operation write is modelled as ignored; less common writes
 are treated as deferred by draining first. Tests:
 `busy_bltcon0_write_disables_remaining_d_output_without_draining_blit`,
 `busy_bltsize_write_finishes_current_blit_then_starts_replacement`.
+
+Writes after BBUSY has dropped, while the terminal cycles are still
+pending, program the next blit. They never reach the finishing one:
+`BLTCON0` latches without disabling the queued final D word, the data
+and control registers keep the values software wrote, and the deferred
+groups above still drain the terminal cycles before latching. A 68000
+cannot land a register write in that two-cycle window after a BBUSY poll,
+but the 020+ chip-bus timing can. Treating such a write as mid-blit
+dropped the final D word, which for a one-word, one-row blit is its whole
+output: graphics.library's per-plane `BltBitMap` loop on a fast A4000
+lost entire bitplanes of small copies.
+Tests: `bltcon0_write_after_bbusy_poll_keeps_pending_final_d_write`,
+`register_writes_after_bbusy_drop_survive_blit_completion`.
 
 ### Micro-cycle stall classes
 
@@ -724,7 +749,8 @@ become visible.
 ## Real-time pacing
 
 Pacing never changes emulated behaviour -- it only decides how much
-emulated time to advance per host frame and when to sleep. Real mode
+emulated time to advance per host frame and when to sleep. (The one
+opt-in exception is the fastest-possible JIT speed described below.) Real mode
 debits a per-frame instruction budget one of two ways, selected by
 `[emulation] pacing_budget`:
 
@@ -748,6 +774,16 @@ for one run; the config overrides the built-in `cycles` default.
 `cpu_clocks_per_cck`; fast RAM/ROM access costs are scaled with sub-CCK
 carry accumulation so fractional costs are not lost.
 
+Warp (`Emulator::set_paced(false)`) skips the sleep entirely. While the
+window sees the operator holding a host key or a button on the guest's
+mouse, and for a short grace period after (`WARP_INPUT_YIELD_GRACE`), it
+engages `Emulator::set_warp_input_yield`, which re-anchors the pacing clock
+and keeps the sleep in force underneath warp until released, so a physical
+hold or the gap between two clicks lasts as long in emulated time as it did
+in the hand. `paced()` keeps reporting warp as engaged throughout; only
+the pacer's sleep decision (`paces_realtime`) changes. Scheduled and
+control-protocol input never engages it.
+
 `cycles` became the default once the core's 68000 cycle counts were made
 accurate: under flat instruction pacing, or with the old static cycle
 counts, a blitter-bound chip-RAM scene had the CPU over-issuing chip-bus
@@ -755,6 +791,64 @@ accesses and starving the line blitter. With
 accurate per-instruction costs the CPU's chip-bus slot ratio settles at a
 physically valid value naturally, which (together with the area-fill C-slot
 fix) resolved that blanking regression.
+
+(jit-fastest-pacing)=
+### Fastest-possible JIT speed
+
+`[cpu] speed = "fastest"` (JIT only) is the one setting where pacing does
+change emulated behaviour, and it is opt-in and documented as not
+reproducible. WinUAE's *Fastest possible* keeps the chipset in real time
+and gives the CPU whatever host time each frame leaves; Copperline does
+the same by moving the JIT's effective clock
+([](#jit-fastest-speed)), driven by
+`SpeedGovernor` in `src/emulator/fastest.rs`:
+
+- After every real-time quantum `step_real_until` reports the host time it
+  spent emulating (pacing sleep excluded), the host time since the previous
+  quantum ended (the frontend's share of the main thread), the emulated time
+  advanced, the instructions retired, and whether the JIT batch path ran.
+  Time the window spends presenting a frame on the main thread (the RTG,
+  inspector and screenshot paths, which can block on vsync) is reported
+  through `Emulator::note_frontend_wait` and left out of the frontend
+  share: it is a wait, not work, and frames the present worker takes never
+  touch the main thread at all.
+- Every 0.1 s of emulated *or* host time, whichever comes first, the
+  governor computes the load: host time over emulated time, 1.0 when the
+  host only just keeps up. Closing on host time as well bounds how long an
+  overloaded clock survives in wall time.
+- Above 0.93 it lowers the clock and below 0.80 it raises it, each time by
+  the square root of `0.85 / load`: at most a 4x cut or a 1.25x rise per
+  window. A full proportional step overshoots near saturation, where frame
+  cost climbs faster than the clock, and made the clock hunt between two
+  values in measurements; half the log-gain settles. It only raises the
+  clock when the CPU is clock-bound: it retired at least a quarter of an
+  instruction per billed clock. A CPU idling in STOP or
+  starved by chip-bus waits gains nothing from a faster clock, and ramping
+  it would only cause a hiccup when the workload changes. Between the two
+  thresholds it holds, so measurement noise does not make it hunt. Host
+  cost grows less than in proportion to the clock (the chipset's work per
+  emulated second is fixed), so the steps approach the band from below.
+- The clock stays between `clock_mhz` and 2000 MHz.
+- A gap of more than 100 ms between quanta (a paused machine, a modal
+  dialog, a debugger break) discards the window, as does any quantum
+  stepped on the precise core (debug hooks armed, a run-to-PC request).
+  `reanchor_realtime_clock` discards it too.
+- A save-state load rebases the floor to the state's clock. A governor
+  that has never moved the clock follows the new floor exactly, so an
+  unpaced run that loads a state still matches `speed = "fixed"`; one
+  that has adapted keeps its clock within the new bounds.
+- Unpaced quanta (warp, run-ahead bursts, headless runs) discard the
+  window and leave the clock where it is. A headless run therefore never
+  leaves `clock_mhz` and is byte-identical to `speed = "fixed"`, unless
+  `COPPERLINE_HEADLESS_PACED=1` paces it like the window to measure exactly
+  this.
+
+Measuring wall time rather than CPU time makes the controller back off
+when other processes compete for the core. It also copes with hosts whose
+scheduler parks a lightly loaded thread on efficiency cores at a low clock
+(macOS does): the paced thread looks expensive at first, moves to a
+performance core as the load rises, its cost per instruction falls, and
+the governor raises the clock further.
 
 ### Thread scheduling priority
 

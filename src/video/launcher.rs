@@ -28,7 +28,7 @@ use crate::config::{
     FluxBridgeConfig, JoystickInputMode, MachineModel, MenuScale, MouseCapture, Mt32Lcd, Overscan,
     PacingBudget, ParallelDevice, PixelAspect, RawConfig, RawDrive, RawFilesysMount,
     RawFloppyDrive, RawHostDisk, RawZorroBoard, RtgCard, ScsiController, SerialMode, ShaderMode,
-    Tint, WarpSpeed, BOOT_PRI_NEVER,
+    Tint, TrackDisplay, WarpSpeed, BOOT_PRI_NEVER,
 };
 use crate::ide_zorro::LidePersonality;
 use crate::memory::{RamInit, DEFAULT_RAM_PATTERN, DEFAULT_RANDOM_RAM_SEED};
@@ -579,6 +579,9 @@ pub struct MachineSetup {
     dcache: bool,
     /// Fast batch/trace-JIT CPU execution (`[cpu] jit`); not cycle-exact.
     jit: bool,
+    /// `[cpu] speed = "fastest"`: the JIT clock adapts to the host. Kept
+    /// while the JIT is off (the row greys), emitted only while it applies.
+    jit_fastest: bool,
     // Memory (bytes)
     chip_ram: usize,
     fast_ram: usize,
@@ -945,10 +948,17 @@ pub struct MachineSetup {
     window_position: Option<[i32; 2]>,
     /// Initial window size ([display] window_scale), retained from TOML.
     window_scale: f64,
+    /// Custom desktop title ([display] title), preserved when Run/Save rebuilds TOML.
+    window_title: Option<String>,
     /// Show the status bar at start ([display] status_bar).
     show_status_bar: bool,
+    /// What the status bar's floppy counter reads ([display] track_display).
+    track_display: TrackDisplay,
     floppy_sounds: bool,
     floppy_volume: u8,
+    /// A WinUAE-format drive sample set ([audio] floppy_sounds_set): a set
+    /// name in the floppy sounds folder or a path. `None` synthesizes.
+    floppy_sounds_set: Option<String>,
     power_on: bool,
     auto_launch: bool,
     pacing_budget: PacingBudget,
@@ -981,6 +991,9 @@ pub struct MachineSetup {
     /// never seen them, because what cannot be reached is dropped when the
     /// configuration is adopted.
     paths: crate::pathconf::Paths,
+    /// The keys the launcher has no rows for, as the configuration it was
+    /// opened on had them (see [`carry_unowned_keys`]).
+    carried: RawConfig,
 }
 
 impl Default for MachineSetup {
@@ -1171,6 +1184,7 @@ impl MachineSetup {
         self.icache = base.cpu_icache;
         self.dcache = base.cpu_dcache;
         self.jit = base.cpu_jit;
+        self.jit_fastest = base.cpu_speed == crate::config::CpuSpeed::Fastest;
         self.chip_ram = base.chip_ram_bytes;
         self.fast_ram = base.fast_ram_bytes;
         self.slow_ram = base.slow_ram_bytes;
@@ -1205,8 +1219,10 @@ impl MachineSetup {
         self.start_maximized = base.maximized;
         self.window_scale = base.window_scale;
         self.show_status_bar = base.status_bar;
+        self.track_display = base.track_display;
         self.floppy_sounds = base.audio.floppy_sounds;
         self.floppy_volume = base.audio.floppy_sounds_volume;
+        self.floppy_sounds_set = base.audio.floppy_sounds_set.clone();
         self.power_on = base.emulation.power_on;
         self.auto_launch = base.emulation.auto_launch;
         self.pacing_budget = base.emulation.pacing_budget;
@@ -1387,18 +1403,33 @@ impl MachineSetup {
         // `reason` is returned when the applicability condition is *false*.
         let reason = |applicable: bool, why: &'static str| (!applicable).then_some(why);
         match field {
-            F::Fpu => reason(self.cpu != CpuModel::M68000, "needs 68020+"),
+            F::Fpu => reason(
+                self.cpu.can_have_fpu(),
+                if matches!(self.cpu, CpuModel::M68000 | CpuModel::M68010) {
+                    "needs 68020+"
+                } else {
+                    "EC part: no FPU"
+                },
+            ),
             // Gate on the model's actual cache capability so the launcher tracks
             // CpuModel rather than a second hand-maintained list (the 040 has
             // both caches; only the 68000 has neither).
             F::Icache => reason(self.cpu.has_instruction_cache(), "needs 68020+"),
-            F::Dcache => reason(self.cpu.has_data_cache(), "needs 68030/040"),
+            F::Dcache => reason(self.cpu.has_data_cache(), "needs 68030+"),
             // The 68000/68010 shared-bus float model needs the precise
             // core, so the JIT never engages there (see cpu.rs).
             F::Jit => reason(
                 !matches!(self.cpu, CpuModel::M68000 | CpuModel::M68010),
                 "needs 68020+",
             ),
+            // Only the JIT's clock adapts to the host.
+            F::JitSpeed => {
+                if matches!(self.cpu, CpuModel::M68000 | CpuModel::M68010) {
+                    Some("needs 68020+")
+                } else {
+                    reason(self.jit, "needs JIT")
+                }
+            }
             F::Z3Ram => reason(cpu_is_32bit(self.cpu), "needs 32-bit CPU"),
             // The CPU-slot space at $08000000 is beyond a 24-bit bus too.
             F::AccelRam => reason(cpu_is_32bit(self.cpu), "needs 32-bit CPU"),
@@ -5877,10 +5908,7 @@ impl LauncherState {
 // --- helpers --------------------------------------------------------------
 
 fn cpu_is_32bit(cpu: CpuModel) -> bool {
-    matches!(
-        cpu,
-        CpuModel::M68020 | CpuModel::M68030 | CpuModel::M68040 | CpuModel::M68060
-    )
+    cpu.has_32bit_bus()
 }
 
 /// Whether `field` appears anywhere with the given row kind. Used to classify a
@@ -6187,6 +6215,35 @@ fn cycle_slice<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T
     items[next]
 }
 
+/// Step the floppy sound set through Synthesized (`None`), then each set
+/// installed in the floppy sounds folder. A set the configuration names
+/// that is not among them -- a path, or one since removed -- keeps a place
+/// at the end, so stepping past it and back does not lose it.
+fn cycle_sound_set(installed: &[String], current: Option<String>, forward: bool) -> Option<String> {
+    let mut options: Vec<Option<String>> = std::iter::once(None)
+        .chain(installed.iter().cloned().map(Some))
+        .collect();
+    let same = |a: &Option<String>, b: &Option<String>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    let idx = match options.iter().position(|option| same(option, &current)) {
+        Some(idx) => idx,
+        None => {
+            options.push(current);
+            options.len() - 1
+        }
+    };
+    let n = options.len();
+    let next = if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    };
+    options.swap_remove(next)
+}
+
 /// Cycle a network board's fitted/backend state (`None` = not fitted)
 /// through the backends this build can actually bring up: NAT only where
 /// available, a bridge choice only when an adapter exists to name (keeping
@@ -6459,8 +6516,11 @@ fn cpu_name(cpu: CpuModel) -> &'static str {
         CpuModel::M68010 => "68010",
         CpuModel::M68EC020 => "68EC020",
         CpuModel::M68020 => "68020",
+        CpuModel::M68EC030 => "68EC030",
         CpuModel::M68030 => "68030",
+        CpuModel::M68EC040 => "68EC040",
         CpuModel::M68040 => "68040",
+        CpuModel::M68EC060 => "68EC060",
         CpuModel::M68060 => "68060",
     }
 }

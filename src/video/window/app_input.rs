@@ -201,9 +201,9 @@ impl App {
                     self.nav.clear();
                     self.cursor_pos = None;
                     self.last_display_cursor_pos = None;
-                    self.mouse_delta_remainder = (0.0, 0.0);
+                    self.forget_host_mouse_motion();
                     window.set_cursor_visible(false);
-                    window.set_title(&window_title_mouse_captured());
+                    self.refresh_window_title();
                     info!("mouse captured; press {HOST_SHORTCUT_MODIFIER_LABEL}+G to release");
                 }
                 Err((locked_err, confined_err)) => {
@@ -216,24 +216,23 @@ impl App {
             self.mouse_captured = false;
             self.cursor_pos = None;
             self.last_display_cursor_pos = None;
-            self.mouse_delta_remainder = (0.0, 0.0);
+            self.forget_host_mouse_motion();
             self.release_mouse_buttons();
             if let Some(r) = self.render.as_ref() {
                 if let Err(e) = r.window.set_cursor_grab(CursorGrabMode::None) {
                     warn!("mouse release failed: {e}");
                 }
                 r.window.set_cursor_visible(true);
-                r.window.set_title(if self.debug_layout_active {
-                    "Copperline · Debug"
-                } else {
-                    window_title()
-                });
             }
+            self.refresh_window_title();
             info!("mouse released");
         }
     }
 
     pub(super) fn release_mouse_buttons(&mut self) {
+        // The machine is being told to let go whatever the hand is doing,
+        // so the hand no longer holds anything warp should yield for.
+        self.live_mouse_buttons = 0;
         if self.netplay.is_some() {
             self.netplay_input.held.mouse_buttons = 0;
             self.netplay_input.mouse_pending = (0, 0);
@@ -336,6 +335,12 @@ impl App {
         let input = &mut self.emu.bus_mut().input;
         input.set_mouse_button(port, 0, js.fire);
         input.set_mouse_button(port, 1, js.button2);
+        // A pad button held as a mouse button is a hand on the machine like
+        // the host mouse's own; this runs every pass, so holding it keeps
+        // warp's input yield (see update_warp_input_yield) alive.
+        if js.fire || js.button2 {
+            self.note_live_input();
+        }
     }
 
     /// Let go of everything the pad was holding on the mouse, and forget
@@ -393,14 +398,58 @@ impl App {
     }
 
     pub(super) fn add_mouse_delta_i32(&mut self, dx: i32, dy: i32) {
-        let Some(port) = self.mouse_port() else {
+        if self.mouse_port().is_none() {
             return;
-        };
+        }
         if self.netplay.is_some() {
             self.netplay_input.add_mouse_delta(dx, dy);
             return;
         }
-        self.apply_scripted_mouse_delta(port as u8, dx, dy);
+        self.mouse_pending.0 = self.mouse_pending.0.saturating_add(dx);
+        self.mouse_pending.1 = self.mouse_pending.1.saturating_add(dy);
+        self.deliver_host_mouse_motion();
+    }
+
+    /// Hand pending host-mouse motion to the port's counters, as much as
+    /// this emulated frame still has room for under
+    /// [`HOST_MOUSE_COUNTS_PER_FRAME`]. Runs on every host motion event and
+    /// once per pass, so a remainder held back in one frame lands in the
+    /// next even when the hand has stopped. What is still pending beyond one
+    /// more frame's worth is dropped rather than queued: a backlog would
+    /// keep the pointer coasting after the hand stops.
+    pub(super) fn deliver_host_mouse_motion(&mut self) {
+        if self.mouse_pending == (0, 0) {
+            return;
+        }
+        let Some(port) = self.mouse_port() else {
+            self.mouse_pending = (0, 0);
+            return;
+        };
+        let frame = self.emu.bus().emulated_frames();
+        if self.mouse_frame_sent.0 != frame {
+            self.mouse_frame_sent = (frame, 0, 0);
+        }
+        let room_x = HOST_MOUSE_COUNTS_PER_FRAME - self.mouse_frame_sent.1;
+        let room_y = HOST_MOUSE_COUNTS_PER_FRAME - self.mouse_frame_sent.2;
+        let dx = self.mouse_pending.0.clamp(-room_x, room_x);
+        let dy = self.mouse_pending.1.clamp(-room_y, room_y);
+        self.mouse_frame_sent.1 += dx.abs();
+        self.mouse_frame_sent.2 += dy.abs();
+        let carry = HOST_MOUSE_COUNTS_PER_FRAME;
+        self.mouse_pending.0 = (self.mouse_pending.0 - dx).clamp(-carry, carry);
+        self.mouse_pending.1 = (self.mouse_pending.1 - dy).clamp(-carry, carry);
+        if dx != 0 || dy != 0 {
+            self.apply_scripted_mouse_delta(port as u8, dx, dy);
+        }
+    }
+
+    /// Forget host-mouse motion that has not reached the machine yet: the
+    /// fractional remainder and any whole counts held back for a later
+    /// frame. For a capture change, a lost focus, or a netplay session
+    /// taking the mouse over.
+    pub(super) fn forget_host_mouse_motion(&mut self) {
+        self.mouse_delta_remainder = (0.0, 0.0);
+        self.mouse_pending = (0, 0);
     }
 
     /// Apply quadrature motion to an explicit port: scripted/CCP events
@@ -430,46 +479,93 @@ impl App {
     }
 
     /// Advance the scripted `--mouse-to-after` pointer targets: start the
-    /// next one that is due when nothing is steering, then give the
-    /// running servo this frame's correction.
+    /// next one that is due when nothing is steering, then let the
+    /// running servo look at the display.
     ///
-    /// One correction per frame is the servo's whole contract -- it has
-    /// to see what the previous delta did before choosing the next -- and
-    /// this runs once per emulated frame, in the same pass the other
-    /// scheduled input fires from.
+    /// Targets are pixels of a `--screenshot-after` capture, so the servo
+    /// steers in those: each poll maps sprite 0's rendered-field origin
+    /// through the capture's framing ([`Self::capture_field_map`]). A
+    /// target therefore waits for the first presented frame, and one that
+    /// falls due while an RTG board's frame is the screenshot is dropped,
+    /// since that picture has no sprite pointer.
+    ///
+    /// This runs on every pass of the frame loop, in the same pass the
+    /// other scheduled input fires from. A pass is an instruction budget
+    /// rather than a field, so the servo itself decides when there is
+    /// something new to see and a correction to make (`ServoStep::Wait`
+    /// otherwise).
     pub(super) fn advance_scripted_pointer_targets(&mut self, emu_secs: f64) {
-        if self.active_mouse_to.is_none() {
-            if let Some(pos) = self
+        let due = self.active_mouse_to.is_none()
+            && self.auto_mouse_to.iter().any(|&(at, ..)| emu_secs >= at);
+        if self.active_mouse_to.is_none() && !due {
+            return;
+        }
+        let Some(map) = self.capture_field_map() else {
+            if self.rtg_present_dims.is_some() {
+                if self.active_mouse_to.take().is_none() {
+                    if let Some(pos) = self
+                        .auto_mouse_to
+                        .iter()
+                        .position(|&(at, ..)| emu_secs >= at)
+                    {
+                        self.auto_mouse_to.remove(pos);
+                    }
+                }
+                warn!(
+                    "auto-mouse-to: the display is an RTG board's frame, which has no sprite \
+                     pointer to steer"
+                );
+            }
+            return;
+        };
+        if due {
+            let pos = self
                 .auto_mouse_to
                 .iter()
                 .position(|&(at, ..)| emu_secs >= at)
-            {
-                let (_, x, y, port) = self.auto_mouse_to.remove(pos);
+                .expect("a due target");
+            let (_, x, y, port) = self.auto_mouse_to.remove(pos);
+            info!(
+                "auto-mouse-to: steering the pointer to screenshot pixel ({x}, {y}) on port {}",
+                port + 1
+            );
+            if self.native_screenshots {
                 info!(
-                    "auto-mouse-to: steering the pointer to ({x}, {y}) on port {}",
-                    port + 1
+                    "auto-mouse-to: targets are measured in the default screenshot framing, \
+                     not the --native-screenshots crop"
                 );
-                self.active_mouse_to = Some(crate::pointer::PointerServo::new(
+            }
+            // Seed the learned ratio in screenshot pixels: a count moves a
+            // lo-res pointer two field columns and one field row.
+            let (sx, sy) = map.scale();
+            self.active_mouse_to = Some(
+                crate::pointer::PointerServo::new(
                     port,
                     (x, y),
                     crate::pointer::DEFAULT_TOLERANCE,
                     crate::pointer::DEFAULT_MAX_FRAMES,
-                ));
-            }
+                )
+                .with_gain((2.0 * sx, sy)),
+            );
         }
         let Some(servo) = self.active_mouse_to.as_mut() else {
             return;
         };
-        match servo.poll(self.emu.bus()) {
+        let bus = self.emu.bus();
+        let at = crate::pointer::pointer_position(bus).and_then(|field| map.capture_point(field));
+        match servo.poll_observed(bus.emulated_frames(), at) {
             crate::pointer::ServoStep::Move { port, dx, dy } => {
                 self.apply_scripted_mouse_delta(port, dx, dy);
             }
+            crate::pointer::ServoStep::Wait => {}
             crate::pointer::ServoStep::Arrived { x, y, frames } => {
-                info!("auto-mouse-to: pointer at ({x}, {y}) after {frames} frame(s)");
+                info!(
+                    "auto-mouse-to: pointer at screenshot pixel ({x}, {y}) after {frames} frame(s)"
+                );
                 self.active_mouse_to = None;
             }
             crate::pointer::ServoStep::Failed(why) => {
-                warn!("auto-mouse-to: {why}");
+                warn!("auto-mouse-to: {why} (screenshot pixels)");
                 self.active_mouse_to = None;
             }
         }
@@ -494,7 +590,7 @@ impl App {
         if self.handle_keyboard_joystick_key(code, pressed) {
             return;
         }
-        self.handle_amiga_key_event(rawkey, pressed);
+        self.handle_live_amiga_key_event(rawkey, pressed);
     }
 
     pub(super) fn update_host_modifiers(&mut self, modifiers: ModifiersState) {
@@ -534,6 +630,90 @@ impl App {
             || rawkey_is_held(&self.panel_held_rawkeys, rawkey)
     }
 
+    /// A transition the operator made on the host keyboard, as against a
+    /// scheduled or control-protocol key: handled like any other
+    /// host-keyboard transition, then noted for warp's input yield. The key
+    /// is marked live only once the machine actually holds it; any later
+    /// host-keyboard transition of it, from whatever source, clears the
+    /// mark again (see [`Self::handle_amiga_key_event_from`]).
+    pub(super) fn handle_live_amiga_key_event(&mut self, rawkey: u8, pressed: bool) {
+        self.handle_amiga_key_event(rawkey, pressed);
+        self.live_held_rawkeys[rawkey_index(rawkey)] =
+            pressed && rawkey_is_held(&self.held_rawkeys, rawkey);
+        self.note_live_input();
+    }
+
+    /// A host mouse button the operator pressed or let go of on the guest's
+    /// mouse, noted for warp's input yield.
+    pub(super) fn note_live_mouse_button(&mut self, index: u8, pressed: bool) {
+        let bit = 1u8 << index.min(7);
+        if pressed {
+            self.live_mouse_buttons |= bit;
+        } else {
+            self.live_mouse_buttons &= !bit;
+        }
+        self.note_live_input();
+    }
+
+    /// The operator just touched something the machine sees: keep warp
+    /// yielding to real-time pacing for [`WARP_INPUT_YIELD_GRACE`] from now.
+    pub(super) fn note_live_input(&mut self) {
+        self.warp_input_yield_until = Some(Instant::now() + WARP_INPUT_YIELD_GRACE);
+    }
+
+    /// Drop the live mark of every key and mouse button the machine no
+    /// longer holds. A mark outlives its key when the machine is made to let
+    /// go by something other than the operator's own release -- a reset
+    /// clearing the host keys, a button release that went astray -- and left
+    /// in place it would turn a later scripted or control-protocol press of
+    /// the same key into a "live" hold and pace that input to real time.
+    pub(super) fn prune_live_input_marks(&mut self) {
+        for (live, held) in self.live_held_rawkeys.iter_mut().zip(&self.held_rawkeys) {
+            *live &= *held;
+        }
+        let held_buttons = self.mouse_port().map_or(0, |port| {
+            let p = &self.emu.bus().input.ports[port];
+            u8::from(p.fire) | u8::from(p.button2) << 1 | u8::from(p.button3) << 2
+        });
+        self.live_mouse_buttons &= held_buttons;
+    }
+
+    /// Whether the operator is holding down a host key or mouse button the
+    /// machine sees (after [`Self::prune_live_input_marks`]).
+    pub(super) fn live_input_held(&self) -> bool {
+        self.live_mouse_buttons != 0 || self.live_held_rawkeys.iter().any(|live| *live)
+    }
+
+    /// Engage or release warp's yield to real-time pacing for this pass
+    /// (see [`crate::emulator::Emulator::set_warp_input_yield`]): on while
+    /// the operator holds a host key or mouse button down, and for
+    /// [`WARP_INPUT_YIELD_GRACE`] after the last one was touched, so a hold
+    /// lasts as long in emulated time as it did in the hand and the two
+    /// clicks of a double-click land as close together. Only live input
+    /// counts: scheduled and control-protocol input is timed in emulated
+    /// time already, and pasted keystrokes keep their warp speed.
+    pub(super) fn update_warp_input_yield(&mut self) {
+        self.prune_live_input_marks();
+        if self.live_input_held() {
+            self.note_live_input();
+        }
+        let yielding = !self.emu.paced()
+            && self
+                .warp_input_yield_until
+                .is_some_and(|until| Instant::now() < until);
+        if yielding != self.emu.warp_input_yield() {
+            log::debug!(
+                "warp: {} real-time pacing for live input",
+                if yielding {
+                    "yielding to"
+                } else {
+                    "resuming after"
+                }
+            );
+        }
+        self.emu.set_warp_input_yield(yielding);
+    }
+
     /// A transition from the host keyboard.
     pub(super) fn handle_amiga_key_event(&mut self, rawkey: u8, pressed: bool) {
         if self.netplay.is_some() {
@@ -564,7 +744,14 @@ impl App {
         }
         let was_held = self.amiga_rawkey_held(rawkey);
         match source {
-            KeySource::Host => self.held_rawkeys[idx] = pressed,
+            KeySource::Host => {
+                self.held_rawkeys[idx] = pressed;
+                // Whoever moved the key last owns it: a scheduled press or
+                // a forced release is not the operator's hand, so the live
+                // mark goes (handle_live_amiga_key_event sets it again
+                // after a live transition).
+                self.live_held_rawkeys[idx] = false;
+            }
             KeySource::Panel => self.panel_held_rawkeys[idx] = pressed,
         }
         // The other source is holding the same key, so the aggregate did

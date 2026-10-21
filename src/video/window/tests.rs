@@ -9,32 +9,33 @@ use super::{
     bar_layout, cap_texture_scale, center_present_frame_for_visible_start,
     center_present_frame_horizontally, control_at, copperline_icon_image, copperline_logo_image,
     copy_present_frame, copy_tv_aperture_to_window, copy_window_present_frame,
-    cursor_position_in_texture, draw_seven_segment_digit, draw_status_bar, fdd_track_counter_rect,
-    fdd_track_digit_rect, host_shortcut_modifier_pressed, host_to_amiga_rawkey,
-    joystick_toggle_rect, kbdpanel, keyboard_toggle_rect, led_row_rect, mask_present_frame_to_tv,
-    paint_test_screen, parse_amiga_key, pause_button_rect, plan_present_scaling_for,
-    power_button_rect, present_height, presentation_pixels_equal, presentation_source_y_offset,
-    raw_device_qualifier_family_held, raw_device_qualifier_rawkey, rawkey_is_held,
-    rawkey_transition_is_duplicate, reboot_button_rect, repeated_main_key_should_drop, rgba,
-    short_status_error, shorten_status_paths, shot_button_rect, should_render_emulated_frame,
-    standard_window_top_row, status_with_latched_fdd_track, take_integral_mouse_delta,
-    texture_height, texture_width, tint_display_rows, tint_lut, tint_rows_in_place,
-    track_counter_digit_rect, track_counter_layout, tv_aperture_source_row,
-    tv_centre_source_offset, tv_source_h_bounds, volume_mute_hit_rect, volume_percent_from_pos,
-    volume_slider_knob_rect, volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode,
-    MediaBar, PresentationLatch, StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT,
-    AMIGA_RAWKEY_LEFT_SHIFT, AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH,
-    BUTTON_GLYPH_DISABLED, CD_BODY, CD_LED_OFF, CD_LED_ON, CD_TRACK_SEGMENT_OFF,
-    CD_TRACK_SEGMENT_ON, DISK_BODY, DISK_BODY_SHADOW, DISK_LABEL, FDD_LED_OFF, FDD_LED_ON,
-    HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON, POWER_LED_BRIGHT, POWER_LED_DIM,
-    POWER_LED_OFF, STANDARD_PAL_VISIBLE_LINES, STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG,
-    TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON, TUBE_NTSC_PRESENT_HEIGHT, TUBE_PAL_PRESENT_HEIGHT,
-    TV_CAPTURED_SOURCE_X, TV_CAPTURED_WIDTH, TV_LIVE_PAD_X, TV_NTSC_PRESENT_HEIGHT,
-    TV_PAL_PRESENT_HEIGHT, TV_PRESENT_SOURCE_Y, VOLUME_FILL, VOLUME_GLYPH_X,
+    cursor_position_in_texture, draw_seven_segment_digit, draw_status_bar, fdd_counter_readout,
+    fdd_track_counter_rect, fdd_track_digit_rect, host_shortcut_modifier_pressed,
+    host_to_amiga_rawkey, joystick_toggle_rect, kbdpanel, keyboard_toggle_rect, led_row_rect,
+    mask_present_frame_to_tv, paint_test_screen, parse_amiga_key, pause_button_rect,
+    plan_present_scaling_for, power_button_rect, present_height, presentation_pixels_equal,
+    presentation_source_y_offset, raw_device_qualifier_family_held, raw_device_qualifier_rawkey,
+    rawkey_is_held, rawkey_transition_is_duplicate, reboot_button_rect,
+    repeated_main_key_should_drop, rgba, short_status_error, shorten_status_paths,
+    shot_button_rect, should_render_emulated_frame, standard_window_top_row,
+    status_with_latched_fdd_track, take_integral_mouse_delta, texture_height, texture_width,
+    tint_display_rows, tint_lut, tint_rows_in_place, track_counter_digit_rect,
+    track_counter_layout, tv_aperture_source_row, tv_centre_source_offset, tv_source_h_bounds,
+    volume_mute_hit_rect, volume_percent_from_pos, volume_slider_knob_rect,
+    volume_slider_track_rect, BarControl, DriveBar, JoystickInputMode, MediaBar, PresentationLatch,
+    StatusBarView, ToolPanelKind, AMIGA_RAWKEY_LEFT_ALT, AMIGA_RAWKEY_LEFT_SHIFT,
+    AMIGA_RAWKEY_RIGHT_ALT, AMIGA_RAWKEY_RIGHT_SHIFT, BUTTON_GLYPH, BUTTON_GLYPH_DISABLED, CD_BODY,
+    CD_LED_OFF, CD_LED_ON, CD_TRACK_SEGMENT_OFF, CD_TRACK_SEGMENT_ON, DISK_BODY, DISK_BODY_SHADOW,
+    DISK_LABEL, FDD_LED_OFF, FDD_LED_ON, HDD_LED_OFF, HDD_LED_ON, POWER_GLYPH_OFF, POWER_GLYPH_ON,
+    POWER_LED_BRIGHT, POWER_LED_DIM, POWER_LED_OFF, STANDARD_PAL_VISIBLE_LINES,
+    STANDARD_PAL_VISIBLE_START_VPOS, STATUS_BG, TRACK_SEGMENT_OFF, TRACK_SEGMENT_ON,
+    TUBE_NTSC_PRESENT_HEIGHT, TUBE_PAL_PRESENT_HEIGHT, TV_CAPTURED_SOURCE_X, TV_CAPTURED_WIDTH,
+    TV_LIVE_PAD_X, TV_NTSC_PRESENT_HEIGHT, TV_PAL_PRESENT_HEIGHT, TV_PRESENT_SOURCE_Y, VOLUME_FILL,
+    VOLUME_GLYPH_X,
 };
 use crate::audio::{AudioSink, NullSink};
 use crate::bus::{FrontPanelStatus, RenderRegisterSnapshot};
-use crate::config::{Overscan, Tint, WarpSpeed};
+use crate::config::{Overscan, Tint, TrackDisplay, WarpSpeed};
 use crate::heatmap;
 use crate::video::{FB_PIXELS, FB_WIDTH};
 use std::cell::RefCell;
@@ -1279,6 +1280,234 @@ fn native_screenshots_follow_playfield_resolution_without_tv_borders() {
     }
 }
 
+/// A laced picture is two fields: the native capture weaves the current
+/// field with the one before it, long field on the even rows, so a 320x512
+/// laced lo-res screen saves at 320x512 rather than as one 320x256 field.
+#[test]
+fn native_screenshots_weave_both_fields_of_a_laced_picture() {
+    let mut app = test_app();
+    let bus = app.emu.bus_mut();
+    bus.custom_write(0x08E, 2, 0x2C81);
+    bus.custom_write(0x090, 2, 0x2CC1);
+    bus.custom_write(0x092, 2, 0x0038);
+    bus.custom_write(0x094, 2, 0x00D0);
+    bus.custom_write(0x100, 2, 0x1204);
+    bus.custom_write(0x096, 2, 0x8300);
+    // The first field's frame-start snapshot predates the mode.
+    app.emu.step_video_frame().unwrap();
+    // Paint each laced field its own background so the rows show which
+    // field they came from.
+    let colours: [u16; 2] = [0x0F00, 0x000F];
+    for colour in colours {
+        app.emu.bus_mut().custom_write(0x180, 2, colour.into());
+        app.emu.step_video_frame().unwrap();
+    }
+    app.set_native_screenshots(true);
+    let image = app.capture_present_image();
+    assert_eq!((image.width, image.height), (320, 512));
+
+    let current_is_long = app.emu.bus().frame_render_base().long_field;
+    let (long, short) = if current_is_long {
+        (colours[1], colours[0])
+    } else {
+        (colours[0], colours[1])
+    };
+    let long = crate::chipset::denise::rgb12_to_rgba8(long);
+    let short = crate::chipset::denise::rgb12_to_rgba8(short);
+    for (y, row) in image.pixels.chunks(320).enumerate() {
+        let expected = if y % 2 == 0 { long } else { short };
+        assert!(row.iter().all(|px| *px == expected), "row {y}");
+    }
+}
+
+/// The player writes its menu settings to `settings.toml` and its startup
+/// layers that file back over the manifest. Whatever the write records must
+/// come back through the merge, or the player forgets the choice on the next
+/// launch: the Framing choice was written but never read back, and Autocrop
+/// was read back but never written.
+#[test]
+fn player_settings_written_are_all_read_back_on_the_next_launch() {
+    let mut app = test_app();
+    app.overscan = Overscan::Smart;
+    let written = app.player_prefs();
+    assert_eq!(written.display.overscan.as_deref(), Some("smart"));
+    assert!(written.display.autocrop.is_some());
+
+    let mut restored = crate::config::RawConfig::default();
+    restored.merge_player_settings(&written);
+    assert_eq!(
+        restored.to_toml_string().unwrap(),
+        written.to_toml_string().unwrap()
+    );
+}
+
+/// Menu changes in the full build are written through to the saved default
+/// as they are made -- only the changed keys, over whatever the file holds --
+/// and the session's own configuration follows, so the launcher shows and
+/// saves them too (rewind and controller settings were reported lost across
+/// restarts).
+#[test]
+fn menu_settings_write_through_to_the_saved_default() {
+    use crate::config::RawConfig;
+    let path = std::env::temp_dir().join(format!(
+        "copperline-menu-settings-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "[machine]\nprofile = \"A1200\"\n").unwrap();
+    let read_back =
+        |path: &std::path::Path| RawConfig::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut app = test_app();
+    // The fixture wires port 2 after construction; a real start configures
+    // the ports before the session takes its settings baseline.
+    app.menu_settings_saved = app.menu_prefs();
+    app.set_menu_settings_file(Some(path.clone()));
+
+    app.toggle_rewind();
+    app.autofire_hz = 8;
+    app.persist_settings();
+    let saved = read_back(&path);
+    assert_eq!(saved.machine.profile.as_deref(), Some("A1200"));
+    assert_eq!(saved.emulation.rewind, Some(true));
+    assert_eq!(saved.input.autofire_hz, Some(8));
+    // Settings the user left alone stay out of the default every machine
+    // starts from.
+    assert_eq!(saved.input.port2, None);
+    assert_eq!(saved.display.vsync, None);
+    assert_eq!(app.machine_config.emulation.rewind, Some(true));
+    assert_eq!(app.machine_config.input.autofire_hz, Some(8));
+
+    // Turning a setting back writes it back.
+    app.toggle_rewind();
+    app.persist_settings();
+    let saved = read_back(&path);
+    assert_eq!(saved.emulation.rewind, Some(false));
+    assert_eq!(saved.input.autofire_hz, Some(8));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A write-through that fails leaves its change pending rather than
+/// counting it as saved: a default that does not parse is left alone, and
+/// once it is fixed the next persist writes the earlier change.
+#[test]
+fn failed_menu_settings_write_is_retried() {
+    use crate::config::RawConfig;
+    let path = std::env::temp_dir().join(format!(
+        "copperline-menu-settings-retry-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "not [toml").unwrap();
+    let mut app = test_app();
+    app.rebaseline_menu_settings();
+    app.set_menu_settings_file(Some(path.clone()));
+
+    app.autofire_hz = 8;
+    app.persist_settings();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "not [toml");
+
+    std::fs::write(&path, "").unwrap();
+    app.persist_settings();
+    let saved = RawConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.input.autofire_hz, Some(8));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Whatever the full build's menu write-through records must come back
+/// through its merge, or the setting is lost on the next launch.
+#[test]
+fn menu_settings_written_are_all_read_back() {
+    let app = test_app();
+    let written = app.menu_prefs();
+    assert!(written.emulation.rewind.is_some());
+    assert!(written.input.mouse_sensitivity.is_some());
+
+    let mut restored = crate::config::RawConfig::default();
+    restored.merge_menu_settings(&written);
+    assert_eq!(
+        restored.to_toml_string().unwrap(),
+        written.to_toml_string().unwrap()
+    );
+}
+
+#[test]
+fn native_scheduled_capture_leaves_interactive_output_capture_unchanged() {
+    let mut app = test_app();
+    app.set_native_screenshots(true);
+    app.take_screenshot();
+    assert!(app.pending_output_screenshot.is_some());
+    assert!(app.native_screenshots);
+}
+
+#[test]
+fn native_screenshot_shortcut_is_distinct_from_screenshot_and_save_state() {
+    let host = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::ALT
+    };
+    let extra = if cfg!(target_os = "macos") {
+        ModifiersState::ALT
+    } else {
+        ModifiersState::CONTROL
+    };
+    assert!(!super::native_screenshot_shortcut_pressed(host));
+    assert!(!super::native_screenshot_shortcut_pressed(extra));
+    assert!(super::native_screenshot_shortcut_pressed(host | extra));
+    assert!(!super::native_screenshot_shortcut_pressed(
+        host | extra | ModifiersState::SHIFT
+    ));
+}
+
+#[cfg(feature = "game-library")]
+#[test]
+fn library_wheel_scrolls_games_and_favourites_and_accumulates_trackpad_motion() {
+    use crate::video::launcher::LauncherTab;
+    use winit::{dpi::PhysicalPosition, event::MouseScrollDelta};
+    let mut app = test_app();
+    app.open_launcher();
+    let state = app.launcher_state_mut().unwrap();
+    state.tab = LauncherTab::WhdloadLibrary;
+    state.library.games =
+        crate::gamelib::Library::of_titles((0..80).map(|i| format!("Game {i:03}")));
+    for i in 0..80 {
+        let title = format!("Game {i:03}");
+        state.library.db.toggle_favourite(&title, &title);
+    }
+    // Find the two actual tables through their public pointer routing.
+    let find = |control| {
+        (0..present_height() as i32)
+            .find_map(|y| {
+                (0..FB_WIDTH as i32).find_map(|x| {
+                    (crate::video::ui::launcher_wheel_control(&app.ui, (x, y)) == Some(control))
+                        .then_some((x, y))
+                })
+            })
+            .unwrap()
+    };
+    let games = find(UiControl::LauncherLibraryScroll(0));
+    let favourites = find(UiControl::LauncherLibraryFavouriteScroll(0));
+    app.cursor_pos = Some(games);
+    assert!(app.scroll_launcher_with_wheel(MouseScrollDelta::LineDelta(0.0, -1.0)));
+    assert_eq!(app.launcher_state().unwrap().library.scroll, 3);
+    for _ in 0..3 {
+        app.scroll_launcher_with_wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, -4.0,
+        )));
+    }
+    assert_eq!(app.launcher_state().unwrap().library.scroll, 3);
+    app.scroll_launcher_with_wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+        0.0, -4.0,
+    )));
+    assert_eq!(app.launcher_state().unwrap().library.scroll, 4);
+    app.cursor_pos = Some(favourites);
+    app.scroll_launcher_with_wheel(MouseScrollDelta::LineDelta(0.0, -1.0));
+    assert_eq!(app.launcher_state().unwrap().library.favourite_scroll, 3);
+    assert_eq!(app.launcher_state().unwrap().library.scroll, 4);
+    app.scroll_launcher_with_wheel(MouseScrollDelta::LineDelta(0.0, 100.0));
+    assert_eq!(app.launcher_state().unwrap().library.favourite_scroll, 0);
+    app.cursor_pos = Some((0, 0));
+    assert!(!app.scroll_launcher_with_wheel(MouseScrollDelta::LineDelta(0.0, -1.0)));
+}
+
 #[test]
 fn native_screenshot_sprite_pitch_distinguishes_ecs_from_aga() {
     use crate::chipset::agnus::AgnusRevision;
@@ -2433,6 +2662,117 @@ fn warp_burst_decouples_emulation_from_the_vsync_present() {
     assert_eq!(app.warp_burst_plan(false), (1, None));
 }
 
+/// Under warp a hand on the machine used to be stretched by the warp
+/// factor: a tenth-of-a-second key tap was held for seconds of emulated
+/// time (input.device repeated it) and two clicks landed too far apart to
+/// be a double-click. A live key or mouse button now holds warp to
+/// real-time pacing while it is down and for a grace period after, without
+/// switching warp itself off.
+#[test]
+fn warp_yields_to_real_time_while_a_live_key_or_button_is_held() {
+    let mut app = test_app();
+    // test_app builds an unpaced (warp) emulator.
+    app.warp_speed = WarpSpeed::X4;
+    app.update_warp_input_yield();
+    assert!(!app.emu.warp_input_yield(), "nothing touched yet");
+    assert_eq!(app.warp_burst_plan(false), (4, None));
+
+    // A host key goes down: real-time pacing, one frame per present, warp
+    // still engaged as far as the toggle and the status bar are concerned.
+    app.handle_live_amiga_key_event(0x20, true);
+    app.update_warp_input_yield();
+    assert!(app.emu.warp_input_yield());
+    assert!(!app.emu.paced(), "warp itself stays on");
+    assert_eq!(app.warp_burst_plan(false), (1, None));
+
+    // Released, it keeps yielding through the grace period, so the next
+    // press of a double-click is not flung seconds ahead...
+    app.handle_live_amiga_key_event(0x20, false);
+    app.update_warp_input_yield();
+    assert!(app.emu.warp_input_yield(), "within the grace period");
+    // ...and once the grace has run out, warp picks up again.
+    app.warp_input_yield_until = Some(std::time::Instant::now());
+    app.update_warp_input_yield();
+    assert!(!app.emu.warp_input_yield());
+    assert_eq!(app.warp_burst_plan(false), (4, None));
+
+    // A mouse button on the guest's mouse does the same, held past any
+    // grace: the hold itself keeps the yield up.
+    let port = app.mouse_port().expect("fixture has a mouse in port 1");
+    app.emu.bus_mut().input.set_mouse_button(port, 0, true);
+    app.note_live_mouse_button(0, true);
+    app.warp_input_yield_until = Some(std::time::Instant::now());
+    app.update_warp_input_yield();
+    assert!(app.emu.warp_input_yield(), "a held button keeps yielding");
+
+    // Should the release go astray (capture dropped, focus lost), the
+    // machine letting go of the button is enough to end it.
+    app.release_mouse_buttons();
+    app.warp_input_yield_until = Some(std::time::Instant::now());
+    app.update_warp_input_yield();
+    assert!(!app.emu.warp_input_yield());
+
+    // Out of warp there is nothing to yield.
+    app.handle_live_amiga_key_event(0x20, true);
+    app.emu.set_paced(true);
+    app.update_warp_input_yield();
+    assert!(!app.emu.warp_input_yield());
+}
+
+/// When the machine is made to let go of a live key or button by something
+/// other than the operator's release (a debugger hand-back, a capture
+/// release, a scripted release), the live mark has to go with it.
+/// Otherwise a later scripted or control-protocol press of the same key or
+/// button revives it, and warp paces that scripted input to real time.
+#[test]
+fn a_forced_release_leaves_no_live_mark_for_scripted_input() {
+    fn expire_grace_and_update(app: &mut super::App) -> bool {
+        app.warp_input_yield_until = Some(std::time::Instant::now());
+        app.update_warp_input_yield();
+        app.emu.warp_input_yield()
+    }
+    let mut app = test_app();
+    let port = app.mouse_port().expect("fixture has a mouse in port 1");
+
+    // A live key whose physical release never arrives, released by force
+    // (the debugger hand-back path), then pressed again by a script.
+    app.handle_live_amiga_key_event(0x20, true);
+    app.release_amiga_rawkey_if_held(0x20);
+    app.handle_amiga_key_event(0x20, true);
+    assert!(app.amiga_rawkey_held(0x20), "the script holds the key");
+    assert!(!expire_grace_and_update(&mut app), "a scripted key hold");
+    app.handle_amiga_key_event(0x20, false);
+
+    // The same for a live button let go by a capture release.
+    app.emu.bus_mut().input.set_mouse_button(port, 0, true);
+    app.note_live_mouse_button(0, true);
+    app.release_mouse_buttons();
+    app.emu.bus_mut().input.set_mouse_button(port, 0, true);
+    assert!(!expire_grace_and_update(&mut app), "a scripted button hold");
+    app.emu.bus_mut().input.set_mouse_button(port, 0, false);
+
+    // And for one a script let go of: the next pass drops the mark, so a
+    // later scripted press cannot pick it back up.
+    app.emu.bus_mut().input.set_mouse_button(port, 1, true);
+    app.note_live_mouse_button(1, true);
+    app.emu.bus_mut().input.set_mouse_button(port, 1, false);
+    assert!(!expire_grace_and_update(&mut app));
+    app.emu.bus_mut().input.set_mouse_button(port, 1, true);
+    assert!(!expire_grace_and_update(&mut app), "a scripted button hold");
+}
+
+/// Scheduled and control-protocol keys are timed in emulated time already,
+/// so warp has nothing to correct for them: a long paste typed as
+/// keystrokes keeps its warp speed.
+#[test]
+fn warp_does_not_yield_to_scripted_keys() {
+    let mut app = test_app();
+    app.handle_amiga_key_event(0x20, true);
+    assert!(app.amiga_rawkey_held(0x20), "the machine has the key down");
+    app.update_warp_input_yield();
+    assert!(!app.emu.warp_input_yield());
+}
+
 #[test]
 fn cycle_warp_speed_walks_the_levels() {
     let mut app = test_app();
@@ -2555,6 +2895,67 @@ fn mouse_delta_integrator_keeps_fractional_remainder() {
     delta -= 1.5;
     assert_eq!(take_integral_mouse_delta(&mut delta), -1);
     assert_eq!(delta, -0.25);
+}
+
+/// A brisk flick of a high-resolution host mouse (X11 reports raw device
+/// counts) used to land in the 8-bit JOYxDAT counters in one piece: 200
+/// counts right read back as 56 counts left, and the pointer jumped the
+/// wrong way. Host motion now reaches the counters at most
+/// HOST_MOUSE_COUNTS_PER_FRAME per axis per emulated frame, with one more
+/// frame's worth carried and the rest dropped.
+#[test]
+fn a_fast_host_mouse_never_wraps_the_quadrature_counters() {
+    use super::HOST_MOUSE_COUNTS_PER_FRAME as PER_FRAME;
+    fn next_frame(app: &mut super::App) {
+        let frame = app.emu.bus().emulated_frames();
+        while app.emu.bus().emulated_frames() == frame {
+            app.emu.step_frame().expect("frame");
+        }
+    }
+    let mut app = test_app();
+    let port = app.mouse_port().expect("fixture has a mouse in port 1");
+    let counters = |app: &super::App| {
+        let p = &app.emu.bus().input.ports[port];
+        (p.counter_x, p.counter_y)
+    };
+    let mut last = counters(&app);
+    let mut moved = |app: &super::App| {
+        let now = counters(app);
+        let delta = (
+            now.0.wrapping_sub(last.0) as i8,
+            now.1.wrapping_sub(last.1) as i8,
+        );
+        last = now;
+        delta
+    };
+
+    app.add_host_mouse_delta(200.0, -200.0);
+    assert_eq!(
+        moved(&app),
+        (PER_FRAME as i8, -PER_FRAME as i8),
+        "a frame's worth goes in, each axis the way the hand went"
+    );
+    app.add_host_mouse_delta(30.0, 0.0);
+    assert_eq!(moved(&app), (0, 0), "this frame has had its share");
+
+    next_frame(&mut app);
+    app.deliver_host_mouse_motion();
+    assert_eq!(
+        moved(&app),
+        (PER_FRAME as i8, -PER_FRAME as i8),
+        "one more frame's worth was carried"
+    );
+    next_frame(&mut app);
+    app.deliver_host_mouse_motion();
+    assert_eq!(
+        moved(&app),
+        (0, 0),
+        "the rest of the flick was dropped, so the pointer stops with the hand"
+    );
+
+    // Ordinary motion is untouched: it arrives whole and at once.
+    app.add_host_mouse_delta(12.0, 5.0);
+    assert_eq!(moved(&app), (12, 5));
 }
 
 #[test]
@@ -3267,6 +3668,84 @@ fn status_bar_adapts_track_counters_to_connected_drives() {
     assert_eq!(
         pixel(&frame, bay.x + 1, bay.y + 1, scale),
         STATUS_BG.to_le_bytes()
+    );
+}
+
+#[test]
+fn fdd_counter_splits_track_into_cylinder_and_side() {
+    // Track = cylinder * 2 + side: track 81 is the upper head on
+    // cylinder 40.
+    let readout = fdd_counter_readout(Some(81), TrackDisplay::Cylinder);
+    assert_eq!(&readout.glyphs, b"401");
+    assert_eq!(readout.point_after, Some(1));
+    let readout = fdd_counter_readout(Some(80), TrackDisplay::Cylinder);
+    assert_eq!(&readout.glyphs, b"400");
+    // Single-digit cylinders keep their leading zero, as the track
+    // readout keeps its leading zeros.
+    assert_eq!(
+        &fdd_counter_readout(Some(11), TrackDisplay::Cylinder).glyphs,
+        b"051"
+    );
+    // The last cylinder of an 80-cylinder mechanism.
+    assert_eq!(
+        &fdd_counter_readout(Some(159), TrackDisplay::Cylinder).glyphs,
+        b"791"
+    );
+    // No drive selected yet: dashes, still in CYL.SIDE shape.
+    let readout = fdd_counter_readout(None, TrackDisplay::Cylinder);
+    assert_eq!(&readout.glyphs, b"---");
+    assert_eq!(readout.point_after, Some(1));
+    // The default mode is unchanged: the plain track number, no point.
+    let readout = fdd_counter_readout(Some(81), TrackDisplay::Track);
+    assert_eq!(&readout.glyphs, b"081");
+    assert_eq!(readout.point_after, None);
+}
+
+#[test]
+fn status_bar_cylinder_mode_lights_the_point_after_the_cylinder() {
+    let scale = 1;
+    let status = FrontPanelStatus {
+        power_led_bright: true,
+        fdd_led_on: true,
+        fdd_track: Some(81),
+        hdd_led: None,
+        cd_led: None,
+        cd_track: None,
+        output_volume_percent: 100,
+    };
+    // The point sits in the gap after the second digit, on the bottom
+    // segment's line.
+    let tens = fdd_track_digit_rect(1);
+    let point = (tens.x + tens.w + 1, tens.y + tens.h - 1);
+
+    crate::video::set_track_display(TrackDisplay::Track);
+    let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+    draw_status_bar(&mut frame, &view(status, true, false), scale);
+    assert_ne!(
+        pixel(&frame, point.0, point.1, scale),
+        TRACK_SEGMENT_ON.to_le_bytes(),
+        "track mode drew a decimal point"
+    );
+
+    crate::video::set_track_display(TrackDisplay::Cylinder);
+    let mut frame = vec![0u8; texture_width(scale) * texture_height(scale) * 4];
+    draw_status_bar(&mut frame, &view(status, true, false), scale);
+    crate::video::set_track_display(TrackDisplay::Track);
+    assert_eq!(
+        pixel(&frame, point.0, point.1, scale),
+        TRACK_SEGMENT_ON.to_le_bytes(),
+        "cylinder mode left the decimal point dark"
+    );
+    // "40.1": the side digit is a 1, so its left-hand strokes stay dark
+    // while its right-hand ones light.
+    let side = fdd_track_digit_rect(2);
+    assert_eq!(
+        pixel(&frame, side.x, side.y + side.h / 4, scale),
+        TRACK_SEGMENT_OFF.to_le_bytes()
+    );
+    assert_eq!(
+        pixel(&frame, side.x + side.w - 1, side.y + side.h / 4, scale),
+        TRACK_SEGMENT_ON.to_le_bytes()
     );
 }
 
@@ -4824,6 +5303,7 @@ fn test_app_with_audio_cpu_and_program(
         crate::config::MouseCapture::Click,
         false,
         vec!["Machine: test".to_string()],
+        true,
         crate::config::RawConfig::default(),
         None,
         true,
@@ -4946,6 +5426,7 @@ fn test_app_with_copperhf_units(units: &[(usize, PathBuf)]) -> super::App {
         crate::config::MouseCapture::Click,
         false,
         vec!["Machine: test".to_string()],
+        true,
         raw,
         None,
         true,
@@ -5030,6 +5511,9 @@ const POINTER_COPPER_LIST: u32 = 0x0000_2000;
 /// Chip-RAM address of sprite 0's DMA list: control words, then one
 /// DATA/DATB pair per line, then the null control word.
 const POINTER_SPRITE_LIST: u32 = 0x0000_3000;
+/// Chip-RAM address of the fixture's blank playfield: one lo-res plane
+/// of zeros, which chip RAM already holds.
+const POINTER_PLAYFIELD: u32 = 0x0001_0000;
 /// Lines of sprite data in that list, and so the pointer's height.
 const POINTER_SPRITE_LINES: u16 = 8;
 
@@ -5231,12 +5715,37 @@ fn pointer_machine() -> (super::App, PointerFixture) {
 
     // The Copper list: reload SPR0PT for this field, then park. Without
     // it the channel would fetch from wherever the previous field's DMA
-    // left the pointer.
+    // left the pointer. It also runs a blank one-plane lo-res playfield
+    // in the standard display window -- Denise only shows sprites on
+    // lines bitplane DMA has opened the display on -- and paints the
+    // pointer (sprite colour 17) white on black, so a capture shows it.
     let copper_list = [
         0x0120, // MOVE SPR0PTH
         (POINTER_SPRITE_LIST >> 16) as u16,
         0x0122, // MOVE SPR0PTL
         POINTER_SPRITE_LIST as u16,
+        0x008E, // MOVE DIWSTRT
+        0x2C81,
+        0x0090, // MOVE DIWSTOP
+        0x2CC1,
+        0x0092, // MOVE DDFSTRT
+        0x0038,
+        0x0094, // MOVE DDFSTOP
+        0x00D0,
+        0x0100, // MOVE BPLCON0: one plane, colour
+        0x1200,
+        0x0108, // MOVE BPL1MOD
+        0x0000,
+        0x00E0, // MOVE BPL1PTH
+        (POINTER_PLAYFIELD >> 16) as u16,
+        0x00E2, // MOVE BPL1PTL
+        POINTER_PLAYFIELD as u16,
+        0x0096, // MOVE DMACON: SET|BPLEN
+        0x8100,
+        0x0180, // MOVE COLOR00
+        0x0000,
+        0x01A2, // MOVE COLOR17
+        0x0FFF,
         0xFFFF, // WAIT for a beam position that never comes: end of list
         0xFFFE,
     ];
@@ -5277,16 +5786,152 @@ fn step_fields(app: &mut super::App, fields: u64) {
 }
 
 /// Run the fixture until the hardware is painting sprite 0, and report
-/// where, in the presented-pixel coordinates the servo works in.
+/// where, in rendered-field coordinates (the control protocol's servo
+/// works in these; the scripted one in screenshot pixels).
 fn settle_pointer_machine(app: &mut super::App) -> (i32, i32) {
     step_fields(app, POINTER_SETTLE_FIELDS);
     crate::pointer::pointer_position(app.emu.bus())
         .expect("the fixture's Copper list re-arms sprite 0 every field")
 }
 
-/// Sprite 0's origin on the last completed field, as the servo reads it.
+/// Sprite 0's origin on the last completed field, in rendered-field
+/// coordinates (the control protocol's `capture.screenshot`).
 fn pointer_origin(app: &super::App) -> (i32, i32) {
     crate::pointer::pointer_position(app.emu.bus()).expect("sprite 0 is being drawn")
+}
+
+/// One pass of the headless frame loop: a `step_frame` quantum, that
+/// quantum's presentation, then the scheduled-input pass.
+fn frame_loop_pass(app: &mut super::App) {
+    app.emu.step_frame().expect("the pointer machine runs");
+    app.render_emulated_frame_if_needed();
+    app.fire_scheduled_events();
+}
+
+/// Present the last completed field, so a screenshot shows it.
+fn present_pointer_frame(app: &mut super::App) {
+    app.finish_render_for_current_frame();
+    assert!(
+        app.present_placement.is_some(),
+        "the field has been presented"
+    );
+}
+
+/// Sprite 0's origin in the pixels of a `--screenshot-after` capture of
+/// the presented frame: what `--mouse-to-after` steers.
+fn pointer_in_screenshot(app: &super::App) -> (i32, i32) {
+    app.capture_field_map()
+        .expect("a frame has been presented")
+        .capture_point(pointer_origin(app))
+        .expect("the capture shows the field")
+}
+
+/// The top-left of the white pointer in a scheduled capture of the
+/// presented frame, found by looking at the picture. The TV glass blends
+/// neighbouring columns, so a pixel counts as pointer when it is more
+/// white than black -- the column whose nearer tap is the sprite.
+fn pointer_drawn_in_screenshot(app: &super::App) -> (i32, i32) {
+    let image = app.capture_present_image();
+    let width = image.width as usize;
+    let lit: Vec<usize> = image
+        .pixels
+        .iter()
+        .enumerate()
+        .filter(|(_, px)| ((**px >> 8) & 0xFF) >= 0x80)
+        .map(|(i, _)| i)
+        .collect();
+    let x = lit.iter().map(|i| i % width).min();
+    let y = lit.iter().map(|i| i / width).min();
+    let (Some(x), Some(y)) = (x, y) else {
+        panic!("the capture shows no pointer");
+    };
+    (x as i32, y as i32)
+}
+
+/// The screenshot framings the pointer tests run under: the whole field,
+/// the TV aperture (the default), and the aperture nudged by the H/V
+/// centre controls.
+fn screenshot_framings() -> [crate::video::present_common::ScreenshotFraming; 3] {
+    use crate::config::{Overscan, TvCentre};
+    use crate::video::present_common::ScreenshotFraming;
+    [
+        ScreenshotFraming {
+            overscan: Overscan::Full,
+            tv_centre: TvCentre::default(),
+        },
+        ScreenshotFraming {
+            overscan: Overscan::Tv,
+            tv_centre: TvCentre::default(),
+        },
+        ScreenshotFraming {
+            overscan: Overscan::Tv,
+            tv_centre: TvCentre { h: 3, v: -2 },
+        },
+    ]
+}
+
+/// Present under `framing`, as the window would after the user (or the
+/// config) chose it.
+fn apply_screenshot_framing(
+    app: &mut super::App,
+    framing: crate::video::present_common::ScreenshotFraming,
+) {
+    app.apply_overscan(framing.overscan);
+    app.tv_centre = framing.tv_centre;
+    app.refresh_tv_centre();
+    present_pointer_frame(app);
+}
+
+#[test]
+fn the_pointer_servo_sees_the_pointer_where_a_screenshot_shows_it() {
+    // `--mouse-to-after` targets are read off `--screenshot-after`
+    // captures, which frame the rendered field through the TV aperture:
+    // rows doubled and cropped, columns resampled onto the glass. The
+    // servo's observation has to come through that same framing, or it
+    // steers somewhere other than where the picture says.
+    for framing in screenshot_framings() {
+        let (mut app, _fixture) = pointer_machine();
+        settle_pointer_machine(&mut app);
+        apply_screenshot_framing(&mut app, framing);
+        // Moves that keep the pointer inside the display window: Denise
+        // clips sprites to it, so a pointer left of DIWSTRT draws nothing.
+        for (dx, dy) in [(0, 0), (37, 21), (-20, 45), (100, -30)] {
+            app.emu.bus_mut().input.add_mouse_delta(0, dx, dy);
+            step_fields(&mut app, POINTER_RESPONSE_FIELDS);
+            present_pointer_frame(&mut app);
+            assert_eq!(
+                pointer_in_screenshot(&app),
+                pointer_drawn_in_screenshot(&app),
+                "{framing:?}, rendered-field origin {:?}",
+                pointer_origin(&app)
+            );
+            // And back: the screenshot pixel names the field pixel it shows.
+            let map = app.capture_field_map().unwrap();
+            let (x, y) = pointer_in_screenshot(&app);
+            assert_eq!(
+                map.field_point(x, y),
+                Some(pointer_origin(&app)),
+                "{framing:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_window_without_a_presentation_pipeline_frames_the_screenshot_the_same_way() {
+    // The headless control server records light-pen lines in screenshot
+    // pixels without presenting anything; its framing, decided from the
+    // field and the configured settings, must match the window's.
+    for framing in screenshot_framings() {
+        let (mut app, _fixture) = pointer_machine();
+        settle_pointer_machine(&mut app);
+        apply_screenshot_framing(&mut app, framing);
+        assert_eq!(
+            crate::video::present_common::CaptureFieldMap::for_bus(app.emu.bus(), framing),
+            app.capture_field_map(),
+            "{framing:?}"
+        );
+    }
 }
 
 #[test]
@@ -5347,7 +5992,9 @@ fn sprite_pointer_fixture_redraws_each_frame_via_copper_pointer_rewrite() {
 #[test]
 fn scripted_mouse_deltas_defer_to_a_steering_pointer_servo() {
     let (mut app, _fixture) = pointer_machine();
-    let (x0, y0) = settle_pointer_machine(&mut app);
+    settle_pointer_machine(&mut app);
+    present_pointer_frame(&mut app);
+    let (x0, y0) = pointer_in_screenshot(&app);
 
     // A --mouse-to-after target and a --mouse-after delta both due now.
     // The servo measures the pointer's response to its own counts to
@@ -5363,8 +6010,10 @@ fn scripted_mouse_deltas_defer_to_a_steering_pointer_servo() {
     loop {
         // The servo has to see what its previous delta did before
         // choosing the next, so the scheduled-event pass runs at the
-        // fixture's response cadence.
+        // fixture's response cadence, on a presented frame as the frame
+        // loop runs it.
         step_fields(&mut app, POINTER_RESPONSE_FIELDS);
+        present_pointer_frame(&mut app);
         app.fire_scheduled_events();
         if !app.scripted_pointer_target_active() {
             break;
@@ -5386,7 +6035,7 @@ fn scripted_mouse_deltas_defer_to_a_steering_pointer_servo() {
 
     // The servo arrived rather than being knocked off course, and the
     // pass it finished on released the deltas again.
-    let arrived = pointer_origin(&app);
+    let arrived = pointer_in_screenshot(&app);
     assert!(
         (arrived.0 - target.0).abs() <= crate::pointer::DEFAULT_TOLERANCE
             && (arrived.1 - target.1).abs() <= crate::pointer::DEFAULT_TOLERANCE,
@@ -5398,12 +6047,240 @@ fn scripted_mouse_deltas_defer_to_a_steering_pointer_servo() {
     );
 
     // The held-back delta then lands intact: 20 counts is 20 lo-res
-    // pixels, 40 columns of the presented canvas.
+    // pixels, 40 columns of the rendered field.
+    let arrived = pointer_origin(&app);
     step_fields(&mut app, POINTER_RESPONSE_FIELDS);
     assert_eq!(
         pointer_origin(&app),
         (arrived.0 + 40, arrived.1),
         "the deferred delta is applied, not dropped"
+    );
+}
+
+/// A scripted pointer target driven the way the headless frame loop
+/// drives it: one `step_frame` quantum, its presentation, then the
+/// scheduled-input pass. A quantum is an instruction budget rather than a
+/// field, so the servo is polled more or less often than once per field,
+/// and the guest only samples the counters at its next vertical blank --
+/// counts injected part-way through a field reach the display in the
+/// field after it. Reading that latency as a pointer that refused to move
+/// made the servo stack a second delta into the same field (wrapping the
+/// 8-bit counter) and give up after a couple of fields. The target is a
+/// screenshot pixel, under each framing a screenshot can have.
+#[test]
+fn scripted_pointer_target_converges_at_the_frame_loop_cadence() {
+    for framing in screenshot_framings() {
+        let (mut app, _fixture) = pointer_machine();
+        settle_pointer_machine(&mut app);
+        apply_screenshot_framing(&mut app, framing);
+        let (x0, y0) = pointer_in_screenshot(&app);
+        let target = (x0 + 300, y0 + 40);
+        app.arm_scripted_pointer_target(0.0, target.0, target.1, 0);
+
+        let start = app.emu.bus().emulated_frames();
+        loop {
+            frame_loop_pass(&mut app);
+            if !app.scripted_pointer_target_active() {
+                break;
+            }
+            assert!(
+                app.emu.bus().emulated_frames() - start
+                    <= u64::from(crate::pointer::DEFAULT_MAX_FRAMES),
+                "{framing:?}: the servo should finish inside its own frame budget"
+            );
+        }
+        present_pointer_frame(&mut app);
+        let arrived = pointer_in_screenshot(&app);
+        assert!(
+            (arrived.0 - target.0).abs() <= crate::pointer::DEFAULT_TOLERANCE
+                && (arrived.1 - target.1).abs() <= crate::pointer::DEFAULT_TOLERANCE,
+            "{framing:?}: servo stopped at {arrived:?}, wanted {target:?}"
+        );
+        // Where the picture shows it, not only where the map says.
+        assert_eq!(pointer_drawn_in_screenshot(&app), arrived, "{framing:?}");
+    }
+}
+
+#[test]
+fn a_scheduled_pen_position_is_a_screenshot_pixel() {
+    for framing in screenshot_framings() {
+        let (mut app, _fixture) = pointer_machine();
+        app.emu
+            .bus_mut()
+            .input
+            .set_port_device(1, crate::bus::PortDevice::LightPen);
+        settle_pointer_machine(&mut app);
+        apply_screenshot_framing(&mut app, framing);
+        let map = app.capture_field_map().expect("a frame has been presented");
+        app.auto_pens.push((0.0, 200, 150, None));
+        app.fire_scheduled_events();
+        let held = app.emu.bus().input.light_pen.position;
+        assert!(held.is_some(), "{framing:?}: the pixel shows the field");
+        assert_eq!(held, map.field_point(200, 150), "{framing:?}");
+        // A negative coordinate lifts the pen off the glass.
+        app.auto_pens.push((0.0, -1, -1, None));
+        app.fire_scheduled_events();
+        assert_eq!(app.emu.bus().input.light_pen.position, None);
+    }
+}
+
+#[test]
+fn a_window_without_a_presentation_pipeline_settles_smart_centring_the_same_way() {
+    // Smart framing trims the glass toward an off-centre playfield once
+    // its envelope has held for the latch's settling window. The headless
+    // control server presents nothing, so it settles the trim on the one
+    // field it renders; on a steady display that is the window's trim.
+    use crate::config::{Overscan, TvCentre};
+    use crate::video::present_common::{CaptureFieldMap, ScreenshotFraming};
+    let (mut app, _fixture) = pointer_machine();
+    // Move the playfield 16 lo-res pixels right of the standard window:
+    // the fixture's Copper list rewrites DIWSTRT, DIWSTOP, DDFSTRT and
+    // DDFSTOP (its words 5, 7, 9 and 11) every field.
+    let chip_ram = &mut app.emu.bus_mut().mem.chip_ram;
+    poke_chip_words(chip_ram, POINTER_COPPER_LIST + 10, &[0x2C91]);
+    poke_chip_words(chip_ram, POINTER_COPPER_LIST + 14, &[0x2CD1]);
+    poke_chip_words(chip_ram, POINTER_COPPER_LIST + 18, &[0x0040]);
+    poke_chip_words(chip_ram, POINTER_COPPER_LIST + 22, &[0x00D8]);
+    settle_pointer_machine(&mut app);
+    let framing = ScreenshotFraming {
+        overscan: Overscan::Smart,
+        tv_centre: TvCentre::default(),
+    };
+    apply_screenshot_framing(&mut app, framing);
+    // The window advances its latch once per presented field.
+    for _ in 0..30 {
+        step_fields(&mut app, 1);
+        present_pointer_frame(&mut app);
+    }
+    assert_ne!(
+        app.present_tv_centre,
+        TvCentre::default(),
+        "the off-centre playfield earns an automatic trim"
+    );
+    assert_eq!(
+        CaptureFieldMap::for_bus(app.emu.bus(), framing),
+        app.capture_field_map()
+    );
+}
+
+#[test]
+fn deferred_pen_events_apply_in_time_order() {
+    // Positions wait for a presented frame; a lift must wait with them,
+    // or a later lift would overtake an earlier placement and leave the
+    // pen down. Several due at once apply in time order whatever order
+    // they were scheduled in.
+    let (mut app, _fixture) = pointer_machine();
+    app.emu
+        .bus_mut()
+        .input
+        .set_port_device(1, crate::bus::PortDevice::LightPen);
+    app.auto_pens.push((0.0, 200, 150, None));
+    app.auto_pens.push((0.0, -1, -1, None));
+    app.auto_pens.push((0.02, 120, 100, None));
+    app.auto_pens.push((0.01, -1, -1, None));
+    app.fire_scheduled_events();
+    assert_eq!(app.auto_pens.len(), 4, "everything waits for a frame");
+    settle_pointer_machine(&mut app);
+    present_pointer_frame(&mut app);
+    app.fire_scheduled_events();
+    assert!(app.auto_pens.is_empty());
+    let last = app.capture_field_map().unwrap().field_point(120, 100);
+    assert!(last.is_some());
+    assert_eq!(
+        app.emu.bus().input.light_pen.position,
+        last,
+        "the latest event, the placement at 0.02 s, wins"
+    );
+}
+
+#[test]
+fn a_scheduled_pen_position_waits_for_a_presented_frame() {
+    // A screenshot pixel means nothing before there is a screenshot; the
+    // position is held, not dropped or applied in the wrong space.
+    let (mut app, _fixture) = pointer_machine();
+    app.emu
+        .bus_mut()
+        .input
+        .set_port_device(1, crate::bus::PortDevice::LightPen);
+    app.auto_pens.push((0.0, 200, 150, None));
+    app.fire_scheduled_events();
+    assert_eq!(app.auto_pens.len(), 1, "held until a frame is presented");
+    assert_eq!(app.emu.bus().input.light_pen.position, None);
+    settle_pointer_machine(&mut app);
+    present_pointer_frame(&mut app);
+    app.fire_scheduled_events();
+    assert!(app.auto_pens.is_empty());
+    assert!(app.emu.bus().input.light_pen.position.is_some());
+}
+
+#[test]
+fn recorded_pen_lines_name_screenshot_pixels() {
+    let (mut app, _fixture) = pointer_machine();
+    app.emu
+        .bus_mut()
+        .input
+        .set_port_device(1, crate::bus::PortDevice::LightPen);
+    settle_pointer_machine(&mut app);
+    apply_screenshot_framing(&mut app, screenshot_framings()[1]);
+    app.input_recorder = Some(crate::inputrec::InputRecorder::new(
+        app.emu.bus().emulated_seconds(),
+    ));
+    app.fire_scheduled_events();
+    let field = (300, 120);
+    app.emu.bus_mut().input.set_light_pen_position(Some(field));
+    app.fire_scheduled_events();
+    let (x, y) = app
+        .capture_field_map()
+        .unwrap()
+        .capture_point(field)
+        .unwrap();
+    let script = app.input_recorder.take().unwrap().finish();
+    assert!(
+        script.contains(&format!(" {x} {y} 2\n")),
+        "pen at field {field:?} should record as screenshot ({x}, {y}): {script}"
+    );
+    // Replayed, that line puts the pen back on the same field pixel.
+    assert_eq!(
+        app.capture_field_map().unwrap().field_point(x, y),
+        Some(field)
+    );
+}
+
+/// The CCP `input.mouse_to` loop at its own cadence (one `step_frame` per
+/// step) against the same vertical-blank-sampling guest.
+#[cfg(feature = "control")]
+#[test]
+fn ccp_pointer_servo_converges_on_a_guest_that_answers_in_vertical_blank() {
+    let (mut app, _fixture) = pointer_machine();
+    let (x0, y0) = settle_pointer_machine(&mut app);
+    let target = (x0 + 200, y0 - 20);
+
+    let reply = crate::control::exec::mouse_to(
+        &mut app.emu,
+        0,
+        target,
+        crate::pointer::DEFAULT_TOLERANCE,
+        crate::pointer::DEFAULT_MAX_FRAMES,
+        |emu, action| {
+            if let crate::control::session::InputAction::MouseMove { port, dx, dy } = action {
+                emu.bus_mut().input.add_mouse_delta(port as usize, dx, dy);
+            }
+        },
+    )
+    .unwrap_or_else(|err| panic!("the servo should converge: {}", err.message));
+    let landed = (
+        reply["x"].as_i64().expect("x") as i32,
+        reply["y"].as_i64().expect("y") as i32,
+    );
+    assert!(
+        (landed.0 - target.0).abs() <= crate::pointer::DEFAULT_TOLERANCE
+            && (landed.1 - target.1).abs() <= crate::pointer::DEFAULT_TOLERANCE,
+        "servo reported {landed:?}, wanted {target:?}"
+    );
+    assert_eq!(
+        pointer_origin(&app),
+        landed,
+        "the reply is where the hardware is drawing the pointer"
     );
 }
 
@@ -5693,11 +6570,16 @@ fn state_load_closes_launcher_and_powers_restored_machine() {
     app.power_off();
     let parked_present = app.present_fb.clone();
     app.open_launcher();
+    app.about_machine_lines = vec![crate::config::ABOUT_PLACEHOLDER_LINE.to_string()];
     assert!(matches!(app.ui.panel, Some(Panel::Launcher(_))));
+    assert_eq!(app.base_window_title(), super::window_title());
 
     assert!(app.load_state_from_path(&path));
     assert!(app.ui.panel.is_none(), "state load should dismiss launcher");
     assert!(app.powered_on);
+    assert!(app.base_window_title().contains("A500"));
+    assert!(app.base_window_title().contains("ROM"));
+    assert_ne!(app.base_window_title(), super::window_title());
     assert!(!app.cpu_halted);
     assert!(
         app.present_fb == parked_present,
@@ -8488,9 +9370,7 @@ fn debugger_poke_writes_memory_and_registers() {
 
 // --- dropped disk images -------------------------------------------------
 
-/// A blank standard ADF written to a unique temp path (floppy inserts read
-/// from the filesystem). Callers remove it when done.
-fn temp_adf(name: &str) -> PathBuf {
+fn temp_drop_path(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -8498,8 +9378,28 @@ fn temp_adf(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("copperline-drop-test-{nanos}-{counter}-{name}"));
+    std::env::temp_dir().join(format!("copperline-drop-test-{nanos}-{counter}-{name}"))
+}
+
+/// A blank standard ADF written to a unique temp path (floppy inserts read
+/// from the filesystem). Callers remove it when done.
+fn temp_adf(name: &str) -> PathBuf {
+    let path = temp_drop_path(name);
     std::fs::write(&path, vec![0u8; crate::floppy::ADF_SIZE]).unwrap();
+    path
+}
+
+fn temp_drop_zip(name: &str, members: &[(&str, &[u8])]) -> PathBuf {
+    use std::io::Write;
+    let path = temp_drop_path(name);
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in members {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
     path
 }
 
@@ -8529,14 +9429,13 @@ fn dropped_media_classifies_by_extension() {
     assert_eq!(kind("Disk.VHD"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("disk.img"), DroppedMediaKind::HardDisk);
     assert_eq!(kind("kick31.rom"), DroppedMediaKind::Rom);
-    // Every shape a WHDLoad package comes in, since the launcher and the
-    // CLI take all of them: a dropped zip used to be handed to the floppy
-    // bay as a disk image.
+    // ZIPs need an actual slave member to select WHDLoad; unreadable or
+    // missing archives fall through to the floppy loader's error handling.
     assert_eq!(kind("game.lha"), DroppedMediaKind::WhdloadGame);
     assert_eq!(kind("Game.LHA"), DroppedMediaKind::WhdloadGame);
     assert_eq!(kind("game.lzh"), DroppedMediaKind::WhdloadGame);
-    assert_eq!(kind("game.zip"), DroppedMediaKind::WhdloadGame);
-    assert_eq!(kind("game.ZIP"), DroppedMediaKind::WhdloadGame);
+    assert_eq!(kind("game.zip"), DroppedMediaKind::Floppy);
+    assert_eq!(kind("game.ZIP"), DroppedMediaKind::Floppy);
     assert_eq!(kind("x.slave"), DroppedMediaKind::WhdloadGame);
     assert_eq!(kind("x.slav"), DroppedMediaKind::WhdloadGame);
 }
@@ -8570,6 +9469,64 @@ fn dropped_floppy_with_single_drive_inserts_directly() {
     assert!(app.ui.panel.is_none());
     assert!(app.osd.as_ref().unwrap().text.starts_with("DF0:"));
     std::fs::remove_file(&adf).unwrap();
+}
+
+#[test]
+fn dropped_zipped_adf_with_single_drive_inserts_directly() {
+    let adf = vec![0x5a; crate::floppy::ADF_SIZE];
+    for name in ["disk.zip", "disk.ZIP", "disk.adz"] {
+        let mut app = test_app();
+        let path = temp_drop_zip(name, &[("disk.adf", &adf)]);
+        app.handle_dropped_files(vec![path.clone()]);
+        assert!(app.emu.bus().floppy.disk_inserted(0), "{name}");
+        assert_eq!(app.emu.bus().floppy.export_disk_image(0).unwrap(), adf);
+        assert_eq!(app.disk_playlists[0], vec![path.clone()]);
+        assert!(app.ui.panel.is_none());
+        assert!(app.osd.as_ref().unwrap().text.starts_with("DF0:"));
+        assert!(app.machine_config.whdload.game.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn dropped_zip_ignores_macos_slave_metadata() {
+    use super::{classify_dropped_media, DroppedMediaKind};
+    let path = temp_drop_zip(
+        "disk.zip",
+        &[
+            ("disk.adf", &vec![0; crate::floppy::ADF_SIZE]),
+            ("__MACOSX/._Game.slave", b"resource fork"),
+            ("._Game.slave", b"resource fork"),
+        ],
+    );
+    assert_eq!(classify_dropped_media(&path), DroppedMediaKind::Floppy);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn dropped_zip_with_a_slave_remains_a_whdload_package() {
+    use super::{classify_dropped_media, DroppedMediaKind};
+    use crate::video::launcher::LauncherField;
+    let path = temp_drop_zip(
+        "package.ZIP",
+        &[
+            ("Disk.1", &vec![0; crate::floppy::ADF_SIZE]),
+            ("Game/Game.SlAv", b"slave"),
+        ],
+    );
+    assert_eq!(classify_dropped_media(&path), DroppedMediaKind::WhdloadGame);
+    let mut app = test_app();
+    app.open_launcher();
+    app.handle_dropped_files(vec![path.clone()]);
+    assert_eq!(
+        app.launcher_state_mut()
+            .unwrap()
+            .setup
+            .path(LauncherField::WhdloadGame),
+        Some(path.as_path())
+    );
+    assert!(!app.emu.bus().floppy.disk_inserted(0));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -8925,13 +9882,21 @@ mod control_drain {
     fn a_scripted_pointer_target_gives_up_when_no_sprite_pointer_exists() {
         let (mut app, _cmd_tx, _reply_rx) = attached_app();
         app.arm_scripted_pointer_target(0.0, 300, 120, 0);
-        // The NOP sled draws no sprites, so the first poll has nothing to
-        // observe. It must clear the servo rather than steering blind or
-        // retrying every frame for the rest of the run.
-        app.emu.step_frame().unwrap();
+        // The target is a screenshot pixel, so it waits for a presented
+        // frame. The NOP sled draws no sprites, so the first poll after
+        // that has nothing to observe. It must clear the servo rather than
+        // steering blind or retrying every frame for the rest of the run.
+        for _ in 0..8 {
+            app.emu.step_frame().unwrap();
+            app.finish_render_for_current_frame();
+            if app.present_placement.is_some() {
+                break;
+            }
+        }
+        assert!(app.present_placement.is_some(), "the sled presents a frame");
         app.fire_scheduled_events();
         assert!(
-            !app.scripted_pointer_target_active(),
+            !app.scripted_pointer_target_active() && app.auto_mouse_to.is_empty(),
             "a pointerless guest must not leave a servo armed"
         );
     }
@@ -10846,6 +11811,52 @@ fn draw_re_applies_a_surface_size_the_window_has_moved_past() {
     assert_eq!(resize((1432, 1162), (0, 0)), Some((0, 0)));
 }
 
+/// The present worker acquires only for a window still at the size its job
+/// was planned for. On Windows the main thread pumps the modal size-move
+/// loop while the user drags, so the window changes size under frames still
+/// queued for the worker; acquiring against that surface had `pixels` rebuild
+/// the swapchain at the stale size without end, while the main thread waited
+/// on the worker to reclaim the GPU side -- the window hung and the
+/// swapchain churn slowed the whole host.
+#[test]
+fn present_worker_drops_a_frame_the_window_has_resized_past() {
+    let current = |planned, live: Option<(u32, u32)>| {
+        super::worker_surface_current(
+            planned,
+            live.map(|(w, h)| winit::dpi::PhysicalSize::new(w, h)),
+        )
+    };
+
+    // The window is where the job was planned: present it.
+    assert!(current((1432, 1162), Some((1432, 1162))));
+    // A drag moved either edge after the job was queued: drop it.
+    assert!(!current((1432, 1162), Some((1440, 1162))));
+    assert!(!current((1432, 1162), Some((1432, 1150))));
+    // Minimized under a queued frame: never present into a 0x0 window.
+    assert!(!current((1432, 1162), Some((0, 0))));
+    // Where the worker cannot ask the window (macOS), it presents as before.
+    assert!(current((1432, 1162), None));
+}
+
+/// A surface still out of date after `pixels`' one reconfigure is the race
+/// the worker's size check cannot close (a resize between the check and the
+/// acquire). It drops the frame quietly; every other present failure is still
+/// an error.
+#[test]
+fn an_out_of_date_surface_is_a_dropped_frame_not_an_error() {
+    use pixels::{Error, GetSurfaceError};
+    assert!(super::present_raced_a_resize(&Error::GetSurface(
+        GetSurfaceError::Outdated
+    )));
+    assert!(!super::present_raced_a_resize(&Error::GetSurface(
+        GetSurfaceError::Lost
+    )));
+    assert!(!super::present_raced_a_resize(&Error::GetSurface(
+        GetSurfaceError::Init
+    )));
+    assert!(!super::present_raced_a_resize(&Error::Validation));
+}
+
 // --- Performance overlay (issue #370) ---
 
 #[test]
@@ -10918,6 +11929,7 @@ fn perf_overlay_lines_format_one_data_point_per_line() {
         audio_lead_ms: 148.3,
         audio_underruns_per_s: 0.0,
         pacer_slips: 2,
+        jit_mhz: None,
     };
     assert_eq!(
         super::perf_overlay_lines(&r),
@@ -10931,6 +11943,19 @@ fn perf_overlay_lines_format_one_data_point_per_line() {
             "slip 2",
         ]
     );
+}
+
+#[test]
+fn perf_overlay_shows_the_fastest_mode_jit_clock() {
+    // `[cpu] speed = "fastest"` adds the governor's effective clock as a
+    // last line; the fixed clock (above) prints none.
+    let r = super::PerfReadout {
+        jit_mhz: Some(212.4),
+        ..Default::default()
+    };
+    let lines = super::perf_overlay_lines(&r);
+    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.last().map(String::as_str), Some("cpu 212 MHz"));
 }
 
 /// The classic overlay anchor: the whole display region, what every

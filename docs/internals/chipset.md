@@ -429,6 +429,12 @@ no media keep the active-low disk-change line asserted; a step pulse only
 clears that latch once media is actually present, so guest software sees a
 no-disk condition rather than unreadable track data.
 
+The window's drop handler checks ZIP member names through `package::list`
+before routing an archive. A `.slave` or `.slav` member selects WHDLoad;
+otherwise the archive goes to the floppy loader, as it does through the
+disk picker. The package listing ignores macOS metadata files and requires
+no payload decompression for this decision.
+
 Standard ADF and AmigaDOS tracks are synthesized as one PAL-sized
 revolution: 11 sectors occupy 5984 MFM words, and the generated revolution
 is 6334 16-bit MFM words so the index gap matches normal Amiga floppy
@@ -457,9 +463,14 @@ detect the intended cell density differences (the Copylock check on
 *Lemmings*, for example). Weak bits currently replay as the single
 deterministic revolution stored in the file.
 
-The synthesized drive sounds ([](../guide/configuration)) are driven by
-this model's real state transitions -- motor spin-up, seeks, the
-empty-drive poll click.
+The drive sounds ([](../guide/configuration)) are driven by this model's
+real state transitions -- motor spin-up, seeks, the empty-drive poll click.
+Each step that reaches the stepper is reported with its drive and the
+cylinder it landed on (a sample set picks its click by cylinder), and disk
+inserts and ejects are reported so a set's "snatch" plays on the next
+spin-up. What a sample set plays is computed from a serialized record of
+these events that does not depend on which set, if any, is installed, so
+save states and netplay checksums are the same with or without one.
 
 Floppy drive motors are controlled by an internal latch: `/MTR` is sampled on
 the falling edge of `/SEL`, and the level of `MTR` while selected is ignored.

@@ -26,11 +26,18 @@ like nothing in particular are reading a mirror.
 
 Gary's three registers are single read/write bits in bit 7: TIMEOUT
 (`$DE0000`, whether an unanswered bus cycle produces BERR or DSACK), TOENB
-(`$DE0001`, timeout enable), and COLDBOOT (`$DE0002`, the power-up flag
-the OS clears on warm reboot). None of them change emulated behaviour --
-bus timeouts are not modelled; an unanswered cycle floats -- but the
-read/write COLDBOOT bit is what identification tools use to detect a Fat
-Gary, and without one they never go looking for the Ramsey behind it.
+(`$DE0001`, timeout enable), and COLDBOOT (`$DE0002`, the power-up flag).
+Bus timeouts are not modelled -- an unanswered cycle floats -- so TIMEOUT
+and TOENB only store and read back. The read/write COLDBOOT bit is what
+identification tools use to detect a Fat Gary, and without one they never
+go looking for the Ramsey behind it. COLDBOOT also steers Kickstart's reset
+path: early in every reset Kickstart tests it and then clears it, and
+finding it set, it clears `$4` and cold-starts, discarding everything a warm
+reboot keeps (KickTag/KickMem residents, the capture vectors, a recoverable
+RAM disk, and the Kickstart 3.2 boot menu's boot-device choice, which
+crosses a `ColdReboot()`). Only a power cycle sets it: the /RESET line from
+the keyboard or the CPU RESET instruction clears the timeout registers but
+leaves COLDBOOT as the OS last wrote it.
 
 Ramsey drives the motherboard fast RAM (`[memory] motherboard`): a 32-bit
 local bank ending at `$08000000` and growing downward, so a full 16 MiB
@@ -1277,9 +1284,11 @@ it, and on the board that pin is Agnus's LP input -- port 1's on the A1000
 (detected by the WCS at $FC0000), port 2's on the A500 and every later
 Amiga -- so `Bus::light_pen_wired_port` decides whether a fitted pen
 reaches the chip at all. The pen's glass position is kept in rendered-field
-coordinates (the space `sprite_framebuffer_origin`, `--mouse-to-after` and
-`input.mouse_to` share); at every frame start the bus maps it back
-through the renderer's comparator origin
+coordinates (the space `sprite_framebuffer_origin`, `input.mouse_to` and
+`capture.screenshot` share; `--pen-after`, `--mouse-to-after` and recorded
+`pen-after` lines are `--screenshot-after` pixels, mapped to and from the
+field through `present_common::CaptureFieldMap`); at every frame start the
+bus maps it back through the renderer's comparator origin
 (`bitplane::framebuffer_beam_position`) to the beam line and colour clock
 that paints that pixel and hands Agnus the target, and Agnus fires the
 latch as its counters sweep past that exact clock (`light_pen_sweep`),
@@ -1343,8 +1352,9 @@ Two profiling knobs cover the audio/pacing boundary, both emitting one
   itself never logs; it only updates atomic counters under this flag.
 - `COPPERLINE_REAL_PACING_PROFILE=1` -- the real-speed pacing line:
   retired instructions, raw `m68k` cycles, chip-bus wait CCK, device CCK,
-  CPU chip-bus slots, host sleep count/time, and wall-time late
-  count/time. Kept separate so CPU/device pacing can be measured without
+  CPU chip-bus slots, host sleep count/time, wall-time late count/time,
+  and, under `[cpu] speed = "fastest"`, the JIT's effective clock
+  (`jit_mhz`). Kept separate so CPU/device pacing can be measured without
   enabling the lower-level cpal counters.
 
 Default live-audio warnings are emitted from the producer side at the same

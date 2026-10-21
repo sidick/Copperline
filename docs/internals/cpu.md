@@ -46,7 +46,8 @@ FBcc/FScc/FDBcc/FTRAPcc, the control registers, the FPCR rounding
 mode/precision, the FPSR exception/accrued bytes, and the FSAVE/FRESTORE
 state frames. The state frame is NULL after reset and, once the FPU has
 been touched, the CPU's own IDLE frame: the 68881-style $18-byte frame on
-020/030 systems and the 68040's version-$41, $28-byte frame on the 040.
+020/030 systems, the 68040's version-$41, $28-byte frame on the 040, and
+three long words on the 060 (see [The 68060](#the-68060)).
 Guests validate the size byte, and Linux/m68k's sigreturn kills a process
 whose saved FPU frame carries a foreign size. FMOD/FREM compute the exact
 remainder and the FPSR quotient byte. This covers Kickstart's detection
@@ -95,9 +96,8 @@ approximate (`M68kMachine::step_slice_jit`):
   accesses bill nothing (an ideal zero-wait external bus) -- the machine
   behaves like a perfect pipelined accelerator whose throughput tracks
   `[cpu] clock_mhz` directly, e.g. ~50 MIPS for a 50 MHz 68040 in fast
-  RAM. This is the deterministic equivalent of a "fastest possible"
-  mode: a truly host-speed CPU would make emulated results depend on the
-  host, which Copperline never allows;
+  RAM. At a fixed clock this is deterministic; the opt-in
+  `[cpu] speed = "fastest"` (below) varies the clock with the host;
 - chip and slow RAM accesses still arbitrate into DMA slots through the
   normal `CpuBus` paths and advance the beam as they land (that bus is
   shared silicon), and CIA/RTC accesses keep their E-clock costs, keeping
@@ -140,6 +140,28 @@ or clearing the buffer allows sampling to resume but preserves the counter.
 The profile status and summary retain the loss count after the sampler stops.
 This bound is independent of frame polling, so a debugger execution path that
 does not drain samples cannot grow the buffer indefinitely.
+
+(jit-fastest-speed)=
+### Fastest possible (`[cpu] speed = "fastest"`)
+
+The opt-in host-adaptive mode, WinUAE's *Fastest possible*, adds no second
+timing model. `M68kMachine::set_jit_speed_factor` divides every CPU clock
+the JIT path bills (the flat per-instruction clock and the exception and
+interrupt entry costs) by a factor, kept as a 16.16 fixed-point divisor
+with its sub-clock remainder carried across batches. Dividing the CPU's
+own clocks is exactly a faster CPU clock: chip-bus and CIA accesses keep
+their bus-time costs, fast RAM and ROM stay free, and beam, DMA and
+interrupt delivery remain as consistent as at any fixed `clock_mhz`. At a
+factor of 1 the divisor is unity and the billing path is the unscaled one,
+so the fixed-clock JIT and the precise core are untouched. The precise core
+never reads the factor.
+
+The factor comes from the emulator's speed governor
+(`src/emulator/fastest.rs`), which watches the host time each real-time
+quantum costs against the emulated time it advanced; [the pacing
+chapter](#jit-fastest-pacing) describes the control loop and when it may
+adapt. It never adapts outside paced quanta, so headless runs stay at
+the configured clock and remain deterministic.
 
 The 68000 and 68010 never take the batch path. On the small-box machines
 every CPU cycle drives the one bus shared with Agnus, and the floating-bus
@@ -313,7 +335,8 @@ has rather than silently running cacheless after a load.
 
 ## The 68060
 
-The 68060 is modelled as the full part: on-die FPU and MMU, the 8 KB
+The 68060 is modelled as the full part (the LC060 and EC060 drop its FPU,
+the EC060 its MMU too): on-die FPU and MMU, the 8 KB
 caches (in the same pragmatic direct-mapped host model as the other
 parts), and its own timing engine.
 
@@ -324,7 +347,7 @@ contract. The unimplemented integer set (MOVEP, CHK2/CMP2, CAS2,
 misaligned CAS, 64-bit MUL/DIV) raises vector 61 with a format $0 frame
 stacking the faulting instruction, gated before any architectural side
 effect so the handler can re-decode and re-execute. The unimplemented
-FPU set (the transcendentals, FINT/FINTRZ, FGETEXP/FGETMAN,
+FPU set (the transcendentals, FGETEXP/FGETMAN,
 FMOD/FREM/FSCALE, FSINCOS, FMOVECR, and the FDBcc/FTRAPcc/FScc
 conditionals) raises the Line-F vector with the six-word format $2
 frame the 68060SP dispatches on -- next-instruction PC stacked, the
@@ -344,10 +367,21 @@ SR M bit is storable (and interrupts clear it) but never banks A7, and
 MSP/ISP are gone from the MOVEC set. Access errors push the eight-word
 format $4 frame with the fault address and FSLW (composed from the MMU
 walk cause, R/W, size, and transfer modifier), and RTE pops it as well
-as the 040's format 7. The FPU state frame is one long word for NULL (as
-on every part since the 68881; exec's hand-built task contexts depend on
-it) and three for IDLE. The MMU shares the 040's three-level walker and
-TC[15] enable; PTEST is gone (undefined F-line) and PLPAR/PLPAW translate
+as the 040's format 7. Every FPU state frame is three long words, NULL
+included (MC68060UM section 6.7), where the 68881/68882/68040 NULL frame
+is one long word -- the frame Kickstart's exec hand-builds into every new
+task's context. Restoring that context on an enabled 060 FPU consumes
+eight bytes too many and launches the task from the wrong PC. A real
+060 board's boot ROM therefore disables the FPU (PCR.DFP) on every
+reset, and `68060.library` enables it once it has converted exec's
+context switch; Copperline sets DFP on every CPU reset to model that
+firmware (as WinUAE does), so without the library a 060 runs FPU-less,
+as on a real board. The LC/EC060 (`fpu = false`) presents the same way,
+but as the part itself: PCR identifies it as $0431 (the full part is
+$0430) and DFP stays set across MOVEC writes and resets, so no software
+can enable the FPU it lacks. FINT and FINTRZ are implemented in
+silicon (only the 040 traps them). The MMU shares the 040's three-level
+walker and TC[15] enable; PTEST is gone (undefined F-line) and PLPAR/PLPAW translate
 an address into An, faulting with the format $4 frame.
 
 **Timing.**
@@ -597,7 +631,8 @@ covers, both still open on the Copperline side:
 
 ## MMU
 
-The 68030, 68040, and 68060 model the on-chip MMU (`has_pmmu`), so software
+The 68030, 68040, and 68060 model the on-chip MMU (`has_pmmu`; the EC parts
+without one are covered at the end of this section), so software
 that sets up and enables address translation runs rather than having its MMU
 writes ignored. The 030 and 040 differ enough to need separate walkers: the
 68030 uses its programmable table walk (CRP/SRP selection, the optional
@@ -709,6 +744,50 @@ substitution on the re-executed instruction's matching access. Remaining:
 the used/modified/limit MMUSR bits and descriptor write-back, CRP limit
 checks, and the DT=1 page-descriptor root; the 030 walk has no ATC, so
 every access re-walks the tables.
+
+### The MMU-less EC parts
+
+The 68EC030, 68EC040 and 68EC060 (`CpuModel::M68EC0x0`) are the full
+parts with the paged MMU removed: `M68kMachine::new` clears `has_pmmu` for
+every model without one, so the walk never runs and every address passes
+through untranslated, whatever software writes to TC. What differs is how
+each part answers the MMU's instructions and registers:
+
+- **68EC060** runs the core's 060 type with `fpu_present` clear (PCR
+  identifies $0431, shared with the LC060). MOVEC to TC/URP/SRP takes no
+  exception (MC68060UM appendix B.2 leaves the TC E/P bits and root pointers
+  undefined), `PFLUSH` is a no-op and `PLPA` leaves An unchanged, all of
+  which follow from translation being off.
+- **68EC040** runs the core's **LC040** type. The EC040's access control
+  unit answers at the MMU's MOVEC codes -- TC and MMUSR become its
+  control/status pair and ITT/DTT its IACR/DACR (MC68040UM appendix B.6) --
+  and `PTEST`/`PFLUSH` raise no exception. The core's own EC040 type traps
+  those MOVEC codes as illegal instructions, which kills AROS's 040 boot
+  (it clears TC with MOVEC); the LC040 type differs from it only in that
+  MOVEC table and raises Line-F on FP opcodes the same way.
+- **68EC030** runs the core's EC030 type, which raises Line-F on every PMMU
+  encoding. The silicon has an access control unit there instead
+  (M68000PRM `PMOVE`/`PTEST` (MC68EC030)): `PMOVE` moves AC0/AC1 (the
+  68030's TT0/TT1 encodings and format) and ACUSR (the MMUSR encoding),
+  `PTEST` sets ACUSR bit 6 when AC0 or AC1 matches, and `PFLUSH`/`PLOAD`
+  have no effect. `cpu/ec030_acu.rs` completes those instructions from the
+  trap the core surfaces before taking it -- `StepResult::FlineTrap` from a
+  precise step (the precise loop steps a PMMU opword with the plain
+  `step()` on this part, judging the next opword through the instruction
+  cache the way the core will fetch it), `BatchExit::FlineTrap` from a JIT
+  batch -- so both paths agree. A bus error on one of the instruction's
+  accesses ends it the way the core ends its own faulted instructions:
+  nothing is committed, no trace exception follows, and execution resumes
+  at the fault handler's entry. The ACU registers live in the core's TT0/TT1/MMUSR
+  fields. `PMOVE` to TC/SRP/CRP is undefined on the EC030; it takes no
+  exception here, drops writes and reads back zero. The other ACUSR bits
+  are undefined and read as zero, and the 68030 `PTEST` form's level and
+  address-register operands are ignored. Bundled AROS needs this: it picks
+  its MMU code from AttnFlags alone, so on any 68030 it issues `PTEST`
+  without a trap handler.
+
+Both core-side gaps (the EC040's MOVEC set, the EC030's ACU) are marked
+TODO at their workarounds for when the m68k crate models them itself.
 
 ## Interrupts and STOP
 

@@ -100,6 +100,59 @@ pub(crate) fn set_str(doc: &mut DocumentMut, path: &[&str], key: &str, value: &s
     table(doc, path)[key] = toml_edit::value(value);
 }
 
+/// What one floppy drive's sound setting in the source config asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DriveSound {
+    /// A silent drive.
+    Off,
+    /// The emulator's own built-in sounds; Copperline's are synthesized.
+    BuiltIn,
+    /// A WinUAE-format sample set (`drive_click_NAME.wav` and friends).
+    Set(String),
+}
+
+/// Map per-drive sound settings, given as `(key, value, choice)` in drive
+/// order for the drives the source mentions. Copperline makes one choice
+/// for every drive, so the first drive's decides and a drive asking for
+/// something else is flagged. A named set is the user's own files, which
+/// the import cannot carry over, so it is flagged for them to copy.
+pub(crate) fn apply_drive_sounds(
+    doc: &mut DocumentMut,
+    report: &mut ImportReport,
+    choices: &[(String, String, DriveSound)],
+) {
+    let Some((key, value, choice)) = choices.first() else {
+        return;
+    };
+    match choice {
+        DriveSound::Off => table(doc, &["audio"])["floppy_sounds"] = toml_edit::value(false),
+        DriveSound::BuiltIn => {}
+        DriveSound::Set(name) => {
+            set_str(doc, &["audio"], "floppy_sounds_set", name);
+            report.approximated(
+                key,
+                value,
+                format!(
+                    "copy the set's drive_*_{name}.wav files into Copperline's \"Floppy \
+                     Sounds\" folder (Documents/Copperline/Floppy Sounds), or set \
+                     floppy_sounds_set to the path of one of them"
+                ),
+            );
+        }
+    }
+    for (other_key, other_value, other) in &choices[1..] {
+        if other != choice {
+            report.unsupported(
+                other_key,
+                other_value,
+                format!(
+                    "Copperline makes one drive sound choice for every drive; {key}'s was used"
+                ),
+            );
+        }
+    }
+}
+
 /// Copperline's chip RAM ceiling for the common ECS/AGA case (OCS caps
 /// lower still, at 512K, which validation catches separately). A source
 /// config claiming more chip RAM than real hardware ever carried is
@@ -115,6 +168,103 @@ pub(crate) fn clamp_chip_mb(size: &str) -> (String, Option<String>) {
             )),
         ),
         _ => (size.to_string(), None),
+    }
+}
+
+/// The 680x0 cores UAE's `cpu_model` can name.
+pub(crate) const CPU_CORES: [u32; 6] = [68000, 68010, 68020, 68030, 68040, 68060];
+
+/// The leading decimal digits of `value`, the way UAE's `_tstol` reads a
+/// number: "68030" is 68030, and "68EC030" reads as 68.
+pub(crate) fn leading_number(value: &str) -> Option<u32> {
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// UAE's old-style `cpu_type`, as its parser reads it (cfgfile.cpp, the
+/// same in WinUAE, Amiberry and FS-UAE's core): (core, 24-bit addressing if
+/// the value says, FPU fitted). UAE's spellings are 68000, 68010, 68020,
+/// 68040, 68060, "68ec020" and the 68020 forms with "/68881" (a
+/// hand-written 68030 is taken too); the 68040/68060 bring their on-chip
+/// FPU. WinUAE leaves the 68EC020's 24-bit addressing to the
+/// `cpu_24bit_addressing` line it writes next, so a config without one
+/// takes it from the name here.
+pub(crate) fn parse_cpu_type(value: &str) -> Option<(u32, Option<bool>, bool)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "68ec020" => Some((68020, Some(true), false)),
+        "68ec020/68881" => Some((68020, Some(true), true)),
+        "68020/68881" => Some((68020, None, true)),
+        other => {
+            let core = other.parse().ok().filter(|n| CPU_CORES.contains(n))?;
+            Some((core, None, core >= 68040))
+        }
+    }
+}
+
+/// UAE booleans are spelled `true`/`false`, `yes`/`no`, or `1`/`0`
+/// depending on the key's age.
+pub(crate) fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// The Copperline `[cpu] model` for a UAE core (one of [`CPU_CORES`]):
+/// `narrow` is 24-bit addressing (the 68EC020, on a 68020 core), `mmu`
+/// whether the part keeps its MMU, and `fpu` whether an FPU is fitted. No
+/// real 68040/68060 has its FPU without the MMU, so that combination is the
+/// full part; callers report it.
+pub(crate) fn cpu_part(core: u32, narrow: bool, mmu: bool, fpu: bool) -> &'static str {
+    match core {
+        68000 => "68000",
+        68010 => "68010",
+        68020 if narrow => "68EC020",
+        68020 => "68020",
+        68030 if mmu => "68030",
+        68030 => "68EC030",
+        68040 if mmu || fpu => "68040",
+        68040 => "68EC040",
+        _ if mmu || fpu => "68060",
+        _ => "68EC060",
+    }
+}
+
+/// Whether `model` can take an FPU: the 68000/68010 have no coprocessor
+/// interface, and the 68EC040/68EC060 no FPU.
+pub(crate) fn can_fit_fpu(model: &str) -> bool {
+    !matches!(model, "68000" | "68010" | "68EC040" | "68EC060")
+}
+
+/// Write `[cpu] fpu` for `model`. The full 68040/68060 carry their FPU by
+/// default, so their FPU-less LC parts need it said; elsewhere it is said
+/// when it differs from the model's default or the source named an FPU.
+pub(crate) fn set_cpu_fpu(doc: &mut DocumentMut, model: &str, fpu: bool, named: bool) {
+    if can_fit_fpu(model) && (named || fpu != matches!(model, "68040" | "68060")) {
+        table(doc, &["cpu"])["fpu"] = toml_edit::value(fpu);
+    }
+}
+
+/// Why the Copperline part for `core` cannot keep UAE's address width
+/// (`narrow` being 24 address lines), if it cannot: UAE runs a 68000/68010
+/// on 32 lines and a 68030 on 24 as extensions of its own, and itself
+/// forces the 68040/68060 onto 32 (main.cpp `fixup_cpu`).
+pub(crate) fn addressing_note(core: u32, narrow: bool) -> Option<&'static str> {
+    match (core, narrow) {
+        (68000 | 68010, false) => Some(
+            "a 68000/68010 with 32-bit addressing is a UAE extension; Copperline's has the \
+             chip's 24 address lines",
+        ),
+        (68030, true) => Some(
+            "UAE's 24-bit 68030 has no Copperline equivalent; imported with the 68030's own \
+             32-bit address bus",
+        ),
+        _ => None,
     }
 }
 

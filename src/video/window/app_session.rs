@@ -730,16 +730,16 @@ impl App {
             Some(blob) => {
                 if let Err(e) = self.emu.runahead_restore(blob) {
                     error!("run-ahead disabled: anchor restore failed: {e:?}");
-                    self.run_ahead_frames = 0;
+                    self.drop_run_ahead();
                 }
             }
             None => {
                 error!("run-ahead disabled: speculative burst has no anchor snapshot");
-                self.run_ahead_frames = 0;
+                self.drop_run_ahead();
             }
         }
         if !burst_complete {
-            self.run_ahead_frames = 0;
+            self.drop_run_ahead();
         }
     }
 
@@ -764,7 +764,9 @@ impl App {
         &self,
         headless_capture: bool,
     ) -> (usize, Option<std::time::Duration>) {
-        if self.emu.paced() || headless_capture {
+        // Warp yielding to the operator's input runs paced, one frame per
+        // presented frame, until the hands are off again.
+        if self.emu.paced() || headless_capture || self.emu.warp_input_yield() {
             return (1, None);
         }
         (
@@ -949,6 +951,9 @@ impl App {
                 if restoring_over_placeholder {
                     self.install_live_audio_after_placeholder_load();
                 }
+                // The state brings its machine's own settings (port devices,
+                // floppy speed), which are not menu choices.
+                self.rebaseline_menu_settings();
                 if outcome.reconfigured {
                     // The state was built on a different machine; the host
                     // has been reconfigured to match it (see log for the
@@ -966,6 +971,7 @@ impl App {
                 } else {
                     self.show_osd(format!("Loaded {}", display_file_name(path)));
                 }
+                self.refresh_window_title();
                 self.request_redraw();
                 true
             }
@@ -1075,6 +1081,8 @@ impl App {
                     }
                     (None, None) => {}
                 }
+                self.record_rom_title_hint();
+                self.refresh_window_title();
                 self.powered_on = true;
                 self.cpu_halted = false;
                 // The cold reset restarts the frame timeline; force a repaint.
@@ -1576,11 +1584,17 @@ impl App {
         self.emu.set_live_audio_suspended(suspended);
     }
 
-    /// The presented frame as a screenshot captures it, before encoding:
-    /// the single path behind saved screenshots and `--expect-screenshot`.
+    /// The CPU presentation image for scheduled screenshots and expectations.
     ///
     pub(super) fn capture_present_image(&self) -> super::present::PresentImage<'_> {
-        if self.native_screenshots {
+        self.capture_screenshot_image(self.native_screenshots)
+    }
+
+    pub(super) fn capture_screenshot_image(
+        &self,
+        native: bool,
+    ) -> super::present::PresentImage<'_> {
+        if native {
             return self.capture_native_image();
         }
         let src_rows = self.present_rows;
@@ -1606,8 +1620,22 @@ impl App {
         )
     }
 
+    /// How the scheduled-screenshot capture above frames the rendered
+    /// field, for input stated in its pixels (`--mouse-to-after`,
+    /// `--pen-after`, recorded pen lines). Always the default capture's
+    /// framing, whatever `--native-screenshots` says. `None` before a
+    /// frame has been presented, and while an RTG board's frame is what a
+    /// screenshot shows.
+    pub(super) fn capture_field_map(&self) -> Option<super::present::CaptureFieldMap> {
+        capture_field_map_for(CaptureFramingInputs::of(self))
+    }
+
     pub(super) fn save_screenshot(&self, path: &std::path::Path) {
-        let image = self.capture_present_image();
+        self.save_screenshot_with_mode(path, self.native_screenshots);
+    }
+
+    fn save_screenshot_with_mode(&self, path: &std::path::Path, native: bool) {
+        let image = self.capture_screenshot_image(native);
         match screenshot::save(path, &image.pixels, image.width, image.height) {
             Ok(()) => info!("screenshot saved: {}", path.display()),
             Err(e) => warn!("screenshot save failed ({}): {e:#}", path.display()),
@@ -1652,15 +1680,11 @@ impl App {
         }
     }
 
-    /// Interactive screenshot grab: save to an auto-named PNG and
-    /// flash the filename on screen. The overlay is painted into the
-    /// presentation texture after the frame is captured, so it never
-    /// appears in the saved image.
+    /// Save the next displayed picture through the window's GPU passes.
+    /// The success message is shown only after capture, so it is excluded.
     pub(super) fn take_screenshot(&mut self) {
-        self.finish_render_for_current_frame();
-        let path = screenshot::auto_filename();
-        self.save_screenshot(&path);
-        self.show_osd(format!("Saved {}", display_file_name(&path)));
+        self.pending_output_screenshot = Some(screenshot::auto_filename());
+        self.request_main_redraw();
     }
 
     /// Show a transient overlay message over the display for
@@ -1969,6 +1993,7 @@ impl App {
             self.sync_live_audio_suspension();
         }
         self.held_rawkeys = [false; 128];
+        self.live_held_rawkeys = [false; 128];
         self.reset_render_pipeline();
         self.last_fdd_track = None;
         paint_test_screen(&mut self.fb);
@@ -1994,7 +2019,62 @@ impl App {
             self.last_fdd_track = None;
             if clear_host_keys {
                 self.held_rawkeys = [false; 128];
+                self.live_held_rawkeys = [false; 128];
             }
         }
     }
+}
+
+/// The presentation state a screenshot's framing depends on, copied out of
+/// the App so the framing can be resolved while another part of it is
+/// borrowed (the input recorder maps pen positions through it).
+#[derive(Clone, Copy)]
+pub(super) struct CaptureFramingInputs {
+    rtg: bool,
+    placement: Option<super::present::FieldPlacement>,
+    present_rows: usize,
+    present_width: usize,
+    overscan: Overscan,
+    tv_centre: crate::config::TvCentre,
+    tv_aperture_rows: Option<usize>,
+}
+
+impl CaptureFramingInputs {
+    pub(super) fn of(app: &App) -> Self {
+        Self {
+            rtg: app.rtg_present_dims.is_some(),
+            placement: app.present_placement,
+            present_rows: app.present_rows,
+            present_width: app.present_width,
+            overscan: app.overscan,
+            tv_centre: app.present_tv_centre,
+            tv_aperture_rows: app.present_tv_aperture_rows,
+        }
+    }
+}
+
+/// [`App::capture_field_map`] for framing inputs already copied out.
+pub(super) fn capture_field_map_for(
+    inputs: CaptureFramingInputs,
+) -> Option<super::present::CaptureFieldMap> {
+    if inputs.rtg {
+        return None;
+    }
+    let placement = inputs.placement?;
+    if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
+        // The raw-buffer capture (see `render_present_frame`).
+        return Some(super::present::CaptureFieldMap::presentation_buffer(
+            placement,
+            inputs.present_rows,
+            inputs.present_width,
+        ));
+    }
+    Some(super::present::CaptureFieldMap::new(
+        placement,
+        inputs.present_rows,
+        inputs.present_width,
+        inputs.overscan,
+        inputs.tv_centre,
+        inputs.tv_aperture_rows,
+    ))
 }

@@ -504,7 +504,7 @@ band below the picture still comes from the CPU texture, and every case
 above falls back to composing the whole frame on the CPU.
 
 Normal display can be one frame behind emulation; exact capture paths
-call `finish_render_for_current_frame` so screenshots, frame dumps,
+call `finish_render_for_current_frame` so scheduled screenshots, frame dumps,
 recordings, debugger step, and run-to-PC output use the requested
 emulated frame.
 
@@ -716,7 +716,7 @@ expands the display quad to the full display area so overlays remain
 visible. CRT presets render over the cropped area. Programmable multisync
 modes (e.g. DblPAL) are cropped using their sync-anchored windows.
 Autocrop is suspended when a monitor bezel is drawn or an RTG board owns
-the display; captures keep the full aperture.
+the display; scheduled captures keep the full aperture.
 
 `Overscan::Smart` leaves the presentation raster unmasked, then applies a
 bounded horizontal correction through the same aperture map as manual
@@ -760,16 +760,33 @@ scale uniformly.
 Every redraw first re-syncs the surface to the host window's current size
 (`resync_surface_size`), rather than trusting the Resized event to have
 arrived first. `pixels` rebuilds its swapchain from the size the last
-`resize_surface` gave it, and retries the acquire in a loop with no bound,
-so a surface left behind by a resize the app has not seen yet is a hang and
-not a misdraw: a driver that rejects the mismatched extent (Mesa's X11
-Vulkan WSI answers `VK_ERROR_OUT_OF_DATE_KHR`) sends that loop round
-forever, and because it runs inside the event callback it also starves the
-Resized event that would have corrected the size. Entering or leaving
-fullscreen is the usual trigger: the window manager resizes the window a
-moment before the event is delivered. Both window kinds record the size
-their surface was configured with, and all resizes go through the wrappers
-that keep that record in step.
+`resize_surface` gave it, so a surface left behind by a resize the app has
+not seen yet is rejected by drivers that check the extent against the window
+(Mesa's X11 Vulkan WSI and the Windows Vulkan drivers answer
+`VK_ERROR_OUT_OF_DATE_KHR`). `pixels` 0.17.2 retried that acquire in a loop
+with no bound, so the stale size was a hang rather than a misdraw (issue
+#362, fullscreen toggles on X11); Copperline patches in the bounded retry
+from parasyte/pixels#462, which gives up after one reconfigure. Both window
+kinds record the size their surface was configured with, and all resizes go
+through the wrappers that keep that record in step.
+
+The present worker widens the gap between that check and the acquire: a
+frame is planned on the main thread and presented later, and on Windows the
+main thread pumps the modal size-move loop while the user drags an edge, so
+the window changes size under frames still queued. Before 0.17.2's loop was
+bounded this hung the window -- the worker rebuilt the swapchain at the
+stale size without end, while the main thread waited in
+`PresentWorker::reclaim` to apply the Resized event -- and the swapchain
+churn slowed the whole host. Each `PresentJob` therefore carries the surface
+size it was planned for, and the worker drops a job whose window has since
+changed size (`worker_surface_current`) instead of acquiring for it; the
+Resized behind the change reclaims the GPU side and reconfigures it, and the
+next frame is planned for the new size. A resize between the worker's check
+and the acquire is what the bounded retry is for: that present fails with
+an out-of-date surface, which is logged at debug level as a dropped frame
+(`log_present_error`). The worker cannot ask winit for the size on macOS
+(see above), where the Metal layer never reports a resized surface out of
+date.
 
 The frontend-independent half of this pass lives in
 `video/present_common.rs`: the post-render pipeline (vertical/horizontal
@@ -833,7 +850,7 @@ framebuffer):
   the web frontend's CSS filter chain on grey. The window applies it to the
   display rows of the composed texture after the display copy and before the
   status bar and UI are drawn, so only the emulated picture is tinted and
-  captures never are.
+  interactive screenshots include it. Scheduled captures stay untinted.
 
 Both content-keyed decisions -- the TV aperture crop and the full-overscan
 recentring shift -- are latched across border-only frames
@@ -1110,10 +1127,9 @@ disk (the live-reload path). A failed load leaves no custom pipeline, and
 the selection falls back to `None` with the full diagnostic logged and its
 first line shown as an OSD message.
 
-Every capture path bypasses the pass by construction rather than by a check:
-screenshots, frame dumps, video recording, CCP capture and the web frontend
-all read the CPU presentation buffer, and the shader only ever writes to the
-surface. Strength 0 makes every preset's arithmetic an exact identity, but
+Interactive screenshots render through the same GPU passes as the window.
+Scheduled screenshots, frame dumps, video recording, CCP capture and the web
+frontend read the CPU presentation buffer and bypass the shader. Strength 0 makes every preset's arithmetic an exact identity, but
 the pass is still a resample through a plain linear sampler where the
 scaler pass uses a texel-snapped sharp bilinear, so it is marginally
 softer at magnification than the pass-through; `ShaderKind::None` skips the
@@ -1153,8 +1169,24 @@ sticker with a drop shadow (`shaders/bezel_stickers.wgsl`; the web
 player's `try.js` carries a GLSL port that must be kept in step). Stickers
 draw only while the bezel does.
 
-Both passes are presentation only: screenshots, frame dumps, recordings
-and headless runs never include the bezel or its stickers.
+Interactive screenshots include the bezel and stickers. Scheduled screenshots,
+frame dumps, recordings and headless runs bypass both passes.
+
+## Interactive screenshots (`window/output_capture.rs`)
+
+The camera button and normal screenshot shortcut request a GPU capture on the
+next redraw. That redraw reclaims the GPU from the presentation worker and
+renders the same composed texture, scaler draws, RTG texture, CRT, bezel and
+sticker passes to an offscreen texture in the renderer's format. A cropped
+readback saves only the picture viewport, excluding the status bar and window
+margins, at physical surface resolution. It handles padded rows and BGRA
+surfaces. Resources are allocated only for a requested capture; readback has
+a bounded wait and the success overlay follows the save.
+
+Native screenshots use a separate shortcut and `screenshot::render_native`.
+The retired button-mode preference is accepted when loading old configurations
+but has no effect and is omitted on save. `--native-screenshots` continues to
+select native scheduled screenshots and expectations.
 
 ## Headless capture (`screenshot.rs`)
 

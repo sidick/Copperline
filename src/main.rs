@@ -12,11 +12,7 @@ use anyhow::{anyhow, Result};
 use copperline::gdbstub;
 use copperline::{config, crashlog, debugger, emulator, envcfg, gamepad, priority, video};
 use log::{info, warn};
-use std::path::Path;
-// Only the Linux net-helper setup and the Windows disk broker build
-// PathBuf values; other targets would carry an unused-import warning.
-#[cfg(any(windows, target_os = "linux"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use copperline::audio::{AudioSink, CpalSink, NullSink, WavSink};
@@ -615,30 +611,6 @@ fn print_net_interfaces() -> Result<()> {
 fn run_net_helper_setup(action: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        if std::env::var_os("FLATPAK_ID").is_some() {
-            if action == "status" {
-                #[cfg(feature = "net-bridge")]
-                {
-                    let socket = copperline::net::bridge::linux::helper_socket_path()?;
-                    if socket.exists() {
-                        println!("host helper socket is visible at {}", socket.display());
-                        return Ok(());
-                    }
-                    anyhow::bail!(
-                        "host helper socket is not visible at {}; install and enable \
-                         the Linux network-helper companion on the host",
-                        socket.display()
-                    );
-                }
-                #[cfg(not(feature = "net-bridge"))]
-                anyhow::bail!("this build has no bridged-networking support");
-            }
-            anyhow::bail!(
-                "the Flatpak cannot install a host capability binary from \
-                 inside its sandbox; download the Copperline Linux network-helper \
-                 companion archive, then run its copperline-net-helper-setup {action}"
-            );
-        }
         let executable = std::env::current_exe()?;
         let mut candidates = vec![
             executable.with_file_name("copperline-net-helper-setup"),
@@ -873,11 +845,10 @@ fn main() -> Result<()> {
     // bare launcher start has no --rom to fold in: launcher_requested
     // requires its absence.)
     if launcher_requested(&cli) {
-        return run_configuration_screen(load_raw_config(
-            cli.config_path.as_deref(),
-            &cli.overrides,
-            cli.factory,
-        )?);
+        return run_configuration_screen(
+            load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?,
+            menu_settings_file(cli.config_path.as_deref(), cli.factory),
+        );
     }
 
     // Guests and spectators receive the host's machine; their own
@@ -1150,6 +1121,11 @@ fn main() -> Result<()> {
         || cli.control.is_some()
         || coverage_capture
         || exit_capture;
+    // A scripted capture has no one at the menu, and must not touch the
+    // saved default if something drives it anyway.
+    let menu_settings = (!headless_capture)
+        .then(|| menu_settings_file(cli.config_path.as_deref(), cli.factory))
+        .flatten();
     // A real drive on a bridge is the exception: its platter turns in
     // wall-clock time and cannot be hurried. Left unthrottled, the emulated
     // machine outruns it -- spinning the motor up and down faster than it can
@@ -1157,9 +1133,16 @@ fn main() -> Result<()> {
     // them -- so the guest sees a drive that answers almost nothing. Pace a
     // bridged machine like a real Amiga, whatever else was asked for.
     let bridged = cfg.floppy.bridges.iter().any(Option::is_some);
-    let paced = !headless_capture || bridged;
+    // A diagnostic: pace a capture run like the window, to measure real-time
+    // pacing behaviour ([cpu] speed = "fastest" adapting, frame costs) on a
+    // host with no visible window. Scheduled captures still fire on emulated
+    // time; only the wall-clock sleep returns.
+    let headless_paced = headless_capture && copperline::envcfg::flag("COPPERLINE_HEADLESS_PACED");
+    let paced = !headless_capture || bridged || headless_paced;
     if bridged && headless_capture {
         info!("emulation timing: paced to wall-clock because a physical floppy drive is attached");
+    } else if headless_paced {
+        info!("emulation timing: paced to wall-clock (COPPERLINE_HEADLESS_PACED)");
     }
     info!("emulation timing: deterministic core, paced={paced}");
     // Host clipboard sharing is off unless the configuration asked for it,
@@ -1246,6 +1229,15 @@ fn main() -> Result<()> {
         // The headless server owns the machine, so it journals
         // --record-input itself; windowed mode journals through the App.
         config.record_input = cli.record_input.clone();
+        // Its recorder writes light-pen lines in --screenshot-after pixels,
+        // so the capture geometry must be the one a replay will have: the
+        // resolved pixel aspect (capture height) and overscan, env
+        // overrides included, exactly as the window resolves them below.
+        video::set_pixel_aspect(config::resolve_pixel_aspect(cfg.pixel_aspect));
+        config.screenshot_framing = copperline::video::present_common::ScreenshotFraming {
+            overscan: copperline::config::resolve_overscan(cfg.overscan),
+            tv_centre: cfg.tv_centre,
+        };
         // --run + --control: the first resume stops the moment the guest
         // OS loads the program, like --gdb.
         config.stop_on_load = run_prog_name.clone();
@@ -1262,6 +1254,7 @@ fn main() -> Result<()> {
     video::set_hidpi_texture(cfg.hidpi_texture);
     video::set_autocrop(cfg.autocrop);
     video::set_menu_scale(cfg.menu_scale);
+    video::set_track_display(cfg.track_display);
     // A fascia belongs to a machine that carries the instrument: with the
     // serial port out of MIDI mode, or another device chosen, the strip
     // would be blank glass, so the flag follows the configuration.
@@ -1433,6 +1426,7 @@ fn main() -> Result<()> {
         cfg.mouse_capture,
         cfg.middle_click_release,
         config::about_machine_lines(&cfg),
+        cli.load_state.is_none(),
         raw_cfg,
         if cli.load_state.is_some() {
             Some("loaded save state")
@@ -1442,6 +1436,7 @@ fn main() -> Result<()> {
         live_audio,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
+    app.set_menu_settings_file(menu_settings);
     app.set_expect_screenshots(cli.expect_screenshot);
     app.set_native_screenshots(cli.native_screenshots);
     if let Some(marker) = run_done_marker {
@@ -1554,7 +1549,21 @@ fn build_placeholder_machine() -> Result<Emulator> {
 /// started with no machine specified). A placeholder machine sits powered off
 /// behind the panel until the user presses Run, which builds and starts their
 /// chosen machine in place.
-fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
+/// The saved default that menu settings changes are written through to: a
+/// session started from it (or from the built-in defaults, which a first
+/// change turns into one), but not one whose settings belong to a file the
+/// user named (`--config`, `./copperline.toml`) or that `--factory` keeps
+/// independent of the saved default.
+fn menu_settings_file(config_path: Option<&Path>, factory: bool) -> Option<PathBuf> {
+    (config_path.is_none() && !factory && !Path::new("copperline.toml").exists())
+        .then(copperline::paths::default_config_file)
+        .flatten()
+}
+
+fn run_configuration_screen(
+    raw_cfg: config::RawConfig,
+    menu_settings: Option<PathBuf>,
+) -> Result<()> {
     info!("no machine specified; opening the configuration screen");
     let emu = build_placeholder_machine()?;
     video::set_pixel_aspect(config::resolve_pixel_aspect(config::PixelAspect::Tv));
@@ -1567,6 +1576,7 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
     // The launcher opens before a machine config is built, so the menu size
     // comes straight off the raw file.
     video::set_menu_scale(raw_cfg.menu_scale());
+    video::set_track_display(raw_cfg.track_display());
     // The placeholder is always silent; seed the session's audio from the config
     // intent so a state loaded over the launcher gets the configured output.
     let audio_output_enabled = raw_cfg.audio_output_enabled();
@@ -1620,12 +1630,14 @@ fn run_configuration_screen(raw_cfg: config::RawConfig) -> Result<()> {
         config::MouseCapture::default(),
         false,
         vec![config::ABOUT_PLACEHOLDER_LINE.to_string()],
+        false,
         raw_cfg,
         None,
         audio_output_enabled,
         // The placeholder runs no sampler; run_machine attaches it on Run.
         copperline::sampler::SamplerRequest::default(),
     );
+    app.set_menu_settings_file(menu_settings);
     app.open_launcher();
     // `[emulation] auto_launch` in the configuration the launcher opened
     // showing: straight to the machine, no configuration screen first.
@@ -1814,28 +1826,45 @@ fn load_raw_config(
         .then(copperline::paths::default_config_file)
         .flatten()
         .filter(|path| path.is_file());
+    let raw = load_startup_config(explicit, cwd, saved.as_deref(), overrides)?;
+    // Before any conversion: implicit battery-RAM paths use this policy.
+    copperline::paths::adopt(raw.paths());
+    Ok(raw)
+}
+
+fn load_startup_config(
+    explicit: Option<&Path>,
+    cwd: &Path,
+    saved: Option<&Path>,
+    overrides: &ConfigOverrides,
+) -> Result<config::RawConfig> {
     let path = if explicit.is_some() {
         explicit
     } else if cwd.exists() {
         info!("loading config from {}", cwd.display());
         Some(cwd)
-    } else if let Some(saved) = saved.as_deref() {
+    } else if let Some(saved) = saved {
         info!(
             "loading the saved default configuration {}",
             saved.display()
         );
-        Some(saved)
+        // A saved preference must not prevent the launcher from opening.
+        // Keep the file so the user can recover it after access is restored.
+        return match Config::load_raw(Some(saved), overrides) {
+            Ok(raw) => Ok(raw),
+            Err(error) => {
+                warn!(
+                    "cannot load saved default configuration {}: {error:#}; \
+                     continuing with built-in defaults and command-line overrides",
+                    saved.display()
+                );
+                Config::load_raw(None, overrides)
+            }
+        };
     } else {
         None
     };
-    let raw = Config::load_raw(path, overrides)?;
-    // Before any conversion: `Config::try_from` resolves the implicit
-    // battery-RAM backing files through the paths in force, so adopting
-    // afterwards would site this run's NVRAM by the previous answer.
-    // Whatever this host cannot reach is dropped here and inherits
-    // instead, so a config naming somebody else's memory stick still starts.
-    copperline::paths::adopt(raw.paths());
-    Ok(raw)
+    Config::load_raw(path, overrides)
 }
 
 #[cfg(test)]
@@ -1852,10 +1881,54 @@ mod tests {
     }
 
     #[test]
+    fn menu_settings_write_through_skips_named_and_factory_configs() {
+        assert_eq!(menu_settings_file(Some(Path::new("my.toml")), false), None);
+        assert_eq!(menu_settings_file(None, true), None);
+    }
+
+    #[test]
     fn placeholder_machine_builds() {
         // The configuration screen's host machine must build without any ROM
         // file or audio device (it sits powered off behind the launcher).
         build_placeholder_machine().expect("placeholder machine builds");
+    }
+
+    #[test]
+    fn unreadable_saved_default_falls_back_and_preserves_cli_overrides() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("copperline.toml");
+        let missing = dir.path().join("default.toml");
+        let overrides = ConfigOverrides {
+            model: Some("A1200".into()),
+            ..Default::default()
+        };
+        // A disappearing file and a path that cannot be read as a file both
+        // recover, without depending on root/host permission behavior.
+        for saved in [&missing, dir.path()] {
+            let raw = load_startup_config(None, &cwd, Some(saved), &overrides)?;
+            assert_eq!(
+                Config::try_from(raw)?.machine,
+                Some(config::MachineModel::A1200)
+            );
+        }
+        assert!(dir.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_saved_default_recovers_but_requested_configs_report_errors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("copperline.toml");
+        let saved = dir.path().join("default.toml");
+        std::fs::write(&saved, "[broken")?;
+        let overrides = ConfigOverrides::default();
+        let raw = load_startup_config(None, &cwd, Some(&saved), &overrides)?;
+        Config::try_from(raw)?;
+        assert_eq!(std::fs::read_to_string(&saved)?, "[broken");
+        assert!(load_startup_config(Some(&saved), &cwd, None, &overrides).is_err());
+        std::fs::write(&cwd, "[broken")?;
+        assert!(load_startup_config(None, &cwd, Some(&saved), &overrides).is_err());
+        Ok(())
     }
 
     #[test]
@@ -2588,14 +2661,14 @@ mod tests {
         let mut rec = copperline::inputrec::InputRecorder::new(0.0);
         let mut input = copperline::bus::InputState::default();
         input.set_port_device(1, copperline::bus::PortDevice::Joystick);
-        rec.observe(&input, 1.0);
+        rec.observe(&input, 1.0, Some);
         rec.record_key(0x45, true, 1.5);
         rec.record_key(0x45, false, 1.75);
         input.ports[0].counter_x = 5;
         input.ports[0].fire = true;
-        rec.observe(&input, 2.0);
+        rec.observe(&input, 2.0, Some);
         input.ports[0].fire = false;
-        rec.observe(&input, 2.5);
+        rec.observe(&input, 2.5, Some);
         rec.record_disk_insert(0, Path::new("/tmp/demo.adf"), 3.0);
         let path = temp_script("roundtrip", &rec.finish());
 
@@ -3178,6 +3251,22 @@ mod tests {
     fn cpu_clock_rejects_non_numeric() {
         let err = parse(&["--cpu-clock", "fast"]).unwrap_err();
         assert!(err.to_string().contains("--cpu-clock"), "{err:#}");
+    }
+
+    #[test]
+    fn cpu_speed_flag_parses_and_rejects_unknown_values() -> Result<()> {
+        assert_eq!(parse(&[])?.overrides.cpu_speed, None);
+        assert_eq!(
+            parse(&["--cpu-speed", "fastest"])?
+                .overrides
+                .cpu_speed
+                .as_deref(),
+            Some("fastest")
+        );
+        let err = parse(&["--cpu-speed", "max"]).unwrap_err();
+        assert!(err.to_string().contains("--cpu-speed"), "{err:#}");
+        assert!(parse(&["--cpu-speed"]).is_err());
+        Ok(())
     }
 }
 

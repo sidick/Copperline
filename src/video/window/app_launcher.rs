@@ -5,11 +5,55 @@
 use super::*;
 
 impl App {
+    #[cfg(feature = "game-library")]
+    pub(super) fn scroll_launcher_with_wheel(&mut self, delta: MouseScrollDelta) -> bool {
+        let target = self
+            .cursor_pos
+            .filter(|_| !self.mouse_captured)
+            .and_then(|pos| crate::video::ui::launcher_wheel_control(&self.ui, pos))
+            .and_then(scroll_arrow_of)
+            .map(|(_, list)| list);
+        if self.library_wheel.0 != target {
+            self.library_wheel = (target, 0.0);
+        }
+        let Some(list) = target else {
+            return false;
+        };
+        let rows = match delta {
+            MouseScrollDelta::LineDelta(_, y) => -f64::from(y) * 3.0,
+            MouseScrollDelta::PixelDelta(pos) => -pos.y / 14.0,
+        };
+        if rows.is_finite() {
+            self.library_wheel.1 += rows;
+            let whole = self.library_wheel.1.trunc() as isize;
+            self.library_wheel.1 -= whole as f64;
+            if whole != 0 {
+                self.activate_ui_control_with_event_loop(scroll_arrow_for(list, whole), None);
+                self.request_redraw();
+            }
+        }
+        true
+    }
+
     /// Open the machine-configuration screen, seeded from the running (or
     /// last-applied) machine so it reflects the current settings.
     pub fn open_launcher(&mut self) {
         self.ui.menu_open = false;
-        let mut state = LauncherState::from_raw(&self.machine_config);
+        let mut state = match crate::video::launcher::MachineSetup::from_raw(&self.machine_config) {
+            Ok(setup) => LauncherState::new(setup),
+            Err(error) => {
+                // Opening on the built-in defaults without a word invites
+                // Save default to overwrite a configuration that may need
+                // only one fix (an image that moved, a drive not mounted).
+                warn!("configuration not shown in the launcher: {error:#}");
+                let mut state = LauncherState::new(Default::default());
+                state.status = Some(StatusMessage::err(format!(
+                    "{} (showing defaults)",
+                    short_status_error(&error)
+                )));
+                state
+            }
+        };
         if let Some(setup) = &self.netplay_setup {
             state.netplay = setup.clone();
         }
@@ -1605,6 +1649,8 @@ impl App {
         self.rearm_tool_panels();
         self.keyboard_joy_held = [keymap::HeldKeys::default(); keymap::MAPPING_COUNT];
         self.about_machine_lines = crate::config::about_machine_lines(cfg);
+        self.record_rom_title_hint();
+        self.refresh_window_title();
         // The threaded path picks the new settings up from the next render
         // job; the recreated deinterlacer covers the synchronous fallback.
         self.deinterlace = crate::config::resolve_deinterlace(cfg.deinterlace);
@@ -1639,6 +1685,7 @@ impl App {
         self.perf = PerfOverlay::default();
         self.set_tint(crate::config::resolve_tint(cfg.tint));
         crate::video::set_menu_scale(cfg.menu_scale);
+        crate::video::set_track_display(cfg.track_display);
         #[cfg(feature = "mt32")]
         {
             crate::video::set_mt32_lcd(cfg.serial.mt32_lcd);
@@ -1691,6 +1738,9 @@ impl App {
         }
         self.sync_live_audio_suspension();
         self.reset_render_pipeline();
+        // The new machine's settings came from its configuration; only what
+        // the menu changes from here on is written through.
+        self.rebaseline_menu_settings();
         // The last overlay set here is the one that gets drawn, so a shader
         // or sticker folder that failed to load has to travel in this
         // message rather than in one of its own.

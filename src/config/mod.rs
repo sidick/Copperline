@@ -18,6 +18,7 @@ mod resolve;
 #[cfg(test)]
 mod tests;
 mod validate;
+pub mod window_title;
 
 pub use about::*;
 pub use monitor::HostMonitor;
@@ -122,6 +123,9 @@ pub struct Config {
     /// the machine behaves like one with an accelerator card fitted.
     /// Defaults off.
     pub cpu_jit: bool,
+    /// Fixed clock or host-adaptive "fastest" JIT speed (`[cpu] speed`).
+    /// `Fastest` is only ever set together with `cpu_jit` on a 68020+.
+    pub cpu_speed: CpuSpeed,
     pub emulation: Emulation,
     pub chip_ram_bytes: usize,
     pub fast_ram_bytes: usize,
@@ -307,9 +311,8 @@ pub struct Config {
     /// monitor in its own bank at $A10000, entered by a level-7 interrupt
     /// on a freeze.
     pub cartridge: CartridgeConfig,
-    /// GIF clip ring (`[recording]`, `crate::gifclip`): how much of the
-    /// presented picture the window keeps for Save Clip as GIF, and the
-    /// rate clips (interactive and `--gif-after`) are written at.
+    /// Capture settings (`[recording]`): the GIF clip ring and interactive
+    /// screenshot button mode.
     pub recording: RecordingConfig,
     /// The MHI virtual MPEG audio decoder board (`[mhi] enabled = true`):
     /// when true, an MHI board autoconfigs on the Zorro chain and its
@@ -454,6 +457,8 @@ pub struct Config {
     /// Initial window width and height as a multiple of the presentation
     /// canvas (`[display] window_scale` / `--window-scale`, 0.5 to 4.0).
     pub window_scale: f64,
+    /// Optional title template for the desktop window (`[display] title`).
+    pub window_title: Option<String>,
     /// Open the window in fullscreen at start (`[display] full_screen`, or
     /// `--full-screen` / `--windowed`). The `Cmd+F` / `Alt+F` toggle flips it
     /// live without affecting this start-up value.
@@ -470,6 +475,10 @@ pub struct Config {
     /// `--show-status-bar` / `--hide-status-bar`). `Cmd+Shift+F` /
     /// `Alt+Shift+F` toggles it live.
     pub status_bar: bool,
+    /// What the status bar's floppy counter reads (`[display]
+    /// track_display`): the track number, or CYL.SIDE. The menu's *Video
+    /// Settings -> Track Display* switches it live.
+    pub track_display: TrackDisplay,
     /// Initial host input source for the emulated joystick/CD32-pad port
     /// (`[input] joystick` / `--joystick`). Defaults to
     /// [`JoystickInputMode::Gamepad`]; the runtime status-bar toggle, `Cmd+J` /
@@ -852,6 +861,40 @@ impl MenuScale {
         match self {
             MenuScale::Normal => 1,
             MenuScale::Large => 2,
+        }
+    }
+}
+
+/// What the status bar's floppy counter shows for the selected drive's
+/// head position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackDisplay {
+    /// The track number, cylinder * 2 + side (0-159). The default.
+    #[default]
+    Track,
+    /// Cylinder and side with a decimal point between them (`40.0`): the
+    /// cylinder changes with every head step, and the side is the
+    /// /SIDE line the guest last drove.
+    Cylinder,
+}
+
+impl TrackDisplay {
+    /// Every mode, in the order a picker offers them.
+    pub const MENU_ORDER: [TrackDisplay; 2] = [TrackDisplay::Track, TrackDisplay::Cylinder];
+
+    /// The config name (round-trips through [`parse_track_display`]).
+    pub fn label(self) -> &'static str {
+        match self {
+            TrackDisplay::Track => "track",
+            TrackDisplay::Cylinder => "cylinder",
+        }
+    }
+
+    /// What a picker shows the user.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            TrackDisplay::Track => "Track",
+            TrackDisplay::Cylinder => "Cyl.Side",
         }
     }
 }
@@ -1491,8 +1534,7 @@ pub struct LideConfig {
     pub drives: [Option<DriveImage>; 4],
 }
 
-/// `[recording]`: the GIF clip ring behind the window's Save Clip as GIF
-/// and the rate of every GIF clip written.
+/// `[recording]`: GIF clip settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingConfig {
     /// Emulated seconds of presented frames the window keeps (default
@@ -1877,12 +1919,17 @@ pub(crate) fn parse_audio_filter_mode(s: &str) -> Result<AudioFilterMode> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioConfig {
-    /// Synthesized floppy-drive sound effects: motor hum, head-step
-    /// clacks and seek buzz (and the empty-drive change-line poll
-    /// click).
+    /// Floppy-drive sound effects on or off: the synthesized motor hum,
+    /// head-step clacks and seek buzz (and the empty-drive change-line poll
+    /// click), or `floppy_sounds_set` in their place. Off silences both.
     pub floppy_sounds: bool,
     /// Drive sound level, 0-100, relative to Paula's output.
     pub floppy_sounds_volume: u8,
+    /// A WinUAE-format drive sample set every drive plays instead of the
+    /// synthesized sounds (`[audio] floppy_sounds_set`) while
+    /// `floppy_sounds` is on: a set name in the floppy sounds folder, or a
+    /// path. `None` synthesizes.
+    pub floppy_sounds_set: Option<String>,
     /// Host audio output device, matched by case-insensitive substring against
     /// the names cpal enumerates. `None` uses the system default output.
     pub output_device: Option<String>,
@@ -1909,6 +1956,7 @@ impl Default for AudioConfig {
         Self {
             floppy_sounds: true,
             floppy_sounds_volume: 100,
+            floppy_sounds_set: None,
             output_device: None,
             output_enabled: true,
             channel_mode: ChannelMode::Stereo,
@@ -2254,6 +2302,14 @@ pub struct FloppyDriveConfig {
     pub write_protected: bool,
 }
 
+/// The CPU in the socket. The EC ("embedded controller") parts are the same
+/// silicon generation as their full counterparts with units removed: the
+/// 68EC020 has a 24-bit address bus, and the 68EC030/68EC040/68EC060 have no
+/// paged MMU (the 040/060 ones no FPU either).
+///
+/// Append new models at the end: positional (bincode) state encodings carry
+/// the discriminant, so inserting one in the middle renames every model
+/// below it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CpuModel {
     M68000,
@@ -2263,15 +2319,59 @@ pub enum CpuModel {
     M68030,
     M68040,
     M68060,
+    /// 68030 without the PMMU (the A4000/030's CPU). Its access control
+    /// unit sits where the 030's transparent translation registers are; it
+    /// keeps the coprocessor interface, so a 68881/68882 can still be fitted.
+    M68EC030,
+    /// 68040 with neither the paged MMU nor the FPU.
+    M68EC040,
+    /// 68060 with neither the paged MMU nor the FPU. Its transparent
+    /// translation registers still assign cache modes; PCR identifies it as
+    /// an LC/EC060 ($0431).
+    M68EC060,
 }
 
 impl CpuModel {
-    /// Whether the model ships with an FPU by default: the full 68040 has
-    /// its floating-point unit on-die (the FPU-less variants are the LC/EC
-    /// parts, which Copperline does not model); 68881/68882 boards for the
-    /// other CPUs are opt-in via `[cpu] fpu = true`.
+    /// Whether the model ships with an FPU by default: the full 68040 and
+    /// 68060 have their floating-point unit on-die (`[cpu] fpu = false`
+    /// models their FPU-less LC parts); 68881/68882 boards for the
+    /// 68020/68030 are opt-in via `[cpu] fpu = true`.
     pub fn default_fpu(self) -> bool {
         matches!(self, CpuModel::M68040 | CpuModel::M68060)
+    }
+
+    /// Whether an FPU can be fitted at all: the 68020/68030 drive an external
+    /// 68881/68882 over their coprocessor interface and the full 68040/68060
+    /// carry one on-die. The 68000/68010 have no coprocessor interface, and
+    /// the 68EC040/68EC060 have no FPU and no interface to add one.
+    pub fn can_have_fpu(self) -> bool {
+        !matches!(
+            self,
+            CpuModel::M68000 | CpuModel::M68010 | CpuModel::M68EC040 | CpuModel::M68EC060
+        )
+    }
+
+    /// Whether the part has an on-chip paged MMU: the full 68030, 68040 and
+    /// 68060. The EC parts drop it (the 68020 never had one; its external
+    /// 68851 is not modelled).
+    pub fn has_mmu(self) -> bool {
+        matches!(self, CpuModel::M68030 | CpuModel::M68040 | CpuModel::M68060)
+    }
+
+    /// Whether this is a 68060-family part (full or EC), which share the
+    /// 060 execution unit and its unimplemented-instruction traps.
+    pub fn is_68060(self) -> bool {
+        matches!(self, CpuModel::M68060 | CpuModel::M68EC060)
+    }
+
+    /// Whether the external address bus is 32 bits wide. Only the 68000,
+    /// 68010 and 68EC020 bring out 24 address lines, so they cannot reach
+    /// Zorro III space or the big-box CPU-slot RAM.
+    pub fn has_32bit_bus(self) -> bool {
+        !matches!(
+            self,
+            CpuModel::M68000 | CpuModel::M68010 | CpuModel::M68EC020
+        )
     }
 
     /// Default CPU clock in MHz for this model: a stock 68000/68010 runs at
@@ -2282,8 +2382,8 @@ impl CpuModel {
         match self {
             CpuModel::M68000 | CpuModel::M68010 => 7.09,
             CpuModel::M68EC020 | CpuModel::M68020 => 14.0,
-            CpuModel::M68030 | CpuModel::M68040 => 25.0,
-            CpuModel::M68060 => 50.0,
+            CpuModel::M68EC030 | CpuModel::M68030 | CpuModel::M68EC040 | CpuModel::M68040 => 25.0,
+            CpuModel::M68EC060 | CpuModel::M68060 => 50.0,
         }
     }
 
@@ -2292,22 +2392,24 @@ impl CpuModel {
     /// and the 68040 a 4 KB one; AmigaOS enables it (CACR) at boot. Real
     /// A1200/A4000 software (demos especially) leans on it: code looping out of
     /// chip RAM otherwise contends with bitplane DMA on every fetch and runs
-    /// roughly half-speed.
+    /// roughly half-speed. The EC parts keep their caches.
     pub fn has_instruction_cache(self) -> bool {
-        matches!(
-            self,
-            CpuModel::M68EC020
-                | CpuModel::M68020
-                | CpuModel::M68030
-                | CpuModel::M68040
-                | CpuModel::M68060
-        )
+        !matches!(self, CpuModel::M68000 | CpuModel::M68010)
     }
 
     /// Whether this model has the on-chip data cache Copperline models. The
-    /// 68030 (256 bytes) and 68040 (4 KB) have one; the 020 has none.
+    /// 68030 (256 bytes), 68040 (4 KB) and 68060 (8 KB) have one, EC parts
+    /// included; the 020 has none.
     pub fn has_data_cache(self) -> bool {
-        matches!(self, CpuModel::M68030 | CpuModel::M68040 | CpuModel::M68060)
+        matches!(
+            self,
+            CpuModel::M68EC030
+                | CpuModel::M68030
+                | CpuModel::M68EC040
+                | CpuModel::M68040
+                | CpuModel::M68EC060
+                | CpuModel::M68060
+        )
     }
 }
 
@@ -2320,6 +2422,32 @@ pub enum UnimplementedPolicy {
     #[default]
     Trap,
     Native,
+}
+
+/// How fast the `[cpu] jit` CPU runs (`[cpu] speed`, `--cpu-speed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpuSpeed {
+    /// The CPU runs at `[cpu] clock_mhz`: deterministic, the same on every
+    /// host.
+    #[default]
+    Fixed,
+    /// WinUAE's "fastest possible": while the run is paced to the wall
+    /// clock, the JIT's effective clock adapts to what the host can sustain,
+    /// from `[cpu] clock_mhz` upward, keeping the chipset in real time.
+    /// Not cycle-exact and not reproducible; unpaced runs (headless
+    /// captures, benchmarks) stay at `clock_mhz`. Needs `[cpu] jit` on a
+    /// 68020 or later.
+    Fastest,
+}
+
+impl CpuSpeed {
+    /// The config/CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CpuSpeed::Fixed => "fixed",
+            CpuSpeed::Fastest => "fastest",
+        }
+    }
 }
 
 /// PAL Amiga colour clock (CCK), in Hz. The 68000 bus advances one slot per
@@ -2681,6 +2809,7 @@ impl Default for Config {
             cpu_dcache: false,
             cpu_unimplemented: UnimplementedPolicy::Trap,
             cpu_jit: false,
+            cpu_speed: CpuSpeed::Fixed,
             emulation: Emulation {
                 power_on: true,
                 auto_launch: false,
@@ -2785,11 +2914,13 @@ impl Default for Config {
             tint: Tint::None,
             menu_scale: MenuScale::Normal,
             window_scale: 1.0,
+            window_title: None,
             full_screen: false,
             maximized: false,
             monitor: HostMonitor::Auto,
             window_position: None,
             status_bar: true,
+            track_display: TrackDisplay::Track,
             joystick_input_mode: JoystickInputMode::Gamepad,
             mouse_sensitivity: 50,
             mouse_capture: MouseCapture::Click,
@@ -2831,6 +2962,12 @@ impl Config {
     /// serialized core. Dynamic media and observers are checked on the live
     /// Bus by the window session.
     pub fn runahead_machine_block_reason(&self) -> Option<&'static str> {
+        // Run-ahead re-emulates frames from a snapshot and must land on the
+        // same machine state each time; the adaptive JIT clock changes with
+        // host timing, so a re-run would not.
+        if self.cpu_speed == CpuSpeed::Fastest {
+            return Some("fastest CPU speed");
+        }
         if !self.filesys.is_empty() {
             return Some("host directory volume");
         }
@@ -2987,6 +3124,9 @@ pub struct ConfigOverrides {
     /// Fast CPU execution via the batch/trace-JIT path (`--jit`/`--no-jit`).
     /// Same semantics as `[cpu] jit`.
     pub cpu_jit: Option<bool>,
+    /// JIT CPU speed (`--cpu-speed fixed|fastest`). Same syntax as
+    /// `[cpu] speed`.
+    pub cpu_speed: Option<String>,
     /// Host clipboard sharing (`--clipboard`/`--no-clipboard`). Same
     /// semantics as `[clipboard] share`.
     pub clipboard: Option<bool>,
@@ -3163,6 +3303,7 @@ impl ConfigOverrides {
             && self.fpu.is_none()
             && self.cpu_clock_mhz.is_none()
             && self.cpu_jit.is_none()
+            && self.cpu_speed.is_none()
             && self.chip.is_none()
             && self.fast.is_none()
             && self.slow.is_none()
@@ -3244,6 +3385,9 @@ impl ConfigOverrides {
         }
         if let Some(jit) = self.cpu_jit {
             raw.cpu.jit = Some(jit);
+        }
+        if let Some(speed) = &self.cpu_speed {
+            raw.cpu.speed = Some(speed.clone());
         }
         if let Some(share) = self.clipboard {
             raw.clipboard.share = Some(share);

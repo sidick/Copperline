@@ -3,6 +3,71 @@
 Copperline is currently released as a source application rather than a
 crates.io library, so the root package remains marked `publish = false`.
 
+## Branches
+
+Copperline has two long-lived branches:
+
+- `main` is the default branch and the development line. New features, and
+  anything that breaks compatibility, land here for the next major release.
+  Nothing is released from `main`: when that release is ready for its first
+  beta, cut `v2` from `main` and tag the beta there.
+- `v1` is the 1.x maintenance branch, cut from `main` after 1.0.0. Fixes land
+  here, and 1.x releases are tagged from it.
+
+Fixes reach `main` by merging `v1` forward, not by cherry-picking:
+
+```sh
+git checkout main
+git merge --no-ff v1
+```
+
+Merge forward after each fix lands on `v1` and after every release from it,
+so `git log main..v1` stays empty between merges and no fix is left behind.
+The exception is a fix that was made on `main` first and also affects 1.x:
+cherry-pick it onto a branch from `v1` with `git cherry-pick -x`, so the
+commit records where it came from, and open the pull request against `v1`.
+
+What may land on `v1`: bug fixes, documentation corrections, packaging fixes,
+dependency patch and security updates, and small additions that change no
+existing behaviour. What may not: anything that stops existing
+configurations, save states or scripts working the same way. That rules out
+removed or renamed configuration keys and command-line flags, changed
+defaults, save-state chunk version bumps (an additive `#[serde(default)]`
+field is fine), netplay wire protocol changes, MSRV bumps and new major or
+minor series of dependencies. Dependabot opens grouped patch updates against
+`v1`; it raises security updates against `main` only, so port those by hand
+(`cargo deny` in CI on `v1` flags the advisory).
+
+Resolving a forward merge:
+
+- `Cargo.toml` and the lockfiles: a release bump on `v1` edits the version
+  line that `main` also owns. Keep `main`'s version.
+- `packaging/linux/dev.copperline.Copperline.metainfo.xml`: keep both
+  sides, so `main` lists every release.
+- `Formula/copperline.rb`: take `v1`'s while `v1` is the newest stable line.
+  The tap serves the formula from the default branch, so the forward merge is
+  what moves `brew upgrade` users to a 1.x release. `brew install --HEAD`
+  builds `main`.
+- Golden renders (`timing-test/golden/`, `tests/golden/`): when both sides
+  changed one, re-bless on the merge result rather than picking a side (see
+  `timing-test/README.md`).
+
+To release from `v1`, follow the rest of this checklist on `v1`: bump the
+version, run the checks, push the branch, tag, then commit the Homebrew
+update there and merge forward. Push the release commit to `v1` before the
+tag: the `Browser demo` and `Docs site HTML` workflows publish to
+copperline.dev only when the tagged commit is already on a `vN` release
+branch, and skip any other `v*` tag with a notice (the release-asset
+workflows still run for it). Once two release branches are live, such as
+`v1` alongside a `v2` beta, the site shows whichever of their tags was pushed
+last; to switch it back, run those two workflows by hand (Actions tab, "Use
+workflow from") on the tag the site should show.
+
+The push-triggered workflows run on both branches, and pull requests are
+checked whichever branch they target. Those workflows save Rust build caches
+only on `main`; on `v1` they restore the default branch's. (A manual run of
+the nightly `cputest` workflow on `v1` does save a cache scoped to `v1`.)
+
 ## Before Creating the Public Repository
 
 1. Create the public repository from a clean tree with rewritten history.
@@ -75,7 +140,7 @@ and commit them:
 ```
 
 The `Lockfile sync` workflow (`.github/workflows/locks.yml`) runs these
-checks on every pull request, push to `main`, and `v*` tag push, so a tag
+checks on every pull request, push to `main` or `v1`, and `v*` tag push, so a tag
 cut from a commit with a stale lock turns red within about a minute --
 delete and re-cut the tag if that happens. The pre-tag check below is still
 part of the checklist so the drift never reaches the tag at all; the
@@ -116,7 +181,7 @@ On a `v*` tag the `Docs release PDF` workflow rebuilds the PDF and attaches
 `Copperline-X.Y.Z-manual.pdf` to the GitHub Release automatically (the
 everyday PDF build check stays in the `docs` job in ci.yml). To back-fill a
 release whose tag predates the workflow, run it from the Actions tab against
-`main` with `release_tag` set to that tag.
+the branch the release was tagged from, with `release_tag` set to that tag.
 
 ## Homebrew formula
 
@@ -148,27 +213,12 @@ brew upgrade --build-from-source copperlinehq/copperline/copperline
 brew test copperlinehq/copperline/copperline
 ```
 
-## Linux: Flatpak and AppImage
+## Linux: AppImage
 
-Linux distribution uses two channels (see `packaging/`).
-
-**Flatpak / Flathub** (`packaging/flatpak/`) is the primary channel. After a
-release commit lands, generate the untracked vendored crate list and point the
-manifest at the tag:
-
-```sh
-./packaging/flatpak/generate-cargo-sources.sh
-```
-
-Set `tag:` and `commit:` in `dev.copperline.Copperline.yaml` to the release,
-add a `<release>` entry to `dev.copperline.Copperline.metainfo.xml`, then push
-the same change to the `flathub/dev.copperline.Copperline` repository (the
-Flathub app repo created at first acceptance). The `Flatpak` workflow builds
-and lints the bundle the same way Flathub does. First-time submission steps are
-in `packaging/flatpak/README.md`.
-
-**AppImage** (`packaging/appimage/`) is the no-install fallback. The `AppImage`
-workflow builds it on `ubuntu-22.04` and, on a `v*` tag, attaches
+Linux releases ship as an **AppImage** (`packaging/appimage/`). Add a
+`<release>` entry to `packaging/linux/dev.copperline.Copperline.metainfo.xml`
+when bumping the version. The `AppImage` workflow builds it on `ubuntu-22.04`
+and, on a `v*` tag, attaches
 `Copperline-X.Y.Z-<arch>.AppImage` to the GitHub Release automatically. To
 build one by hand on a Linux host:
 

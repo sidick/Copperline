@@ -12,7 +12,7 @@
 //! from hosts nobody here controls, unpacked, and then *run on the
 //! emulated machine*, so a file that is not the file expected is not
 //! written at all. They are pinned in several places -- this module, the
-//! script, the Flatpak manifest, the Homebrew formula -- and
+//! script, the Homebrew formula, the Windows packaging script -- and
 //! [`tests::the_pinned_digests_match_the_fetch_script`] is what keeps this
 //! copy honest with the script's.
 
@@ -46,7 +46,7 @@ impl Archive {
     /// What it must hash to.
     pub fn sha256(self) -> &'static str {
         match self {
-            Archive::Whdload => "093333953737528d79c1eda7d21a16a0aa298698722624e7cfb31f588a0a156d",
+            Archive::Whdload => "725b9255e6f55c57a57b2dd52dec221b223df5560d29153607088ffff6ae1bc1",
             Archive::Skick => "02b4d01852d12ab391c6469064f917221a0f7319fd0b3ba6c359403ec1d59f96",
         }
     }
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn the_pinned_digests_match_the_fetch_script() {
         // The same two archives are pinned here, in tools/fetch-whdload.sh,
-        // in the Flatpak manifest and in the Homebrew formula. This one is
+        // and in the Homebrew formula and Windows packaging script. This is
         // the copy a running Copperline checks its download against, so it
         // is the one most worth catching adrift.
         let script = include_str!("../../tools/fetch-whdload.sh");

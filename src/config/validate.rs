@@ -46,6 +46,12 @@ impl TryFrom<RawConfig> for Config {
                 "[cpu] fpu = true needs the 68020+ coprocessor interface; \
                  a 68000/68010 cannot drive a 68881/68882"
             ));
+        } else if fpu && !cpu.can_have_fpu() {
+            errors.push(anyhow!(
+                "[cpu] fpu = true: the 68EC040/68EC060 have no FPU and no \
+                 coprocessor interface to add one (use the 68040/68060 for \
+                 an on-die FPU)"
+            ));
         }
         // The on-chip caches are silicon: model them by default whenever the
         // CPU has them (AmigaOS turns them on via CACR), so a 020/030 matches
@@ -70,9 +76,9 @@ impl TryFrom<RawConfig> for Config {
                         UnimplementedPolicy::Trap
                     }
                 };
-                if cpu != CpuModel::M68060 {
+                if !cpu.is_68060() {
                     errors.push(anyhow!(
-                        "[cpu] unimplemented applies only to the 68060 \
+                        "[cpu] unimplemented applies only to the 68060/68EC060 \
                          (other models implement their full instruction sets)"
                     ));
                 }
@@ -81,17 +87,45 @@ impl TryFrom<RawConfig> for Config {
         };
         if cpu_icache && !cpu.has_instruction_cache() {
             errors.push(anyhow!(
-                "[cpu] icache = true needs a 68020/68EC020/68030/68040 \
-                 (the 68000 has no instruction cache)"
+                "[cpu] icache = true needs a 68020 or later \
+                 (the 68000/68010 have no instruction cache)"
             ));
         }
         if cpu_dcache && !cpu.has_data_cache() {
             errors.push(anyhow!(
-                "[cpu] dcache = true needs a 68030 or 68040 \
+                "[cpu] dcache = true needs a 68030, 68040 or 68060 \
                  (the 68000/68020 have no data cache)"
             ));
         }
         let cpu_jit = raw.cpu.jit.unwrap_or(false);
+        let cpu_speed = match raw.cpu.speed.as_deref() {
+            None => CpuSpeed::Fixed,
+            Some(s) => match parse_cpu_speed(s) {
+                Ok(speed) => speed,
+                Err(e) => {
+                    errors.push(e);
+                    CpuSpeed::Fixed
+                }
+            },
+        };
+        // "fastest" adapts the JIT's billing, so it means nothing to the
+        // precise core: refuse it rather than silently running at the
+        // fixed clock. The 68000/68010 never take the JIT path at all
+        // (their shared-bus float model needs the precise core).
+        if cpu_speed == CpuSpeed::Fastest {
+            if matches!(cpu, CpuModel::M68000 | CpuModel::M68010) {
+                errors.push(anyhow!(
+                    "[cpu] speed = \"fastest\" needs a 68020 or later: the \
+                     68000/68010 always run on the precise core, which has no \
+                     adaptive clock"
+                ));
+            } else if !cpu_jit {
+                errors.push(anyhow!(
+                    "[cpu] speed = \"fastest\" needs [cpu] jit = true (--jit): \
+                     only the JIT's clock adapts to the host"
+                ));
+            }
+        }
         if let Some(speed) = raw.emulation.speed.as_deref() {
             log::warn!(
                 "[emulation] speed = {speed:?} is deprecated and ignored: the \
@@ -275,6 +309,11 @@ impl TryFrom<RawConfig> for Config {
                     defaults.audio.floppy_sounds_volume
                 }
             },
+            floppy_sounds_set: raw
+                .audio
+                .floppy_sounds_set
+                .as_deref()
+                .and_then(parse_floppy_sounds_set),
             output_device: raw
                 .audio
                 .output_device
@@ -434,7 +473,15 @@ impl TryFrom<RawConfig> for Config {
                 "[display] window_scale must be between 0.5 and 4.0, got {window_scale}"
             ));
         }
+        let window_title = raw.display.title.clone();
+        if let Some(template) = &window_title {
+            super::window_title::validate(template).context("[display] title")?;
+        }
         let status_bar = raw.display.status_bar.unwrap_or(defaults.status_bar);
+        let track_display = match raw.display.track_display.as_deref() {
+            None => defaults.track_display,
+            Some(s) => parse_track_display(s)?,
+        };
         let joystick_input_mode = match raw.input.joystick.as_deref() {
             None => defaults.joystick_input_mode,
             Some(s) => parse_joystick_input_mode(s)?,
@@ -1130,7 +1177,7 @@ impl TryFrom<RawConfig> for Config {
         if raw.zz9k.enabled.unwrap_or(false) {
             let version = match raw.zz9k.zorro {
                 None => {
-                    if cpu_has_32bit_bus(cpu) {
+                    if cpu.has_32bit_bus() {
                         ZorroVersion::III
                     } else {
                         ZorroVersion::II
@@ -1257,7 +1304,7 @@ impl TryFrom<RawConfig> for Config {
             .iter()
             .chain(wasm_boards.iter().map(|w| &w.spec));
         for board in board_specs {
-            if board.version == ZorroVersion::III && !cpu_has_32bit_bus(cpu) {
+            if board.version == ZorroVersion::III && !cpu.has_32bit_bus() {
                 errors.push(anyhow!(
                     "zorro board {:?} is Zorro III, which needs a 32-bit CPU \
                      (68020/68030/68040/68060); {:?} has a 24-bit address bus",
@@ -1403,6 +1450,7 @@ impl TryFrom<RawConfig> for Config {
             cpu_dcache,
             cpu_unimplemented,
             cpu_jit,
+            cpu_speed,
             emulation,
             chip_ram_bytes,
             fast_ram_bytes,
@@ -1521,11 +1569,13 @@ impl TryFrom<RawConfig> for Config {
             tint,
             menu_scale,
             window_scale,
+            window_title,
             full_screen,
             maximized,
             monitor,
             window_position,
             status_bar,
+            track_display,
             joystick_input_mode,
             mouse_sensitivity,
             mouse_capture,
@@ -1714,6 +1764,27 @@ pub(crate) fn parse_menu_scale(s: &str) -> Result<MenuScale> {
     }
 }
 
+/// Parse an `[audio] floppy_sounds_set` value: `None` for the synthesized
+/// sounds (empty, or "synthesized"), otherwise the set's name or path as
+/// written. Whether the set is there is the machine build's business: a
+/// missing set falls back to the synthesized sounds rather than failing
+/// the config, since the files live on the host, not in the config.
+pub(crate) fn parse_floppy_sounds_set(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty() && !s.eq_ignore_ascii_case("synthesized")).then(|| s.to_string())
+}
+
+/// Parse a `[display] track_display` value.
+pub(crate) fn parse_track_display(s: &str) -> Result<TrackDisplay> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "track" => Ok(TrackDisplay::Track),
+        "cylinder" | "cyl.side" | "cyl" => Ok(TrackDisplay::Cylinder),
+        other => {
+            bail!("[display] track_display must be \"track\" or \"cylinder\", got \"{other}\"")
+        }
+    }
+}
+
 pub(crate) fn parse_port_device(s: &str, key: &str) -> Result<PortDevice> {
     let device = PortDevice::parse(s).ok_or_else(|| {
         anyhow!(
@@ -1788,6 +1859,18 @@ pub(crate) fn parse_serial_mode(s: &str) -> Result<SerialMode> {
     }
 }
 
+/// `[cpu] speed` / `--cpu-speed`.
+pub fn parse_cpu_speed(s: &str) -> Result<CpuSpeed> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fixed" => Ok(CpuSpeed::Fixed),
+        "fastest" => Ok(CpuSpeed::Fastest),
+        _ => Err(anyhow!(
+            "unknown [cpu] speed {:?}: expected \"fixed\" or \"fastest\"",
+            s
+        )),
+    }
+}
+
 fn parse_pacing_budget(s: &str) -> Result<PacingBudget> {
     match s.trim().to_ascii_lowercase().as_str() {
         "cycles" | "m68k-cycles" => Ok(PacingBudget::Cycles),
@@ -1823,8 +1906,12 @@ fn parse_cpu(s: &str) -> Result<CpuModel> {
         "68030" | "030" => Ok(CpuModel::M68030),
         "68040" | "040" => Ok(CpuModel::M68040),
         "68060" | "060" => Ok(CpuModel::M68060),
+        "68ec030" | "ec030" => Ok(CpuModel::M68EC030),
+        "68ec040" | "ec040" => Ok(CpuModel::M68EC040),
+        "68ec060" | "ec060" => Ok(CpuModel::M68EC060),
         _ => Err(anyhow!(
-            "unknown cpu model {:?}: expected 68000 / 68010 / 68EC020 / 68020 / 68030 / 68040 / 68060",
+            "unknown cpu model {:?}: expected 68000 / 68010 / 68EC020 / 68020 / \
+             68EC030 / 68030 / 68EC040 / 68040 / 68EC060 / 68060",
             s
         )),
     }
@@ -2048,7 +2135,7 @@ pub fn machine_profile_defaults(model: MachineModel) -> Config {
     // a Zorro III board, so the gate is the same one Zorro III RAM uses: a
     // CPU with a 32-bit address bus. That is the A3000 and A4000 today, and
     // any future profile that qualifies, without a model list to maintain.
-    if cpu_has_32bit_bus(d.cpu) {
+    if d.cpu.has_32bit_bus() {
         d.rtg = RtgCard::Z3660;
     }
     d
@@ -2318,7 +2405,7 @@ fn validate_mb_ram(mb: usize, mem_controller: MemController, cpu: CpuModel) -> R
              fitted by the A3000/A4000 profiles)"
         );
     }
-    if !cpu_has_32bit_bus(cpu) {
+    if !cpu.has_32bit_bus() {
         bail!(
             "motherboard RAM ends at $08000000, beyond a 24-bit address bus: \
              {:?} cannot reach it (needs a 68020/68030/68040/68060)",
@@ -2363,7 +2450,7 @@ fn validate_accel_ram(accel: usize, cpu: CpuModel) -> Result<()> {
     if accel == 0 {
         return Ok(());
     }
-    if !cpu_has_32bit_bus(cpu) {
+    if !cpu.has_32bit_bus() {
         bail!(
             "accelerator RAM sits at $08000000-$0FFFFFFF, beyond a 24-bit \
              address bus: {:?} cannot reach it (needs a 68020/68030/68040/68060)",
@@ -2380,15 +2467,8 @@ fn validate_accel_ram(accel: usize, cpu: CpuModel) -> Result<()> {
     Ok(())
 }
 
-fn cpu_has_32bit_bus(cpu: CpuModel) -> bool {
-    matches!(
-        cpu,
-        CpuModel::M68020 | CpuModel::M68030 | CpuModel::M68040 | CpuModel::M68060
-    )
-}
-
 fn validate_rtg_card(rtg: RtgCard, vram_bytes: usize, cpu: CpuModel) -> Result<()> {
-    if rtg == RtgCard::Z3660 && !cpu_has_32bit_bus(cpu) {
+    if rtg == RtgCard::Z3660 && !cpu.has_32bit_bus() {
         bail!(
             "[rtg] card = \"z3660\" is a Zorro III board and needs a CPU \
              with a 32-bit address bus (68020/68030/68040/68060); {:?} has \
@@ -2396,7 +2476,7 @@ fn validate_rtg_card(rtg: RtgCard, vram_bytes: usize, cpu: CpuModel) -> Result<(
             cpu
         );
     }
-    if rtg == RtgCard::GraffityZ3 && !cpu_has_32bit_bus(cpu) {
+    if rtg == RtgCard::GraffityZ3 && !cpu.has_32bit_bus() {
         bail!(
             "[rtg] card = \"graffityz3\" is a Zorro III board and needs a CPU \
              with a 32-bit address bus (68020/68030/68040/68060); {:?} has \
@@ -2421,7 +2501,7 @@ fn validate_z3_ram(z3: usize, cpu: CpuModel) -> Result<()> {
     if z3 == 0 {
         return Ok(());
     }
-    if !cpu_has_32bit_bus(cpu) {
+    if !cpu.has_32bit_bus() {
         bail!(
             "Zorro III RAM needs a CPU with a 32-bit address bus \
              (68020/68030/68040/68060); {:?} has a 24-bit bus",

@@ -7,13 +7,13 @@ Support: [Patreon](https://www.patreon.com/cw/Copperline)
 
 Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and AGA) written in Rust. It models the Amiga custom chipset, 680x0 CPU, memory subsystems, and common expansion hardware on a unified clock timeline.
 
-It boots out of the box with the bundled open-source AROS Kickstart replacement, and supports official Kickstart ROMs (1.3 through 3.1), DiagROM, and standard disk, hardfile, and CD media.
+It boots out of the box with the bundled open-source AROS Kickstart replacement, and supports official Kickstart ROMs (1.x through 3.2, plus the CDTV and CD32 extended ROMs), DiagROM, and standard disk, hardfile, and CD media.
 
 ## Features
 
 - **Chipset and machine models**: OCS, ECS, and AGA support with profiles from the A500 through the A4000, plus CDTV and CD32.
 - **Configurable CPU and memory**: Motorola 68000 through 68060, optional FPU and MMU support, and configurable Chip, Fast, and Slow RAM.
-- **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF, SCP), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
+- **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF, SCP, and ZIP-packed ADF), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
 - **Audio and video**: 4-channel Paula audio, RTG graphics cards (Picasso II/II+, Z3660), host MIDI in/out bridging, and built-in Roland MT-32 and General MIDI synthesis.
 - **Expansion and networking**: Zorro II/III autoconfig, A2065 Ethernet, host-backed bsdsocket.library, and sandboxed WebAssembly expansion plugins.
 - **Debugging**: CPU and chipset debugger, reverse stepping, live Kickstart/AROS symbols, frame and [instruction profiling](docs/debugger/profiling.md) with bounded sample buffering and overflow reporting, VCD waveforms, and source debugging through GDB or DAP. Both the native VS Code extension and the [Copperline fork of Bartman's extension](docs/debugger/vscode-bartman.md) are supported.
@@ -49,9 +49,7 @@ chmod +x Copperline-*.AppImage
 ./Copperline-*.AppImage
 ```
 
-Copperline is not published on Flathub. To build a Flatpak yourself from [`packaging/flatpak`](packaging/flatpak/README.md), follow [Getting started](docs/guide/getting-started.md).
-
-*Note:* On Linux, presentation requires a Vulkan driver. Most modern GPUs support Vulkan natively. For virtual machines or older hardware, install the Mesa software Vulkan driver (`mesa-vulkan-drivers` on Debian/Ubuntu/Fedora, or `vulkan-swrast` on Arch). A self-built Flatpak gets software Vulkan from its runtime and needs neither.
+*Note:* On Linux, presentation requires a Vulkan driver. Most modern GPUs support Vulkan natively. For virtual machines or older hardware, install the Mesa software Vulkan driver (`mesa-vulkan-drivers` on Debian/Ubuntu/Fedora, or `vulkan-swrast` on Arch).
 
 ### Building from source
 
@@ -117,11 +115,20 @@ ordinary windows.
 
 - **Quit**: `Cmd+Q` (macOS) / `Alt+Q` (Linux/Windows)
 - **Debugger**: `Cmd+B` (macOS) / `Alt+B` (Linux/Windows)
-- **Screenshot**: `Cmd+S` (macOS) / `Alt+S` (Linux/Windows)
+- **Screenshot**: `Cmd+S` (macOS) / `Alt+S` (Linux/Windows) saves the displayed picture with its current effects.
+- **Native screenshot (1:1)**: `Cmd+Option+S` (macOS) / `Ctrl+Alt+S` (Linux/Windows)
 - **Mouse capture**: `Cmd+G` (macOS) / `Alt+G` (Linux/Windows)
 - **Joystick toggle**: `Cmd+J` (macOS) / `Alt+J` (Linux/Windows) switches between physical gamepad and keyboard arrows.
 
 See the [UI guide](docs/guide/ui.md) for full interface details.
+
+The camera button captures the displayed picture, including scaling, shaders
+and the monitor bezel. Native screenshots save the original playfield pixels.
+The WHDLoad library and favourites support mouse-wheel and trackpad scrolling.
+An unreadable saved default configuration falls back to built-in settings.
+
+The desktop window title identifies the machine and boot ROM; `[display] title`
+in a TOML configuration can set a custom title format for multiple instances.
 
 ## Configuration
 

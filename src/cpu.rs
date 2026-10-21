@@ -15,6 +15,8 @@ use log::{debug, trace};
 use m68k::core::memory::{BusFault, BusFaultKind};
 use m68k::{AddressBus, BatchExit, CpuCore, CpuType, FastMem, StepResult};
 
+mod ec030_acu;
+
 pub const CIA_A_BASE: u32 = 0x00BF_E000;
 pub const CIA_A_SIZE: u32 = 0x0000_1000;
 pub const CIA_B_BASE: u32 = 0x00BF_D000;
@@ -122,6 +124,16 @@ pub struct M68kMachine {
     /// each instruction a flat bus-cycle cost. Configuration, not machine
     /// state: like `fpu_enabled` it is never serialized.
     jit_enabled: bool,
+    /// `[cpu] speed = "fastest"`: the CPU clocks the JIT path bills, as a
+    /// 16.16 fraction of the clocks it retired. `JIT_CLOCK_DIVISOR_UNITY`
+    /// (the fixed clock) except while the emulator's speed governor runs
+    /// the JIT faster than `clock_mhz`; dividing the CPU's own clocks is
+    /// exactly a faster CPU clock, while chip-bus and CIA accesses keep
+    /// their bus-time costs. Host configuration, never serialized.
+    jit_clock_divisor_q16: u32,
+    /// Sub-clock remainder of the scaled billing (16.16), carried across
+    /// batches so a fractional divisor bills exactly over time.
+    jit_clock_carry_q16: u32,
     /// Last CACR value pushed into the cache models, so the per-instruction
     /// sync is a single compare when nothing changed.
     last_cacr: u32,
@@ -401,9 +413,15 @@ const JIT_BATCH_INSTRUCTIONS: usize = 64;
 /// machine's nominal speed: one instruction per clock models an ideal
 /// pipelined accelerator, making guest throughput track `[cpu] clock_mhz`
 /// directly (a 50 MHz 68040 runs ~50 MIPS in fast RAM). Deterministic by
-/// construction -- a truly host-speed "fastest possible" mode would make
-/// emulated results depend on the host, which Copperline never allows.
+/// construction at a fixed clock; the opt-in, host-dependent
+/// `[cpu] speed = "fastest"` scales the billed clocks instead (see
+/// `M68kMachine::set_jit_speed_factor`), never this constant.
 const JIT_CPU_CLOCKS_PER_INSTRUCTION: u32 = 1;
+
+/// Unity value of `M68kMachine::jit_clock_divisor_q16` (16.16 fixed
+/// point): the JIT path bills its CPU clocks unscaled, so it runs at
+/// exactly `[cpu] clock_mhz`.
+const JIT_CLOCK_DIVISOR_UNITY: u32 = 1 << 16;
 
 struct CpuBus {
     bus: Bus,
@@ -471,7 +489,7 @@ pub fn build(
     let mut machine = M68kMachine::new(bus, cpu_model, fpu_enabled)?;
     machine.cpu.emulate_unimplemented_060 =
         unimplemented == crate::config::UnimplementedPolicy::Native;
-    if cpu_model == CpuModel::M68060 && unimplemented == crate::config::UnimplementedPolicy::Trap {
+    if cpu_model.is_68060() && unimplemented == crate::config::UnimplementedPolicy::Trap {
         log::info!(
             "68060 unimplemented instructions will trap faithfully: the OS \
              needs 68060.library (or set [cpu] unimplemented = \"native\")"
@@ -489,13 +507,19 @@ impl M68kMachine {
     pub fn new(bus: Bus, cpu_model: CpuModel, fpu_enabled: bool) -> Result<Self> {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(cpu_type_for_model(cpu_model));
-        cpu.address_mask = address_mask_for_model(cpu_model);
-        if cpu_model == CpuModel::M68060 && !fpu_enabled {
-            // An FPU-less 060 (LC/EC060) presents as PCR.DFP: the core
-            // raises the faithful format $4 disabled frame instead of the
-            // host's generic Line-F shim for discrete 68881/68882 absence.
-            cpu.pcr |= m68k::PCR_DFP;
+        // The EC parts have no paged MMU, but the core types they run on
+        // (060, LC040) may carry one. With it removed, translation never
+        // engages: the EC060's TC, URP and SRP still take MOVEC without an
+        // exception (the E/P bits are simply undefined), its PFLUSH is a
+        // no-op and PLPA never changes An (MC68060UM appendix B.2).
+        if !cpu_model.has_mmu() {
+            cpu.has_pmmu = false;
         }
+        cpu.address_mask = address_mask_for_model(cpu_model);
+        // The 060 FPU (fitted or absent) is gated by PCR.DFP, which
+        // `reset_cpu` sets on every reset -- including the one below.
+        // Without an FPU the core models the MC68LC060/MC68EC060: PCR
+        // identification $0431 and DFP held set against MOVEC writes.
         // A 68020/030 without an attached 68881/68882 routes cpID-1 F-line
         // opcodes to the Line-F exception inside the core. The precise path
         // additionally pre-empts them with `force_fpu_line_f_if_needed`
@@ -528,6 +552,8 @@ impl M68kMachine {
             },
             fpu_enabled,
             jit_enabled: false,
+            jit_clock_divisor_q16: JIT_CLOCK_DIVISOR_UNITY,
+            jit_clock_carry_q16: 0,
             last_cacr: 0,
             dbg_ipl_main_cyc: 0,
             dbg_ipl_irq_cyc: 0,
@@ -2925,6 +2951,51 @@ impl M68kMachine {
         self.jit_enabled
     }
 
+    /// Whether `step_slice` currently takes the batch/JIT path: JIT on and
+    /// no debug hook or model property forcing the precise core.
+    pub fn jit_batch_path_active(&self) -> bool {
+        self.jit_enabled && self.jit_fast_path_ok()
+    }
+
+    /// Run the JIT path `factor` times faster than the configured clock
+    /// (`[cpu] speed = "fastest"`): every CPU clock it bills -- the flat
+    /// per-instruction cost, exception and interrupt entry -- is divided by
+    /// `factor`, which is exactly a faster CPU clock. Chip-bus and CIA
+    /// accesses keep their bus-time costs, as on a real accelerator. A
+    /// factor of 1 or below (or not finite) restores the fixed clock,
+    /// whose billing path is then the unscaled one. The precise core never
+    /// reads this.
+    pub fn set_jit_speed_factor(&mut self, factor: f64) {
+        let divisor = if factor.is_finite() && factor > 1.0 {
+            ((f64::from(JIT_CLOCK_DIVISOR_UNITY) / factor).round() as u32)
+                .clamp(1, JIT_CLOCK_DIVISOR_UNITY)
+        } else {
+            JIT_CLOCK_DIVISOR_UNITY
+        };
+        if divisor == JIT_CLOCK_DIVISOR_UNITY {
+            self.jit_clock_carry_q16 = 0;
+        }
+        self.jit_clock_divisor_q16 = divisor;
+    }
+
+    /// The JIT speed factor in effect (1.0 = the configured clock).
+    pub fn jit_speed_factor(&self) -> f64 {
+        f64::from(JIT_CLOCK_DIVISOR_UNITY) / f64::from(self.jit_clock_divisor_q16)
+    }
+
+    /// CPU clocks the JIT path bills for `clocks` retired at the configured
+    /// clock (see `set_jit_speed_factor`). Identity at the fixed clock.
+    #[inline]
+    fn jit_scaled_clocks(&mut self, clocks: u32) -> u32 {
+        if self.jit_clock_divisor_q16 == JIT_CLOCK_DIVISOR_UNITY {
+            return clocks;
+        }
+        let total = u64::from(clocks) * u64::from(self.jit_clock_divisor_q16)
+            + u64::from(self.jit_clock_carry_q16);
+        self.jit_clock_carry_q16 = (total & 0xFFFF) as u32;
+        (total >> 16) as u32
+    }
+
     /// Whether `step_slice` may take the batch/JIT path right now: every
     /// per-instruction debug or diagnostic hook the precise loop services
     /// must be idle, and the FPU-absence shim must not be needed (the
@@ -3142,11 +3213,21 @@ impl M68kMachine {
                 let cpu_was_stopped = self.cpu.is_stopped();
                 // The no-op handler declines every trap, so the CPU takes the
                 // real exception -- the plain step() would surface traps as
-                // StepResults instead of raising them.
-                match self
-                    .cpu
-                    .step_with_hle_handler(&mut self.bus, &mut m68k::NoOpHleHandler)
-                {
+                // StepResults instead of raising them. That is what an EC030
+                // PMMU instruction needs: the core reports it as Line-F and
+                // the access control unit model completes it.
+                let step = if self.ec030_acu_instruction_next() {
+                    match self.cpu.step(&mut self.bus) {
+                        StepResult::FlineTrap { opcode } => StepResult::Ok {
+                            cycles: self.service_fline_trap(opcode),
+                        },
+                        other => other,
+                    }
+                } else {
+                    self.cpu
+                        .step_with_hle_handler(&mut self.bus, &mut m68k::NoOpHleHandler)
+                };
+                match step {
                     StepResult::Ok { cycles } => {
                         if DEBUG_HOOKS && self.bus.bus.smc.is_some() {
                             // Mark the instruction just retired as code.
@@ -3329,8 +3410,9 @@ impl M68kMachine {
             let bus_before = self.bus.bus.slice_bus_advanced_cck();
             let cpu_cck_before = cpu_cck;
             if let Some(irq) = self.service_pending_irq_cycles() {
-                cpu_cycles = cpu_cycles.saturating_add(positive_cpu_cycles(irq.cycles));
-                cpu_cck = cpu_cck.saturating_add(self.charge_cpu_clocks(irq.cycles));
+                let irq_clocks = self.jit_scaled_clocks(positive_cpu_cycles(irq.cycles));
+                cpu_cycles = cpu_cycles.saturating_add(irq_clocks);
+                cpu_cck = cpu_cck.saturating_add(self.charge_cpu_clocks(irq_clocks as i32));
             }
             // A level the boundary could not deliver (the CPU is still
             // inside a handler at that priority) must not ride into the
@@ -3369,8 +3451,10 @@ impl M68kMachine {
                         .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
                     instructions = instructions.saturating_add(1);
                 }
-                BatchExit::FlineTrap { .. } => {
-                    let cycles = self.cpu.take_fline_exception(&mut self.bus);
+                // An EC030 PMMU instruction completes in the access control
+                // unit model instead of trapping.
+                BatchExit::FlineTrap { opcode } => {
+                    let cycles = self.service_fline_trap(opcode);
                     batch_clocks = batch_clocks
                         .saturating_add(positive_cpu_cycles(cycles))
                         .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
@@ -3398,6 +3482,7 @@ impl M68kMachine {
                     instructions = instructions.saturating_add(1);
                 }
             }
+            let batch_clocks = self.jit_scaled_clocks(batch_clocks);
             cpu_cycles = cpu_cycles.saturating_add(batch_clocks);
             cpu_cck = cpu_cck
                 .saturating_add(self.charge_cpu_clocks_less_bus_overlap(batch_clocks as i32));
@@ -3563,6 +3648,20 @@ impl M68kMachine {
     fn reset_cpu(&mut self) {
         self.cpu.reset(&mut self.bus);
         self.cpu.set_sr(0x2700);
+        if self.cpu.is_060() {
+            // Reset clears PCR.DFP, enabling the 060's FPU, but that FPU is
+            // not 68040-compatible: every FSAVE/FRESTORE frame, NULL
+            // included, is three long words, while exec's hand-built task
+            // contexts carry the one-long NULL frame of the 68881/68882/
+            // 68040. A 060 accelerator's boot ROM therefore disables the
+            // FPU on every reset, and 68060.library re-enables it once it
+            // has converted exec's context switch; model that firmware
+            // here. An FPU-less LC/EC060 presents the same way (its core
+            // reset already sets DFP, and holds it), so FP instructions
+            // take the format $4 FPU-disabled exception instead of the
+            // host's generic Line-F shim.
+            self.cpu.pcr |= m68k::PCR_DFP;
+        }
         self.apply_cacr_updates();
         debug!(
             "reset vector: SP={:#010X} PC={:#010X} SR={:#06X}",
@@ -3641,8 +3740,8 @@ impl M68kMachine {
         if self.fpu_enabled {
             return false;
         }
-        // The 060 models FPU absence in the core via PCR.DFP (set at
-        // construction), with the proper format $4 disabled frame.
+        // The 060 models FPU absence in the core via PCR.DFP (set on
+        // every reset), with the proper format $4 disabled frame.
         if self.cpu.is_060() {
             return false;
         }
@@ -5244,11 +5343,26 @@ fn cpu_type_for_model(model: CpuModel) -> CpuType {
         CpuModel::M68010 => CpuType::M68010,
         CpuModel::M68EC020 => CpuType::M68EC020,
         CpuModel::M68020 => CpuType::M68020,
+        CpuModel::M68EC030 => CpuType::M68EC030,
         CpuModel::M68030 => CpuType::M68030,
         // Full 68040: FPU on-die (default_fpu) and the MMU enabled (has_pmmu).
-        // The FPU-less LC/EC variants are not modelled (see CpuModel docs).
+        // `fpu = false` keeps this type and pre-empts FP opcodes in
+        // `force_fpu_line_f_if_needed`.
         CpuModel::M68040 => CpuType::M68040,
-        CpuModel::M68060 => CpuType::M68060,
+        // The EC040 replaces the paged MMU with an access control unit
+        // whose registers answer at the MMU's MOVEC codes (TC and MMUSR are
+        // the ACU's control/status pair, ITT/DTT its IACR/DACR; MC68040UM
+        // appendix B.6), and PTEST/PFLUSH raise no exception. The core's
+        // M68EC040 type traps those MOVEC codes as illegal instead -- AROS's
+        // 040 boot path clears TC with MOVEC and dies there -- so run the
+        // LC040 type, which differs from it only in that MOVEC table, with
+        // the paged MMU removed by `M68kMachine::new`.
+        // TODO: map to CpuType::M68EC040 once the core's EC040 MOVEC set
+        // follows appendix B.6.
+        CpuModel::M68EC040 => CpuType::M68LC040,
+        // The EC060 is the 060 execution unit; `M68kMachine::new` removes
+        // its paged MMU, and its missing FPU is `fpu_present = false`.
+        CpuModel::M68060 | CpuModel::M68EC060 => CpuType::M68060,
     }
 }
 
@@ -5264,11 +5378,10 @@ fn cache_lines_for_cpu_type(cpu_type: CpuType) -> usize {
 }
 
 fn address_mask_for_model(model: CpuModel) -> u32 {
-    match model {
-        CpuModel::M68000 | CpuModel::M68010 | CpuModel::M68EC020 => ADDRESS_MASK_24BIT,
-        CpuModel::M68020 | CpuModel::M68030 | CpuModel::M68040 | CpuModel::M68060 => {
-            ADDRESS_MASK_32BIT
-        }
+    if model.has_32bit_bus() {
+        ADDRESS_MASK_32BIT
+    } else {
+        ADDRESS_MASK_24BIT
     }
 }
 
@@ -7801,6 +7914,110 @@ mod tests {
         Ok(())
     }
 
+    /// `[cpu] speed = "fastest"` speeds the JIT up by dividing the CPU
+    /// clocks it bills: the same instructions take a quarter of the clocks
+    /// (and so of the chipset time) at factor 4, a fractional factor
+    /// carries its remainder exactly across batches, and factor 1 is the
+    /// fixed clock's unscaled billing.
+    #[test]
+    fn jit_speed_factor_divides_the_billed_cpu_clocks() -> Result<()> {
+        let program = [0x4E71u16, 0x60FC]; // nop; bra.s <nop>
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let run = |factor: f64| -> Result<(u32, u32, f64)> {
+            let mut machine = machine_with_program_model(pc, &program, CpuModel::M68030)?;
+            machine.set_jit_enabled(true);
+            machine.set_jit_speed_factor(factor);
+            let (mut clocks, mut cck) = (0u32, 0u32);
+            for _ in 0..10 {
+                let slice = machine.step_slice(4096)?;
+                assert_eq!(slice.instructions, 4096);
+                clocks += slice.cpu_cycles;
+                cck += slice.cpu_cck;
+            }
+            Ok((clocks, cck, machine.jit_speed_factor()))
+        };
+        let (fixed_clocks, fixed_cck, fixed_factor) = run(1.0)?;
+        assert_eq!(fixed_clocks, 40_960, "one clock per instruction");
+        assert_eq!(fixed_factor, 1.0);
+        let (fast_clocks, fast_cck, fast_factor) = run(4.0)?;
+        assert_eq!(fast_factor, 4.0);
+        assert_eq!(fast_clocks * 4, fixed_clocks);
+        assert_eq!(fast_cck * 4, fixed_cck);
+        let (third_clocks, _, _) = run(3.0)?;
+        assert!(
+            third_clocks.abs_diff(fixed_clocks / 3) <= 1,
+            "{third_clocks} clocks at factor 3"
+        );
+        // Out-of-range factors fall back to the fixed clock.
+        for factor in [0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(run(factor)?.0, fixed_clocks, "factor {factor}");
+        }
+        Ok(())
+    }
+
+    /// The interrupt entry's CPU clocks scale with the JIT speed factor
+    /// like the rest of its billing, but the entry's chip-RAM accesses (a
+    /// stack in chip RAM, the vector table at VBR 0) keep their chip-bus
+    /// cost: the same chip slots are granted at any factor, and a chip-RAM
+    /// stack still costs the chipset time those slots take, where a
+    /// fast-RAM stack gets the whole speed-up.
+    #[test]
+    fn jit_speed_factor_scales_interrupt_entry_clocks_but_not_chip_accesses() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let handler = FAST_RAM_BASE as u32 + 0x200;
+        let fast_stack = FAST_RAM_BASE as u32 + 0x8000;
+        let chip_stack = 0x0004_0000;
+        // (CPU clocks billed, chipset colour clocks advanced, chip slots
+        // granted to the CPU) for the slice that takes the interrupt and
+        // retires the handler's first instruction.
+        let run = |factor: f64, stack: u32| -> Result<(u32, u32, u64)> {
+            let mut bus = test_bus_with_pc(pc);
+            write_program(&mut bus, pc, &[0x46FC, 0x2000, 0x60FE]); // move #$2000,SR; bra.s *
+            write_program(&mut bus, handler, &[0x4E71, 0x60FE]); // nop; bra.s *
+            set_autovector(&mut bus, 3, handler);
+            bus.paula.intena = INT_MASTER | INT_VERTB;
+            bus.irq_latency_setting = 0;
+            let mut machine = M68kMachine::new(bus, CpuModel::M68030, false)?;
+            machine.set_jit_enabled(true);
+            machine.debug_set_register(15, stack);
+            machine.step_slice(2)?;
+            machine.set_jit_speed_factor(factor);
+            machine.bus_mut().paula.intreq = INT_VERTB;
+            let slots_before = machine.bus().cpu_granted_chip_slots();
+            let slice = machine.step_slice(1)?;
+            assert_eq!(
+                machine.pc(),
+                handler + 2,
+                "entry taken, handler NOP retired"
+            );
+            assert_eq!(machine.a(7), stack - 8, "format $0 frame pushed");
+            Ok((
+                slice.cpu_cycles,
+                slice.bus_advanced_cck,
+                machine.bus().cpu_granted_chip_slots() - slots_before,
+            ))
+        };
+        let fast_1 = run(1.0, fast_stack)?;
+        let fast_4 = run(4.0, fast_stack)?;
+        let chip_1 = run(1.0, chip_stack)?;
+        let chip_4 = run(4.0, chip_stack)?;
+        // The CPU's own clocks divide by the factor wherever the stack is.
+        assert!(fast_1.0 > 8, "entry billed {} clocks", fast_1.0);
+        assert_eq!(fast_4.0, fast_1.0 / 4);
+        assert_eq!(chip_4.0, chip_1.0 / 4);
+        // The chip-bus accesses do not: the same slots at both factors,
+        // and more of them with the stack in chip RAM.
+        assert_eq!(fast_4.2, fast_1.2);
+        assert_eq!(chip_4.2, chip_1.2);
+        assert!(chip_4.2 >= fast_4.2 + 4, "{chip_4:?} vs {fast_4:?}");
+        // A fast-RAM stack takes the speed-up in chipset time; a chip-RAM
+        // stack still pays every granted slot.
+        assert!(fast_4.1 < fast_1.1, "{fast_4:?} vs {fast_1:?}");
+        assert!(chip_4.1 >= chip_4.2 as u32, "{chip_4:?}");
+        assert!(chip_4.1 > fast_4.1, "{chip_4:?} vs {fast_4:?}");
+        Ok(())
+    }
+
     /// The fastmem window is only offered while nothing intercepts plain
     /// fast-RAM accesses, and covers the largest fitted fast bank.
     #[test]
@@ -8210,6 +8427,42 @@ mod tests {
         assert_eq!(machine.bus().mem.chip_ram[0x1234], 0xAA);
         assert!(machine.bus().emulated_cck() > start_cck);
         assert_eq!(machine.pc(), pc + 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_reset_instruction_leaves_fat_gary_coldboot_clear() -> Result<()> {
+        // Kickstart clears Gary's COLDBOOT latch on every boot, and
+        // ColdReboot()'s RESET instruction must not set it again: the A3000
+        // reset code tests the bit and, finding it set, clears $4 and cold
+        // starts, losing the KickTag/KickMem state a warm reboot carries
+        // (the Kickstart 3.2 boot menu's boot-device choice rides on it).
+        // The program runs from slow RAM: RESET brings the overlay back over
+        // chip RAM and un-configures the Zorro fast RAM, but leaves $C00000.
+        let pc = SLOW_RAM_BASE as u32 + 0x100;
+        let mut bus = test_bus_with_pc(pc);
+        bus.attach_gary(crate::gary::Gary::new());
+        write_program(
+            &mut bus,
+            pc,
+            &[
+                0x08B9, 0x0007, 0x00DE, 0x0002, // BCLR #7,$DE0002
+                0x4E70, // RESET
+                0x0839, 0x0007, 0x00DE, 0x0002, // BTST #7,$DE0002
+                0x57C0, // SEQ D0: $FF when COLDBOOT reads clear
+            ],
+        );
+
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+        machine.bus_mut().mem.overlay = false;
+        let slice = machine.step_slice(4)?;
+
+        assert_eq!(slice.instructions, 4);
+        assert_eq!(
+            machine.d(0) & 0xFF,
+            0xFF,
+            "the reboot after RESET reads as warm"
+        );
         Ok(())
     }
 
@@ -8765,6 +9018,377 @@ mod tests {
         let mut machine = M68kMachine::new(bus, CpuModel::M68020, false)?;
         machine.step_slice(1)?;
         assert_eq!(machine.pc(), 0x0000_0200);
+        Ok(())
+    }
+
+    #[test]
+    fn m68060_reset_disables_the_fpu_until_pcr_dfp_is_cleared() -> Result<()> {
+        // A 060 board's boot ROM sets PCR.DFP on every reset, because the
+        // 060's three-long NULL state frame does not fit exec's hand-built
+        // task contexts; 68060.library clears it again. An LC/EC060 shows
+        // the same disabled FPU, and its DFP must survive resets too.
+        for fpu in [true, false] {
+            let mut bus = test_bus_with_pc(0x0000_0100);
+            write_program(
+                &mut bus,
+                0x0000_0100,
+                &[
+                    0xF200, 0xB000, // FMOVE.L FPCR,D0
+                    0x31FC, 0x0001, 0x3000, // MOVE.W #1,$3000.W (alive marker)
+                ],
+            );
+            // Line-F vector. The FPU-disabled exception is pre-instruction:
+            // the handler enables the FPU and RTE restarts the faulting
+            // instruction.
+            write_chip_long(&mut bus, 0x2C, 0x0000_0200);
+            write_program(
+                &mut bus,
+                0x0000_0200,
+                &[
+                    0x7000, // MOVEQ #0,D0
+                    0x4E7B, 0x0808, // MOVEC D0,PCR (clears DFP)
+                    0x4E73, // RTE
+                ],
+            );
+            let mut machine = M68kMachine::new(bus, CpuModel::M68060, fpu)?;
+            assert_ne!(machine.cpu.pcr & m68k::PCR_DFP, 0, "power-on, fpu={fpu}");
+
+            machine.step_slice(1)?;
+            assert_eq!(machine.pc(), 0x0000_0200, "disabled FPU traps, fpu={fpu}");
+            let frame = machine.cpu.a(7);
+            assert_eq!(
+                read_chip_word(machine.bus(), frame + 6),
+                0x402C,
+                "format $4 FPU-disabled frame on the Line-F vector, fpu={fpu}"
+            );
+            assert_eq!(read_chip_long(machine.bus(), frame + 2), 0x0000_0100);
+            assert_eq!(read_chip_long(machine.bus(), frame + 0x0C), 0x0000_0100);
+            if fpu {
+                // Handler (3), restarted FMOVE, alive marker.
+                machine.step_slice(5)?;
+                assert_eq!(read_chip_word(machine.bus(), 0x3000), 1);
+                assert_eq!(machine.cpu.pcr & m68k::PCR_DFP, 0);
+            }
+
+            // A hardware reset re-runs the board firmware: DFP is set.
+            machine.reset_after_bus_reset();
+            assert_ne!(machine.cpu.pcr & m68k::PCR_DFP, 0, "after reset, fpu={fpu}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn m68lc060_pcr_reports_its_identification_and_holds_dfp() -> Result<()> {
+        // The FPU-less MC68LC060/MC68EC060 identifies as $0431 in
+        // PCR[31:16] (the full MC68060 is $0430) and has no FPU for a
+        // cleared DFP to enable: the bit stays set across MOVEC writes and
+        // resets, where the full part's DFP is software's to clear.
+        for (fpu, id) in [(true, 0x0430u32), (false, 0x0431)] {
+            let mut bus = test_bus_with_pc(0x0000_0100);
+            write_program(
+                &mut bus,
+                0x0000_0100,
+                &[
+                    0x7000, // MOVEQ #0,D0
+                    0x4E7B, 0x0808, // MOVEC D0,PCR (clear EDEBUG/DFP/ESS)
+                    0x4E7A, 0x1808, // MOVEC PCR,D1
+                ],
+            );
+            let mut machine = M68kMachine::new(bus, CpuModel::M68060, fpu)?;
+            // Identification in the high half, revision 1, DFP from reset.
+            let reset_pcr = (id << 16) | 0x0100 | m68k::PCR_DFP;
+            assert_eq!(machine.cpu.pcr, reset_pcr, "power-on, fpu={fpu}");
+
+            machine.step_slice(3)?;
+            let held = if fpu { 0 } else { m68k::PCR_DFP };
+            assert_eq!(
+                machine.cpu.d(1),
+                (id << 16) | 0x0100 | held,
+                "PCR after MOVEC clears it, fpu={fpu}"
+            );
+
+            machine.reset_after_bus_reset();
+            assert_eq!(machine.cpu.pcr, reset_pcr, "after reset, fpu={fpu}");
+        }
+        Ok(())
+    }
+
+    /// Exception handlers for the MMU-less CPU tests: each records its
+    /// vector in D7 and parks, so a test can tell "no exception" (D7 = 0)
+    /// from the bus error, illegal instruction, privilege violation, trace
+    /// or Line-F an MMU-less part must not (or must) raise.
+    fn install_parking_handlers(bus: &mut Bus) {
+        for (vector, handler) in [
+            (2u16, 0x0200u32),
+            (4, 0x0210),
+            (8, 0x0220),
+            (9, 0x0240),
+            (11, 0x0230),
+        ] {
+            write_chip_long(bus, u32::from(vector) * 4, handler);
+            write_program(bus, handler, &[0x7E00 | vector, 0x60FE]); // MOVEQ #v,D7 ; BRA.S *
+        }
+    }
+
+    /// The EC030's access control unit program: AC0 round trip, a PTEST
+    /// hit and miss, PFLUSHA, and the TC encodings the part lacks.
+    const EC030_ACU_PROGRAM: [u16; 31] = [
+        0xF038, 0x0800, 0x3000, // PMOVE $3000.W,AC0
+        0xF038, 0x0A00, 0x3004, // PMOVE AC0,$3004.W
+        0x207C, 0x0012, 0x3456, // MOVEA.L #$00123456,A0
+        0xF010, 0x8211, // PTESTR #1,(A0)
+        0xF038, 0x6200, 0x3008, // PMOVE ACUSR,$3008.W
+        0x207C, 0x0100, 0x0000, // MOVEA.L #$01000000,A0
+        0xF010, 0x8211, // PTESTR #1,(A0)
+        0xF038, 0x6200, 0x300A, // PMOVE ACUSR,$300A.W
+        0xF000, 0x2400, // PFLUSHA
+        0xF038, 0x4200, 0x300C, // PMOVE TC,$300C.W
+        0xF038, 0x4000, 0x3010, // PMOVE $3010.W,TC
+        0x7007, // MOVEQ #7,D0
+    ];
+
+    fn ec030_acu_machine(jit: bool) -> Result<M68kMachine> {
+        let mut bus = test_bus_with_pc(0x0000_0100);
+        write_program(&mut bus, 0x0000_0100, &EC030_ACU_PROGRAM);
+        install_parking_handlers(&mut bus);
+        // AC0: enabled, $00xxxxxx, any function code, reads and writes.
+        write_chip_long(&mut bus, 0x3000, 0x0000_8107);
+        write_chip_long(&mut bus, 0x3008, 0xFFFF_FFFF);
+        write_chip_long(&mut bus, 0x300C, 0xFFFF_FFFF);
+        // A TC value that would enable a 68030's translation.
+        write_chip_long(&mut bus, 0x3010, 0x80C0_7760);
+        let mut machine = M68kMachine::new(bus, CpuModel::M68EC030, false)?;
+        machine.bus_mut().agnus.hpos = 0x21;
+        machine.set_jit_enabled(jit);
+        Ok(machine)
+    }
+
+    #[test]
+    fn ec030_access_control_unit_answers_pmmu_instructions() -> Result<()> {
+        // The 68EC030 has an access control unit where the 68030's PMMU
+        // sits: PMOVE reaches AC0/AC1/ACUSR, PTEST sets ACUSR bit 6 on an
+        // AC match, PFLUSH has no effect, and none of them trap (M68000PRM
+        // PMOVE/PTEST (MC68EC030)). The batch path surfaces the core's
+        // Line-F the same way as the precise step, so both must agree.
+        for jit in [false, true] {
+            let mut machine = ec030_acu_machine(jit)?;
+            assert!(!machine.cpu.has_pmmu, "the EC030 has no paged MMU");
+            assert_eq!(
+                machine.jit_enabled() && machine.jit_fast_path_ok(),
+                jit,
+                "batch path in use"
+            );
+            machine.step_slice(13)?;
+
+            assert_eq!(machine.d(7), 0, "no exception, jit={jit}");
+            assert_eq!(machine.d(0), 7, "ran to the end, jit={jit}");
+            assert_eq!(machine.cpu.mmu_tt0, 0x0000_8107, "AC0 loaded, jit={jit}");
+            assert_eq!(read_chip_long(machine.bus(), 0x3004), 0x0000_8107);
+            assert_eq!(
+                read_chip_word(machine.bus(), 0x3008),
+                0x0040,
+                "PTEST inside AC0 sets ACUSR.AC, jit={jit}"
+            );
+            assert_eq!(
+                read_chip_word(machine.bus(), 0x300A),
+                0x0000,
+                "PTEST outside AC0/AC1 clears it, jit={jit}"
+            );
+            assert_eq!(
+                machine.cpu.a(0),
+                0x0100_0000,
+                "PTEST leaves An alone, jit={jit}"
+            );
+            assert_eq!(
+                read_chip_long(machine.bus(), 0x300C),
+                0,
+                "there is no TC to read back, jit={jit}"
+            );
+            assert_eq!(machine.cpu.mmu_tc, 0, "a TC write is dropped, jit={jit}");
+            assert!(
+                !machine.cpu.pmmu_enabled,
+                "translation stays off, jit={jit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ec030_acu_dispatches_the_opword_in_the_instruction_cache() -> Result<()> {
+        // The instruction cache does not snoop writes: after the CPU
+        // overwrites a cached PFLUSHA with a NOP, the next pass still
+        // fetches PFLUSHA, which the ACU must execute rather than leave
+        // to the core's Line-F. The precise loop picks the core step from
+        // a look at the next opword, so that look must go through the
+        // cache too; the batch path services the opcode the core fetched.
+        let program = [
+            0x7001u16, // MOVEQ #1,D0
+            0x4E7B, 0x0002, // MOVEC D0,CACR (instruction cache on)
+            0xF000, 0x2400, // $1006: PFLUSHA
+            0x33FC, 0x4E71, 0x0000, 0x1006, // MOVE.W #$4E71,$1006 (NOP)
+            0x5201, // ADDQ.B #1,D1
+            0x0C01, 0x0002, // CMPI.B #2,D1
+            0x66EC, // BNE.S $1006
+            0x7407, // MOVEQ #7,D2
+        ];
+        let mut bus = test_bus_with_pc(0x0000_1000);
+        write_program(&mut bus, 0x0000_1000, &program);
+        install_parking_handlers(&mut bus);
+        let mut machine = M68kMachine::new(bus, CpuModel::M68EC030, false)?;
+        machine.bus_mut().agnus.hpos = 0x21;
+        machine.set_cache_emulation(true, false);
+        machine.step_slice(13)?;
+        assert_eq!(machine.d(7), 0, "no Line-F");
+        assert_eq!(machine.d(1) & 0xFF, 2, "both passes ran");
+        assert_eq!(machine.d(2), 7, "ran to the end");
+        Ok(())
+    }
+
+    #[test]
+    fn ec030_acu_bus_error_commits_nothing_and_takes_no_trace() -> Result<()> {
+        // A bus error on any of an ACU instruction's accesses ends it the
+        // way the core ends its own: the fault's handler runs next from
+        // its entry, AC0 keeps its value, and the trace the instruction
+        // would have raised (T1 is set) does not follow the fault.
+        let cases: [(&str, &[u16], u32); 3] = [
+            (
+                "operand read",
+                &[0xF038, 0x0800, 0x3000], // PMOVE $3000.W,AC0
+                0x3000,
+            ),
+            (
+                "extension word fetch",
+                &[0xF038, 0x0800, 0x3000], // PMOVE $3000.W,AC0
+                0x0106,
+            ),
+            (
+                // The outer displacement is still fetched after the base
+                // displacement faults, from the handler entry onwards.
+                "base displacement fetch",
+                &[0xF030, 0x0800, 0x0172, 0x0000, 0x3000, 0x0004], // PMOVE ([$3000.L,A0],4),AC0
+                0x010A,
+            ),
+        ];
+        for (name, pmove, fault_at) in cases {
+            for jit in [false, true] {
+                let mut bus = test_bus_with_pc(0x0000_0100);
+                write_program(&mut bus, 0x0000_0100, &[0x46FC, 0xA700]); // MOVE #$A700,SR (T1)
+                write_program(&mut bus, 0x0000_0104, pmove);
+                write_program(&mut bus, 0x0000_0104 + 2 * pmove.len() as u32, &[0x7407]); // MOVEQ #7,D2
+                install_parking_handlers(&mut bus);
+                bus.inject_bus_fault(crate::bus::FaultInjection {
+                    start: fault_at,
+                    end: fault_at + 3,
+                    on_read: true,
+                    on_write: false,
+                    remaining: Some(1),
+                    hits: 0,
+                });
+                let mut machine = M68kMachine::new(bus, CpuModel::M68EC030, false)?;
+                machine.bus_mut().agnus.hpos = 0x21;
+                machine.cpu.mmu_tt0 = 0x1234_8107;
+                machine.set_jit_enabled(jit);
+                // MOVE to SR, the faulting PMOVE, then the bus error
+                // handler's MOVEQ and its parking branch.
+                machine.step_slice(4)?;
+                assert_eq!(machine.d(7), 2, "{name}: bus error handler, jit={jit}");
+                assert_eq!(machine.pc(), 0x0000_0202, "{name}: parked in it, jit={jit}");
+                assert_eq!(
+                    machine.cpu.mmu_tt0, 0x1234_8107,
+                    "{name}: AC0 kept, jit={jit}"
+                );
+                assert_ne!(
+                    machine.d(2),
+                    7,
+                    "{name}: the PMOVE did not complete, jit={jit}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ec030_pmmu_instructions_are_privileged_and_validate_their_encoding() -> Result<()> {
+        // User mode: privilege violation, as on the full 68030.
+        let mut bus = test_bus_with_pc(0x0000_0100);
+        write_program(
+            &mut bus,
+            0x0000_0100,
+            &[
+                0x41F8, 0x4000, // LEA $4000.W,A0
+                0x4E60, // MOVE A0,USP
+                0x46FC, 0x0000, // MOVE #$0000,SR (user mode)
+                0xF000, 0x2400, // PFLUSHA
+            ],
+        );
+        install_parking_handlers(&mut bus);
+        let mut machine = M68kMachine::new(bus, CpuModel::M68EC030, false)?;
+        machine.bus_mut().agnus.hpos = 0x21;
+        machine.step_slice(5)?;
+        assert_eq!(
+            machine.d(7),
+            8,
+            "user-mode PFLUSHA is a privilege violation"
+        );
+
+        // Encodings the ACU does not have stay Line-F: PMOVE to a
+        // postincrement operand (not control alterable; A0 must not step)
+        // and the 68851's PVALID.
+        for program in [[0xF018u16, 0x0A00], [0xF010, 0x2800]] {
+            let mut bus = test_bus_with_pc(0x0000_0100);
+            write_program(&mut bus, 0x0000_0100, &[0x41F8, 0x4000]); // LEA $4000.W,A0
+            write_program(&mut bus, 0x0000_0104, &program);
+            install_parking_handlers(&mut bus);
+            let mut machine = M68kMachine::new(bus, CpuModel::M68EC030, false)?;
+            machine.bus_mut().agnus.hpos = 0x21;
+            machine.step_slice(3)?;
+            assert_eq!(machine.d(7), 11, "{program:04X?} raises Line-F");
+            assert_eq!(machine.cpu.a(0), 0x4000, "{program:04X?} leaves A0 alone");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ec040_and_ec060_take_mmu_movec_but_never_translate() -> Result<()> {
+        // The EC040's access control unit answers at the MMU's MOVEC codes
+        // (MC68040UM appendix B.6), and the EC060 takes MOVEC to TC/URP/SRP
+        // without an exception (MC68060UM appendix B.2): AROS's 040 boot
+        // clears TC this way. With no paged MMU, setting TC.E then changes
+        // nothing -- the store below lands untranslated.
+        for model in [CpuModel::M68EC040, CpuModel::M68EC060] {
+            let mut bus = test_bus_with_pc(0x0000_0100);
+            write_program(
+                &mut bus,
+                0x0000_0100,
+                &[
+                    0x7000, // MOVEQ #0,D0
+                    0x4E7B, 0x0003, // MOVEC D0,TC
+                    0x4E7B, 0x0806, // MOVEC D0,URP
+                    0x4E7B, 0x0807, // MOVEC D0,SRP
+                    0x203C, 0x0000, 0x8000, // MOVE.L #$8000,D0
+                    0x4E7B, 0x0003, // MOVEC D0,TC (TC.E)
+                    0x31FC, 0x0001, 0x3000, // MOVE.W #1,$3000.W
+                    0x7407, // MOVEQ #7,D2
+                ],
+            );
+            install_parking_handlers(&mut bus);
+            let mut machine = M68kMachine::new(bus, model, false)?;
+            machine.bus_mut().agnus.hpos = 0x21;
+            assert!(!machine.cpu.has_pmmu, "{model:?} has no paged MMU");
+            machine.step_slice(8)?;
+            assert_eq!(machine.d(7), 0, "{model:?}: no exception");
+            assert_eq!(machine.d(2), 7, "{model:?}: ran to the end");
+            assert_eq!(read_chip_word(machine.bus(), 0x3000), 1, "{model:?}");
+        }
+
+        // The EC060 identifies as an LC/EC060 in PCR.
+        let machine = machine_with_program_model(0x0100, &[0x4E71], CpuModel::M68EC060)?;
+        assert_eq!(machine.cpu.pcr >> 16, 0x0431);
+        // The full parts keep their MMU.
+        for model in [CpuModel::M68030, CpuModel::M68040, CpuModel::M68060] {
+            let machine = machine_with_program_model(0x0100, &[0x4E71], model)?;
+            assert!(machine.cpu.has_pmmu, "{model:?} has its paged MMU");
+        }
         Ok(())
     }
 

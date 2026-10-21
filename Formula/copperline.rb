@@ -19,8 +19,8 @@
 class Copperline < Formula
   desc "Cycle-driven Amiga emulator (OCS/ECS/AGA) written in Rust"
   homepage "https://copperline.dev/"
-  url "https://github.com/CopperlineHQ/Copperline/archive/refs/tags/v1.0.0-rc.1.tar.gz"
-  sha256 "de985ec0dac7c525c658479af78de616e54132287fe3e6e005a1c25c8d6c26aa"
+  url "https://github.com/CopperlineHQ/Copperline/archive/refs/tags/v1.0.1.tar.gz"
+  sha256 "26c69ddcc6fcaa3707e0d1383c585272b72a8b7eb0ff509f95a2e4eb5f98d2a1"
   license "GPL-3.0-or-later"
   head "https://github.com/CopperlineHQ/Copperline.git", branch: "main"
 
@@ -38,7 +38,7 @@ class Copperline < Formula
   # fetch script's header lists.
   resource "whdload" do
     url "https://whdload.de/whdload/WHDLoad_usr.lha", using: :nounzip
-    sha256 "093333953737528d79c1eda7d21a16a0aa298698722624e7cfb31f588a0a156d"
+    sha256 "725b9255e6f55c57a57b2dd52dec221b223df5560d29153607088ffff6ae1bc1"
   end
 
   resource "skick" do

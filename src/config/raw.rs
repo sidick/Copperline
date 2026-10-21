@@ -167,6 +167,16 @@ impl RawConfig {
             .unwrap_or_default()
     }
 
+    /// The configured status-bar track display (`[display] track_display`),
+    /// for the launcher's status bar before a machine config is built.
+    pub fn track_display(&self) -> TrackDisplay {
+        self.display
+            .track_display
+            .as_deref()
+            .and_then(|s| parse_track_display(s).ok())
+            .unwrap_or_default()
+    }
+
     /// The configured live-audio state (`[audio] output_enabled`), defaulting to
     /// on when unset -- matching [`AudioConfig`]'s default. Lets the binary seed
     /// the config-screen session audio without reaching into private raw fields.
@@ -285,6 +295,7 @@ impl RawConfig {
         take(&mut self.display.bezel, &overlay.display.bezel);
         take(&mut self.display.tv_h_centre, &overlay.display.tv_h_centre);
         take(&mut self.display.tv_v_centre, &overlay.display.tv_v_centre);
+        take(&mut self.display.overscan, &overlay.display.overscan);
         take(&mut self.display.full_screen, &overlay.display.full_screen);
         take(&mut self.input.port1, &overlay.input.port1);
         take(&mut self.input.port2, &overlay.input.port2);
@@ -298,6 +309,68 @@ impl RawConfig {
             &overlay.audio.output_enabled,
         );
         take(&mut self.audio.audio_filter, &overlay.audio.audio_filter);
+    }
+
+    /// Layer menu settings changed in a full-build session over this
+    /// configuration: the player's set ([`Self::merge_player_settings`])
+    /// plus the emulation, input and display settings only the full menu
+    /// offers. Fields the overlay leaves unset keep their value.
+    pub(crate) fn merge_menu_settings(&mut self, overlay: &RawConfig) {
+        fn take<T: Clone>(base: &mut Option<T>, over: &Option<T>) {
+            if over.is_some() {
+                *base = over.clone();
+            }
+        }
+        self.merge_player_settings(overlay);
+        take(&mut self.emulation.rewind, &overlay.emulation.rewind);
+        take(
+            &mut self.emulation.run_ahead_frames,
+            &overlay.emulation.run_ahead_frames,
+        );
+        take(
+            &mut self.emulation.warp_speed,
+            &overlay.emulation.warp_speed,
+        );
+        take(&mut self.floppy.speed, &overlay.floppy.speed);
+        take(&mut self.display.status_bar, &overlay.display.status_bar);
+        take(
+            &mut self.display.perf_overlay,
+            &overlay.display.perf_overlay,
+        );
+        take(
+            &mut self.input.mouse_sensitivity,
+            &overlay.input.mouse_sensitivity,
+        );
+        take(&mut self.clipboard.share, &overlay.clipboard.share);
+    }
+
+    /// The keys whose values differ between `self` and `before`, as a
+    /// configuration holding only those keys. A key `self` no longer sets
+    /// is not reported: this names what changed, it does not remove keys.
+    pub(crate) fn changed_from(&self, before: &RawConfig) -> Result<RawConfig> {
+        fn diff(now: &toml::Table, before: &toml::Table) -> toml::Table {
+            let mut out = toml::Table::new();
+            for (key, value) in now {
+                match (value, before.get(key)) {
+                    (toml::Value::Table(now), Some(toml::Value::Table(before))) => {
+                        let changed = diff(now, before);
+                        if !changed.is_empty() {
+                            out.insert(key.clone(), toml::Value::Table(changed));
+                        }
+                    }
+                    (value, Some(before)) if value == before => {}
+                    (value, _) => {
+                        out.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            out
+        }
+        let now = toml::Table::try_from(self).context("serializing configuration")?;
+        let before = toml::Table::try_from(before).context("serializing configuration")?;
+        toml::Value::Table(diff(&now, &before))
+            .try_into()
+            .context("reading changed configuration keys")
     }
 }
 
@@ -390,6 +463,9 @@ pub(crate) struct RawDisplay {
     /// Initial logical window size multiplier (0.5 to 4.0, default 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) window_scale: Option<f64>,
+    /// Window title template; placeholders include {machine}, {rom}, and {hash}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
     /// Open fullscreen at start (default false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) full_screen: Option<bool>,
@@ -405,6 +481,10 @@ pub(crate) struct RawDisplay {
     /// Show the status bar at start (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status_bar: Option<bool>,
+    /// What the status bar's floppy counter reads: "track" (default, the
+    /// track number) or "cylinder" (CYL.SIDE, e.g. 40.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) track_display: Option<String>,
 }
 
 /// A host disk named on the command line, before it is checked against the
@@ -1038,7 +1118,7 @@ pub(crate) struct RawCartridge {
     pub(crate) rom: Option<String>,
 }
 
-/// `[recording]` GIF clip ring (`crate::gifclip`).
+/// `[recording]` capture settings.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawRecording {
@@ -1049,6 +1129,9 @@ pub(crate) struct RawRecording {
     /// Clip frame rate (default 0 = 25 on PAL, 30 on NTSC).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) clip_fps: Option<u32>,
+    /// Retired preference, accepted so existing saved configs still load.
+    #[serde(skip_serializing)]
+    pub(crate) native_screenshot_button: Option<bool>,
 }
 
 /// `[mhi]` MHI virtual MPEG audio decoder board.
@@ -1261,6 +1344,10 @@ pub(crate) struct RawCpu {
     /// off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) jit: Option<bool>,
+    /// JIT CPU speed: "fixed" (default) runs at `clock_mhz`; "fastest"
+    /// adapts the JIT's effective clock to the host while paced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speed: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -1479,6 +1566,11 @@ pub(crate) struct RawAudio {
     pub(crate) floppy_sounds: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) floppy_sounds_volume: Option<u16>,
+    /// A WinUAE-format drive sample set to play instead of the synthesized
+    /// sounds: a set name in the floppy sounds folder, or a path. Empty or
+    /// "synthesized" keeps the synthesized sounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) floppy_sounds_set: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

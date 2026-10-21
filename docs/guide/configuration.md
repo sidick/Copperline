@@ -11,6 +11,20 @@ this reference.
 settings; `--config` and `./copperline.toml` always win over it anyway. With
 no default saved, the flag changes nothing.
 
+Settings changed from the menu during a session that started without
+`--config`, `./copperline.toml` or `--factory` are written into the saved
+default as they change (only the changed keys; see
+[Settings the menu remembers](ui.md#menu-settings-persist)).
+
+If the saved default cannot be read or parsed, Copperline logs a warning and
+continues with built-in settings and any command-line overrides. It leaves
+the saved file untouched. A saved default that parses but no longer
+validates -- a disk image that moved, a drive not yet mounted -- opens the
+configuration screen on the built-in settings with the reason on its status
+line, so it can be fixed before **Save default** replaces it. Errors in
+`--config` or `./copperline.toml` still report the requested configuration
+problem.
+
 Configuration parsing rejects unknown keys, invalid CPU or chipset names,
 and out-of-range sizes. Media are opened during startup; depending on the
 device, an unavailable image either stops startup or leaves the unit absent
@@ -46,10 +60,11 @@ range checks as the equivalent TOML fields:
 | `--model NAME` | `[machine] profile` | `A1000`, `A500`, `A500OCS`, `A500Plus`, `A600`, `A1200`, `A3000`, `A4000`, `CDTV`, `CD32` |
 | `--chipset NAME` | `[chipset] revision` | `OCS`, `ECS`, `AGA` |
 | `--video STANDARD` | `[chipset] video` | `PAL`, `NTSC` |
-| `--cpu MODEL` | `[cpu] model` | `68000`, `68010`, `68EC020`, `68020`, `68030`, `68040`, `68060` |
+| `--cpu MODEL` | `[cpu] model` | `68000`, `68010`, `68EC020`, `68020`, `68EC030`, `68030`, `68EC040`, `68040`, `68EC060`, `68060` |
 | `--cpu-clock MHZ` | `[cpu] clock_mhz` | a number of MHz |
 | `--fpu` / `--no-fpu` | `[cpu] fpu` | fit / omit a 68881/68882 |
 | `--jit` / `--no-jit` | `[cpu] jit` | experimental fast batch/trace-JIT CPU execution (68020+; not cycle-exact) |
+| `--cpu-speed MODE` | `[cpu] speed` | `fixed` (default) or `fastest`: the JIT clock adapts to the host while paced (needs `--jit`; not reproducible) |
 | `--clipboard` / `--no-clipboard` | `[clipboard] share` | share the host clipboard with the guest's `clipboard.device`; fits an extra autoconfig board, so it is opt-in (default: off) |
 | `--cartridge MODEL` | `[cartridge] model` | `none` (default) or `hrtmon`, the bundled HRTMon freezer cartridge |
 | `--chip SIZE` | `[memory] chip` | `512K`, `1M`, `2M`, ... |
@@ -569,23 +584,38 @@ carried no information.)
 
 ```toml
 [cpu]
-model = "68000"     # 68000, 68010, 68EC020, 68020, 68030, 68040, 68060
+model = "68000"     # 68000, 68010, 68EC020, 68020, 68EC030, 68030,
+                    # 68EC040, 68040, 68EC060, 68060
 clock_mhz = 14.0    # optional; defaults to the model's stock speed
 # icache = false    # instruction-cache model (on by default on all 020+ models)
 # dcache = false    # data-cache model (on by default: 030/040/060)
 # fpu = true        # fit a 68881/68882 (needs the 68020+ coprocessor
-#                   # interface, so not valid on a 68000/68010). The full
-#                   # 68040's and 68060's on-die FPUs are on by default.
-# unimplemented = "trap"  # 68060 only: "trap" (faithful; the OS needs
+#                   # interface, so not valid on a 68000/68010/68EC040/
+#                   # 68EC060). The full 68040's and 68060's on-die FPUs
+#                   # are on by default.
+# unimplemented = "trap"  # 68060/68EC060 only: "trap" (faithful; the OS needs
 #                   # 68060.library) or "native" (execute the removed
 #                   # instructions directly)
 # jit = true        # experimental: fast batch/trace-JIT CPU execution
 #                   # (68020+; not cycle-exact)
+# speed = "fastest" # with jit: adapt the JIT clock to the host while the
+#                   # window paces to real time, like WinUAE's "fastest
+#                   # possible" (not reproducible; default "fixed")
 ```
 
 - `model`: the 68010 models the vector base register, the format-stacking
   exception model, and DBcc loop mode; the 68EC020 is a 68020 instruction
-  set with a 24-bit external address bus.
+  set with a 24-bit external address bus. The 68EC030, 68EC040 and 68EC060
+  are their full parts without the paged MMU (the CPU in, for example, the
+  A4000/030 and many budget accelerator boards): MMU register writes are
+  taken without trapping wherever the silicon takes them, but no address is
+  ever translated. They keep their caches, stock clock and 32-bit bus. The 68EC030's access control unit
+  takes the 68030's MMU instructions without trapping: `PMOVE` reaches its
+  AC0/AC1 and ACUSR registers, `PTEST` reports an AC0/AC1 match in ACUSR,
+  and `PFLUSH`/`PLOAD` do nothing. It can still take a 68881/68882; the
+  68EC040 and 68EC060 have no FPU at all, so `fpu = true` is rejected for
+  them. The FPU-less parts that keep the MMU (68LC040, 68LC060) are the
+  68040 and 68060 with `fpu = false`.
 - `clock_mhz` defaults to the model's stock speed (68000/68010 ~7.09, 020 ~14,
   030/040 ~25, 060 50) and is modelled as a whole multiple of the colour clock
   (3.546895 MHz), rounded to the nearest one. Fast RAM and ROM run at the CPU
@@ -603,7 +633,7 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
   modelled. The data cache covers expansion RAM/ROM only, since chip and
   slow RAM are DMA-visible and cache-inhibited as on real Amigas. Set
   either key to `false` to opt out.
-- `unimplemented` (68060 only) picks what happens on the instructions the
+- `unimplemented` (68060/68EC060 only) picks what happens on the instructions the
   68060 dropped from silicon: MOVEP, CHK2/CMP2, CAS2, misaligned CAS,
   64-bit MUL/DIV, and most of the FPU beyond basic arithmetic
   (transcendentals, FMOVECR, packed decimal). `"trap"` (the default) is
@@ -611,9 +641,15 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
   and the OS-side `68060.library` emulates them, as on a real CyberStorm or
   Blizzard board, so software using them needs that library installed.
   `"native"` executes them directly for systems without it. Kickstart 3.1
-  itself boots under `"trap"`. `fpu = false` on the 68060 models the
-  LC/EC060: FP instructions take the FPU-disabled exception (PCR.DFP),
-  which an OS handler can also use to enable and restart. The 68060's
+  itself boots under `"trap"`. The 68060's FPU is not 68040-compatible
+  (its FPU state frames are a different size from the ones Kickstart
+  builds), so, as a real 060 board's boot ROM does, Copperline disables
+  it (PCR.DFP) on every reset and `68060.library` enables it once it has
+  adapted the OS. Without the library the system runs with no FPU under
+  either setting. `fpu = false` on the 68060 models the LC060 (the
+  68EC060 is FPU-less too): its PCR identifies the FPU-less part ($0431)
+  and keeps PCR.DFP set even when software clears it, so FP instructions
+  always take the FPU-disabled exception. The 68060's
   superscalar dual-issue and branch cache are modelled and activate when
   system software enables them (PCR.ESS and CACR.EBC, which `68060.library`
   does at boot); until then the chip runs scalar, as on real silicon.
@@ -636,6 +672,52 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
   launcher greys the toggle). Known issue: the bundled AROS ROM's boot
   screen may stay grey under JIT on some 020+ configurations (the guest
   still runs; Kickstart ROMs are unaffected).
+- `speed` (also `--cpu-speed`) picks how fast the JIT runs. `"fixed"` (the
+  default) runs it at `clock_mhz`, deterministically. `"fastest"` is the
+  equivalent of WinUAE's *Fastest possible* CPU setting: while the window
+  paces the machine to real time, the JIT's effective clock adapts to what
+  the host can sustain. It starts at `clock_mhz`, which is also its floor
+  (it never runs slower), and rises while the host has headroom, up to
+  2000 MHz. The chipset, audio and emulated time stay in real time, so the
+  pointer and sound stay smooth, and the CPU gets the host time that is
+  left. Every tenth of a second Copperline compares the main thread's host
+  time (emulation plus the window's own work, pacing sleeps excluded) with
+  the emulated time that passed. It raises the clock while that stays below
+  about 80% and the CPU is actually busy; a CPU waiting in STOP, or one
+  stalled on the chip bus, keeps its clock. It lowers the clock as soon as
+  the share passes about 93%, for example when another program loads the
+  host. The performance overlay (`cpu N MHz`)
+  and the control protocol's `status` reply (`jit_mhz`) show the current
+  clock, and the launcher's CPU page has a matching **JIT speed** row,
+  greyed until the JIT is on.
+
+  The mode is deliberately not reproducible: how many instructions run per
+  frame depends on the host and on what else it is doing, so two runs
+  differ. Copperline logs this once at start. In detail:
+  - It needs `jit = true` on a 68020 or later; any other combination is
+    rejected with an error.
+  - Runs without a wall clock -- `--screenshot-after`, `--dump-frames`,
+    `--gif-after`, `--expect-screenshot`, `--exit-on-return`,
+    `--benchmark-until`, headless `--control` and `--gdb` sessions -- have
+    nothing to keep up with, so they stay at `clock_mhz` and match
+    `speed = "fixed"` exactly. They remain deterministic; raise `clock_mhz`
+    for a faster fixed CPU there. (`COPPERLINE_HEADLESS_PACED=1` paces such
+    a run like the window, and the clock then adapts as it would there; see
+    [Headless operation](headless.md).)
+  - Warp Speed holds the clock the paced run had reached; adaptation
+    resumes when warp ends.
+  - Netplay refuses it, and run-ahead stays inactive under it: both depend
+    on re-running or comparing frames that must come out identical.
+  - Save states do not store the adapted clock. A session whose clock has
+    not adapted yet (any unpaced run) takes the loaded state's CPU clock
+    exactly, as `speed = "fixed"` does; one that has adapted keeps the
+    clock it reached. A resumed windowed run is not byte-identical to the
+    original.
+  - `--record-input`/`--script` replays, `--expect-screenshot` comparisons
+    and reverse debugging are exact only in unpaced runs, where the clock is
+    fixed.
+  - Any debugger hook that forces the precise core (breakpoints, traces,
+    `COPPERLINE_DBG_*`) suspends adaptation, just as it suspends the JIT.
 
 ## `[memory]`
 
@@ -753,10 +835,20 @@ full_screen = false   # open borderless fullscreen at start (default false)
 maximized = false     # maximize with title bar and desktop taskbar (default false)
 monitor = "auto"      # host display: auto, primary, one-based number, or exact name
 window_scale = 1.0    # initial window width and height multiplier, 0.5-4.0
+# title = "{app} {version} · {machine} · {rom}"
 status_bar = true     # show the status bar at start (default true)
+track_display = "track"  # floppy counter: "track" (default) or "cylinder" (CYL.SIDE)
 vsync = true          # synchronise desktop presentation to vblank (default true)
 hidpi_texture = true  # draw the presentation texture at device-pixel density (default true)
 ```
+
+The default window title shows the machine and boot ROM. For a different
+layout, set `title` with `{app}`, `{version}`, `{machine}` (or `{m}`), `{rom}`
+(or `{r}`), and `{hash}` (eight hexadecimal digits of the loaded ROM). Other
+text is literal; `{{` and `}}` insert braces. For example,
+`title = "Workbench test · {m} · {r}"` gives an instance a visible name.
+Known Kickstarts use their checksum-identified version; AROS and unrecognised
+ROMs include the short hash. The title follows ROM changes and loaded states.
 
 `vsync` controls desktop presentation. On uses strict FIFO vsync to prevent
 tearing. Off requests unsynchronised presentation where the graphics backend
@@ -881,8 +973,8 @@ enough for an 8:7 ratio. Odd scanline multiples stay crisp on progressive
 displays because woven line pairs are identical. `pixel_aspect = "square"`
 with `"integer"` keeps the multiples uniform and square, for side-by-side
 pixel comparisons. Switching integer scaling on in TV mode resizes the
-window to the unresampled canvas; captures always keep the configured
-aspect geometry. Monitor bezels (`bezel`) use the resampled TV canvas under
+window to the unresampled canvas; interactive screenshots follow it, while
+scheduled captures keep the configured aspect geometry. Monitor bezels (`bezel`) use the resampled TV canvas under
 both scaling modes. Programmable (ECS/AGA VARBEAMEN) and RTG displays scale
 by uniform integer multiples. The menu's *Video Settings -> Scaling* item
 switches modes at runtime.
@@ -901,8 +993,9 @@ larger display and tightens smoothly after a smaller viewport has remained
 stable for roughly half a second, preventing visual jitter during scene changes.
 The status bar and overlay panels remain docked at the bottom of the window;
 opening a menu or panel temporarily reveals the full display area so no controls
-are obscured. Autocrop only affects window presentation (screenshots, frame
-dumps, and recordings always capture the full configured aperture). CRT shader
+are obscured. Interactive screenshots follow the visible crop. Scheduled
+screenshots, frame dumps, and recordings capture the full configured
+aperture. CRT shader
 presets render over the cropped area. Programmable multisync modes (such as
 DblPAL or 31 kHz displays) are also cropped based on their active display
 windows. Autocrop is automatically suspended when using monitor bezels or RTG
@@ -1002,11 +1095,11 @@ config file; the launcher's *A/V & Emu* tab (*Video* category) has
 `COPPERLINE_SHADER_STRENGTH=0.0..1.0` override the config for a single run.
 There is no command-line flag.
 
-The pass is presentation and nothing else. Screenshots
+Interactive screenshots include the selected shader. Scheduled screenshots
 (`--screenshot-after`), frame dumps (`--dump-frames`), video recordings, the
 [control protocol](../debugger/control.md)'s capture methods and the web
 frontend all read the CPU presentation buffer, which the shader never
-touches, so captures stay comparable whatever is selected here. Individual
+touches, so those captures stay comparable whatever is selected here. Individual
 frames also skip the pass in three cases: while a menu or overlay panel is
 open (a phosphor mask and a curved face make overlay text unreadable), for
 frames coming from an RTG board's scanout (see `[rtg]` below), and for
@@ -1043,8 +1136,8 @@ chosen, for the rest of the session and without touching the config;
 bezel* row (*A/V & Emu*, *Video*) writes it, and `COPPERLINE_BEZEL` (a
 style name, or the old `1`/`0`) overrides the config for a single run.
 
-Like the shader pass, a bezel is presentation and nothing else: captures
-never include it, and it is skipped while a menu or overlay panel is open
+Interactive screenshots include the bezel; scheduled captures bypass it.
+It is skipped while a menu or overlay panel is open
 and for RTG scanout frames. Unlike the shader it does stay on for
 programmable multisync scans -- a frame has no line structure to get wrong.
 
@@ -1083,8 +1176,8 @@ the web player's `#bezel-stickers` page hook
 the app and on a hosting page.
 
 Stickers ride the bezel: they draw only while a front does, follow it
-through Cmd+M / Alt+M, and are presentation only -- captures never include
-them. `COPPERLINE_BEZEL_STICKERS` (a folder path, or empty for none)
+through Cmd+M / Alt+M, and appear in interactive screenshots. Scheduled captures,
+frame dumps and recordings exclude them. `COPPERLINE_BEZEL_STICKERS` (a folder path, or empty for none)
 overrides the config for a single run.
 
 `perf_overlay` (default `false`) shows the performance overlay at start: a
@@ -1096,8 +1189,8 @@ Cmd+P (macOS) / Alt+P toggles it live for the rest of the session without
 touching the config, `--perf-overlay` shows it for one run, and
 `COPPERLINE_PERF_OVERLAY=1|0` overrides the config for a single run; the
 launcher's *Perf overlay* row (*A/V & Emu*, *Display*) writes it. Like the
-transient message overlay it is presentation only: screenshots, frame
-dumps, and recordings never include it.
+transient message overlay it is presentation only. Interactive screenshots
+include it; scheduled screenshots, frame dumps, and recordings exclude it.
 
 `tint` recolours the picture like the phosphor of a monochrome monitor:
 `"bw"` (black and white), `"green"` and `"amber"` (the two classic
@@ -1106,8 +1199,8 @@ accepted) presents full colour. These are the five looks the web frontend's
 *Screen* selector offers, produced by the same colour chain, so a tint
 chosen in the browser matches the desktop. It composes with `shader` --
 green phosphor under the `crt` preset makes a convincing monochrome tube.
-Like the shader, the tint is presentation only: screenshots, frame dumps,
-recordings and headless runs stay untinted, the status bar and overlay
+Interactive screenshots include the tint. Scheduled screenshots, frame dumps,
+recordings and headless runs stay untinted; the status bar and overlay
 menus keep their colours, and RTG board scanout (the monitor on the
 board's own output, not the Amiga's video output) is never tinted. The
 menu's *Screen Tint* item changes the tint live for the rest of the
@@ -1137,6 +1230,14 @@ provides them. `--maximized` selects this mode from a build pipeline:
 copperline --run build/hello --window-scale 2
 copperline --run build/hello --maximized
 ```
+
+`track_display` chooses what the status bar's floppy counter reads: the track
+number (`"track"`, the default, 0-159) or the cylinder and side with a decimal
+point between them (`"cylinder"`, so track 81 reads `40.1`). In cylinder mode
+the first figure changes with every head step, in time with the step sound,
+and the last digit is the side the guest has selected. *Video Settings ->
+Track Display* switches it live, and the launcher's Display category has a
+*Track display* row for the start-up value.
 
 `full_screen` opens the window fullscreen at start (borderless), and
 `status_bar` chooses whether the status bar starts visible. Both are start-up
@@ -1309,8 +1410,9 @@ shader never fails the config, and never stops the machine from running.
 
 ```toml
 [audio]
-floppy_sounds = true        # synthesized drive sounds (not sampled)
+floppy_sounds = true        # drive sounds on/off: synthesized, or the set below
 floppy_sounds_volume = 100  # 0-100, relative to Paula's output
+# floppy_sounds_set = "A500"  # a WinUAE/FS-UAE sample set instead of synthesis; see below
 # output_device = "..."     # host output device (substring); omit = system default
 # output_enabled = true     # false = no sound (GUI "Disabled"); --audio/--noaudio still win
 channel_mode = "stereo"     # "stereo" (default) or "mono"
@@ -1331,6 +1433,45 @@ used. Only step pulses that actually fire the stepper are audible: like
 a real 3.5" mechanism, an outward pulse with the head at track 0 is
 gated by the /TRK0 sensor, so NoClick-style patches silence the
 empty-drive poll just as they do on real hardware.
+
+`floppy_sounds` is the switch for all drive sounds: with it `false` the
+drives are silent whatever `floppy_sounds_set` names. While it is on,
+`floppy_sounds_set` replaces the synthesis with a recorded sample set -- the
+drive sound packs WinUAE and FS-UAE use (FS-UAE's `floppy_drive_N_sounds`). A
+set is up to five WAV files sharing a name:
+
+| File | Plays |
+|---|---|
+| `drive_click_NAME.wav` | each head step |
+| `drive_spin_NAME.wav` | looped while the motor runs with a disk in |
+| `drive_spinnd_NAME.wav` | looped while the motor runs with no disk |
+| `drive_startup_NAME.wav` | when the motor starts from a standstill |
+| `drive_snatch_NAME.wav` | on the first spin-up after a disk goes in, in place of the start-up sound |
+
+Copperline ships no sets. Put a set's files in the `Floppy Sounds` folder of
+Copperline's host-data directory (`Documents/Copperline/Floppy Sounds`, or
+beside the executable in a portable install) and name the set:
+`floppy_sounds_set = "A500"`. Any other value with a path separator is a path,
+either to one of the set's files (`".../floppysounds/drive_click_A500.wav"`)
+or to its folder joined with the name (`".../floppysounds/A500"`), so a set
+can stay where WinUAE or FS-UAE keeps it. File names match case-insensitively
+and the `.wav` may be left off, as in WinUAE. Any of the five files may be
+missing; that sound is just silent. The launcher's Audio category has a
+*Floppy sound set* row that steps through **Synthesized** and every set in
+the folder.
+
+A set plays the way WinUAE plays it, so it sounds the same as there. A click
+file may hold several clicks, each starting at a peak above 0x6FF0; the
+first is the click for stepping onto cylinder 0, the next for cylinder 1, and
+so on, the last standing in for any cylinder past the count. The motor and
+click sounds of a drive are averaged together, as are several drives
+sounding at once, and 16-bit full scale is mixed at the same level as CD
+audio; `floppy_sounds_volume` still scales the result. The files are read
+when the machine starts. A set that is missing or unreadable logs a warning
+and leaves the synthesized sounds in place, rather than failing the
+configuration. Which set is playing is a host preference, not machine state:
+save states, input replays and netplay are unaffected by it, and two netplay
+peers may use different sets.
 
 `output_device` picks the host output by a case-insensitive substring of the
 names `--list-audio-devices` prints (`--audio-device` overrides it); an omitted
@@ -1383,6 +1524,12 @@ rate every GIF clip is written at, the interactive one and headless
 25 fps on PAL and 30 on NTSC. Clips land in the `[paths] recordings`
 folder.
 
+The camera button and `Cmd+S` / `Alt+S` save the displayed picture with its
+current effects. Native screenshots use `Cmd+Option+S` on macOS or
+`Ctrl+Alt+S` on Linux/Windows; `--native-screenshots` selects native scheduled
+captures. The retired `native_screenshot_button` key is accepted and ignored
+when reading older configs, and omitted when saving them.
+
 ## `[input]`
 
 ```toml
@@ -1432,8 +1579,8 @@ Either port accepts any device, as on real hardware:
   trigger) is the port's third-button line (`POTxX`, read through
   `POTGOR`), since `/FIRx` is the pulse line itself. In the window the
   pen follows the host pointer over the display and a left click presses
-  the switch; headless, `--pen-after SECS X Y` holds it over a screen
-  pixel (in `--mouse-to-after` coordinates) and `--joy-after SECS red MS
+  the switch; headless, `--pen-after SECS X Y` holds it over a pixel of a
+  `--screenshot-after` capture and `--joy-after SECS red MS
   PORT` or `--click-after SECS left MS PORT` works the switch. The
   control protocol has `input.pen`.
 - `none` -- an empty port.
@@ -1863,12 +2010,15 @@ every platform with nothing to install. Because an IPF preserves the encoded
 track -- sync marks, gaps, and sector headers, not just sector contents -- it
 carries the custom trackloaders and copy protections that an ADF cannot
 express. Each track is decoded to the revolution of MFM the head would pass
-over and read back through the same path as a flux capture. The decoder has
-two limits. Tracks recorded with a variable cell *rate* (the Copylock,
-Speedlock, and Brierley density models) are decoded with uniform 2 us cells,
-which is logged at load time, so a protection that measures cell timing sees
-the wrong answer. Weak ("flakey") bits are replayed as the single
-deterministic revolution the file stores rather than varying per revolution.
+over and read back through the same path as a flux capture. Tracks recorded
+with a variable cell *rate* keep it: the decoder models the Copylock,
+Speedlock, and Brierley density profiles, so the sectors a protection times
+pass the head with the same longer or shorter cells the original disk was
+mastered with. A density model the decoder does not know is decoded with
+uniform 2 us cells, which is logged at load time, so a protection that
+measures cell timing on that track may fail. Weak ("flakey") bits are
+replayed as the single deterministic revolution the file stores rather than
+varying per revolution.
 The browser frontend shares this decoder, so it reads IPF too.
 
 A `paths` playlist lets multi-disk software that only uses DF0: run

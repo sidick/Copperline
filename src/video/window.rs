@@ -241,6 +241,29 @@ const PAD_MOUSE_MAX_STEP: std::time::Duration = std::time::Duration::from_millis
 /// rate, a comfortable Workbench pointer speed.
 const KEYBOARD_MOUSE_COUNTS_PER_QUANTUM: i32 = 3;
 
+/// The most live host-mouse motion, in quadrature counts per axis, that
+/// reaches a port's JOYxDAT counters in one emulated video frame.
+///
+/// The counters are eight bits wide, and software takes the difference of
+/// successive reads -- input.device and nearly every game once a frame,
+/// from the vertical blank -- so 128 counts or more between two reads
+/// aliases into motion the other way. A real mouse's encoders never turn
+/// that fast; a host mouse reports whatever the hand does, and a modern
+/// high-resolution one (X11 hands over raw device counts) moved briskly
+/// delivers hundreds of counts a frame. Host motion lands at quantum
+/// boundaries anywhere in a frame, so two deliveries can straddle one read:
+/// half the wrap limit per frame keeps any two reads a frame apart inside
+/// it. At PAL rate that is still over 3000 counts a second.
+const HOST_MOUSE_COUNTS_PER_FRAME: i32 = 63;
+
+/// How long warp keeps yielding to real-time pacing after the operator last
+/// pressed or let go of a host key or mouse button (see
+/// [`crate::emulator::Emulator::set_warp_input_yield`]). Comfortably longer
+/// than the gap between the two clicks of a deliberate double-click, so the
+/// second press lands as far after the first in emulated time as it did in
+/// the hand, inside the guest's double-click window.
+const WARP_INPUT_YIELD_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// One port's controls currently held by `--joy-after` scripting.
 #[derive(Debug, Default, Clone, Copy)]
 struct AutoJoyHeld {
@@ -535,7 +558,7 @@ const CAMERA_LENS: u32 = rgba(20, 22, 24);
 pub(super) const STATUS_TEXT: u32 = rgba(174, 170, 154);
 const VOLUME_FILL: u32 = rgba(44, 178, 94);
 const VOLUME_FILL_HIGHLIGHT: u32 = rgba(128, 244, 150);
-const WINDOW_TITLE: &str = concat!("Copperline ", env!("COPPERLINE_DISPLAY_VERSION"));
+const WINDOW_TITLE: &str = concat!("Copperline ", env!("CARGO_PKG_VERSION"));
 
 /// The title on the window: Copperline's own, unless a player build adopted
 /// the game's through [`crate::video::set_branding`].
@@ -670,6 +693,16 @@ fn host_shortcut_modifier_pressed(modifiers: ModifiersState) -> bool {
     }
 }
 
+fn native_screenshot_shortcut_pressed(modifiers: ModifiersState) -> bool {
+    host_shortcut_modifier_pressed(modifiers)
+        && !modifiers.shift_key()
+        && if cfg!(target_os = "macos") {
+            modifiers.alt_key()
+        } else {
+            modifiers.control_key()
+        }
+}
+
 /// Display name for a GDB-style register index (see `debug_set_register`):
 /// D0-D7, A0-A7, SR, PC.
 fn gdb_reg_label(reg: usize) -> String {
@@ -682,16 +715,8 @@ fn gdb_reg_label(reg: usize) -> String {
     }
 }
 
-fn window_title_mouse_captured() -> String {
-    format!(
-        "{} - Mouse captured ({HOST_SHORTCUT_MODIFIER_LABEL}+G releases)",
-        window_title()
-    )
-}
-
-/// A transient on-screen overlay message drawn over the display (but not
-/// captured in screenshots, since it is painted into the presentation
-/// texture, never into the emulated framebuffer `fb`).
+/// A transient on-screen overlay message drawn into window presentation.
+/// Scheduled captures bypass it; interactive output captures include it.
 struct Osd {
     text: String,
     expires_at: Instant,
@@ -766,6 +791,9 @@ struct PerfReadout {
     /// hopelessly behind real time and dropped emulated time. Frames are
     /// never skipped in paced mode; this counts the only case where time is.
     pacer_slips: u32,
+    /// The effective JIT clock under `[cpu] speed = "fastest"`, in MHz (a
+    /// level, sampled as is); `None` at a fixed clock, which prints nothing.
+    jit_mhz: Option<f64>,
 }
 
 fn perf_readout(
@@ -803,6 +831,7 @@ fn perf_readout(
         audio_lead_ms,
         audio_underruns_per_s: underruns / dt,
         pacer_slips,
+        jit_mhz: None,
     }
 }
 
@@ -817,6 +846,9 @@ fn perf_overlay_lines(r: &PerfReadout) -> Vec<String> {
         format!("xrun {:.0}", r.audio_underruns_per_s),
         format!("slip {}", r.pacer_slips),
     ]
+    .into_iter()
+    .chain(r.jit_mhz.map(|mhz| format!("cpu {mhz:.0} MHz")))
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1195,6 +1227,10 @@ pub struct App {
     auto_shot: Vec<(f32, PathBuf)>,
     pending_auto_shot: Vec<(f32, PathBuf)>,
     native_screenshots: bool,
+    /// Interactive output capture, fulfilled by the next GPU redraw.
+    pending_output_screenshot: Option<PathBuf>,
+    #[cfg(feature = "game-library")]
+    library_wheel: (Option<ScrollList>, f64),
     /// `--expect-screenshot` checks, armed like `auto_shot` (deadline
     /// order) and captured through the same frame path.
     auto_expect: Vec<crate::expect::ExpectShotSpec>,
@@ -1377,6 +1413,24 @@ pub struct App {
     /// must not count as the operator letting the capture go.
     capture_suspended_by_ui: bool,
     mouse_delta_remainder: (f64, f64),
+    /// Whole host-mouse counts per axis not yet handed to the port, held
+    /// back by [`HOST_MOUSE_COUNTS_PER_FRAME`]; never more than one more
+    /// frame's worth, so the pointer stops when the hand does.
+    mouse_pending: (i32, i32),
+    /// The emulated frame the host mouse last delivered motion in, and the
+    /// counts per axis it has delivered in that frame so far.
+    mouse_frame_sent: (u64, i32, i32),
+    /// Rawkeys the operator is holding on the host keyboard: the live part
+    /// of `held_rawkeys`, which scheduled and control-protocol keys feed as
+    /// well. Warp yields to real-time pacing while one is down.
+    live_held_rawkeys: [bool; 128],
+    /// Host mouse buttons the operator is holding (bit = button index,
+    /// 0 left, 1 right, 2 middle), for the same yield.
+    live_mouse_buttons: u8,
+    /// Until when warp keeps yielding to real-time pacing after the
+    /// operator last touched a key or mouse button (see
+    /// [`WARP_INPUT_YIELD_GRACE`]).
+    warp_input_yield_until: Option<Instant>,
     last_rendered_emulated_frame: Option<u64>,
     last_submitted_render_frame: Option<u64>,
     render_generation: u64,
@@ -1449,7 +1503,7 @@ pub struct App {
     /// input mapping consumes this same resolved position.
     present_tv_centre: crate::config::TvCentre,
     /// Window shader pass in effect ([display] shader). Presentation only:
-    /// screenshots, frame dumps and recordings never go through it.
+    /// scheduled screenshots, frame dumps and recordings bypass it.
     crt_shader_kind: crate::config::ShaderKind,
     /// Source file behind `ShaderKind::Custom`, kept so the menu can cycle
     /// back to a user shader (and re-read an edited one) after leaving it.
@@ -1458,8 +1512,8 @@ pub struct App {
     /// shader_strength).
     shader_strength: f32,
     /// Which monitor front the bezel pass draws, if any ([display] bezel,
-    /// Video Settings). Presentation only, like the shader pass: captures
-    /// never include it.
+    /// Video Settings). Interactive output screenshots include it;
+    /// scheduled screenshots, frame dumps and recordings bypass it.
     bezel: BezelStyle,
     /// The style `Cmd/Alt+M` switches back on, so the shortcut is an
     /// on-off for whichever front was chosen rather than a third way of
@@ -1472,7 +1526,8 @@ pub struct App {
     bezel_stickers_path: Option<std::path::PathBuf>,
     /// Performance overlay in effect ([display] perf_overlay, Cmd/Alt+P):
     /// a live emulation-performance readout in the top-right of the
-    /// display. Presentation only, like the OSD: captures never include it.
+    /// display. Interactive output screenshots include it; scheduled
+    /// screenshots, frame dumps and recordings exclude it.
     perf_overlay: bool,
     /// Live desktop vsync preference, also used when recreating the surface.
     vsync: bool,
@@ -1634,14 +1689,25 @@ pub struct App {
     about_redraw_at: Instant,
     /// Emulated-machine summary lines for the About window.
     about_machine_lines: Vec<String>,
+    /// Last path-derived ROM name, tied to the live image fingerprint.
+    title_rom_hint: Option<(crate::config::RomId, String)>,
+    #[cfg(target_os = "macos")]
+    macos_about_wake: Option<winit::event_loop::EventLoopProxy<()>>,
     /// The About panel's update check, for the session: not asked until
     /// its button is pressed.
     #[cfg(feature = "update-check")]
     update_check: app_update::UpdateCheck,
     /// Raw config of the running (or last-applied) machine, so the "Machine
     /// Configuration..." menu item reopens the launcher showing the current
-    /// settings.
+    /// settings. Menu settings changes are folded in as they are made.
     machine_config: RawConfig,
+    /// The saved default configuration that menu settings changes write
+    /// through to, or `None` when the session's settings belong to a file
+    /// the user named (`--config`, `./copperline.toml`) or to `--factory`.
+    menu_settings_file: Option<PathBuf>,
+    /// The menu-controlled settings as last persisted, or as the machine
+    /// started: [`Self::persist_menu_settings`] writes only what differs.
+    menu_settings_saved: RawConfig,
     /// Host pause state before the debugger forced a pause, restored when
     /// the debugger window closes (unless Run was used inside it).
     paused_before_debugger: bool,
@@ -1932,6 +1998,11 @@ type PresentAfter<'a> =
 struct PresentJob {
     frame: Option<Vec<u8>>,
     emulated_frame: Option<u64>,
+    /// The surface size the draws were planned for, which is the size the
+    /// GPU side's surface is configured with when the worker gets the job:
+    /// only the main thread reconfigures it, and only after reclaiming the
+    /// GPU side, which waits out every job already queued.
+    surface: (u32, u32),
     draws: Vec<scaler::ScalerDraw>,
     pass: PresentPass,
     /// The presentation buffer for a display draw that samples it on the
@@ -1977,6 +2048,7 @@ fn present_job(
     notify: Option<&Window>,
     job: &PresentJob,
     mut after: Option<PresentAfter<'_>>,
+    mut capture: Option<&mut output_capture::OutputCapture>,
 ) -> Result<(), pixels::Error> {
     let Gpu {
         pixels,
@@ -2005,76 +2077,80 @@ fn present_job(
             picture.rows,
         );
     }
-    presenter.render(
-        pixels,
-        notify,
-        job.emulated_frame,
-        |encoder, target, ctx| {
-            scaler.render(
-                &ctx.device,
-                &ctx.queue,
-                &ctx.texture,
-                encoder,
-                target,
-                &job.draws,
-            );
-            match &job.pass {
-                PresentPass::Plain => {}
-                PresentPass::Rtg {
-                    rect,
-                    integer_scaling,
-                } => rtg_texture.render(&ctx.queue, encoder, target, *rect, *integer_scaling),
-                PresentPass::Crt(crt) => {
-                    if crt.bezel_active {
-                        let opening = bezel::opening_rect(crt.style, crt.viewport);
-                        if crt.crt_active {
-                            crt_shader.render(
-                                &ctx.device,
-                                &ctx.queue,
-                                &ctx.texture,
-                                encoder,
-                                target,
-                                opening,
-                                crt.kind,
-                                crt.uniforms.with_viewport(opening),
-                            );
-                        }
-                        bezel_shader.render(
-                            &ctx.device,
-                            &ctx.queue,
-                            &ctx.texture,
-                            encoder,
-                            target,
-                            crt.viewport,
-                            crt.style,
-                            bezel::uniforms_from(
-                                &crt.uniforms,
-                                crt.viewport,
-                                opening,
-                                crt.crt_active,
-                            ),
-                        );
-                        sticker_pass.render(
-                            &ctx.device,
-                            &ctx.queue,
-                            encoder,
-                            target,
-                            crt.viewport,
-                            opening,
-                        );
-                    } else {
+    let mut draw = |encoder: &mut wgpu::CommandEncoder,
+                    target: &wgpu::TextureView,
+                    ctx: &pixels::PixelsContext<'_>| {
+        scaler.render(
+            &ctx.device,
+            &ctx.queue,
+            &ctx.texture,
+            encoder,
+            target,
+            &job.draws,
+        );
+        match &job.pass {
+            PresentPass::Plain => {}
+            PresentPass::Rtg {
+                rect,
+                integer_scaling,
+            } => rtg_texture.render(&ctx.queue, encoder, target, *rect, *integer_scaling),
+            PresentPass::Crt(crt) => {
+                if crt.bezel_active {
+                    let opening = bezel::opening_rect(crt.style, crt.viewport);
+                    if crt.crt_active {
                         crt_shader.render(
                             &ctx.device,
                             &ctx.queue,
                             &ctx.texture,
                             encoder,
                             target,
-                            crt.viewport,
+                            opening,
                             crt.kind,
-                            crt.uniforms,
+                            crt.uniforms.with_viewport(opening),
                         );
                     }
+                    bezel_shader.render(
+                        &ctx.device,
+                        &ctx.queue,
+                        &ctx.texture,
+                        encoder,
+                        target,
+                        crt.viewport,
+                        crt.style,
+                        bezel::uniforms_from(&crt.uniforms, crt.viewport, opening, crt.crt_active),
+                    );
+                    sticker_pass.render(
+                        &ctx.device,
+                        &ctx.queue,
+                        encoder,
+                        target,
+                        crt.viewport,
+                        opening,
+                    );
+                } else {
+                    crt_shader.render(
+                        &ctx.device,
+                        &ctx.queue,
+                        &ctx.texture,
+                        encoder,
+                        target,
+                        crt.viewport,
+                        crt.kind,
+                        crt.uniforms,
+                    );
                 }
+            }
+        }
+    };
+    presenter.render(
+        pixels,
+        notify,
+        job.emulated_frame,
+        |encoder, target, ctx| {
+            draw(encoder, target, ctx);
+            if let Some(capture) = capture.as_mut() {
+                draw(encoder, &capture.view(), ctx);
+                capture.copy(encoder);
             }
             if let Some(after) = after.as_mut() {
                 after(&ctx.device, &ctx.queue, encoder, target);
@@ -2142,6 +2218,14 @@ fn worker_notify_window(window: &Arc<Window>) -> Option<&Window> {
     }
 }
 
+/// The host window's size as the present worker sees it, for
+/// `worker_surface_current`. None on macOS, where the worker must not call
+/// winit (see `worker_notify_window`) and the Metal layer never reports a
+/// resized surface out of date anyway.
+fn worker_live_size(window: &Window) -> Option<PhysicalSize<u32>> {
+    (!cfg!(target_os = "macos")).then(|| window.inner_size())
+}
+
 impl PresentWorker {
     fn new(window: Arc<Window>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PresentCmd>(PRESENT_FRAMES_IN_FLIGHT + 2);
@@ -2157,9 +2241,11 @@ impl PresentWorker {
                         PresentCmd::Lend(gpu) => held = Some(gpu),
                         PresentCmd::Frame(job) => {
                             if let Some(gpu) = held.as_mut() {
-                                let notify = worker_notify_window(&window);
-                                if let Err(e) = present_job(gpu, notify, &job, None) {
-                                    error!("pixels.render: {e}");
+                                if worker_surface_current(job.surface, worker_live_size(&window)) {
+                                    let notify = worker_notify_window(&window);
+                                    if let Err(e) = present_job(gpu, notify, &job, None, None) {
+                                        log_present_error(&e);
+                                    }
                                 }
                             }
                             let back = PresentBack::Frame {
@@ -2684,6 +2770,7 @@ impl App {
         mouse_capture: crate::config::MouseCapture,
         middle_click_release: bool,
         about_machine_lines: Vec<String>,
+        rom_hint_trusted: bool,
         machine_config: RawConfig,
         runahead_machine_block: Option<&'static str>,
         // Effective live-audio state for this machine: for a real machine the
@@ -2757,6 +2844,14 @@ impl App {
         // before the first frame: seed it with the style the window opens
         // with, as `main` seeds the aspect and the scaling.
         crate::video::set_bezel_shown(bezel.is_on());
+        let title_rom_hint = rom_hint_trusted
+            .then(|| {
+                about_machine_lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix("ROM: "))
+                    .map(|name| (emu.machine_descriptor().rom, name.to_string()))
+            })
+            .flatten();
         let mut app = Self {
             emu,
             serial_is_midi,
@@ -2810,6 +2905,9 @@ impl App {
             auto_shot: Vec::new(),
             pending_auto_shot: screenshot_after,
             native_screenshots: false,
+            pending_output_screenshot: None,
+            #[cfg(feature = "game-library")]
+            library_wheel: (None, 0.0),
             auto_expect: Vec::new(),
             pending_auto_expect: Vec::new(),
             verdict: crate::verdict::RunVerdict::default(),
@@ -2881,6 +2979,11 @@ impl App {
             mouse_captured: false,
             capture_suspended_by_ui: false,
             mouse_delta_remainder: (0.0, 0.0),
+            mouse_pending: (0, 0),
+            mouse_frame_sent: (0, 0, 0),
+            live_held_rawkeys: [false; 128],
+            live_mouse_buttons: 0,
+            warp_input_yield_until: None,
             last_rendered_emulated_frame: None,
             last_submitted_render_frame: None,
             render_generation: 0,
@@ -2976,9 +3079,14 @@ impl App {
             about_opened_at: Instant::now(),
             about_redraw_at: Instant::now(),
             about_machine_lines,
+            title_rom_hint,
+            #[cfg(target_os = "macos")]
+            macos_about_wake: None,
             #[cfg(feature = "update-check")]
             update_check: app_update::UpdateCheck::Idle,
             machine_config,
+            menu_settings_file: None,
+            menu_settings_saved: RawConfig::default(),
             paused_before_debugger: false,
             paused_before_analyzer: false,
             paused_before_console: false,
@@ -3013,6 +3121,7 @@ impl App {
                 app.run_ahead_frames
             );
         }
+        app.rebaseline_menu_settings();
         app
     }
 
@@ -3380,6 +3489,11 @@ impl App {
         input.set_mouse_button(port, 0, state.fire);
         input.set_mouse_button(port, 1, state.button2);
         input.set_mouse_button(port, 2, state.green);
+        // Held mouse buttons from the keys are a hand on the machine, as the
+        // pad mouse's are (see update_warp_input_yield).
+        if state.fire || state.button2 || state.green {
+            self.note_live_input();
+        }
     }
 
     /// The controller state keyboard mapping `index` is producing right now.
@@ -3692,10 +3806,30 @@ impl App {
         true
     }
 
-    /// Hold the light pen over presented pixel (`x`, `y`) -- or lift it
-    /// off the glass with a negative coordinate -- from `--pen-after` or
-    /// the control protocol. `port` names the port the pen must be in;
-    /// `None` takes whichever port has one.
+    /// `--pen-after`: hold the light pen over pixel (`x`, `y`) of a
+    /// `--screenshot-after` capture, or lift it off the glass with a
+    /// negative coordinate. The pixel goes back through the capture's
+    /// framing to the rendered-field pixel it shows; a pixel showing no
+    /// field (black glass past the raster) is a pen the beam never passes.
+    fn apply_scheduled_pen_target(&mut self, x: i32, y: i32, port: Option<u8>) {
+        let field = if x < 0 || y < 0 {
+            None
+        } else if let Some(map) = self.capture_field_map() {
+            let field = map.field_point(x, y);
+            info!("auto-pen: screenshot pixel ({x}, {y}) is rendered-field pixel {field:?}");
+            field
+        } else {
+            warn!("pen: the screenshot shows an RTG board's frame, so the pen is lifted");
+            None
+        };
+        let (x, y) = field.unwrap_or((-1, -1));
+        self.apply_scripted_pen_position(x, y, port);
+    }
+
+    /// Hold the light pen over rendered-field pixel (`x`, `y`) -- the
+    /// control protocol's `capture.screenshot` coordinates -- or lift it
+    /// off the glass with a negative coordinate. `port` names the port the
+    /// pen must be in; `None` takes whichever port has one.
     fn apply_scripted_pen_position(&mut self, x: i32, y: i32, port: Option<u8>) {
         let input = &mut self.emu.bus_mut().input;
         let pen_port = input.light_pen_port();
@@ -3780,6 +3914,10 @@ impl App {
         let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = self;
+        #[cfg(target_os = "macos")]
+        {
+            app.macos_about_wake = Some(event_loop.create_proxy());
+        }
         // Start the control server's socket threads with a wake that
         // kicks the loop out of ControlFlow::Wait, so a command arriving
         // while the machine is paused is serviced promptly.
@@ -3889,6 +4027,12 @@ impl App {
     /// `--expect-screenshot` checks to arm alongside the screenshots.
     pub fn set_expect_screenshots(&mut self, specs: Vec<crate::expect::ExpectShotSpec>) {
         self.pending_auto_expect = specs;
+    }
+
+    /// Write menu settings changes through to `path`, the saved default
+    /// configuration, as they are made (see [`Self::persist_menu_settings`]).
+    pub fn set_menu_settings_file(&mut self, path: Option<PathBuf>) {
+        self.menu_settings_file = path;
     }
 
     /// Use original field pixels for screenshots and expectations.
@@ -4258,17 +4402,23 @@ impl App {
         }
         // Fire any scheduled --pen-after light-pen positions (one-shot
         // each).
+        // Positions are screenshot pixels, which mean nothing until a frame
+        // has been presented. Every pen event waits for one, lifts
+        // included, and the due ones then apply in time order, so a lift
+        // scheduled after a placement cannot overtake it.
+        let presented = self.present_placement.is_some() || self.rtg_present_dims.is_some();
         let mut pen_sets = Vec::new();
         self.auto_pens.retain(|&(at, x, y, port)| {
-            if emu_secs >= at {
-                pen_sets.push((x, y, port));
+            if presented && emu_secs >= at {
+                pen_sets.push((at, x, y, port));
                 false
             } else {
                 true
             }
         });
-        for (x, y, port) in pen_sets {
-            self.apply_scripted_pen_position(x, y, port);
+        pen_sets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, x, y, port) in pen_sets {
+            self.apply_scheduled_pen_target(x, y, port);
         }
         let mut disk_inserts = Vec::new();
         let mut disk_change_available = self.netplay.as_ref().is_none_or(|s| s.can_change_disk());
@@ -4329,8 +4479,14 @@ impl App {
         // timestamp. Skipped while the core is not advancing so paused
         // wall-clock time records nothing.
         if self.powered_on && !self.cpu_halted && !self.paused {
+            // Pen lines are written in screenshot pixels; the framing is
+            // copied out first so it can be resolved while the recorder is
+            // borrowed, and only when the pen actually moved.
+            let framing = app_session::CaptureFramingInputs::of(self);
             if let Some(rec) = self.input_recorder.as_mut() {
-                rec.observe(&self.emu.bus().input, emu_secs);
+                rec.observe(&self.emu.bus().input, emu_secs, |field| {
+                    app_session::capture_field_map_for(framing)?.capture_point(field)
+                });
             }
         }
     }
@@ -4485,7 +4641,7 @@ impl ApplicationHandler for App {
         let fullscreen = (self.start_fullscreen && !headless_capture)
             .then(|| Fullscreen::Borderless(selected_monitor.clone()));
         let mut attrs = WindowAttributes::default()
-            .with_title(window_title())
+            .with_title(self.base_window_title())
             .with_window_icon(copperline_window_icon())
             .with_visible(!headless_capture)
             .with_fullscreen(fullscreen)
@@ -4513,6 +4669,10 @@ impl ApplicationHandler for App {
         // the application icon explicitly now that NSApplication exists.
         #[cfg(target_os = "macos")]
         set_macos_dock_icon();
+        #[cfg(target_os = "macos")]
+        if let Some(wake) = self.macos_about_wake.take() {
+            macos_about::install(wake);
+        }
         let inner = window.inner_size();
         let texture_scale = plan_present_scaling(
             integer_scaling_requested(),
@@ -4622,6 +4782,9 @@ impl ApplicationHandler for App {
         if let Err(msg) = self.reload_bezel_stickers() {
             self.show_osd(format!("Bezel stickers: off ({msg})"));
         }
+        // Fullscreen and a custom shader that failed to build settle only
+        // once the window exists; neither is a menu choice to write through.
+        self.rebaseline_menu_settings();
         // Paint at least once so the status bar (and power button) is
         // visible immediately, even when the machine starts powered off
         // and no emulated frame is being produced yet. A powered-off
@@ -4694,6 +4857,11 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         event_loop.exit()
+                    }
+                    (KeyCode::KeyS, ElementState::Pressed)
+                        if native_screenshot_shortcut_pressed(self.modifiers) =>
+                    {
+                        self.take_native_screenshot()
                     }
                     (KeyCode::KeyS, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers)
@@ -4773,19 +4941,20 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.cycle_joystick_input_mode();
-                        self.persist_player_prefs();
+                        self.persist_settings();
                     }
                     (KeyCode::KeyM, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.toggle_bezel();
-                        self.persist_player_prefs();
+                        self.persist_settings();
                     }
                     (KeyCode::KeyP, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         if !crate::video::player_profile() {
-                            self.toggle_perf_overlay()
+                            self.toggle_perf_overlay();
+                            self.persist_settings();
                         }
                     }
                     (KeyCode::KeyF, ElementState::Pressed)
@@ -4794,14 +4963,15 @@ impl ApplicationHandler for App {
                     {
                         // The player has no status bar to bring back.
                         if !crate::video::player_profile() {
-                            self.toggle_status_bar()
+                            self.toggle_status_bar();
+                            self.persist_settings();
                         }
                     }
                     (KeyCode::KeyF, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
                         self.toggle_fullscreen();
-                        self.persist_player_prefs();
+                        self.persist_settings();
                     }
                     (KeyCode::KeyR, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers)
@@ -4831,7 +5001,8 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers)
                             && self.modifiers.shift_key() =>
                     {
-                        self.cycle_warp_speed()
+                        self.cycle_warp_speed();
+                        self.persist_settings();
                     }
                     (KeyCode::KeyZ, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
@@ -4857,7 +5028,7 @@ impl ApplicationHandler for App {
                         // running machine, not the config-screen placeholder.
                         if !self.modal_ui_active() {
                             self.cycle_audio_output();
-                            self.persist_player_prefs();
+                            self.persist_settings();
                         }
                     }
                     (KeyCode::KeyA, ElementState::Pressed)
@@ -4868,7 +5039,7 @@ impl ApplicationHandler for App {
                         // menu or panel is open.
                         if !self.modal_ui_active() {
                             self.cycle_audio_filter();
-                            self.persist_player_prefs();
+                            self.persist_settings();
                         }
                     }
                     // Quick save/load slots on the number row: the modifier
@@ -4914,7 +5085,8 @@ impl ApplicationHandler for App {
                     {
                         // Raise the host mouse sensitivity (Shift+. is ">").
                         if !self.modal_ui_active() {
-                            self.step_mouse_sensitivity(true)
+                            self.step_mouse_sensitivity(true);
+                            self.persist_settings();
                         }
                     }
                     (KeyCode::Comma, ElementState::Pressed)
@@ -4923,7 +5095,8 @@ impl ApplicationHandler for App {
                     {
                         // Lower the host mouse sensitivity (Shift+, is "<").
                         if !self.modal_ui_active() {
-                            self.step_mouse_sensitivity(false)
+                            self.step_mouse_sensitivity(false);
+                            self.persist_settings();
                         }
                     }
                     (other, state) => {
@@ -4941,7 +5114,7 @@ impl ApplicationHandler for App {
                             return;
                         }
                         if let Some(rawkey) = host_to_amiga_rawkey(other) {
-                            self.handle_amiga_key_event(rawkey, pressed);
+                            self.handle_live_amiga_key_event(rawkey, pressed);
                         }
                     }
                 }
@@ -5313,16 +5486,26 @@ impl ApplicationHandler for App {
                     }
                 }
                 if let Some(port) = self.mouse_port() {
-                    let input = &mut self.emu.bus_mut().input;
-                    match button {
-                        MouseButton::Left => input.set_mouse_button(port, 0, pressed),
-                        MouseButton::Right => input.set_mouse_button(port, 1, pressed),
-                        MouseButton::Middle => input.set_mouse_button(port, 2, pressed),
-                        _ => {}
+                    let index = match button {
+                        MouseButton::Left => Some(0),
+                        MouseButton::Right => Some(1),
+                        MouseButton::Middle => Some(2),
+                        _ => None,
+                    };
+                    if let Some(index) = index {
+                        self.emu
+                            .bus_mut()
+                            .input
+                            .set_mouse_button(port, index, pressed);
+                        self.note_live_mouse_button(index, pressed);
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                #[cfg(feature = "game-library")]
+                if self.scroll_launcher_with_wheel(delta) {
+                    return;
+                }
                 // An open menu claims the wheel and does nothing with it,
                 // rather than letting it reach the volume slider underneath.
                 if self.ui.menu_open {
@@ -5365,6 +5548,7 @@ impl ApplicationHandler for App {
                 if self.render.as_ref().is_some_and(|r| r.minimized) {
                     return;
                 }
+                let mut screenshot_message = None;
                 let inspector_actions = self.prepare_debug_workspace();
                 let debug_layout = self.debug_layout_active && !self.ui.active();
                 // The presentation layout can change under a stationary
@@ -5489,7 +5673,10 @@ impl ApplicationHandler for App {
                     // Frames present from the worker unless this one carries
                     // something only the main thread has: the RTG board's
                     // texture upload, or the inspector's egui paint.
-                    let threaded = r.present_worker.is_some() && !rtg_gpu && inspector_ui.is_none();
+                    let threaded = r.present_worker.is_some()
+                        && !rtg_gpu
+                        && inspector_ui.is_none()
+                        && self.pending_output_screenshot.is_none();
                     // The display draw samples the presentation buffer on
                     // the GPU when nothing has to be composed over the
                     // picture on the CPU: no UI, overlay, badge or tint,
@@ -5646,9 +5833,9 @@ impl ApplicationHandler for App {
                         ));
                         if !guest_overlay.is_empty() {
                             // The guest's debug overlay sits directly on the
-                            // picture, under every piece of host chrome, and --
-                            // like everything from here down -- never in a
-                            // capture.
+                            // picture, under every piece of host chrome.
+                            // Interactive output screenshots include it;
+                            // scheduled captures and recordings bypass it.
                             draw_guest_overlay(
                                 frame,
                                 &mut self.guest_overlay_cache,
@@ -5855,6 +6042,7 @@ impl ApplicationHandler for App {
                         let mut job = PresentJob {
                             frame: worker_frame,
                             emulated_frame: self.last_rendered_emulated_frame,
+                            surface: surface_size,
                             draws,
                             pass,
                             picture,
@@ -5870,8 +6058,58 @@ impl ApplicationHandler for App {
                                     }
                                 });
                                 let after = paint.as_mut().map(|paint| paint as PresentAfter<'_>);
-                                if let Err(e) = present_job(gpu, Some(&window), &job, after) {
-                                    error!("pixels.render: {e}");
+                                let capture_path = self.pending_output_screenshot.take();
+                                let mut capture = capture_path
+                                    .as_ref()
+                                    .map(|_| {
+                                        output_capture::OutputCapture::new(
+                                            gpu.pixels.device(),
+                                            surface_size,
+                                            layout.picture_rect(),
+                                            gpu.pixels.render_texture_format(),
+                                        )
+                                    })
+                                    .transpose();
+                                // A frame presented here can block the main
+                                // thread on vsync; the fastest-mode governor
+                                // must not mistake that for frontend load.
+                                let present_started = Instant::now();
+                                let result = match &mut capture {
+                                    Ok(capture) => present_job(
+                                        gpu,
+                                        Some(&window),
+                                        &job,
+                                        after,
+                                        capture.as_mut(),
+                                    ),
+                                    Err(_) => present_job(gpu, Some(&window), &job, after, None),
+                                };
+                                self.emu.note_frontend_wait(present_started.elapsed());
+                                if let Err(e) = &result {
+                                    log_present_error(e);
+                                }
+                                if let Some(path) = capture_path {
+                                    let saved =
+                                        result.map_err(anyhow::Error::from).and_then(|_| {
+                                            capture?
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!("no output capture")
+                                                })?
+                                                .save(gpu.pixels.device(), &path)
+                                        });
+                                    screenshot_message = Some(match saved {
+                                        Ok(()) => {
+                                            info!("screenshot saved: {}", path.display());
+                                            format!("Saved {}", display_file_name(&path))
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                "output screenshot failed ({}): {error:#}",
+                                                path.display()
+                                            );
+                                            "Screenshot save failed".to_string()
+                                        }
+                                    });
                                 }
                                 if let Some(picture) = job.picture.take() {
                                     self.picture_scratch = picture.fb;
@@ -5893,6 +6131,10 @@ impl ApplicationHandler for App {
                         }
                         r.gpu = gpu_home;
                     }
+                }
+                if let Some(message) = screenshot_message {
+                    self.show_osd(message);
+                    self.finish_host_io_pause();
                 }
                 self.dispatch_egui_frame(inspector_actions, Ok(()));
             }
@@ -5926,6 +6168,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if macos_about::take_request() {
+            self.suspend_mouse_capture_for_ui();
+            self.about_opened_at = Instant::now();
+            self.ui.panel = Some(Panel::About);
+            self.request_redraw();
+        }
         // Drain remote control commands first, before this pass's run
         // state is computed, so they land at a frame boundary. Sits
         // ahead of the render guard so tests can drive the drain on an
@@ -6182,6 +6431,10 @@ impl ApplicationHandler for App {
                     }
                 }
             } else {
+                // Host mouse motion held back by the per-frame limit goes
+                // in now that the frame may have moved on.
+                self.deliver_host_mouse_motion();
+                self.update_warp_input_yield();
                 let (total_frames, runahead, time_budget) = self.burst_frames(headless_capture);
                 let burst_start = Instant::now();
                 let mut frames_done = 0usize;
@@ -6214,7 +6467,7 @@ impl ApplicationHandler for App {
                             Ok(blob) => anchor_snapshot = Some(blob),
                             Err(e) => {
                                 warn!("run-ahead disabled: anchor snapshot failed: {e:?}");
-                                self.run_ahead_frames = 0;
+                                self.drop_run_ahead();
                                 burst_complete = false;
                                 break;
                             }
@@ -6273,7 +6526,7 @@ impl ApplicationHandler for App {
                         runahead_presented = self.finish_render_for_current_frame();
                         if !runahead_presented {
                             error!("run-ahead disabled: speculative frame was not renderable");
-                            self.run_ahead_frames = 0;
+                            self.drop_run_ahead();
                             burst_complete = false;
                         }
                     }
@@ -6424,11 +6677,10 @@ fn display_file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// What a file dropped on the window should be treated as. Extension-based:
-/// only floppies get content-sniffed (by the insert path itself), and cue
-/// sheets/hard disks/ROMs have no shared magic worth probing here. The one
-/// exception is `.chd`, which holds either a CD or a hard disk and says
-/// which in its metadata.
+/// What a file dropped on the window should be treated as. Extensions route
+/// most files; ZIP member names distinguish WHDLoad packages from floppy
+/// images, and CHD metadata distinguishes CDs from hard disks. The floppy
+/// insert path itself sniffs and validates the image content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DroppedMediaKind {
     /// Anything the floppy loader may accept (floppy::IMAGE_EXTENSIONS and
@@ -6442,7 +6694,7 @@ enum DroppedMediaKind {
     HardDisk,
     /// Kickstart ROMs load from the config screen, not at runtime.
     Rom,
-    /// A WHDLoad game package (.lha), or a .slave inside an extracted one:
+    /// A WHDLoad game package, or a .slave inside an extracted one:
     /// something to boot into (src/whdload.rs), not media to insert.
     WhdloadGame,
 }
@@ -6456,8 +6708,21 @@ fn classify_dropped_media(path: &std::path::Path) -> DroppedMediaKind {
         Some("cue") | Some("iso") | Some("nrg") | Some("chd") => DroppedMediaKind::Cd,
         Some("hdf") | Some("hdz") | Some("vhd") | Some("img") => DroppedMediaKind::HardDisk,
         Some("rom") => DroppedMediaKind::Rom,
-        // Every shape `package` accepts, or a dropped zip would be taken
-        // for a disk image and handed to the floppy bay.
+        Some("zip") => {
+            // WHDLoad packages may themselves contain disk images, so a
+            // slave takes precedence. Listing filters macOS metadata and
+            // does not decompress the archive's payloads.
+            let has_slave = crate::package::list(path).is_ok_and(|members| {
+                members
+                    .iter()
+                    .any(|member| crate::package::is_slave_name(&member.to_string_lossy()))
+            });
+            if has_slave {
+                DroppedMediaKind::WhdloadGame
+            } else {
+                DroppedMediaKind::Floppy
+            }
+        }
         Some(ext)
             if crate::package::EXTENSIONS.contains(&ext)
                 || crate::package::SLAVE_EXTENSIONS.contains(&ext) =>
@@ -6821,17 +7086,133 @@ impl App {
         !crate::video::player_profile() || crate::video::player_save_states()
     }
 
+    /// Take the settings as they stand as the write-through baseline: they
+    /// came from a configuration, a save state, the window or the host, not
+    /// from a menu choice, so they are not written to the saved default.
+    pub(super) fn rebaseline_menu_settings(&mut self) {
+        self.menu_settings_saved = self.menu_prefs();
+    }
+
+    /// Turn run-ahead off because the host could not sustain it. That is
+    /// not the user's choice, so the write-through must not save it as one.
+    pub(super) fn drop_run_ahead(&mut self) {
+        self.run_ahead_frames = 0;
+        self.menu_settings_saved.emulation.run_ahead_frames = Some(0);
+    }
+
+    /// Keep a settings change made from the menu or a hotkey for the next
+    /// launch: the player's settings file, or the full build's write-through
+    /// to the saved default.
+    pub(super) fn persist_settings(&mut self) {
+        if crate::video::player_profile() {
+            self.persist_player_prefs();
+        } else {
+            self.persist_menu_settings();
+        }
+    }
+
+    /// Fold the menu settings changed since the last call into the session's
+    /// configuration, so the launcher and its Save buttons see them, and
+    /// write them through to the saved default when the session has one
+    /// (see `menu_settings_file`). Only the changed keys are written, so a
+    /// machine-specific setting the user never touched (a CD32 pad on port
+    /// 2, say) is not copied into the default every machine starts from. A
+    /// write failure costs the persistence, not the session.
+    fn persist_menu_settings(&mut self) {
+        let now = self.menu_prefs();
+        let changed = match now.changed_from(&self.menu_settings_saved) {
+            Ok(changed) => changed,
+            Err(e) => {
+                warn!("menu settings not saved: {e:#}");
+                return;
+            }
+        };
+        if changed == RawConfig::default() {
+            self.menu_settings_saved = now;
+            return;
+        }
+        self.machine_config.merge_menu_settings(&changed);
+        let Some(path) = self.menu_settings_file.as_deref() else {
+            self.menu_settings_saved = now;
+            return;
+        };
+        let written = (|| -> anyhow::Result<()> {
+            // A default that exists but does not parse is the user's to fix:
+            // replacing it with just these keys would lose the rest.
+            let mut saved = match std::fs::read_to_string(path) {
+                Ok(text) => RawConfig::parse(&text)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => RawConfig::default(),
+                Err(e) => return Err(e.into()),
+            };
+            saved.merge_menu_settings(&changed);
+            let text = saved.to_toml_string()?;
+            crate::paths::ensure_parent(path)?;
+            // Through a temp file and a rename: a crash mid-write must not
+            // leave a truncated default that no longer parses.
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        // A failed write keeps the old baseline, so the next change retries
+        // these keys instead of treating them as saved.
+        match written {
+            Ok(()) => {
+                info!("menu settings saved to {}", path.display());
+                self.menu_settings_saved = now;
+            }
+            Err(e) => warn!("menu settings not saved to {}: {e:#}", path.display()),
+        }
+    }
+
+    /// The settings the full build's menus and hotkeys change, as the
+    /// configuration fragment [`Self::persist_menu_settings`] diffs: the
+    /// player's set plus what only the full menu offers. Every field set
+    /// here must be one `RawConfig::merge_menu_settings` reads back.
+    fn menu_prefs(&self) -> RawConfig {
+        let mut raw = self.player_prefs();
+        // A key left out is never written (`changed_from` reports changed
+        // keys, not removals), so the choices the player leaves implicit --
+        // the default audio output, a custom shader -- are spelled out here,
+        // or switching back to them would not reach the saved default.
+        let (output_enabled, output_device) = match &self.audio_output {
+            crate::audio::AudioOutput::Default => (true, String::new()),
+            crate::audio::AudioOutput::Device(name) => (true, name.clone()),
+            crate::audio::AudioOutput::Disabled => (false, String::new()),
+        };
+        raw.audio.output_enabled = Some(output_enabled);
+        raw.audio.output_device = Some(output_device);
+        if self.crt_shader_kind == crate::config::ShaderKind::Custom {
+            raw.display.shader = self
+                .custom_shader_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+        }
+        let bus = self.emu.bus();
+        raw.emulation.rewind = Some(self.rewind_armed);
+        raw.emulation.run_ahead_frames = Some(self.run_ahead_frames);
+        raw.emulation.warp_speed = Some(self.warp_speed.label().to_ascii_lowercase());
+        raw.floppy.speed = Some(bus.floppy.speed_percent());
+        raw.display.status_bar = Some(!crate::video::status_bar_hidden());
+        raw.display.perf_overlay = Some(self.perf_overlay);
+        raw.input.mouse_sensitivity = Some(u16::from(self.mouse_sensitivity));
+        raw.clipboard.share = bus
+            .filesys_board()
+            .filter(|board| board.clipboard_fitted())
+            .map(|board| board.clipboard_sharing());
+        raw
+    }
+
     /// Write the player's end-user settings through to `settings.toml` in
     /// the per-game config directory.
     ///
-    /// The full build keeps its session-only menu semantics -- settings
-    /// belong to the config file the user points at. A player has no config
-    /// file for its user to edit, so what they set in the menu is what they
-    /// expect to find on the next launch. The file holds the complete set
-    /// of player-controlled settings as an ordinary configuration fragment,
-    /// which the player's startup layers over the manifest's defaults. A
-    /// no-op outside the player profile, and a write failure costs the
-    /// persistence, not the session.
+    /// A player has no config file for its user to edit, so what they set
+    /// in the menu is what they expect to find on the next launch. The file
+    /// holds the complete set of player-controlled settings as an ordinary
+    /// configuration fragment, which the player's startup layers over the
+    /// manifest's defaults. A no-op outside the player profile, and a write
+    /// failure costs the persistence, not the session.
     fn persist_player_prefs(&self) {
         if !crate::video::player_profile() {
             return;
@@ -6839,6 +7220,21 @@ impl App {
         let Some(path) = crate::paths::config_file(crate::config::PLAYER_SETTINGS_FILE) else {
             return;
         };
+        let written = self.player_prefs().to_toml_string().and_then(|text| {
+            crate::paths::ensure_parent(&path)?;
+            std::fs::write(&path, text)?;
+            Ok(())
+        });
+        if let Err(e) = written {
+            warn!("player settings not saved to {}: {e:#}", path.display());
+        }
+    }
+
+    /// The player-controlled settings as they stand, as the configuration
+    /// fragment [`Self::persist_player_prefs`] writes. Every field set here
+    /// must be one `RawConfig::merge_player_settings` reads back, or the
+    /// player forgets it on the next launch.
+    fn player_prefs(&self) -> crate::config::RawConfig {
         let mut raw = crate::config::RawConfig::default();
         raw.display.vsync = Some(self.vsync);
         raw.display.pixel_aspect =
@@ -6846,6 +7242,7 @@ impl App {
         raw.display.scaling = Some(
             super::launcher::display_scaling_name(crate::video::display_scaling()).to_string(),
         );
+        raw.display.autocrop = Some(crate::video::autocrop());
         raw.display.menu_scale = Some(crate::video::menu_scale().label().to_string());
         // A custom shader is named by its path, which the player menu never
         // offers; skipping it keeps whatever the manifest said.
@@ -6880,14 +7277,7 @@ impl App {
             }
             .to_string(),
         );
-        let written = raw.to_toml_string().and_then(|text| {
-            crate::paths::ensure_parent(&path)?;
-            std::fs::write(&path, text)?;
-            Ok(())
-        });
-        if let Err(e) = written {
-            warn!("player settings not saved to {}: {e:#}", path.display());
-        }
+        raw
     }
 
     /// Automatic capture waits while the Debug layout or a modal UI is visible.
@@ -7702,17 +8092,21 @@ mod egui_debugger;
 mod gdb;
 mod host_input;
 mod kbdpanel;
+#[cfg(target_os = "macos")]
+mod macos_about;
 mod monitors;
 #[cfg(feature = "mt32")]
 mod mt32panel;
 mod native_dialog;
 pub use monitors::print_monitors;
+mod output_capture;
 mod present;
 mod presenter;
 mod rtg_texture;
 mod scaler;
 pub(in crate::video) mod statusbar;
 mod stickers;
+mod title;
 pub(super) use present::{scale_rect, texture_height, texture_width, Rect};
 pub(super) use statusbar::{draw_rect_bevel, fill_rect, fill_rect_blend};
 

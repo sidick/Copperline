@@ -156,14 +156,17 @@ pacing_budget = "cycles"
 
 [cpu]
 
-# CPU type. One of: 68000, 68010, 68EC020, 68020, 68030, 68040, 68060.
-# 68EC020 uses the 68020 instruction set with a 24-bit external address bus.
+# CPU type. One of: 68000, 68010, 68EC020, 68020, 68EC030, 68030, 68EC040,
+# 68040, 68EC060, 68060. 68EC020 uses the 68020 instruction set with a
+# 24-bit external address bus; 68EC030/68EC040/68EC060 are their full parts
+# without the paged MMU (the 040/060 ones without an FPU as well).
 model = "68000"
 
 # FPU (68881/68882 coprocessor; on-die on the full 68040/68060). Needs a
-# 68020 or later -- a 68000/68010 cannot drive one. The 68040 and 68060 enable
-# it by default; on other 020+ CPUs opt in here. fpu = false on the 68060
-# models the FPU-less LC/EC parts (PCR.DFP).
+# 68020 or later -- a 68000/68010 cannot drive one, and the 68EC040/68EC060
+# have none. The 68040 and 68060 enable it by default; on other 020+ CPUs opt
+# in here. fpu = false on the 68040/68060 models their FPU-less LC parts
+# (on the 060 through PCR.DFP).
 # fpu = true
 
 # CPU clock in MHz. Defaults to the model's stock speed (68000/68010 ~7.09,
@@ -197,7 +200,7 @@ model = "68000"
 # core, so it is ignored there). Off by default.
 # jit = true
 
-# 68060 only: the 68060 dropped MOVEP, CHK2/CMP2, CAS2, misaligned CAS,
+# 68060/68EC060 only: the 68060 dropped MOVEP, CHK2/CMP2, CAS2, misaligned CAS,
 # 64-bit MUL/DIV, and most FPU operations beyond basic arithmetic from
 # silicon. "trap" (default) raises the chip's unimplemented-instruction
 # exceptions for the OS-side 68060.library to emulate, exactly like a
@@ -747,29 +750,30 @@ video = "PAL"
 # the built-in CRT presets "scanlines", "mask" and "crt", or the path of a
 # .wgsl file to load a shader of your own (see
 # docs/guide/configuration.md). This is a window-display effect only:
-# screenshots, frame dumps, recordings and headless runs are never
-# shader-processed, so captures stay comparable whatever is set here.
+# interactive screenshots include it; scheduled screenshots, frame dumps,
+# recordings and headless runs bypass it.
 # shader_strength: how strongly the shader is mixed in, 0.0-1.0 (default
 # 1.0, the preset's full effect); 0.0 leaves the picture visually untouched.
 # bezel: frame the picture with a monitor front: "off" (default), "1084"
 # (the monitor the Amiga shipped with) or "classic" (the plainer frame
 # Copperline drew first). Cmd/Alt+M turns the chosen one off and back on.
 # Composes with any shader setting, and like it is a window-display effect
-# only: captures never include the frame.
+# included in interactive screenshots; scheduled captures omit it.
 # bezel_stickers: folder of PNG stickers drawn onto the bezel, the way
 # owners dress a real monitor (unset by default: none). Every *.png in
 # the folder becomes a die-cut decal; without further instruction they
 # line up along the cabinet's top band, and an optional stickers.toml in
 # the folder places each one (see the configuration guide). Drawn only
-# while a bezel is; captures never include them.
+# while a bezel is; interactive screenshots include them.
 # perf_overlay: show the performance overlay at start (default false; also
 # --perf-overlay, and Cmd/Alt+P toggles it live): emulated fps, speed
 # factor, per-frame emulation cost, host utilisation, audio health, and
-# pacer slips in the top-right of the display. Captures never include it.
+# pacer slips in the top-right of the display. Interactive screenshots include
+# it; scheduled captures and recordings omit it.
 # tint: screen tint over the window image. "none" (default, full colour),
 # "bw" (black and white), "green" or "amber" (monochrome-monitor
 # phosphor), or "sepia". Like shader, a window-display effect only:
-# captures are never tinted, and RTG board scanout stays untinted.
+# interactive screenshots include it; scheduled captures and RTG stay untinted.
 # full_screen: open the window fullscreen at start (default false; also
 # --full-screen / --windowed, and Cmd/Alt+F toggles it live).
 # maximized: open a bordered, maximized window with the desktop taskbar
@@ -787,6 +791,9 @@ video = "PAL"
 # (default 1.0; also --window-scale). 2 opens at twice the normal size.
 # status_bar: show the status bar at start (default true; also
 # --show-status-bar / --hide-status-bar, and Cmd/Alt+Shift+F toggles it live).
+# track_display: what the status bar's floppy counter reads. "track"
+# (default) is the track number; "cylinder" is CYL.SIDE, e.g. 40.1 for
+# track 81. Video Settings > Track Display changes it live.
 # menu_scale: how large the pop-up menu is drawn. "1x" (default) or "2x";
 # also --menu-scale, and Video Settings > Menu Size changes it live.
 # vsync: synchronise desktop presentation to vblank (default true).
@@ -819,12 +826,15 @@ video = "PAL"
 # maximized = false
 # monitor = "auto"
 # window_scale = 1.0
+# title = "{app} {version} · {machine} · {rom}"
 # status_bar = true
+# track_display = "track"
 # vsync = true
 # hidpi_texture = true
 
-# [recording] -- the GIF clip ring behind Save Clip as GIF (Cmd/Alt+Shift+G)
-# and the rate of every GIF clip, including headless --gif-after captures.
+# [recording] -- GIF clip and interactive screenshot settings.
+# The clip ring is behind Save Clip as GIF (Cmd/Alt+Shift+G); clip_fps also
+# applies to headless --gif-after captures.
 # clip_seconds: emulated seconds of the presented picture the window keeps
 # (default 10, up to 120); 0 switches the ring and the menu item off.
 # clip_fps: GIF frame rate, 1 to 60 (default 0 = 25 on PAL, 30 on NTSC).
@@ -835,15 +845,28 @@ video = "PAL"
 
 [audio]
 
-# Synthesized floppy-drive sound effects: motor hum with spin-up/down,
-# head-step clacks (including the classic empty-drive poll click) and
-# the seek buzz of fast stepping. Generated from scratch, not sampled.
-# Mixed into the normal audio output, so they need live audio (or
-# --audio-wav) to be heard.
+# Floppy-drive sound effects on or off. This is the switch for all drive
+# sounds: false silences them even with a floppy_sounds_set below. By
+# default they are synthesized: motor hum with spin-up/down, head-step
+# clacks (including the classic empty-drive poll click) and the seek buzz
+# of fast stepping, generated from scratch, not sampled. Mixed into the
+# normal audio output, so they need live audio (or --audio-wav) to be
+# heard.
 floppy_sounds = true
 
 # Drive sound level, 0-100, relative to Paula's output.
 floppy_sounds_volume = 100
+
+# Play a WinUAE/FS-UAE drive sample set instead of the synthesized sounds
+# (only while floppy_sounds is on):
+# drive_click_NAME.wav, drive_spin_NAME.wav, drive_spinnd_NAME.wav,
+# drive_startup_NAME.wav and drive_snatch_NAME.wav (any may be missing). A
+# bare name is looked up in the "Floppy Sounds" folder of the host-data
+# directory (Documents/Copperline/Floppy Sounds); a path names one of the
+# set's files, or its folder joined with the name. Omitted, empty or
+# "synthesized" keeps the synthesized sounds. A missing set warns and falls
+# back to them.
+# floppy_sounds_set = "A500"
 
 # Host audio output device, matched by a case-insensitive substring against
 # the names `--list-audio-devices` prints (also set with `--audio-device`).
