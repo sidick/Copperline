@@ -16,7 +16,7 @@ This chapter is the implementation and format reference.
 ## Design
 
 Most state uses `serde` derives on the live structs, including `Bus` and
-the published `m68k` core. Types with file handles, decoder internals, or
+the `m68k` core. Types with file handles, decoder internals, or
 feature-dependent board variants use custom serialization. `CpuCore`
 serializes architectural state, prefetch state, MMU state, and timing
 configuration; runtime-only decoded-op, FastMem, and trace-JIT caches are
@@ -31,7 +31,7 @@ What is captured:
 | Component | Contents |
 |---|---|
 | `CpuCore` | registers, SR flags, prefetch queue, pending interrupt/stop state, MMU/CACR state, cycle-timing configuration, `cpu_type` and address mask |
-| `MachineRuntimeState` | the `M68kMachine` fields outside the core: `last_cacr`, `sync_cck_on`, `cpu_clocks_per_cck`, `cpu_clock_carry` |
+| `MachineRuntimeState` | the `M68kMachine` fields outside the core: `last_cacr`, `sync_cck_on`, `cpu_clocks_per_cck`, `cpu_clock_carry`, and `jit_window_bank` (the fast-RAM bank the JIT fastmem window covers while code runs outside fast RAM; it decides which fast-RAM accesses allocate cache lines, and saves without it read `None`) |
 | `icache` / `dcache` | the CPU cache models (`Option<Box<CpuCache>>`, `None` when absent or opted out). When the state carries `None`, load keeps the running machine's cache model, if it has one, and re-derives its enable and freeze bits from the restored CACR |
 | `Bus` | chip, slow, motherboard, and accelerator RAM, ROM and extended ROM, Zorro boards (including their RAM), both CIAs, RTC, Agnus/Copper/Denise/Paula/blitter state, floppy controller with in-memory disk images, Gayle IDE and its PCMCIA card (an SRAM card's contents included), A2091 SCSI, Akiko/CDTV with NVRAM, beam-event capture buffers, DMA pointers, interrupt latches, and the bus-arbitration counters |
 
@@ -402,9 +402,14 @@ Three things are versioned, at three rates:
   reordered fields, and widened integers. Unknown chunks are skipped, so a
   build may add a chunk without invalidating its states for older builds.
 
-In this build every chunk, `DESC` and `META` included, is at version 1 and
-`chunk::MIGRATIONS` is empty; the migration tests supply their own step
-table through `savestate::load_with_migrations`.
+CIA-A and CIA-B chunks are version 2; other chunks remain version 1.
+The CIA migration replaces the old active-low PB pulse fields with explicit
+active-high pulse fields. In pulse mode it preserves the saved physical pin
+level on load, then lets an inherited high expire on the next E edge under
+the corrected output model. Toggle output latches retain their saved values.
+States saved by intermediate, unreleased timing prototypes at CIA version 1
+cannot be distinguished from released version-1 states; recreate those
+investigation checkpoints. `chunk::MIGRATIONS` registers both CIA upgrades.
 
 The rule for a change to a serialized struct is therefore:
 

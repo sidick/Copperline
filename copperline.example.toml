@@ -1,7 +1,9 @@
 # Copperline configuration. Copy this to `copperline.toml` in the working
-# directory, or pass it explicitly with `--config path/to/file.toml`. Any
-# field can be omitted; a missing field takes the default the comments
-# below give. docs/guide/configuration.md is the full reference.
+# directory or beside the Copperline executable or `Copperline.app` (either
+# boots straight into the machine, skipping the launcher), or pass it
+# explicitly with `--config path/to/file.toml`. Any field can be omitted; a
+# missing field takes the default the comments below give.
+# docs/guide/configuration.md is the full reference.
 
 # Kickstart ROM image: 512 KiB, or a 256 KiB Kickstart 1.x part (the A1000
 # profile takes its 64 KiB bootstrap ROM here instead). Byte-swapped EPROM
@@ -34,8 +36,10 @@ rom = "kickstart.rom"
 # these up here when you uncomment them.
 
 
-# [paths] -- specifies where Copperline saves generated files and where file
-# dialogs default to when a field is empty. Every key is optional; defaults
+# [paths] -- specifies where Copperline saves generated files, where file
+# dialogs default to when a field is empty, and where a relative ROM, disk or
+# CD path is looked for when it is not in the working directory (so
+# rom = "KICK31.ROM" finds roms/KICK31.ROM). Every key is optional; defaults
 # use subdirectories in the host data directory (~/Documents/Copperline,
 # %USERPROFILE%\Documents\Copperline, or the application folder in portable
 # mode). Relative paths are resolved against `base`, while absolute paths
@@ -48,7 +52,7 @@ rom = "kickstart.rom"
 # nvram = "nvram"             # battery-backed RAMs, incl. CD32 game saves
 # traces = "traces"           # debugger traces and waveform captures
 # configs = "configs"         # configurations saved from the launcher
-# roms = "roms"               # dialog folders: only used if the folder exists
+# roms = "roms"               # media folders: only used if the folder exists
 # mt32_roms = "roms/mt32"
 # floppies = "floppies"
 # harddrives = "harddrives"
@@ -620,6 +624,11 @@ video = "PAL"
 # CD-ROM drive at that slot instead of a hard disk (see [scsi], above, for the
 # read-only SCSI-2 command engine both share).
 # [ide]
+# timing = "period"      # time the drives like the machine's own period drive
+#                        # ("instant", the default; "period"; or a profile id)
+# spin_up = true         # also model the power-on spin-up (opt-in)
+#                        # [[drive_profile]] tables describe further drives
+#                        # (docs/guide/configuration.md, "Drive timing")
 # master = "workbench.hdf"
 # slave = "data.hdf"
 # master = { path = "workbench.hdf", bootpri = 6 }
@@ -955,10 +964,12 @@ floppy_sounds_volume = 100
 # joystick = "gamepad"
 
 # Host mouse sensitivity, 0-100. 50 (default, shown as "Default" in the GUI)
-# tracks the host mouse 1:1; 0 is a quarter speed and 100 quadruple, on an
-# exponential scale. A host-input scale only -- it does not affect the emulated
-# machine or scripted --mouse-after input. Also --mouse-sensitivity N, the
-# launcher's Input tab, and Cmd/Alt+Shift+> / < (held to ramp) to adjust live.
+# is a neutral multiplier; 0 is a quarter speed and 100 quadruple, on an
+# exponential scale. Live mouse motion compensates for the picture's display
+# scale first, including when captured. A host-input scale only -- it does not
+# affect the emulated machine or scripted --mouse-after input. Also
+# --mouse-sensitivity N, the launcher's Input tab, and Cmd/Alt+Shift+> / <
+# (held to ramp) to adjust live.
 # mouse_sensitivity = 50
 
 # When the host mouse is grabbed (pointer confined to the window, host cursor

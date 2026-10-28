@@ -27,8 +27,8 @@
 # Local asset directory for the ignored integration tests.
 /test-assets/
 
-# Local development checkout of the m68k core crate (the root build uses
-# the crates.io release; this tree is for working on the crate itself).
+# Optional local CPU-core research checkout; production uses Cargo dependencies.
+/vendor/m68k/
 /crates/m68k/
 
 # HRTMon cartridge image build output (the committed artifact is
@@ -104,6 +104,11 @@ __pycache__/
 # macOS disk image build artifact (packaging/macos/build-dmg.sh); the .app
 # bundle stages under /target, already ignored above.
 /*.dmg
+
+# Windows packages (packaging/windows/); installer scratch files use /target.
+/Copperline-*-win-*/
+/Copperline-*-win-*.zip
+/Copperline-*-win-*-setup.exe
 
 # Guest-code build intermediates (the committed artifact is the .bin blob).
 /guest/services/handler.*

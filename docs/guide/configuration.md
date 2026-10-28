@@ -1,18 +1,38 @@
 # Configuration reference
 
 Copperline is configured by a TOML file: the file passed with `--config`,
-else `./copperline.toml` if present, else the configuration saved with the
-configuration screen's **Save default** button (see [](ui.md)). Every field
-is optional; missing fields use the defaults documented here.
+else `./copperline.toml` if present, else a `copperline.toml` beside the
+Copperline executable, else the configuration saved with the configuration
+screen's **Save default** button (see [](ui.md)). Every field is optional;
+missing fields use the defaults documented here.
 `copperline.example.toml` in the repository root is a commented companion to
 this reference.
 
-`--factory` ignores the saved default and starts from Copperline's own
-settings; `--config` and `./copperline.toml` always win over it anyway. With
-no default saved, the flag changes nothing.
+A `copperline.toml` in the working directory or beside the executable
+describes a machine to run: like `--config`, it skips the configuration
+screen, and the machine starts running at once (unless the file sets
+`[emulation] power_on = false`). The copy beside the executable works
+whatever directory Copperline is started from, so an installation can
+carry its own default machine. For a downloaded `.AppImage`, put it beside
+the `.AppImage` file. On macOS, put it beside `Copperline.app`; a copy
+inside the bundle's `Contents/MacOS` folder also works, but the one beside
+the bundle wins. macOS runs a downloaded app that has not been moved out of
+its download folder from a temporary private copy, which cannot see the
+files beside it. Move `Copperline.app` with the Finder (to Applications,
+say) before relying on a file beside it. Relative paths inside it work as
+in any configuration file: a media path such as `rom = "KICK31.ROM"` that
+is not in the working directory is looked for in the matching media folder
+(see [Relative media paths](#relative-media-paths)), so a ROM kept in
+`~/Documents/Copperline/roms` is found whatever directory Copperline was
+started from.
+
+`--factory` ignores the saved default and a `copperline.toml` beside the
+executable, and starts from Copperline's own settings. `--config` and
+`./copperline.toml` always win over it anyway. With neither default
+present, the flag changes nothing.
 
 Settings changed from the menu during a session that started without
-`--config`, `./copperline.toml` or `--factory` are written into the saved
+`--config`, a `copperline.toml` or `--factory` are written into the saved
 default as they change (only the changed keys; see
 [Settings the menu remembers](ui.md#menu-settings-persist)).
 
@@ -22,7 +42,7 @@ the saved file untouched. A saved default that parses but no longer
 validates -- a disk image that moved, a drive not yet mounted -- opens the
 configuration screen on the built-in settings with the reason on its status
 line, so it can be fixed before **Save default** replaces it. Errors in
-`--config` or `./copperline.toml` still report the requested configuration
+`--config` or a `copperline.toml` still report the requested configuration
 problem.
 
 Configuration parsing rejects unknown keys, invalid CPU or chipset names,
@@ -46,7 +66,38 @@ rom = "C:/Kickstarts/KICK31.ROM"    # forward slashes also work on Windows
 
 Single-quoted literal strings are the least error-prone. macOS and Linux paths
 use forward slashes and need none of this. TOML paths do not expand `~` or
-shell variables; use an absolute path or a path relative to the working directory.
+shell variables; use an absolute path or a relative one (see below).
+
+(relative-media-paths)=
+## Relative media paths
+
+A relative path is looked for in the working directory first. A ROM, disk
+or CD path that is not there is then looked for in the matching media
+folder from [`[paths]`](#paths-config). By default these are
+under the host data directory, so `rom = "KICK31.ROM"` finds
+`~/Documents/Copperline/roms/KICK31.ROM` and `[copperhf] unit0 =
+"Workbench.hdf"` finds `~/Documents/Copperline/harddrives/Workbench.hdf`,
+whichever directory Copperline was started from. That matters for a copy
+started from the Dock, the Start menu or a desktop launcher, whose working
+directory is rarely one you chose.
+
+| Paths | Media folder |
+|---|---|
+| `rom`, `extended_rom`, `fmv_rom`, `[scsi] rom`/`rom_odd`, `[lide] rom`/`rom_bank2`, `[sf2000sd] rom`, `[cartridge] rom` | `roms` |
+| `[serial] mt32_control_rom`, `mt32_pcm_rom` | `roms/mt32`, then `roms` |
+| `[floppy.dfN]` images | `floppies` |
+| `[ide]`, `[scsi]`, `[lide]`, `[copperhf]` and `[sf2000sd]` drives | `harddrives`, then `cds` |
+| `[[filesys]]` folders, a `[pcmcia]` CF card | `harddrives` |
+| `[cd] image` | `cds` |
+
+A path with folders in it is looked up the same way
+(`rom = "kickstarts/KICK31.ROM"` finds `roms/kickstarts/KICK31.ROM`). A
+media folder that does not exist is skipped; none is created. A path found
+in neither place is reported as written. Absolute paths are always used
+as they are, and every other relative path in a configuration (bezel
+stickers, shaders, printer output, battery-RAM files and so on) is still
+relative to the working directory. Paths given to scheduled input such as
+`--insert-disk-after` are also used as written.
 
 ## Command-line overrides
 
@@ -75,6 +126,7 @@ range checks as the equivalent TOML fields:
 | `--accelerator SIZE` | `[memory] accelerator` | CPU-slot RAM at `$08000000` (32-bit CPUs): `0` to `128M` |
 | `--floppy-drives COUNT` | `[floppy] drives` | `0` to `4` wired drives (`DF0:` plus external drives) |
 | `--floppy-speed PERCENT` | `[floppy] speed` | `100` (real), `200`, `400`, `800`, or `0` (turbo) |
+| `--hd-timing TIMING` | `[ide]`, `[scsi]`, `[lide]` `timing` | `instant` (default), `period`, or a drive profile id (see [Drive timing](#drive-timing)) |
 | `--floppy-bridge DFN NAME` | `[floppy.dfN] bridge` | drive a physical floppy drive: `greaseweazle`, or `off` |
 | `--floppy-bridge-port DFN PORT` | `[floppy.dfN] bridge_port` | that interface's serial port (default: auto-detect) |
 | `--floppy-bridge-cable DFN SEL` | `[floppy.dfN] bridge_cable` | drive select: `a`/`b` (IBM PC cable) or `0`-`3` (Shugart) |
@@ -83,7 +135,7 @@ range checks as the equivalent TOML fields:
 | `--floppy-replay-speed DFN SPEED` | `[floppy.dfN] replay_speed` | replay already-captured tracks at `fast` (the default, double speed) or `normal` (the platter's own) |
 | `--floppy-bridge-writable DFN` | `[floppy.dfN] write_protected = false` | allow writing to the real disk |
 | `--joystick MODE` | `[input] joystick` | `gamepad` (default), `keyboard` |
-| `--mouse-sensitivity N` | `[input] mouse_sensitivity` | `0`-`100` host mouse speed (`50` default = 1:1) |
+| `--mouse-sensitivity N` | `[input] mouse_sensitivity` | `0`-`100` host mouse speed (`50` default = neutral multiplier) |
 | `--mouse-capture MODE` | `[input] mouse_capture` | when the host mouse is grabbed: `click` (default), `auto`, `manual` |
 | `--port1 DEVICE` | `[input] port1` | `mouse` (default), `gamepad-mouse`, `joystick`, `cd32`, `analogue`, `lightpen`, `none` |
 | `--port2 DEVICE` | `[input] port2` | the same devices except `gamepad-mouse`; default `joystick` (`cd32` on the CD32 profile) |
@@ -258,6 +310,7 @@ A key that names its own file (`rom`, `fmv_rom`, `[scsi] rom`, `[lide] rom`,
 `[cartridge] rom`, `[whdload] whd_package` / `skick_package`) is used
 instead of the search.
 
+(paths-config)=
 ## `[paths]` -- where files go
 
 ```toml
@@ -269,15 +322,17 @@ instead of the search.
 # nvram = "nvram"            # battery-backed RAMs, incl. CD32 game saves
 # traces = "traces"          # debugger traces and waveform captures
 # configs = "configs"        # configurations saved from the launcher
-# roms = "roms"              # the rest set where an empty file dialog opens:
+# roms = "roms"              # the rest are media folders (see below):
 # mt32_roms = "roms/mt32"    # MT-32 control and PCM ROMs
 # floppies = "floppies"
 # harddrives = "harddrives"
 # cds = "cds"
 ```
 
-`[paths]` sets where Copperline writes its output files and where file
-dialogs open when their field is empty. Every key is optional and falls back
+`[paths]` sets where Copperline writes its output files, where file
+dialogs open when their field is empty, and where a relative media path is
+looked for when the working directory does not have it (see
+[Relative media paths](#relative-media-paths)). Every key is optional and falls back
 to the default directory structure under the host data directory
 (`~/Documents/Copperline` on macOS and Linux,
 `%USERPROFILE%\Documents\Copperline` on Windows, or the application folder
@@ -285,8 +340,8 @@ in a [portable installation](ui.md#where-files-go)).
 
 Relative paths are resolved against `base` (which itself defaults to the host
 data directory), while absolute paths are used directly. Output folders are
-created automatically on first write. Dialog folders are not created
-automatically and only open in existing directories.
+created automatically on first write. Media folders are not created
+automatically and are only used when they exist.
 
 These name folders on the machine that runs the configuration, so a config
 copied to another machine may name folders that are not there. At startup
@@ -655,17 +710,19 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
   does at boot); until then the chip runs scalar, as on real silicon.
 - `jit` (experimental, also `--jit`/`--no-jit`) runs the CPU through the
   m68k core's batch/trace-JIT path instead of the cycle-exact
-  per-instruction model: hot code compiles to native traces and fast-RAM
-  accesses run through a zero-cost direct-memory window. The machine
+  per-instruction model: hot code compiles to native traces, and fast RAM
+  and ROM are read and written directly, with no bus cost. The machine
   behaves like an ideal accelerator running at `clock_mhz`: one
   instruction per CPU clock with zero-wait fast RAM and ROM, so a 50 MHz
   68040 delivers on the order of 50 MIPS (raise `clock_mhz` for more).
-  Interrupts are recognized at batch boundaries, so chip-level races and
-  cycle-counted effects no longer line up; leave it off for anything
-  timing-sensitive (games, demos). Chip and slow RAM still arbitrate onto
-  the shared chip bus in order, and the on-chip cache models stay active
-  (as on a real accelerator, they are what lets chip-RAM-resident code
-  run at CPU speed), so displays, blits, and device I/O work normally.
+  The CPU runs ahead of the chipset in batches that end at the next
+  hardware event or chip-bus access, and interrupts are recognized only
+  there, so chip-level races and cycle-counted effects no longer line up;
+  leave it off for anything timing-sensitive (games, demos). Chip and
+  slow RAM still arbitrate onto the shared chip bus in order, and the
+  on-chip cache models stay active (as on a real accelerator, they are
+  what lets chip-RAM-resident code run at CPU speed), so displays, blits,
+  and device I/O work normally.
   Requires a 68020 or later: the 68000/68010 share one bus with the chipset
   and their floating-bus and prefetch semantics need the precise core, so
   `jit = true` on those models logs a note and stays precise (the
@@ -675,21 +732,25 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
 - `speed` (also `--cpu-speed`) picks how fast the JIT runs. `"fixed"` (the
   default) runs it at `clock_mhz`, deterministically. `"fastest"` is the
   equivalent of WinUAE's *Fastest possible* CPU setting: while the window
-  paces the machine to real time, the JIT's effective clock adapts to what
-  the host can sustain. It starts at `clock_mhz`, which is also its floor
-  (it never runs slower), and rises while the host has headroom, up to
-  2000 MHz. The chipset, audio and emulated time stay in real time, so the
-  pointer and sound stay smooth, and the CPU gets the host time that is
-  left. Every tenth of a second Copperline compares the main thread's host
-  time (emulation plus the window's own work, pacing sleeps excluded) with
-  the emulated time that passed. It raises the clock while that stays below
-  about 80% and the CPU is actually busy; a CPU waiting in STOP, or one
-  stalled on the chip bus, keeps its clock. It lowers the clock as soon as
-  the share passes about 93%, for example when another program loads the
-  host. The performance overlay (`cpu N MHz`)
-  and the control protocol's `status` reply (`jit_mhz`) show the current
-  clock, and the launcher's CPU page has a matching **JIT speed** row,
-  greyed until the JIT is on.
+  paces the machine to real time, the chipset, audio and emulated time
+  stay in real time, so the pointer and sound stay smooth, and the CPU
+  gets the host time that is left. It uses that time in two ways:
+  - The JIT's clock adapts. It starts at `clock_mhz`, which is also its
+    floor (it never runs slower), and rises while the host has headroom
+    and the CPU is actually busy; a CPU waiting in STOP, or one stalled on
+    the chip bus, keeps its clock. When the host gets loaded, for example
+    by another program, the clock backs off toward `clock_mhz` again.
+  - Before each frame is presented, the remaining host time runs extra
+    CPU-only bursts. Code working in fast RAM and ROM runs there without
+    advancing the chipset; a chip RAM or device access keeps its normal
+    timing, and a short limit stops a polling loop from running the
+    chipset through the whole interval.
+
+  A chipset-heavy configuration can still run slower than real time on a
+  slow host. The performance overlay (`cpu N MHz`) and the control
+  protocol's `status` reply (`jit_mhz`) show the measured throughput as an
+  equivalent clock, bursts included, and the launcher's CPU page has a
+  matching **JIT speed** row, greyed until the JIT is on.
 
   The mode is deliberately not reproducible: how many instructions run per
   frame depends on the host and on what else it is doing, so two runs
@@ -704,20 +765,22 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
     for a faster fixed CPU there. (`COPPERLINE_HEADLESS_PACED=1` paces such
     a run like the window, and the clock then adapts as it would there; see
     [Headless operation](headless.md).)
-  - Warp Speed holds the clock the paced run had reached; adaptation
-    resumes when warp ends.
+  - Warp Speed runs the CPU at the last measured throughput as a fixed
+    clock (never below `clock_mhz`); adaptation and the bursts resume when
+    warp ends.
   - Netplay refuses it, and run-ahead stays inactive under it: both depend
     on re-running or comparing frames that must come out identical.
   - Save states do not store the adapted clock. A session whose clock has
     not adapted yet (any unpaced run) takes the loaded state's CPU clock
     exactly, as `speed = "fixed"` does; one that has adapted keeps the
-    clock it reached. A resumed windowed run is not byte-identical to the
-    original.
+    clock it reached (never below the state's `clock_mhz`). A resumed
+    windowed run is not byte-identical to the original.
   - `--record-input`/`--script` replays, `--expect-screenshot` comparisons
     and reverse debugging are exact only in unpaced runs, where the clock is
     fixed.
   - Any debugger hook that forces the precise core (breakpoints, traces,
-    `COPPERLINE_DBG_*`) suspends adaptation, just as it suspends the JIT.
+    `COPPERLINE_DBG_*`) suspends adaptation and the bursts, just as it
+    suspends the JIT.
 
 ## `[memory]`
 
@@ -959,6 +1022,16 @@ fall back to the smooth fit rather than cropping to what fits. RTG board
 modes follow the setting too: their frame is scaled from its own native
 resolution, so a 640x480 board screen is drawn at 1x, 2x, 3x of *those*
 pixels inside the display area.
+The fit uses the window area above the status bar and open panel strips,
+independently of the chipset canvas: a 640x480 board screen fits at 2x on
+a 1920x1080 display. The debugger's display pane uses the same native fit.
+The performance readout, the on-screen messages and the recording badge
+sit at the corners of that picture. Menus, panels and their translucent
+backgrounds use the same brightness as chipset displays. Menus and panels
+keep the UI canvas's proportions and scale, independently of the board mode.
+They are composited over the native RTG texture, so opening them
+preserves its exact pixel blocks, size and position, including with the
+status bar hidden.
 
 Integer scaling draws from the unresampled canvas (one host row per woven
 scanline, matching `pixel_aspect = "square"`). Under the default TV aspect,
@@ -1539,7 +1612,7 @@ port2 = "joystick"        # same values except gamepad-mouse; default "cd32" on 
 # port3 = "joystick"      # parallel-port four-player adapter sockets:
 # port4 = "joystick"      #   joystick | none (see [parallel] joystick-adapter)
 joystick = "gamepad"      # "gamepad" (default) or "keyboard"
-mouse_sensitivity = 50    # host mouse speed 0-100 (50 default = 1:1)
+mouse_sensitivity = 50    # host mouse speed 0-100 (50 default = neutral multiplier)
 mouse_capture = "click"   # when to grab the mouse: click | auto | manual
 middle_click_release = false # middle click releases capture instead of reaching the guest
 autofire_hz = 0           # pulse a held fire button at this rate; 0 = off
@@ -1635,11 +1708,16 @@ run. (`auto` is still accepted here as a backward-compatibility alias for
 `gamepad`; the old auto-detect mode has been removed.)
 
 `mouse_sensitivity` scales how fast the emulated pointer tracks the host
-mouse, 0-100. `50` (the default, shown as *Default* in the GUI) is 1:1,
-`0` is a quarter speed and `100` quadruple, on an exponential scale so each
-step is an even ratio. It is a host-input
-scale applied to live mouse motion only: it never touches the emulated machine
-or scripted `--mouse-after` input, so headless and recorded runs stay
+mouse, 0-100. `50` (the default, shown as *Default* in the GUI) is a neutral
+multiplier, `0` is a quarter speed and `100` quadruple, on an exponential scale
+so each step is an even ratio. Captured and uncaptured mouse motion both compensate
+for the picture's display scale before this multiplier is applied. Captured
+movement uses logical host size, so a larger window or fullscreen picture does
+not increase mouse speed and monitor DPI does not change the sensitivity.
+Captured RTG motion uses the board's native pixels. Guest mouse
+preferences and host cursor acceleration can still affect the feel.
+It is a host-input scale applied to live mouse motion only: it never touches
+the emulated machine or scripted `--mouse-after` input, so headless and recorded runs stay
 deterministic. Set it from the launcher's *Input* tab or
 `--mouse-sensitivity N`, and adjust it live with `Cmd+Shift+>` / `Cmd+Shift+<`
 (`Alt+Shift+>` / `Alt+Shift+<` on Linux and Windows), which ramp while held.
@@ -2188,6 +2266,10 @@ appears in the status bar on IDE machines. On the `A4000` profile the same
 `$DD2020` (no Gayle involved; Kickstart's `scsi.device` drives it the same
 way).
 
+`timing` and `spin_up` give the drives the seek, rotation and transfer
+times of a real drive of the period instead of completing every transfer at
+once; see [Drive timing](#drive-timing).
+
 A path ending in `.cue`, `.iso`, `.nrg`, or a `.chd` holding a CD (chdman's
 `createcd`; one holding a hard disk, `createhd`, attaches as the hard disk
 described above -- the CHD's own metadata decides, not its name) attaches an
@@ -2264,10 +2346,13 @@ unit0 = "workbench.hdf"      # SCSI IDs 0-6
 unit1 = "data.hdf"
 unit2 = "game.cue"           # .cue/.iso/.nrg/.chd attaches a CD-ROM drive
 # unit3..unit6 = ...
+# timing = "period"          # period drive mechanics (see Drive timing)
 ```
 
 The `[scsi]` section attaches a SCSI host adapter with up to **seven
-drives**. `controller` picks which one:
+drives**. `timing` and `spin_up` give the hard disks on any of the three
+controllers the seek, rotation and transfer times of a real drive of the
+period; see [Drive timing](#drive-timing). `controller` picks which one:
 
 - `"a2091"` (the default on machines without onboard SCSI): a Commodore
   A2091 (Commodore DMAC + WD33C93A) as a Zorro II autoconfig board. It
@@ -2454,6 +2539,158 @@ banking and is never offered one; `rom_bank2 = ""` opts out on its own
 without touching `rom`. Either key can instead name a release download of
 your own, which always wins over the bundled default. The bundled files are
 found as described under [Where bundled files are found](#bundled-assets).
+
+`timing` and `spin_up` time the board's hard disks like real drives of the
+period, as on `[ide]`; see [Drive timing](#drive-timing).
+
+(drive-timing)=
+## Drive timing -- period hard-drive mechanics
+
+```toml
+[machine]
+profile = "A1200"
+
+[ide]
+timing = "period"          # "instant" (the default), "period", or a profile id
+# spin_up = true           # also model the drive spinning up at power-on
+master = "System.hdf"
+slave = { path = "Work.hdf", timing = "seagate-st9080a" }   # this drive only
+```
+
+By default a hard drive completes every transfer within the access that
+starts it, which is far faster than any real drive of the period. `timing`
+gives a drive the mechanism of a real one instead, modelled from its
+manufacturer's datasheet:
+
+- the drive's command overhead;
+- a seek curve through the datasheet's track-to-track, average and
+  full-stroke times;
+- the rotational wait for the first sector, from the platter's position at
+  that moment;
+- the media rate of each recording zone, with the track and cylinder skew
+  that hide head switches on sequential transfers;
+- the drive's buffer, read-ahead and (where the drive had it) write cache.
+
+The guest sees what a real drive shows: on IDE, BSY while it seeks and
+reads and each block of data and its interrupt when the drive has it; on
+SCSI, the command still in progress until the drive has data, the data
+phase at the drive's buffer and SCSI-bus pace, and status once a write is
+on the media (or in a write cache); and an activity LED that stays lit
+through the seek. Loading, booting and benchmarks then run
+at the speed of the machine with that drive fitted.
+
+`timing` takes:
+
+- `"instant"`: the default, and the behaviour of every earlier version.
+- `"period"`: the drive the machine shipped with on that interface
+  (table below).
+- A profile id from the table of built-in drives below.
+
+Set on the section (`[ide]`, `[scsi]` on any of its three controllers,
+`[lide]`), it covers every hard disk there; set in a drive's own table, it
+covers just that drive. A `[[host_disk]]` on
+one of the section's slots takes the section's `timing`. `--hd-timing
+TIMING` sets the section `timing` from the command line.
+
+`spin_up = true` also models the drive coming up to speed at power-on: an
+IDE drive stays busy for its spin-up time (seconds), and a SCSI drive
+answers NOT READY, "becoming ready", until it is up, so Kickstart's probe
+waits for it just as it did on the real machine -- including Kickstart 3.0's
+habit of giving up on a slow IDE drive. It is off by default because it adds
+those seconds to every boot.
+
+A timed drive also does what its power management did. On IDE, SEEK and the
+power commands work (IDLE and STANDBY, immediate or with a standby timer,
+and CHECK POWER MODE), so spin-down tools work: a stopped drive pays its
+standby-to-ready time on the next access. An untimed drive still rejects
+them, as before. On SCSI, START STOP UNIT spins a timed drive down and up.
+The Seagate 2.5" drives also park their heads after 5 seconds without a
+command, so the next access seeks in from the edge.
+
+The configuration screen sets the timing of every section at once on its
+*A/V & Emu -> Emulation* page (see [](ui.md)).
+
+Commodore never documented which drives it fitted, so `period` follows
+owner reports and reviews:
+
+| Machine / interface | `period` is | Fitted to |
+|---|---|---|
+| A600 (`[ide]`) | `conner-cp2024` | the 20 MB A600HD |
+| A1200 (`[ide]`) | `conner-cp2064` | the A1200HD's Conner "60 meg" |
+| A4000 (`[ide]`) | `seagate-st3144a` | the early A4000/040's 120 MB drive |
+| A3000 (`[scsi]`, `controller = "a3000"`) | `quantum-lps-52s` | the A3000's 52 MB Quantum |
+| A2091 in a big-box machine (`[scsi]`) | `quantum-lps-52s` | the A2000HD's 52 MB Quantum |
+| A2091 on an A500, A500+, A1000 or CDTV (`[scsi]`) | `seagate-st125n` | the A590 side-car's 20 MB Seagate |
+| A4091 (`[scsi]`, `controller = "a4091"`) | `seagate-st31200n` | a 1 GB SCSI-2 drive, the class the A4000T shipped with |
+| any machine (`[lide]`) | `wd-ac2120` | a period 3.5" IDE drive |
+
+Built-in drives (`copperline --list-drive-profiles` prints this table):
+
+| id | Drive | rpm | Seek ms (avg) | Media rate | Buffer |
+|---|---|---|---|---|---|
+| `conner-cp2024` | Conner CP2024, 21 MB 2.5" ATA, 1990 | 3433 | 23 | 937 KB/s | 8 KB |
+| `conner-cp2044` | Conner CP2044, 43 MB 2.5" ATA, 1990 | 3486 | 19 | 1130 KB/s | 32 KB |
+| `conner-cp2064` | Conner CP2064, 64 MB 2.5" ATA, 1990 | 3486 | 19 | 1130 KB/s | 32 KB |
+| `conner-cp2084` | Conner CP2084, 85 MB 2.5" ATA, 1991 | 3486 | 19 | 1130 KB/s | 32 KB |
+| `seagate-st9080a` | Seagate ST9080A, 64 MB 2.5" ATA, 1992 | 3449 | 16 | 1.21-1.59 MB/s | 32 KB |
+| `seagate-st9145a` | Seagate ST9145A, 128 MB 2.5" ATA, 1992 | 3449 | 16 | 1.21-1.59 MB/s | 64 KB |
+| `seagate-st9235a` | Seagate ST9235A, 210 MB 2.5" ATA, 1992 | 3449 | 16 | 1.21-1.59 MB/s | 64 KB |
+| `seagate-st9655ag` | Seagate ST9655AG, 524 MB 2.5" ATA, 1994 | 3980 | 16 | 2.1-2.8 MB/s | 120 KB, write cache |
+| `ibm-dpra-21215` | IBM DPRA-21215, 1.2 GB 2.5" ATA, 1995 | 4900 | 12 | 3.6-5.7 MB/s | 64 KB |
+| `seagate-st3144a` | Seagate ST3144A, 130 MB 3.5" ATA, 1991 | 3211 | 16 | 0.88-1.18 MB/s | 32 KB |
+| `conner-cp30084` | Conner CP30084, 84 MB 3.5" ATA, 1991 | 3400 | 19 | 1131 KB/s | 64 KB |
+| `conner-cp30104` | Conner CP30104, 120 MB 3.5" ATA, 1991 | 3400 | 19 | 1131 KB/s | 64 KB |
+| `wd-ac2120` | WD Caviar AC2120, 120 MB 3.5" ATA, 1992 | 3605 | 15 | 1.23-1.48 MB/s | 32 KB |
+| `quantum-fireball-1080at` | Quantum Fireball 1080AT, 1.08 GB 3.5" ATA, 1995 | 5400 | 12 | 4.1-8.2 MB/s | 128 KB |
+| `seagate-st125n` | Seagate ST125N, 21 MB 3.5" SCSI, 1987 | 3600 | 38 | 799 KB/s | none |
+| `seagate-st157n` | Seagate ST157N, 49 MB 3.5" SCSI, 1987 | 3600 | 38 | 799 KB/s | none |
+| `quantum-prodrive-40s` | Quantum ProDrive 40S, 42 MB 3.5" SCSI, 1988 | 3662 | 19 | 0.87-1.09 MB/s | 64 KB |
+| `quantum-prodrive-80s` | Quantum ProDrive 80S, 84 MB 3.5" SCSI, 1988 | 3662 | 19 | 0.87-1.09 MB/s | 64 KB |
+| `quantum-lps-52s` | Quantum ProDrive LPS 52S, 52 MB 3.5" SCSI, 1990 | 3660 | 17 | 1.03-1.59 MB/s | 64 KB |
+| `quantum-lps-105s` | Quantum ProDrive LPS 105S, 105 MB 3.5" SCSI, 1990 | 3660 | 17 | 1.03-1.59 MB/s | 64 KB |
+| `seagate-st31200n` | Seagate Hawk 1LP ST31200N, 1.05 GB 3.5" SCSI, 1995 | 5411 | 9.3 | 2.9-5.0 MB/s | 256 KB |
+| `quantum-fireball-1080s` | Quantum Fireball 1080S, 1.08 GB 3.5" SCSI, 1995 | 5400 | 12 | 4.1-8.2 MB/s | 128 KB |
+
+Any profile works on any interface. A profile describes the mechanism, not
+the capacity: an image smaller than the drive sits on its outer cylinders,
+as a partition at the start of the real disk would, and a larger one is
+spread across its full stroke with more sectors to each cylinder. Either
+way it spins, seeks and transfers like the drive it names.
+
+A drive that is not built in can be described with `[[drive_profile]]`,
+from scratch or as changes to a built-in one, and named in `timing` like
+any other:
+
+```toml
+[[drive_profile]]
+id = "quantum-gls-170"        # what timing = "..." names
+label = "Quantum GoDrive GLS 170"
+rpm = 3600
+heads = 4
+zones = [                     # outermost first; or cylinders = N and
+    { cylinders = 700, sectors_per_track = 70 },  # sectors_per_track = N
+    { cylinders = 695, sectors_per_track = 50 },  # for an unzoned drive
+]
+seek_ms = [5, 17, 30]         # track-to-track, average, full stroke
+buffer_kib = 96
+# write_seek_ms, head_switch_ms (3), skew = [track, cylinder], overhead_ms (1),
+# prefetch_sectors, read_ahead (true), partial_hits (true), write_cache
+# (false), spin_up_s (10), standby_spin_up_s, idle_park_s, scsi_kb_per_s
+
+[[drive_profile]]
+id = "quick-conner"
+base = "conner-cp2064"        # every figure from the built-in...
+seek_ms = [4, 15, 30]         # ...except these
+``` `HDD-TIMING-PLAN.md` in the source tree records
+each profile's sources and the figures that had to be estimated.
+
+The model runs in emulated time, so a timed machine is as reproducible as
+any other: headless runs repeat byte for byte, a save state resumes
+exactly (and carries the drive model it was saved with), and netplay peers
+share the host's drive models. Only spinning hard disks are timed:
+`[copperhf]`, `[sf2000sd]`, `[[filesys]]` folders, a `[pcmcia]` card and
+CD-ROM drives keep their own behaviour, and `timing` on a `[copperhf]` or
+`[sf2000sd]` unit is an error.
 
 ## `[sf2000sd]` -- the SF2000 accelerator's Zorro II SD card controller
 

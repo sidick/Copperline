@@ -142,6 +142,12 @@ impl Sdmac {
         self.wd.first_cd_mut()
     }
 
+    /// Mutable view of target `id`'s disk image -- `disk.fault.*` target
+    /// resolution.
+    pub fn disk_mut(&mut self, id: usize) -> Option<&mut crate::harddrive::HardDriveImage> {
+        self.wd.disk_mut(id)
+    }
+
     /// Let go of any real disk of the host's, and say how many went.
     pub fn release_host_disks(&mut self) -> usize {
         self.wd.release_host_disks()
@@ -166,6 +172,11 @@ impl Sdmac {
     /// Advance emulated time: deliver delayed WD33C93 interrupts, pump any
     /// DMA handshake that became ready, and run the targets (a CD-ROM
     /// drive's tray countdown and CD-DA streaming into the mixer ring).
+    /// Colour clocks until the SCSI side next changes state on its own.
+    pub fn next_event_cck(&self) -> Option<u32> {
+        self.wd.next_event_cck()
+    }
+
     pub fn tick(&mut self, cck: u32, mem: &mut Memory, cd_audio: &mut CdAudioRing) {
         self.wd.tick(cck);
         self.pump_dma(mem);

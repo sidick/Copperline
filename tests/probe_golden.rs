@@ -50,6 +50,8 @@ const BOOTBLOCK_SIZE: usize = 1024;
 /// has 2-cck resolution on ECS vs 4-cck on OCS, so phase probes differ).
 #[derive(Clone, Copy)]
 enum Machine {
+    /// Fixed-clock JIT accelerator with local fast RAM.
+    Jit,
     Ocs,
     Ecs,
     /// A1200 shape (68EC020, AGA, 2M chip) for probes of AGA-only
@@ -142,13 +144,20 @@ fn build_adf(boot: &[u8], program: &[u8]) -> Vec<u8> {
 // Windows temp path's backslashes are not parsed as escape sequences.
 fn probe_config(adf: &Path, machine: Machine) -> String {
     let chipset = match machine {
+        Machine::Jit => "revision = \"ECS\"\n",
         Machine::Ocs => "revision = \"OCS\"\n",
         Machine::Ecs => "revision = \"ECS\"\nagnus = \"8372A\"\ndenise = \"OCS\"\n",
         Machine::Aga => "revision = \"AGA\"\n",
     };
     let (cpu, memory) = match machine {
+        Machine::Jit => ("68040", "chip = \"2M\"\nfast = \"8M\"\n"),
         Machine::Ocs | Machine::Ecs => ("68000", "chip = \"512K\"\nslow = \"512K\"\n"),
         Machine::Aga => ("68EC020", "chip = \"2M\"\n"),
+    };
+    let acceleration = if matches!(machine, Machine::Jit) {
+        "jit = true\nclock_mhz = 25\n"
+    } else {
+        ""
     };
     format!(
         "rom = \"<bundled-aros>\"\n\
@@ -156,6 +165,7 @@ fn probe_config(adf: &Path, machine: Machine) -> String {
          overscan = \"full\"\n\
          [cpu]\n\
          model = \"{cpu}\"\n\
+         {acceleration}\
          [memory]\n\
          {memory}\
          [chipset]\n\
@@ -356,6 +366,7 @@ macro_rules! probe_tests {
 }
 
 probe_tests! {
+    golden_jit_bus_boundary => Probe { name: "jit-bus-boundary", program: "jit-bus-boundary.bin", seconds: 16.0, machine: Machine::Jit };
     golden_timing_test => probe("timing-test", "test.bin", 32.0);
     golden_ddfprobe => probe("ddfprobe", "ddfprobe.bin", 16.0);
     golden_ddfprobe_diw1 => probe("ddfprobe-diw1", "ddfprobe-diw1.bin", 16.0);
@@ -396,6 +407,11 @@ probe_tests! {
     // class, issue #371), and an on-grid start folds from the pipeline
     // alone; FS-UAE-verified band by band.
     golden_ddfprobe_agafold2 => probe_aga("ddfprobe-agafold2", "ddfprobe-agafold2.bin", 16.0);
+    // A DDFSTRT below the hardwired $18 start only latches BPHSTART on
+    // Alice; the run starts at SHW $18, so the fold phase is the $18 one and
+    // every tap renders linearly (the Skeleton Krew CD32 scroll-jump
+    // regression class, issue #836); vAmiga-verified band by band.
+    golden_ddfprobe_agafold3 => probe_aga("ddfprobe-agafold3", "ddfprobe-agafold3.bin", 16.0);
     // Wide-FMODE's absolute gulp grid remains linear below the standard
     // fetch slots: lo-res BPL64 $18/$B8 hides its whole first 64-px gulp
     // left of a standard DIW and presents the remaining 320 px edge to edge;
@@ -476,6 +492,13 @@ probe_tests! {
     // CLXDAT collision matrix bits rendered as cells (the collision
     // matching/enable regression class).
     golden_clxprobe => probe("clxprobe", "clxprobe.bin", 16.0);
+    // Raw startup/BBUSY/BZERO and descending destination-restore snapshots.
+    golden_a500_blit_boundaries => probe("a500-blit-boundaries", "a500-blit-boundaries.bin", 16.0);
+    golden_a500_display_boundaries => probe_ecs("a500-display-boundaries", "a500-display-boundaries.bin", 16.0);
+    // Both CIA timer-A outputs, raw INTREQR, PRB and ICR across instruction
+    // gaps. Model regression snapshot; electrical evidence and phase limits
+    // are documented separately in internals/timing.md.
+    golden_a500_cia_request => probe_ecs("a500-cia-request", "a500-cia-request.bin", 16.0);
     // AUD0 interrupt cadence strip across a scripted AUDxEN
     // enable/punch/disable/restart sequence (the issue #74 deferred
     // AUDxEN-disable regression class).

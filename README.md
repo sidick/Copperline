@@ -13,6 +13,7 @@ It boots out of the box with the bundled open-source AROS Kickstart replacement,
 
 - **Chipset and machine models**: OCS, ECS, and AGA support with profiles from the A500 through the A4000, plus CDTV and CD32.
 - **Configurable CPU and memory**: Motorola 68000 through 68060, optional FPU and MMU support, and configurable Chip, Fast, and Slow RAM.
+- **Accelerated execution**: Optional 68020+ JIT, either at a fixed, reproducible clock or in a `fastest` mode that gives the CPU whatever host time the real-time chipset leaves. See [CPU configuration](docs/guide/configuration.md).
 - **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF, SCP, and ZIP-packed ADF), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
 - **Audio and video**: 4-channel Paula audio, RTG graphics cards (Picasso II/II+, Z3660), host MIDI in/out bridging, and built-in Roland MT-32 and General MIDI synthesis.
 - **Expansion and networking**: Zorro II/III autoconfig, A2065 Ethernet, host-backed bsdsocket.library, and sandboxed WebAssembly expansion plugins.
@@ -51,6 +52,19 @@ chmod +x Copperline-*.AppImage
 
 *Note:* On Linux, presentation requires a Vulkan driver. Most modern GPUs support Vulkan natively. For virtual machines or older hardware, install the Mesa software Vulkan driver (`mesa-vulkan-drivers` on Debian/Ubuntu/Fedora, or `vulkan-swrast` on Arch).
 
+### Windows
+
+Download `Copperline-X.Y.Z-win-x64-setup.exe` or
+`Copperline-X.Y.Z-win-arm64-setup.exe` from the
+[releases page](https://github.com/CopperlineHQ/Copperline/releases), matching
+your PC's architecture. The installer needs no administrator rights and adds
+a Start menu shortcut. Run a newer installer to update; uninstall through
+Windows Settings. Your settings and saves are preserved.
+
+Portable ZIPs remain available for both architectures; extract the whole
+archive and run `copperline.exe`. See the [Windows installation
+guide](docs/guide/getting-started.md#installing-on-windows).
+
 ### Building from source
 
 ```sh
@@ -64,6 +78,10 @@ build option; unoptimized debug builds are too slow for real-time emulation.
 display offsets. Combine it with **Autocrop** and **Integer** scaling to fit
 the detected display at the largest whole-pixel scale, including artwork
 outside the normal TV aperture. See [display configuration](docs/guide/configuration.md).
+RTG integer scaling fits the board's native resolution to the available display
+area: a 640x480 desktop reaches 2x on a 1920x1080 screen, with room for the status bar.
+The RTG picture stays at native pixel quality while menus and panels keep
+their usual proportions and translucency.
 
 The [Debug workspace](docs/debugger/window.md) puts the Amiga display beside
 its debugger, Frame Analyzer, and Console in one desktop window. Open
@@ -90,7 +108,7 @@ Run Copperline from the terminal:
 ./target/release/copperline
 ```
 
-Running with no arguments and no `./copperline.toml` opens the interactive configuration launcher (defaulting to an A500 profile with the bundled AROS ROM).
+Running with no arguments and no `copperline.toml` (in the working directory or beside the executable) opens the interactive configuration launcher (defaulting to an A500 profile with the bundled AROS ROM).
 
 To boot directly into a Kickstart ROM, configuration file, or floppy image:
 
@@ -119,6 +137,12 @@ ordinary windows.
 - **Native screenshot (1:1)**: `Cmd+Option+S` (macOS) / `Ctrl+Alt+S` (Linux/Windows)
 - **Mouse capture**: `Cmd+G` (macOS) / `Alt+G` (Linux/Windows)
 - **Joystick toggle**: `Cmd+J` (macOS) / `Alt+J` (Linux/Windows) switches between physical gamepad and keyboard arrows.
+
+Captured mouse movement compensates for the picture's display scale, so
+enlarging the window or entering fullscreen does not amplify its speed.
+The conversion accounts for monitor DPI and uses native board pixels for RTG.
+Adjust the live mouse speed with `[input] mouse_sensitivity` or the launcher's
+*Input* tab.
 
 See the [UI guide](docs/guide/ui.md) for full interface details.
 
@@ -209,7 +233,8 @@ See [CREDITS.md](CREDITS.md) for contributor and third-party software credits.
 - [AROS Research Operating System](https://www.aros.org/) (bundled boot ROM)
 - [DiagROM](https://www.diagrom.com/) by John "Chucky" Hertell
 - [HRTMon](https://github.com/wepl/hrtmon) by Alain Malek, Bert Jahn and contributors (bundled freezer-cartridge monitor, GPL-2.0-or-later)
-- [m68k](https://crates.io/crates/m68k) CPU core
+- [m68k](https://crates.io/crates/m68k) CPU core (temporarily pinned to the [CopperlineHQ fork](https://github.com/CopperlineHQ/m68k-rs) while the JIT extensions are reviewed upstream)
+- Toni Wilen (WinUAE developer), whose [blitter hardware observations](https://eab.abime.net/showpost.php?p=1426048) helped guide the One ROM A500 timing experiments.
 
 ## License
 

@@ -222,6 +222,9 @@ pub struct CliArgs {
     /// `--sampler-list-audio-inputs`: print the host audio input devices (for
     /// `--sampler-audio-input`) and exit.
     pub list_sampler_inputs: bool,
+    /// `--list-drive-profiles`: print the built-in hard-drive profiles (for
+    /// `timing` / `--hd-timing`) and exit.
+    pub list_drive_profiles: bool,
     /// Command-line machine overrides (`--model`, `--chipset`, `--cpu`,
     /// `--fpu`/`--no-fpu`, `--cpu-clock`, `--chip`, `--fast`, `--slow`,
     /// `--ram-init`, `--floppy-drives`).
@@ -229,8 +232,10 @@ pub struct CliArgs {
     /// validation.
     pub overrides: ConfigOverrides,
     /// `--factory`: start from Copperline's own defaults, ignoring a
-    /// configuration saved with Save default. An explicit `--config` still
-    /// wins -- this says "not the saved default", not "no configuration".
+    /// configuration saved with Save default and an installation's
+    /// `copperline.toml` beside the executable. An explicit `--config` (or
+    /// `./copperline.toml`) still wins -- this says "not a default this run
+    /// did not name", not "no configuration".
     pub factory: bool,
 }
 
@@ -487,6 +492,7 @@ where
     let mut host_disk_broker: Option<Vec<String>> = None;
     let mut net_helper_action: Option<String> = None;
     let mut list_sampler_inputs = false;
+    let mut list_drive_profiles = false;
     let mut overrides = ConfigOverrides::default();
     let mut args = args.into_iter().peekable();
     while let Some(a) = args.next() {
@@ -509,6 +515,9 @@ where
             }
             "--list-disks" => {
                 list_disks = true;
+            }
+            "--list-drive-profiles" => {
+                list_drive_profiles = true;
             }
             // Copperline talking to itself across a privilege boundary, not an
             // interface: the unprivileged half writes this command line, so
@@ -820,6 +829,14 @@ where
                     .next()
                     .ok_or_else(|| anyhow!("--floppy-drives requires COUNT (0-4)"))?;
                 overrides.floppy_drives = Some(parse_floppy_drive_count(&value)?);
+            }
+            "--hd-timing" => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow!("--hd-timing requires instant, period, or a drive profile id")
+                })?;
+                copperline::config::DriveTiming::parse(&value)
+                    .map_err(|e| anyhow!("--hd-timing: {e}"))?;
+                overrides.hd_timing = Some(value);
             }
             // Absent from a build without the feature, so an unknown-argument
             // error names it rather than the flag quietly doing nothing.
@@ -1929,6 +1946,7 @@ where
         host_disk_broker,
         net_helper_action,
         list_sampler_inputs,
+        list_drive_profiles,
         overrides,
         factory,
     })
@@ -1996,9 +2014,10 @@ fn print_help() {
          \n\
          Options:\n  \
          -c, --config FILE              load configuration from FILE (default: ./copperline.toml,\n  \
-         \x20                            then the configuration saved with Save default)\n  \
-         --factory                      ignore the saved default and start from Copperline's own\n  \
-         \x20                            settings\n  \
+         \x20                            then copperline.toml beside the executable, then the\n  \
+         \x20                            configuration saved with Save default)\n  \
+         --factory                      ignore the saved default and a copperline.toml beside the\n  \
+         \x20                            executable, and start from Copperline's own settings\n  \
          --whdload GAME                 boot a WHDLoad game package: an .lha/.lzh or .zip\n  \
          \x20                            archive, or a directory holding a .slave\n  \
          \x20                            (see docs/guide/whdload.md)\n  \
@@ -2049,6 +2068,9 @@ fn print_help() {
          \x20                            CPUs), e.g. 0, 32M, 128M\n  \
          --floppy-drives COUNT          wired floppy drives, 0-4 (DF0 plus externals)\n  \
          --floppy-speed PERCENT         drive speed: 100, 200, 400, 800, or 0 (turbo)\n  \
+         --hd-timing TIMING             hard-drive mechanics on [ide]/[scsi]/[lide]: instant\n  \
+         \x20                            (default), period (the drive the machine shipped\n  \
+         \x20                            with), or a profile id (--list-drive-profiles)\n  \
          {floppy_bridge}--host-disk DEVICE [ATTACH]    give the machine one of the host's own disks\n  \
          \x20                            (--list-disks names them); ATTACH is ide-master\n  \
          \x20                            (default), ide-slave, lide0-master..lide1-slave\n  \
@@ -2065,7 +2087,7 @@ fn print_help() {
          --rtc-frozen                   stop the seeded clock at --rtc-time exactly\n  \
          --joystick MODE                initial joystick input: gamepad or keyboard\n  \
          \x20                            (gamepad lets the keyboard pass through to the Amiga)\n  \
-         --mouse-sensitivity N          host mouse sensitivity 0-100 (50 default = 1:1)\n  \
+         --mouse-sensitivity N          host mouse sensitivity 0-100 (50 default = neutral)\n  \
          --mouse-capture MODE           when to grab the host mouse: click (default), auto, manual\n  \
          --port1 DEVICE                 controller in port 1: mouse (default),\n  \
          \x20                            gamepad-mouse, joystick, cd32, analogue, lightpen,\n  \
@@ -2186,6 +2208,8 @@ fn print_help() {
          --list-net-interfaces          list adapters usable for bridged Ethernet and exit\n  \
          --list-disks                   list the host disks that can be given to a machine,\n  \
          \x20                            and exit\n  \
+         --list-drive-profiles          list the built-in hard-drive profiles (for timing /\n  \
+         \x20                            --hd-timing) and exit\n  \
          --install-net-helper           install Linux bridge helper (CAP_NET_RAW only)\n  \
          --uninstall-net-helper         remove the Linux bridge helper\n  \
          --net-helper-status            report Linux bridge-helper status\n  \

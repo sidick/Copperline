@@ -142,6 +142,12 @@ impl A2091 {
         self.wd.first_cd_mut()
     }
 
+    /// Mutable view of target `id`'s disk image -- `disk.fault.*` target
+    /// resolution.
+    pub fn disk_mut(&mut self, id: usize) -> Option<&mut crate::harddrive::HardDriveImage> {
+        self.wd.disk_mut(id)
+    }
+
     /// Let go of any real disk of the host's, and say how many went.
     pub fn release_host_disks(&mut self) -> usize {
         self.wd.release_host_disks()
@@ -412,6 +418,10 @@ impl crate::zorro_device::ZorroDevice for A2091 {
             let mask = self.rom.len() - 1;
             (u16::from(self.rom[off & mask]) << 8) | u16::from(self.rom[(off + 1) & mask])
         })
+    }
+
+    fn next_event_cck(&self) -> Option<u32> {
+        self.wd.next_event_cck()
     }
 
     fn tick(&mut self, cck: u32, host: &mut crate::zorro_device::DeviceHost) {

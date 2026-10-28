@@ -73,10 +73,29 @@ For virtual machines or older hardware, install the software Vulkan driver (lava
 
 ## Installing on Windows
 
-Download `Copperline-X.Y.Z-win-x64.zip` or `Copperline-X.Y.Z-win-arm64.zip`
+Download `Copperline-X.Y.Z-win-x64-setup.exe` or
+`Copperline-X.Y.Z-win-arm64-setup.exe`
 from the [releases page](https://github.com/CopperlineHQ/Copperline/releases),
-matching your Windows architecture. Extract the whole archive and run
-`copperline.exe`; keep the bundled ROMs and other assets alongside it.
+matching your Windows architecture. The installer puts Copperline, its
+command-line tools and bundled ROMs in
+`%LOCALAPPDATA%\Programs\Copperline` by default, without administrator rights.
+It creates a Start menu shortcut and offers an optional desktop shortcut.
+Start Copperline from either shortcut.
+
+Run a newer installer to update the same installation. Remove it through
+**Settings -> Apps** (**Installed apps** on Windows 11, **Apps & features**
+on Windows 10); uninstalling removes the shipped program files and shortcuts
+while preserving your settings, saves and any media you added. By default,
+user data is in
+`%USERPROFILE%\Documents\Copperline`; see [portable data](ui.md#where-files-go).
+
+The installer and executables are unsigned, so Windows SmartScreen may show
+**Windows protected your PC**. Choose **More info -> Run anyway** to proceed.
+
+For a portable installation, download `Copperline-X.Y.Z-win-x64.zip` or
+`Copperline-X.Y.Z-win-arm64.zip`. Extract the whole archive and run
+`copperline.exe`; keep the bundled ROMs and other assets alongside it. Neither
+package requires the Visual C++ Redistributable.
 
 ### The console window
 
@@ -102,7 +121,7 @@ converter](import-uae.md). Where they land depends on the package:
 |---|---|
 | Homebrew | On PATH, next to `copperline`. |
 | macOS dmg | Inside the bundle, `Copperline.app/Contents/MacOS/`. Add that directory to PATH or name the files in the VS Code settings. |
-| Windows zip | Next to `copperline.exe` in the extracted folder. Add the folder to PATH or name the `.exe` files in the VS Code settings. |
+| Windows installer or ZIP | Next to `copperline.exe`, normally in `%LOCALAPPDATA%\Programs\Copperline` for the installer or in the extracted ZIP folder. Add that folder to PATH or name the `.exe` files in the VS Code settings. |
 | AppImage | The separate `Copperline-X.Y.Z-<arch>-tools.tar.gz` release asset. Unpack it anywhere; set `COPPERLINE_BIN` to the AppImage path so `copperline-ctl` can launch the emulator. |
 
 `copperline-ctl` launches the `copperline` beside it when one is there; the
@@ -192,10 +211,11 @@ Run Copperline from the terminal:
 ./target/release/copperline
 ```
 
-When started with no arguments and no `copperline.toml` in the current directory,
-Copperline displays the interactive launcher screen where you can configure
-machine models, memory, storage, and peripherals. Any machine, media, or
-headless option skips the launcher; `--factory` on its own does not.
+When started with no arguments and no `copperline.toml` in the current directory
+or beside the Copperline executable, Copperline displays the interactive
+launcher screen where you can configure machine models, memory, storage, and
+peripherals. Any machine, media, or headless option skips the launcher;
+`--factory` on its own does not.
 
 With no saved default, the launcher starts with an Amiga 500 (Rev 6A): ECS
 8372A Agnus, OCS 8362 Denise, 512 KiB chip RAM, 512 KiB slow RAM, and the
@@ -204,9 +224,15 @@ bundled AROS Kickstart replacement. **Save default** writes your settings to
 [Where files go](ui.md#where-files-go)) and every later run that names no
 configuration loads it. If that saved default has **Run on startup** set
 (`[emulation] auto_launch`), the launcher starts the machine straight away.
-`--factory` ignores the saved default, and also leaves Coppersynth's and the
-modem's stored settings untouched; an explicit `--config` or a local
-`copperline.toml` still takes precedence.
+`--factory` ignores the saved default and a `copperline.toml` beside the
+executable, and also leaves Coppersynth's and the modem's stored settings
+untouched; an explicit `--config` or a local `copperline.toml` still takes
+precedence.
+
+A `copperline.toml` beside the Copperline executable (on macOS, beside
+`Copperline.app`) boots straight into its machine, running, from any working
+directory, so an installation can carry its own default machine (see
+[](configuration.md)).
 
 To boot directly into a specific Kickstart ROM or configuration file:
 

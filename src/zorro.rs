@@ -961,6 +961,25 @@ impl ZorroChain {
             .map(|&(base, len, idx)| (base, len, idx))
     }
 
+    /// The configured RAM window holding `addr` as (base, len, board
+    /// index), for the CPU's JIT fastmem window.
+    pub fn ram_region_containing(&self, addr: u32) -> Option<(u32, u32, usize)> {
+        self.regions
+            .iter()
+            .copied()
+            .find(|&(base, len, _)| addr.wrapping_sub(base) < len)
+    }
+
+    /// Whether any configured RAM board overlaps a physical range. Used to
+    /// keep lower-priority ROM decode out of the JIT direct-memory table.
+    pub(crate) fn ram_overlaps(&self, base: u32, len: u32) -> bool {
+        len != 0
+            && self.regions.iter().any(|&(start, size, _)| {
+                u64::from(start) < u64::from(base) + u64::from(len)
+                    && u64::from(base) < u64::from(start) + u64::from(size)
+            })
+    }
+
     /// Configured RAM windows as (base, len) pairs, for the debugger's
     /// memory hunt.
     pub fn ram_regions(&self) -> Vec<(u32, u32)> {

@@ -287,6 +287,15 @@ impl IdeZorro {
         self.ata.iter_mut().find_map(AtaBus::first_atapi_mut)
     }
 
+    /// The hard disk in a numbered slot across both channels
+    /// (`disk.fault.*`'s `{"kind": "ide", "unit": N}` target): units 0/1
+    /// are channel 0's master/slave, 2/3 are channel 1's -- mirroring
+    /// `Gayle::hard_disk_mut`/`IdeA4000::hard_disk_mut` for a board with
+    /// two channels instead of one.
+    pub fn hard_disk_mut(&mut self, unit: usize) -> Option<&mut crate::harddrive::HardDriveImage> {
+        self.ata.get_mut(unit / 2)?.hard_disk_mut(unit % 2)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn pending_host_disks(&self, out: &mut Vec<(String, String, bool)>) {
         for bus in &self.ata {
@@ -590,13 +599,18 @@ impl crate::zorro_device::ZorroDevice for IdeZorro {
 
     fn tick(&mut self, cck: u32, host: &mut crate::zorro_device::DeviceHost) {
         // No interrupts, no DMA, no timers of its own, but every attached
-        // ATAPI drive still needs its per-cck tick for pending disc-swap
-        // mounting and CD-DA audio streaming -- RIPPLE has up to four
-        // ATAPI-capable slots across its two channels, not just one.
+        // drive still needs its per-cck tick: ATAPI drives for pending
+        // disc-swap mounting and CD-DA audio streaming -- RIPPLE has up to
+        // four ATAPI-capable slots across its two channels, not just one --
+        // and timed hard disks for their mechanics.
         let cd_audio = host.cd_audio();
         for bus in &mut self.ata {
-            bus.tick_atapi(cck, cd_audio);
+            bus.tick(cck, cd_audio);
         }
+    }
+
+    fn next_event_cck(&self) -> Option<u32> {
+        self.ata.iter().filter_map(AtaBus::next_event_cck).min()
     }
 
     fn take_activity(&mut self) -> bool {

@@ -18,6 +18,61 @@ fn diag_cop_writes_on() -> bool {
 }
 
 impl Bus {
+    /// Batch a proven idle interval between fixed DMA slots. All captures
+    /// and beam bookkeeping still pass through advance_beam; no DMA transfer,
+    /// CPU write, Copper transition or observable slot trace may be skipped.
+    /// Leave line rollover and audio request latching to the ordinary quantum.
+    pub(super) fn advance_inactive_chip_bus_span(
+        &mut self,
+        limit: u32,
+    ) -> Option<(u32, AgnusTick)> {
+        let hpos = self.agnus.hpos;
+        if limit < 2
+            || !(0x34..0xe2).contains(&hpos)
+            || self.blitter.busy
+            || self.cpu_posted_write_debt != 0
+            || self.chip_bus_observers_on
+            || self.bus_event_observers != 0
+            || !self.ui_beam_traps.is_empty()
+            || self.precise_timed_device_trace()
+            || !self.ddf_seq_active()
+        {
+            return None;
+        }
+        let line_end = self.agnus.current_line_cck().saturating_sub(1).min(0xe2);
+        let mut span = limit.min(line_end.saturating_sub(hpos));
+        if self.copper_dma_enabled() {
+            if !self.copper_sleeping_before_wake_bound(span) {
+                return None;
+            }
+            let CopperWakeBound::At(bound) = self.copper_wake_bound else {
+                return None;
+            };
+            span = span.min(
+                bound
+                    .saturating_sub(self.emulated_cck)
+                    .min(u64::from(u32::MAX)) as u32,
+            );
+        }
+        if let Some(deadline) = self.cck_until_pending_copper_frame_start() {
+            span = span.min(deadline);
+        }
+        if let Some(deadline) = self.blit_irq_delay_cck {
+            span = span.min(deadline);
+        }
+        if let Some(fetch) = self.ddf_seq_next_fetch(hpos, hpos + span) {
+            span = span.min(fetch - hpos);
+        }
+        if span < 2 {
+            return None;
+        }
+        self.last_chip_bus_owner = ChipBusOwner::Idle;
+        let tick = self.advance_beam(span);
+        debug_assert_eq!(tick.new_lines, 0);
+        self.audio_pending_cck = self.audio_pending_cck.saturating_add(span);
+        Some((span, tick))
+    }
+
     pub(super) fn advance_one_chip_bus_quantum(
         &mut self,
         forced_owner: Option<ChipBusOwner>,
@@ -226,7 +281,7 @@ impl Bus {
         // drift from the hardware timeline.
         let blitter_non_bus_advanced = !matches!(owner, ChipBusOwner::Blitter)
             && self.blitter.busy
-            && self.blitter_dma_enabled()
+            && (self.blitter_dma_enabled() || self.blitter.start_strobe_pending())
             && match self.blitter.current_slot_class() {
                 crate::chipset::blitter::BlitSlotClass::Bus => false,
                 crate::chipset::blitter::BlitSlotClass::Internal => true,
@@ -235,6 +290,9 @@ impl Bus {
                     ChipBusOwner::Cpu => {
                         !(matches!(forced_owner, Some(ChipBusOwner::Cpu))
                             && self.blitter_yields_to_waiting_cpu())
+                    }
+                    ChipBusOwner::Copper => {
+                        fixed_dma_owner.is_none() && self.blitter.startup_clock_mask(1) != 0
                     }
                     _ => false,
                 },
@@ -362,7 +420,7 @@ impl Bus {
         //   starved CPU is granted (the BLS line blocks busIsFree).
         if !matches!(owner, ChipBusOwner::Blitter)
             && self.blitter.busy
-            && self.blitter_dma_enabled()
+            && (self.blitter_dma_enabled() || self.blitter.start_strobe_pending())
             && blitter_non_bus_advanced
         {
             if diag_blt_slots() {
@@ -374,10 +432,16 @@ impl Bus {
                     self.blitter.current_slot_label()
                 );
             }
+            let bzero_before = self.blitter.bzero;
+            let bzero_delay_cck = if bzero_before {
+                self.blitter.bzero_clear_delay_cck()
+            } else {
+                0
+            };
             if self.blitter.tick_scheduled_slot(&mut self.mem.chip_ram) {
                 self.latch_blitter_completion("idle_pipeline");
             }
-            self.note_blitter_slot_ticked();
+            self.note_blitter_slot_ticked(bzero_before, bzero_delay_cck);
         }
         let tick = self.advance_beam(cck);
         self.audio_pending_cck = self.audio_pending_cck.saturating_add(cck);
@@ -607,7 +671,7 @@ impl Bus {
             let delay = delay.saturating_sub(cck);
             if delay == 0 {
                 self.blit_irq_delay_cck = None;
-                self.raise_blit_irq("scheduled");
+                self.raise_blit_irq("scheduled", BLIT_IRQ_READBACK_DELAY_CCK);
             } else {
                 self.blit_irq_delay_cck = Some(delay);
             }
@@ -711,10 +775,16 @@ impl Bus {
                         self.blitter.current_slot_label()
                     );
                 }
+                let bzero_before = self.blitter.bzero;
+                let bzero_delay_cck = if bzero_before {
+                    self.blitter.bzero_clear_delay_cck()
+                } else {
+                    0
+                };
                 if self.blitter.tick_scheduled_slot(&mut self.mem.chip_ram) {
                     self.latch_blitter_completion("bus_slot");
                 }
-                self.note_blitter_slot_ticked();
+                self.note_blitter_slot_ticked(bzero_before, bzero_delay_cck);
             }
             ChipBusOwner::Audio => self.step_audio_dma_slot(),
             ChipBusOwner::Copper
@@ -796,12 +866,22 @@ impl Bus {
         )
     }
 
+    pub(super) fn cpu_cycle_crosses_line_end_refresh(&self) -> bool {
+        // Kind65 and trace controls isolate DRAM read turnaround after a
+        // Copper transfer immediately before refresh. Uncontended reads,
+        // writes and register grants retain their existing phase.
+        !self.cpu_short_bus_cycle
+            && !self.aga_enabled()
+            && self.last_chip_bus_owner == ChipBusOwner::Copper
+            && Self::line_end_refresh_slot(self.agnus.hpos + 1)
+            && !Self::line_end_refresh_slot(self.agnus.hpos)
+    }
+
     /// Who is denying the CPU the current colour clock, for the frame
     /// analyzer's wait attribution. `for_cpu` selects the arbitration view
     /// the waiting access is actually subject to: a synchronous grant sees
-    /// the CPU's view (`scheduled_dma_owner(true)`), so a BLTPRI warm-up
-    /// fence reads as the blitter even though the slot's recorded owner is
-    /// idle, and the slowdown counter's yield reads as a free slot; a posted
+    /// the CPU's view (`scheduled_dma_owner(true)`), so the slowdown
+    /// counter's yield reads as a free slot; a posted
     /// 020+ write drains through the ordinary arbitration
     /// (`scheduled_dma_owner(false)`), where a busy blitter keeps every
     /// access cycle. A slot the access could have used is the 020+ port
@@ -818,7 +898,13 @@ impl Bus {
                 CpuWaitClass::BlitterNasty
             }
             ChipBusOwner::Blitter => CpuWaitClass::BlitterNice,
-            ChipBusOwner::Cpu | ChipBusOwner::Idle => CpuWaitClass::Port,
+            ChipBusOwner::Cpu | ChipBusOwner::Idle => {
+                if self.cpu_cycle_crosses_line_end_refresh() {
+                    CpuWaitClass::Refresh
+                } else {
+                    CpuWaitClass::Port
+                }
+            }
         }
     }
 
@@ -849,28 +935,6 @@ impl Bus {
             return ChipBusOwner::Copper;
         }
         if self.blitter.busy && self.blitter_dma_enabled() {
-            // With BLTPRI set, BLS fences the CPU (not the Copper or fixed
-            // DMA) during the blit's warm-up: the startup ladder and, for
-            // D-writing blits, the first word's cycles including the empty
-            // first-D bubble, while the sequencer's bus request is held
-            // asserted by the queued back-to-back first fetches. Regression
-            // example: the Jim Power trackloader saves the word below a
-            // descending MFM-decode blit's destination, writes BLTSIZE, and
-            // restores the word two instructions later; the fence keeps the
-            // restore's prefetches out of the startup holes so the CPU write
-            // lands only after the blit completes. Once the pipeline is
-            // primed the request line drops on genuine bus-free micro-cycles
-            // (line-mode Bresenham, fill idle, disabled-channel gaps) and
-            // the CPU uses them even under BLTPRI -- line-heavy demo loops
-            // (Rampage's vector parts) rely on that CPU time, and FS-UAE and
-            // vAmiga agree (timing-test row 26: 25095/25097; a whole-blit
-            // fence overshoots to 25161).
-            if for_cpu
-                && self.agnus.dmacon & DMACON_BLTPRI != 0
-                && self.blitter.bltpri_warmup_fences_cpu()
-            {
-                return ChipBusOwner::Blitter;
-            }
             // Idle blit pipeline cycles (the "-" slots in the HRM cycle diagrams,
             // e.g. the first empty D phase after source fetches or a line blit's
             // internal Bresenham cycles) never claim the bus: per the HRM they
@@ -949,6 +1013,7 @@ impl Bus {
         }
 
         let mut copper = self.copper.clone();
+        let startup_mask = self.blitter.startup_clock_mask(slot_count);
         let mut slot_idx = 0u32;
         let mut elapsed = 0u32;
         let mut hpos = self.agnus.hpos;
@@ -1032,9 +1097,9 @@ impl Bus {
 
             let slot_needs_bus = access_mask & (1u64 << slot_idx) != 0;
             let slot_consumed = if slot_needs_bus {
-                // Bus accesses and bus-free micro-cycles both need a colour
-                // clock the blitter could have won.
-                slot_grantable && !copper_blocks
+                // Body cycles need a clock the blitter could have won. CPU
+                // startup can overlap Copper, but still waits for fixed DMA.
+                slot_grantable && (!copper_blocks || startup_mask & (1u64 << slot_idx) != 0)
             } else {
                 // Internal cycle: elapses unconditionally.
                 true

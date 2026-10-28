@@ -24,13 +24,75 @@ use std::path::PathBuf;
 /// switch, so portable archives need no machine-specific configuration.
 pub const PORTABLE_MARKER: &str = "portable.txt";
 
+/// The machine configuration an installation keeps beside its executable (or
+/// downloaded AppImage, or macOS `.app` bundle): a run that names no
+/// `--config` and finds no `./copperline.toml` boots it straight away,
+/// launcher skipped, whatever directory it was started from. See
+/// [`installation_config_file`].
+pub const INSTALLATION_CONFIG: &str = "copperline.toml";
+
+/// Return the directory containing `program` when a file called `name` sits
+/// beside it.
+fn program_dir_holding(program: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let dir = program.parent()?;
+    dir.join(name).is_file().then(|| dir.to_path_buf())
+}
+
 /// Return the directory containing `program` when it carries the portable
 /// marker.
 fn marked_program_dir(program: &std::path::Path) -> Option<PathBuf> {
-    let dir = program.parent()?;
-    dir.join(PORTABLE_MARKER)
-        .is_file()
-        .then(|| dir.to_path_buf())
+    program_dir_holding(program, PORTABLE_MARKER)
+}
+
+/// The downloaded AppImage the running binary was mounted from, if any (see
+/// [`portable_config_dir`]).
+fn appimage_path() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        crate::envcfg::var_os("APPIMAGE").map(PathBuf::from)
+    } else {
+        None
+    }
+}
+
+/// The `.app` bundle `executable` is the binary of, when it sits at the
+/// bundle's `Contents/MacOS/` like a macOS application's does.
+fn app_bundle(executable: &std::path::Path) -> Option<&std::path::Path> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then_some(bundle)
+}
+
+/// The installation's own configuration, [`INSTALLATION_CONFIG`] beside the
+/// executable, if one is there. The user-visible place wins over the
+/// binary's own directory: the AppImage's download directory over its
+/// read-only mount (as for the portable marker), and on macOS the folder
+/// holding the `.app` over the bundle's `Contents/MacOS/`, which still
+/// works when nothing sits beside the bundle.
+pub fn installation_config_file() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok();
+    installation_config(
+        appimage_path().as_deref(),
+        executable.as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+fn installation_config(
+    appimage: Option<&std::path::Path>,
+    executable: Option<&std::path::Path>,
+    app_bundles: bool,
+) -> Option<PathBuf> {
+    let bundle = executable.filter(|_| app_bundles).and_then(app_bundle);
+    appimage
+        .into_iter()
+        .chain(bundle)
+        .chain(executable)
+        .find_map(|program| program_dir_holding(program, INSTALLATION_CONFIG))
+        .map(|dir| dir.join(INSTALLATION_CONFIG))
 }
 
 /// Resolve portable mode from the program path the user launched. An AppImage
@@ -110,10 +172,7 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 fn discover_config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    let appimage = crate::envcfg::var_os("APPIMAGE").map(PathBuf::from);
-    #[cfg(not(target_os = "linux"))]
-    let appimage: Option<PathBuf> = None;
+    let appimage = appimage_path();
     let executable = std::env::current_exe().ok();
     if let Some(dir) = portable_config_dir(appimage.as_deref(), executable.as_deref()) {
         return Some(dir);
@@ -563,11 +622,13 @@ pub fn modem_profile_file() -> PathBuf {
     battery_ram("modem.profile")
 }
 
-// --- where a dialog opens ------------------------------------------------
+// --- where media is kept -------------------------------------------------
 //
-// Not Copperline's to write, and not created: these only say where a file
-// dialog starts when the field it was opened from is empty. A field with a
-// value opens beside that value, which beats any fixed answer.
+// Not Copperline's to write, and not created: these say where a file
+// dialog starts when the field it was opened from is empty, and where
+// [`locate_media`] looks for a relative path the working directory lacks.
+// A field with a value opens beside that value, which beats any fixed
+// answer.
 //
 // Each returns `None` when the directory does not exist, so a dialog is
 // never pointed at somewhere that isn't there. Make the folder and it gets
@@ -603,6 +664,85 @@ pub fn harddrives_dir() -> Option<PathBuf> {
 /// CD images.
 pub fn cds_dir() -> Option<PathBuf> {
     media_dir(|p, h| p.cds_dir(h))
+}
+
+// --- where a configuration's relative media path is ----------------------
+
+/// What a media path in a configuration names, which decides the folder a
+/// relative one is looked for in when the working directory does not have
+/// it. The same grouping the launcher's dialogs open at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Media {
+    /// Kickstart, extended and expansion-board ROMs.
+    Rom,
+    /// MT-32 control and PCM ROMs: their own folder, then the ROMs folder.
+    Mt32Rom,
+    /// Floppy images.
+    Floppy,
+    /// Hard-disk images and host-filesystem folders.
+    HardDrive,
+    /// CD images.
+    Cd,
+    /// A drive unit's image, which may be either: the hard-drive folder,
+    /// then the CD folder. Which one a CHD is takes reading it, so the
+    /// name alone cannot pick the folder.
+    Drive,
+}
+
+/// Where a media path from a configuration actually is.
+///
+/// The working directory first, so a path that resolves there keeps
+/// meaning that file. Only a relative path the
+/// working directory does not have is then looked for in the matching
+/// media folder (`[paths] roms` and friends, `~/Documents/Copperline/roms`
+/// by default) -- which is what makes `rom = "KICK31.ROM"` mean something
+/// to an installed copy started from the Dock or the Start menu, whose
+/// working directory is nobody's choice. Found nowhere, the path comes back
+/// as written, so the error that follows names what the person wrote.
+///
+/// A missing media folder costs one `stat`, and an unreachable one was
+/// already dropped when `[paths]` was adopted, so this cannot hang on a
+/// dead network share.
+pub fn locate_media(path: impl Into<PathBuf>, media: Media) -> PathBuf {
+    let path = path.into();
+    let dirs: &[fn() -> Option<PathBuf>] = match media {
+        Media::Rom => &[roms_dir],
+        Media::Mt32Rom => &[mt32_roms_dir, roms_dir],
+        Media::Floppy => &[floppies_dir],
+        Media::HardDrive => &[harddrives_dir],
+        Media::Cd => &[cds_dir],
+        Media::Drive => &[harddrives_dir, cds_dir],
+    };
+    let found = locate_in(&path, dirs.iter().filter_map(|dir| dir()));
+    match found {
+        Some(found) => {
+            log::info!(
+                "{} is not in the working directory; using {}",
+                path.display(),
+                found.display()
+            );
+            found
+        }
+        None => path,
+    }
+}
+
+/// The first of `dirs` holding the relative `path`, when the working
+/// directory does not. `None` for an absolute or empty path, for one the
+/// working directory has, and for one found nowhere.
+fn locate_in(path: &std::path::Path, dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    use std::path::Component;
+    // A root or a drive prefix anchors the path already, and joining one
+    // onto a folder would replace the folder rather than look inside it.
+    let anchored = matches!(
+        path.components().next(),
+        None | Some(Component::Prefix(_) | Component::RootDir)
+    );
+    if anchored || path.exists() {
+        return None;
+    }
+    dirs.map(|dir| dir.join(path))
+        .find(|candidate| candidate.exists())
 }
 
 /// Where the launcher saves machine configurations.
@@ -778,14 +918,76 @@ mod tests {
         assert_eq!(cfg.mt32_roms_dir(host), roms.join("mt32"));
     }
 
-    /// Restores the working directory when dropped, so a failing assertion
-    /// cannot leave the rest of the suite running somewhere else: the CWD
-    /// is process state, and `set_current_dir` with no guard holds until
-    /// the process ends, not until the test does.
-    struct CwdGuard(PathBuf);
+    /// A relative media path the working directory lacks is looked for in
+    /// the media folders, in order; anything the working directory has, or
+    /// that is anchored already, is left alone.
+    #[test]
+    fn a_relative_media_path_falls_back_to_its_folder() {
+        use std::path::Path;
+        // Relative names resolve against the working directory, which
+        // another test moves.
+        let _cwd = cwd_lock();
+        let scratch = ScratchDir::new("locate");
+        let first = scratch.0.join("first");
+        let second = scratch.0.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let dirs = || [first.clone(), second.clone()].into_iter();
+
+        // Only the second folder has it: that one, after skipping the first.
+        let name = Path::new("copperline-locate-test.rom");
+        assert!(!name.exists(), "the working directory must not hold it");
+        std::fs::write(second.join(name), []).unwrap();
+        assert_eq!(locate_in(name, dirs()), Some(second.join(name)));
+        // Both have it: the first wins.
+        std::fs::write(first.join(name), []).unwrap();
+        assert_eq!(locate_in(name, dirs()), Some(first.join(name)));
+
+        // Subdirectories resolve inside the folder too.
+        let nested = Path::new("kick").join("copperline-locate-test.rom");
+        std::fs::create_dir_all(second.join("kick")).unwrap();
+        std::fs::write(second.join(&nested), []).unwrap();
+        assert_eq!(locate_in(&nested, dirs()), Some(second.join(&nested)));
+
+        // The working directory wins whatever the folders hold. `cargo
+        // test` runs from the package root, which has a Cargo.toml.
+        let here = Path::new("Cargo.toml");
+        assert!(here.exists());
+        std::fs::write(first.join(here), []).unwrap();
+        assert_eq!(locate_in(here, dirs()), None);
+
+        // Found nowhere, empty, or anchored: left as written.
+        assert_eq!(locate_in(Path::new("copperline-nowhere.rom"), dirs()), None);
+        assert_eq!(locate_in(Path::new(""), dirs()), None);
+        assert_eq!(locate_in(&first.join(name), dirs()), None);
+    }
+
+    /// Serializes the tests that rely on the working directory with the one
+    /// that moves it: the CWD is process state, shared by every test thread.
+    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Moves the working directory for one test, holding [`cwd_lock`], and
+    /// restores it when dropped, so a failing assertion cannot leave the
+    /// rest of the suite running somewhere else: `set_current_dir` with no
+    /// guard holds until the process ends, not until the test does.
+    struct CwdGuard {
+        home: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl CwdGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let lock = cwd_lock();
+            let home = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { home, _lock: lock }
+        }
+    }
     impl Drop for CwdGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
+            let _ = std::env::set_current_dir(&self.home);
         }
     }
 
@@ -794,8 +996,7 @@ mod tests {
         // The no-legacy branch below reads the adopted store.
         let _store = adopted_store_lock();
         let scratch = ScratchDir::new("battery");
-        let _cwd = CwdGuard(std::env::current_dir().unwrap());
-        std::env::set_current_dir(&scratch.0).unwrap();
+        let _cwd = CwdGuard::enter(&scratch.0);
 
         // Nothing there: the new place, under the host data directory.
         let fresh = akiko_nvram_file();
@@ -852,6 +1053,99 @@ mod tests {
         assert_eq!(
             portable_config_dir(None, Some(&executable)).map(|dir| dir.join("states")),
             Some(root.0.join("states"))
+        );
+    }
+
+    #[test]
+    fn installation_config_is_the_file_beside_the_executable() {
+        let root = ScratchDir::new("installation-config");
+        let executable = root.0.join("copperline.exe");
+
+        assert_eq!(installation_config(None, Some(&executable), false), None);
+        // A directory of that name is not a configuration to boot.
+        std::fs::create_dir(root.0.join(INSTALLATION_CONFIG)).unwrap();
+        assert_eq!(installation_config(None, Some(&executable), false), None);
+        std::fs::remove_dir(root.0.join(INSTALLATION_CONFIG)).unwrap();
+
+        std::fs::write(root.0.join(INSTALLATION_CONFIG), []).unwrap();
+        assert_eq!(
+            installation_config(None, Some(&executable), false),
+            Some(root.0.join(INSTALLATION_CONFIG))
+        );
+    }
+
+    #[test]
+    fn app_bundle_is_found_only_from_its_contents_macos_binary() {
+        let bundle = std::path::Path::new("/Applications/Copperline.app");
+        assert_eq!(
+            app_bundle(&bundle.join("Contents/MacOS/copperline")),
+            Some(bundle)
+        );
+        for elsewhere in [
+            "/Applications/Copperline.app/Contents/Resources/copperline",
+            "/Applications/Copperline.app/MacOS/copperline",
+            "/Applications/Copperline/Contents/MacOS/copperline",
+            "/usr/local/bin/copperline",
+            "copperline",
+        ] {
+            assert_eq!(
+                app_bundle(std::path::Path::new(elsewhere)),
+                None,
+                "{elsewhere}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_bundle_installation_config_sits_beside_the_bundle() {
+        let root = ScratchDir::new("app-bundle-installation-config");
+        let macos = root.0.join("Copperline.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let executable = macos.join("copperline");
+
+        // Inside the bundle, beside the binary, keeps working.
+        std::fs::write(macos.join(INSTALLATION_CONFIG), []).unwrap();
+        assert_eq!(
+            installation_config(None, Some(&executable), true),
+            Some(macos.join(INSTALLATION_CONFIG))
+        );
+        // Beside the bundle, where the Finder shows it, wins.
+        std::fs::write(root.0.join(INSTALLATION_CONFIG), []).unwrap();
+        assert_eq!(
+            installation_config(None, Some(&executable), true),
+            Some(root.0.join(INSTALLATION_CONFIG))
+        );
+        // Off macOS a bundle-shaped path is only a directory tree.
+        assert_eq!(
+            installation_config(None, Some(&executable), false),
+            Some(macos.join(INSTALLATION_CONFIG))
+        );
+        std::fs::remove_file(macos.join(INSTALLATION_CONFIG)).unwrap();
+        assert_eq!(
+            installation_config(None, Some(&executable), true),
+            Some(root.0.join(INSTALLATION_CONFIG))
+        );
+    }
+
+    #[test]
+    fn appimage_installation_config_sits_beside_the_download() {
+        let root = ScratchDir::new("appimage-installation-config");
+        let download = root.0.join("download");
+        let mount = root.0.join("mount/usr/bin");
+        std::fs::create_dir_all(&download).unwrap();
+        std::fs::create_dir_all(&mount).unwrap();
+        let appimage = download.join("Copperline.AppImage");
+        let executable = mount.join("copperline");
+
+        std::fs::write(mount.join(INSTALLATION_CONFIG), []).unwrap();
+        assert_eq!(
+            installation_config(Some(&appimage), Some(&executable), false),
+            Some(mount.join(INSTALLATION_CONFIG))
+        );
+        std::fs::write(download.join(INSTALLATION_CONFIG), []).unwrap();
+        assert_eq!(
+            installation_config(Some(&appimage), Some(&executable), false),
+            Some(download.join(INSTALLATION_CONFIG))
         );
     }
 

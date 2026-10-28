@@ -13,9 +13,14 @@ use crate::savestate::{chunk, split};
 use anyhow::{anyhow, bail, Result};
 use log::{debug, trace};
 use m68k::core::memory::{BusFault, BusFaultKind};
-use m68k::{AddressBus, BatchExit, CpuCore, CpuType, FastMem, StepResult};
+use m68k::{
+    AddressBus, BatchExit, CpuCore, CpuType, FastMem, FastMemRegion, StepResult,
+    MAX_FAST_MEM_REGIONS,
+};
 
 mod ec030_acu;
+mod jit;
+use jit::JitBatchTiming;
 
 pub const CIA_A_BASE: u32 = 0x00BF_E000;
 pub const CIA_A_SIZE: u32 = 0x0000_1000;
@@ -127,7 +132,8 @@ pub struct M68kMachine {
     /// `[cpu] speed = "fastest"`: the CPU clocks the JIT path bills, as a
     /// 16.16 fraction of the clocks it retired. `JIT_CLOCK_DIVISOR_UNITY`
     /// (the fixed clock) except while the emulator's speed governor runs
-    /// the JIT faster than `clock_mhz`; dividing the CPU's own clocks is
+    /// the regular JIT workload below `clock_mhz`; a transient zero divisor
+    /// is used only inside a spare-time burst; dividing the CPU's own clocks is
     /// exactly a faster CPU clock, while chip-bus and CIA accesses keep
     /// their bus-time costs. Host configuration, never serialized.
     jit_clock_divisor_q16: u32,
@@ -229,6 +235,8 @@ pub struct M68kMachine {
     /// clocks. Carried across instructions so an accelerated CPU (many clocks
     /// per cck) is not rounded up to a whole cck on every instruction.
     cpu_clock_carry: u32,
+    /// Parity of the 68000 STOP polling grid in colour clocks.
+    stop_poll_phase: Option<u8>,
     dbg_sched_on: bool,
     dbg_sched_top_vpos: u32,
     dbg_sched_top_frame: u64,
@@ -332,6 +340,15 @@ struct MachineRuntimeState {
     sync_cck_on: bool,
     cpu_clocks_per_cck: u32,
     cpu_clock_carry: u32,
+    #[serde(default)]
+    stop_poll_phase: Option<u8>,
+    /// `CpuBus::jit_window_bank`: the bank the JIT fastmem window covers
+    /// while code runs outside fast RAM. It decides which fast-RAM accesses
+    /// allocate cache lines, and so which chip-RAM lines they evict. Saves
+    /// from before it existed read None: the largest bank until code runs
+    /// from a fast bank, as those builds always chose.
+    #[serde(default)]
+    jit_window_bank: Option<u32>,
 }
 
 /// Same-process rollback also needs the interrupt sample consumed at the next
@@ -399,14 +416,14 @@ impl Components {
 /// a straight-line advance, so only the opcode word is marked.
 const MAX_INSTRUCTION_BYTES: u32 = 12;
 
-/// Instruction budget per `run_batch` call in the JIT slice. Interrupts are
-/// only recognized between batches (plus once inside each batch entry), so
-/// this bounds interrupt latency in JIT mode to a small fraction of a
-/// scanline of billed time. Larger batches let compiled traces run longer
-/// between host round-trips but delay interrupt delivery; AROS boot at
-/// accelerated clock ratios proved sensitive to latencies beyond about a
-/// scanline.
-const JIT_BATCH_INSTRUCTIONS: usize = 64;
+/// Maximum native batch size; the actual budget also stops at the next
+/// hardware deadline. Slow bus accesses request an earlier host boundary.
+const JIT_BATCH_INSTRUCTIONS: usize = 4096;
+
+/// Batch size for code fetched from chip or slow RAM. Its CPU clocks are
+/// billed in one lump after the batch, and interrupts are recognized between
+/// batches, so this bounds their latency there instead of modelling it.
+const JIT_SHARED_BATCH_INSTRUCTIONS: usize = 64;
 
 /// Flat CPU-clock cost billed per instruction retired by the JIT slice.
 /// The batch path reports no cycle counts, so this constant sets the JIT
@@ -454,15 +471,21 @@ struct CpuBus {
     /// defined for the complete instruction being resident, not merely its
     /// opcode word.
     instruction_fetches_cached: bool,
-    /// IPL level as sampled at the CPU's most recent bus access. The real
-    /// 68000 latches its IPL pins during bus cycles, and the take-interrupt
-    /// decision at an instruction boundary uses the value latched during the
-    /// PREVIOUS instruction's last bus access -- a level that rises during an
-    /// instruction's trailing internal cycles is not seen until one
-    /// instruction later. Transient: re-sampled on every access, never
-    /// serialized in file saves (a loaded state re-samples within one instruction).
+    /// IPL level eligible for the next instruction-boundary decision, sampled
+    /// at a CPU bus access. Bus-side deadline qualification and core poll
+    /// markers determine which sample is consumed. Transient: re-sampled on
+    /// every access, never serialized in file saves (a loaded state re-samples
+    /// within one instruction).
     /// Exact rollback captures it in `MachineRollbackState`.
     sampled_irq_level: u8,
+    /// Ordinary operand-read poll sample for stock 68000 instructions. The
+    /// board's boundary-qualification sample remains separate above; this
+    /// earlier candidate is used only by core-marked operand poll points.
+    sampled_operand_irq_level: u8,
+    /// The CPU model, rather than the active bus clock ratio, gates the
+    /// additional 68000 poll candidates. The Bus helper itself limits early
+    /// candidates to the stock two-CPU-clocks-per-CCK path.
+    m68000_ipl_poll: bool,
     /// Set by the core's `ipl_hold_sample` poll-point marker: the current
     /// `sampled_irq_level` is the instruction's microcode poll value and
     /// later accesses in the same instruction must not re-latch it (e.g.
@@ -476,6 +499,43 @@ struct CpuBus {
     /// Mirror of `M68kMachine::jit_enabled` so `fast_mem` can gate the
     /// zero-cost fastmem window without reaching back up to the machine.
     jit_enabled: bool,
+    /// The fastmem window, as (base, len), that the cache models keep no
+    /// lines for: the core reads and writes it directly, past every
+    /// `CpuBus` method, so a line held there would go stale. Set when
+    /// `fast_mem` hands the window to a batch (dropping the lines it
+    /// overlaps) and lifted after a batch that ran without it. Host-side
+    /// bookkeeping, never serialized: a restore clears it, and the next
+    /// window capture drops whatever lines the restored caches hold there.
+    cache_free_window: Option<(u32, u32)>,
+    cache_free_regions: [Option<(u32, u32)>; MAX_FAST_MEM_REGIONS],
+    /// Whether `fast_mem` handed out the window during the current batch.
+    window_offered: bool,
+    /// Base of the fast-RAM bank the fastmem window covered last, which
+    /// the window keeps while code runs outside fast RAM (`jit_fast_mem`).
+    /// Emulated state: it decides which fast-RAM accesses allocate cache
+    /// lines, so save states carry it (`MachineRuntimeState`).
+    jit_window_bank: Option<u32>,
+    /// Whether CACR has the 68040/060 layout (`cacr_040_layout`). Follows
+    /// the core's CPU type like `address_mask`, so `cache_control` can
+    /// decode CACR inside a JIT batch.
+    cacr_040_layout: bool,
+    /// Transient accounting inside one run_batch call, never snapshotted.
+    jit_batch: Option<JitBatchTiming>,
+    /// Cache exclusions may be reused only within one CPU slice, until a
+    /// peripheral write, RESET or primary-bank change. Never caches a pointer.
+    jit_cache_exclusions_current: bool,
+    jit_bus_boundary: bool,
+}
+
+/// A fast-RAM bank the JIT fastmem window can cover (`CpuBus::jit_fast_mem`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastRamBank {
+    /// A configured Zorro RAM board's window.
+    Zorro { base: u32, len: u32, idx: usize },
+    /// Ramsey motherboard RAM.
+    Motherboard,
+    /// CPU-slot accelerator RAM.
+    Accel,
 }
 
 pub fn build(
@@ -528,6 +588,7 @@ impl M68kMachine {
         // what makes the batch/JIT path honour a missing FPU.
         cpu.fpu_present = fpu_enabled;
 
+        let cacr_040 = cacr_040_layout(cpu.cpu_type);
         let mut machine = Self {
             cpu,
             bus: CpuBus {
@@ -546,9 +607,19 @@ impl M68kMachine {
                 last_fetch_cache_hit: false,
                 instruction_fetches_cached: false,
                 sampled_irq_level: 0,
+                sampled_operand_irq_level: 0,
+                m68000_ipl_poll: cpu_model == CpuModel::M68000,
                 ipl_sample_held: false,
                 diag_current_pc: 0,
                 jit_enabled: false,
+                cache_free_window: None,
+                cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+                window_offered: false,
+                jit_window_bank: None,
+                cacr_040_layout: cacr_040,
+                jit_batch: None,
+                jit_cache_exclusions_current: false,
+                jit_bus_boundary: false,
             },
             fpu_enabled,
             jit_enabled: false,
@@ -589,6 +660,7 @@ impl M68kMachine {
             sync_cck_on: sync_cck_enabled_setting(),
             cpu_clocks_per_cck: 2,
             cpu_clock_carry: 0,
+            stop_poll_phase: None,
             dbg_sched_on: crate::envcfg::flag("COPPERLINE_DIAG_SCHED"),
             dbg_sched_top_vpos: 0,
             dbg_sched_top_frame: 0,
@@ -1617,6 +1689,8 @@ impl M68kMachine {
             sync_cck_on: self.sync_cck_on,
             cpu_clocks_per_cck: self.cpu_clocks_per_cck,
             cpu_clock_carry: self.cpu_clock_carry,
+            stop_poll_phase: self.stop_poll_phase,
+            jit_window_bank: self.bus.jit_window_bank,
         }
     }
 
@@ -1802,7 +1876,10 @@ impl M68kMachine {
         // address_mask all live in CpuCore); keep the bus adapter's mask copy
         // in step so external decode agrees with the restored core.
         self.bus.address_mask = cpu.address_mask;
+        self.bus.cacr_040_layout = cacr_040_layout(cpu.cpu_type);
         self.cpu = cpu;
+        self.bus.m68000_ipl_poll = self.cpu.cpu_type == CpuType::M68000;
+        self.bus.sampled_operand_irq_level = 0;
         self.bus.bus = bus;
         // The cache is silicon, not dynamic state: a CPU that has one keeps it
         // across a restore. Snapshots taken with the cache modelled carry warm
@@ -1812,10 +1889,19 @@ impl M68kMachine {
         // it, then re-derive its enable/freeze flags from the restored CACR.
         self.bus.icache = icache.or_else(|| self.bus.icache.take());
         self.bus.dcache = dcache.or_else(|| self.bus.dcache.take());
+        // The restored caches may hold lines for the window bank (a state
+        // saved by a precise run, or between JIT batches that ran without
+        // the window, caches it), so forget the cache-free window: the next
+        // capture drops those lines before the core writes the window.
+        self.bus.cache_free_window = None;
+        self.bus.cache_free_regions = [None; MAX_FAST_MEM_REGIONS];
+        self.bus.jit_cache_exclusions_current = false;
         self.last_cacr = runtime.last_cacr;
         self.sync_cck_on = runtime.sync_cck_on;
         self.cpu_clocks_per_cck = runtime.cpu_clocks_per_cck;
         self.cpu_clock_carry = runtime.cpu_clock_carry;
+        self.stop_poll_phase = runtime.stop_poll_phase;
+        self.bus.jit_window_bank = runtime.jit_window_bank;
         // The short-bus-cycle flag is derived from the (restored) CPU model and
         // not serialized, so re-establish it here.
         let short_bus = !self.cpu.is_pre_68020;
@@ -1926,6 +2012,7 @@ impl M68kMachine {
         self.cpu.invalidate_prefetch();
         self.cpu.stopped = u32::from(state.stopped);
         self.cpu_clock_carry = 0;
+        self.stop_poll_phase = None;
     }
 
     /// Set one GDB-style core register: D0-D7, A0-A7, SR, PC.
@@ -2902,14 +2989,28 @@ impl M68kMachine {
         // core slice.
         self.bus.flush_timed_devices_dcache_coherent();
         let mut level = self.pending_irq_level();
-        // The boundary decision uses the IPL level latched at the previous
-        // instruction's last bus access (CpuBus::sample_ipl), not the live
-        // level: on real silicon a level that rose after that sample is taken
-        // one instruction later. A STOPped CPU keeps sampling its pins, so it
-        // wakes on the live level. min() so a level that dropped since the
-        // sample (e.g. the instruction's own INTREQ clear) is never delivered
-        // stale. COPPERLINE_IRQ_LATENCY_CCK=0 disables this together with the
-        // IPL pipe (the raw immediate model, used by mechanism tests).
+        if self.cpu.is_stopped()
+            && self.cpu.cpu_type == CpuType::M68000
+            && self.cpu_clocks_per_cck == 2
+            && self.bus.bus.irq_latency_setting != 0
+        {
+            let now = self.bus.bus.emulated_cck();
+            let phase = *self.stop_poll_phase.get_or_insert((now & 1) as u8);
+            if level > ((self.cpu.get_sr() >> 8) & 7) as u8 && now & 1 != u64::from(phase) {
+                // Observation never advances time. Dispatch owns and accounts
+                // for the wait to STOP's next four-CPU-clock poll.
+                level = 0;
+            }
+        } else if !self.cpu.is_stopped() {
+            self.stop_poll_phase = None;
+        }
+        // The boundary decision uses the previous instruction's qualified
+        // sample (CpuBus::sample_ipl), not the latest live level. A STOPped
+        // CPU continues polling and wakes from the currently eligible level.
+        // min() so a level that dropped since the sample (e.g. the
+        // instruction's own INTREQ clear) is never delivered stale.
+        // COPPERLINE_IRQ_LATENCY_CCK=0 disables this with the IPL pipe, giving
+        // mechanism tests the raw immediate model.
         // JIT batches run whole stretches of instructions without per-access
         // IPL latching, so the sampled level can be arbitrarily stale there;
         // a JIT machine takes the live level instead (the raw model).
@@ -2962,13 +3063,13 @@ impl M68kMachine {
     /// per-instruction cost, exception and interrupt entry -- is divided by
     /// `factor`, which is exactly a faster CPU clock. Chip-bus and CIA
     /// accesses keep their bus-time costs, as on a real accelerator. A
-    /// factor of 1 or below (or not finite) restores the fixed clock,
-    /// whose billing path is then the unscaled one. The precise core never
-    /// reads this.
+    /// factor of 1 restores the fixed clock, whose billing path is then the
+    /// unscaled one. The paced governor never chooses a factor below 1. The
+    /// precise core never reads this.
     pub fn set_jit_speed_factor(&mut self, factor: f64) {
-        let divisor = if factor.is_finite() && factor > 1.0 {
+        let divisor = if factor.is_finite() && factor > 0.0 {
             ((f64::from(JIT_CLOCK_DIVISOR_UNITY) / factor).round() as u32)
-                .clamp(1, JIT_CLOCK_DIVISOR_UNITY)
+                .clamp(1, JIT_CLOCK_DIVISOR_UNITY * 1024)
         } else {
             JIT_CLOCK_DIVISOR_UNITY
         };
@@ -3357,165 +3458,9 @@ impl M68kMachine {
         // save states are taken -- the accumulator is not serialized.
         self.bus.flush_timed_devices_dcache_coherent();
         self.bus.bus.set_cpu_bus_arbitration_enabled(false);
-        let (bus_advanced_cck, _bus_tick) = self.bus.bus.take_slice_bus_advance();
-        if stopped {
-            trace!(
-                "m68k CPU stopped at PC={:#010X} SR={:#06X}",
-                self.pc(),
-                self.sr()
-            );
+        if self.cpu.is_stopped() && self.stop_poll_phase.is_none() {
+            self.stop_poll_phase = Some((self.bus.bus.emulated_cck() & 1) as u8);
         }
-        Ok(CpuStepSlice {
-            instructions,
-            cpu_cycles,
-            cpu_cck,
-            bus_advanced_cck,
-            stopped,
-        })
-    }
-
-    /// Fast execution slice for `[cpu] jit`: run the core's
-    /// instruction-budgeted batch path (natively compiled hot traces with
-    /// the `cpu-jit` build feature, the interpreted trace loop without)
-    /// instead of cycle-stepping one instruction at a time.
-    ///
-    /// The timing contract is deliberately approximate -- the machine
-    /// behaves like one with an accelerator card fitted:
-    /// - every retired instruction is billed a flat
-    ///   `JIT_CPU_CLOCKS_PER_INSTRUCTION` CPU clocks, converted to chipset
-    ///   time at the configured clock ratio exactly like the precise path;
-    /// - chip-bus accesses still arbitrate into DMA slots through `CpuBus`
-    ///   and advance the beam as they land, so chipset side effects stay
-    ///   ordered against display DMA, just not cycle-exactly;
-    /// - accesses inside the fastmem window (the largest fast-RAM bank, see
-    ///   `CpuBus::fast_mem`) cost nothing at all;
-    /// - interrupts are recognized at batch boundaries (and once inside
-    ///   each batch entry), so their latency is bounded by
-    ///   `JIT_BATCH_INSTRUCTIONS` rather than modelled.
-    fn step_slice_jit(&mut self, count: usize) -> Result<CpuStepSlice> {
-        self.bus.bus.begin_cpu_slice();
-        self.bus.bus.slice_preempted = false;
-        self.bus.bus.set_cpu_bus_arbitration_enabled(true);
-        // A batch is charged as one lump, so the shared chip clock phase would
-        // be stale at every access after the first. This slice keeps the older
-        // per-slice accounting, matching the batch model's stated coarseness.
-        self.bus.bus.set_cpu_access_phase_sync(false);
-
-        let mut instructions = 0usize;
-        let mut cpu_cycles = 0u32;
-        let mut cpu_cck = 0u32;
-        let mut stopped = false;
-
-        while instructions < count {
-            let bus_before = self.bus.bus.slice_bus_advanced_cck();
-            let cpu_cck_before = cpu_cck;
-            if let Some(irq) = self.service_pending_irq_cycles() {
-                let irq_clocks = self.jit_scaled_clocks(positive_cpu_cycles(irq.cycles));
-                cpu_cycles = cpu_cycles.saturating_add(irq_clocks);
-                cpu_cck = cpu_cck.saturating_add(self.charge_cpu_clocks(irq_clocks as i32));
-            }
-            // A level the boundary could not deliver (the CPU is still
-            // inside a handler at that priority) must not ride into the
-            // batch: the batch core would service it the moment RTE drops
-            // the mask WITHOUT recomputing INTREQ, spuriously re-entering
-            // a handler whose request was already cleared. Interrupts are
-            // delivered exclusively at slice boundaries, from live state.
-            self.cpu.set_irq(0);
-            let budget = (count - instructions).min(JIT_BATCH_INSTRUCTIONS) as u32;
-            self.bus.diag_current_pc = self.cpu.pc;
-            self.bus.bus.cpu_pc = self.cpu.pc;
-            let cpu_was_stopped = self.cpu.is_stopped();
-            let result = self.cpu.run_batch(&mut self.bus, budget, &[]);
-            if self.bus.icache.is_some() || self.bus.dcache.is_some() {
-                // A CACR write inside the batch (MOVEC) must reach the
-                // cache models -- enables, disables, and flushes -- just
-                // as the precise loop syncs it per instruction.
-                self.apply_cacr_updates();
-            }
-            instructions = instructions.saturating_add(result.instructions as usize);
-            let mut batch_clocks = result
-                .instructions
-                .saturating_mul(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-            let mut exit_stopped = false;
-            match result.exit {
-                BatchExit::BudgetExhausted | BatchExit::WatchedPc { .. } => {}
-                BatchExit::Stopped => exit_stopped = true,
-                // The batch path surfaces traps instead of taking them; the
-                // precise loop's no-op HLE policy is to let every one become
-                // its real hardware exception. Mirror that here, billing the
-                // exception entry and counting the trapping instruction.
-                BatchExit::AlineTrap { .. } => {
-                    let cycles = self.cpu.take_aline_exception(&mut self.bus);
-                    batch_clocks = batch_clocks
-                        .saturating_add(positive_cpu_cycles(cycles))
-                        .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-                    instructions = instructions.saturating_add(1);
-                }
-                // An EC030 PMMU instruction completes in the access control
-                // unit model instead of trapping.
-                BatchExit::FlineTrap { opcode } => {
-                    let cycles = self.service_fline_trap(opcode);
-                    batch_clocks = batch_clocks
-                        .saturating_add(positive_cpu_cycles(cycles))
-                        .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-                    instructions = instructions.saturating_add(1);
-                }
-                BatchExit::TrapInstruction { trap_num } => {
-                    let cycles = self.cpu.take_trap_exception(&mut self.bus, trap_num);
-                    batch_clocks = batch_clocks
-                        .saturating_add(positive_cpu_cycles(cycles))
-                        .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-                    instructions = instructions.saturating_add(1);
-                }
-                BatchExit::Breakpoint { .. } => {
-                    let cycles = self.cpu.take_bkpt_exception(&mut self.bus);
-                    batch_clocks = batch_clocks
-                        .saturating_add(positive_cpu_cycles(cycles))
-                        .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-                    instructions = instructions.saturating_add(1);
-                }
-                BatchExit::IllegalInstruction { .. } => {
-                    let cycles = self.cpu.take_illegal_exception(&mut self.bus);
-                    batch_clocks = batch_clocks
-                        .saturating_add(positive_cpu_cycles(cycles))
-                        .saturating_add(JIT_CPU_CLOCKS_PER_INSTRUCTION);
-                    instructions = instructions.saturating_add(1);
-                }
-            }
-            let batch_clocks = self.jit_scaled_clocks(batch_clocks);
-            cpu_cycles = cpu_cycles.saturating_add(batch_clocks);
-            cpu_cck = cpu_cck
-                .saturating_add(self.charge_cpu_clocks_less_bus_overlap(batch_clocks as i32));
-
-            if self.sync_cck_on {
-                // Advance the chipset through the batch's billed CPU time
-                // beyond what its bus accesses already advanced, exactly as
-                // the precise loop does per instruction.
-                let cpu_cck_iter = cpu_cck.saturating_sub(cpu_cck_before);
-                let bus_iter = self
-                    .bus
-                    .bus
-                    .slice_bus_advanced_cck()
-                    .saturating_sub(bus_before);
-                self.bus
-                    .bus
-                    .advance_cpu_internal_cycles(cpu_cck_iter.saturating_sub(bus_iter));
-            }
-
-            if exit_stopped {
-                if !cpu_was_stopped {
-                    self.bus.bus.note_cpu_stop(false);
-                }
-                stopped = true;
-                break;
-            }
-            if self.bus.bus.slice_preempted {
-                break;
-            }
-        }
-
-        self.bus.flush_timed_devices_dcache_coherent();
-        self.bus.bus.set_cpu_bus_arbitration_enabled(false);
         let (bus_advanced_cck, _bus_tick) = self.bus.bus.take_slice_bus_advance();
         if stopped {
             trace!(
@@ -3537,6 +3482,7 @@ impl M68kMachine {
     /// the configured clock ratio. Sub-cck remainders carry across calls so an
     /// accelerated CPU (many clocks per cck) accumulates fractional cck
     /// instead of being rounded up to a whole cck per instruction.
+    #[cfg(test)]
     fn charge_cpu_clocks(&mut self, cycles: i32) -> u32 {
         self.charge_cpu_clock_value(positive_cpu_cycles(cycles))
     }
@@ -3587,62 +3533,13 @@ impl M68kMachine {
     /// strobes. Called after every instruction; a single compare when
     /// nothing changed.
     fn apply_cacr_updates(&mut self) {
-        use m68k::{
-            CACR_040_DE, CACR_040_IE, CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI,
-            CACR_FD, CACR_FI,
-        };
         let ops = std::mem::take(&mut self.cpu.cacr_pending_ops);
         let cacr = self.cpu.cacr;
         if ops == 0 && cacr == self.last_cacr {
             return;
         }
         self.last_cacr = cacr;
-        let caar = self.cpu.caar;
-        // The 68040/68060 CACR uses different enable bits (IE/DE - the 060's
-        // EIC/EDC sit at the same positions) and has no freeze or CACR clear
-        // strobes - invalidation arrives through CINV/CPUSH, which decode.rs
-        // surfaces as the CACR_CI/CACR_CD pending ops below. The 060's
-        // branch-cache strobes (CABC/CUBC) are consumed inside the core.
-        if matches!(
-            self.cpu.cpu_type,
-            CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060
-        ) {
-            if let Some(icache) = self.bus.icache.as_deref_mut() {
-                icache.enabled = cacr & CACR_040_IE != 0;
-                icache.frozen = false;
-                if ops & CACR_CI != 0 {
-                    icache.clear_all();
-                }
-            }
-            if let Some(dcache) = self.bus.dcache.as_deref_mut() {
-                dcache.enabled = cacr & CACR_040_DE != 0;
-                dcache.frozen = false;
-                if ops & CACR_CD != 0 {
-                    dcache.clear_all();
-                }
-            }
-            return;
-        }
-        if let Some(icache) = self.bus.icache.as_deref_mut() {
-            icache.enabled = cacr & CACR_EI != 0;
-            icache.frozen = cacr & CACR_FI != 0;
-            if ops & CACR_CI != 0 {
-                icache.clear_all();
-            }
-            if ops & CACR_CEI != 0 {
-                icache.clear_entry_by_index(caar);
-            }
-        }
-        if let Some(dcache) = self.bus.dcache.as_deref_mut() {
-            dcache.enabled = cacr & CACR_ED != 0;
-            dcache.frozen = cacr & CACR_FD != 0;
-            if ops & CACR_CD != 0 {
-                dcache.clear_all();
-            }
-            if ops & CACR_CED != 0 {
-                dcache.clear_entry_by_index(caar);
-            }
-        }
+        self.bus.apply_cache_control(cacr, self.cpu.caar, ops);
     }
 
     fn reset_cpu(&mut self) {
@@ -3672,6 +3569,27 @@ impl M68kMachine {
     }
 
     fn service_pending_irq_cycles(&mut self) -> Option<IrqDispatch> {
+        let mut poll_wait_cycles = 0;
+        if self.cpu.is_stopped()
+            && self.cpu.cpu_type == CpuType::M68000
+            && self.cpu_clocks_per_cck == 2
+            && self.bus.bus.irq_latency_setting != 0
+        {
+            // STOP may advance to its next poll before refresh_irq_line. Other
+            // paths use that method's flush, with no duplicate empty flush.
+            self.bus.flush_timed_devices_dcache_coherent();
+            let now = self.bus.bus.emulated_cck();
+            let phase = *self.stop_poll_phase.get_or_insert((now & 1) as u8);
+            if self.pending_irq_level() > ((self.cpu.get_sr() >> 8) & 7) as u8
+                && now & 1 != u64::from(phase)
+            {
+                self.bus.bus.advance_cpu_internal_cycles(1);
+                // This wait precedes exception execution. Include it in both
+                // clock accounts so reconciliation cannot subtract it from
+                // the exception's nominal internal cycles.
+                poll_wait_cycles = self.cpu_clocks_per_cck as i32;
+            }
+        }
         let level = self.refresh_irq_line();
         if !self.cpu.check_interrupts() {
             return None;
@@ -3692,7 +3610,7 @@ impl M68kMachine {
             .unwrap_or(u32::from(level) + 24)
             .min(u32::from(u16::MAX)) as u16;
         Some(IrqDispatch {
-            cycles,
+            cycles: cycles.saturating_add(poll_wait_cycles),
             #[cfg(feature = "control")]
             level,
             #[cfg(feature = "control")]
@@ -3717,13 +3635,15 @@ impl M68kMachine {
             return 0;
         }
 
-        // Bring-up guard: hold off an autovector whose handler slot still
+        // Bring-up guard for the accelerated CPU path: hold off a vector whose handler slot still
         // reads zero. The peek is untranslated, so it only means anything
         // while the MMU is off (with translation enabled, VBR holds a
         // virtual address and the physical bytes under it are unrelated --
         // Linux/m68k maps its vector table high while low chip RAM is
         // cleared, and the guard would silence every interrupt for good).
-        if !self.cpu.tc_enable() {
+        // A 68000 must acknowledge even an uninitialized handler. Its ROM
+        // supplies the vector byte; suppressing delivery hides broken ROMs.
+        if self.bus.bus.cpu_short_bus_cycle() && !self.cpu.tc_enable() {
             let vector_addr = self
                 .cpu
                 .vbr
@@ -4170,6 +4090,7 @@ impl CpuBus {
     }
 
     fn read_sized_unobserved(&mut self, address: u32, size: usize, kind: CpuBusAccessKind) -> u32 {
+        self.note_jit_bus_access(address, size, kind == CpuBusAccessKind::Fetch);
         let addr = self.mask(address);
         if kind == CpuBusAccessKind::Read {
             self.bus
@@ -4236,7 +4157,7 @@ impl CpuBus {
     }
 
     fn cache_fill_after_miss(&mut self, addr: u32, size: usize, kind: CpuBusAccessKind) {
-        if size > 4 {
+        if size > 4 || self.in_cache_free_window(addr, size) {
             return;
         }
         let cacheable = match kind {
@@ -4329,8 +4250,22 @@ impl CpuBus {
                 return read_be(&self.bus.mem.rom, off, size);
             }
             Some(PlainMemRegion::ChipRam(off)) => {
-                self.bus.grant_cpu_bus_access_at(Some(addr), size, kind);
-                return read_be(&self.bus.mem.chip_ram, off, size);
+                let mut sampled = None;
+                self.bus.grant_cpu_bus_access_sampled(
+                    Some(addr),
+                    size,
+                    kind,
+                    |bus, slot, stride| {
+                        let offset = slot as usize * stride;
+                        let width = size.saturating_sub(offset).min(stride);
+                        let value = read_be(&bus.mem.chip_ram, off + offset, width);
+                        sampled = Some(match sampled {
+                            Some(previous) => (previous << (width * 8)) | value,
+                            None => value,
+                        });
+                    },
+                );
+                return sampled.unwrap_or_else(|| read_be(&self.bus.mem.chip_ram, off, size));
             }
             Some(PlainMemRegion::ZorroRam(board, off)) => {
                 // Expansion (Zorro) RAM runs at external-bus speed, off the
@@ -4389,11 +4324,15 @@ impl CpuBus {
 
         if range_contains(CIA_A_BASE, CIA_A_SIZE, addr) {
             self.bus.cpu_cia_access(Self::access_words(size));
-            return self.bus.cia_a_read(u64::from(addr - CIA_A_BASE), size) as u32;
+            let value = self.bus.cia_a_read(u64::from(addr - CIA_A_BASE), size) as u32;
+            self.bus.cpu_cia_access_finish();
+            return value;
         }
         if range_contains(CIA_B_BASE, CIA_B_SIZE, addr) {
             self.bus.cpu_cia_access(Self::access_words(size));
-            return self.bus.cia_b_read(u64::from(addr - CIA_B_BASE), size) as u32;
+            let value = self.bus.cia_b_read(u64::from(addr - CIA_B_BASE), size) as u32;
+            self.bus.cpu_cia_access_finish();
+            return value;
         }
         if self.bus.cdtv.is_some() && range_contains(CDTV_BATTRAM_BASE, CDTV_BATTRAM_SIZE, addr) {
             // CDTV battery-backed bookmark RAM overlays the top half of
@@ -4626,6 +4565,7 @@ impl CpuBus {
     }
 
     fn write_sized(&mut self, address: u32, size: usize, value: u32) {
+        self.note_jit_bus_access(address, size, false);
         self.write_sized_unobserved(address, size, value);
         // MMIO watches see the write once it has landed, stamped like a
         // read: at the end of the access, when the device has it.
@@ -4657,11 +4597,27 @@ impl CpuBus {
                 return;
             }
             Some(PlainMemRegion::ChipRam(off)) => {
-                self.bus
-                    .grant_cpu_bus_access_at(Some(addr), size, CpuBusAccessKind::Write);
-                self.bus.record_cpu_chip_ram_write(off, size, value);
+                let mut committed = false;
+                self.bus.grant_cpu_bus_access_sampled(
+                    Some(addr),
+                    size,
+                    CpuBusAccessKind::Write,
+                    |bus, slot, stride| {
+                        let byte = slot as usize * stride;
+                        let part = (size - byte).min(stride);
+                        let word = value >> ((size - byte - part) * 8);
+                        bus.record_cpu_chip_ram_write(off + byte, part, word);
+                        write_be(&mut bus.mem.chip_ram, off + byte, part, word);
+                        committed = true;
+                    },
+                );
+                // Unclocked debugger/setup accesses and the 020+ posted-write
+                // path do not invoke the classic transfer callback.
+                if !committed {
+                    self.bus.record_cpu_chip_ram_write(off, size, value);
+                    write_be(&mut self.bus.mem.chip_ram, off, size, value);
+                }
                 self.bus.ui_note_cpu_ram_write(addr, size);
-                write_be(&mut self.bus.mem.chip_ram, off, size, value);
                 self.dbg_note_memw(addr, size);
                 if off as u32 != addr {
                     // The write landed through an Agnus image repeat: note
@@ -4735,6 +4691,11 @@ impl CpuBus {
             None => {}
         }
 
+        // Ordinary memory stores above change bytes, not mappings. Autoconfig
+        // and peripheral writes below can change decode, so recapture cache
+        // exclusions before the next batch. RESET and slice entry also do so.
+        self.jit_cache_exclusions_current = false;
+
         if self.bus.uaelib.is_some() && crate::uaelib::debug_port::decodes(addr) {
             // Emulator service in the otherwise unused CIA page. It is
             // write-only; ordinary reads and neighbouring addresses keep
@@ -4753,6 +4714,7 @@ impl CpuBus {
             let effect = self
                 .bus
                 .cia_a_write(u64::from(addr - CIA_A_BASE), size, u64::from(value));
+            self.bus.cpu_cia_access_finish();
             if effect.disable_overlay {
                 // Gary's overlay flip-flop clears the moment the CIA drives
                 // OVL low: the guest's very next access may already expect
@@ -4776,6 +4738,7 @@ impl CpuBus {
             let effect = self
                 .bus
                 .cia_b_write(u64::from(addr - CIA_B_BASE), size, u64::from(value));
+            self.bus.cpu_cia_access_finish();
             if effect.timer_started {
                 self.bus.slice_preempted = true;
             }
@@ -5006,13 +4969,10 @@ impl CpuBus {
 }
 
 impl CpuBus {
-    /// Latch the IPL level presented to the CPU by (the end of) a bus access.
-    /// The real 68000 samples its IPL pins during bus cycles, and the
-    /// take-interrupt decision at an instruction boundary uses the value
-    /// latched during the previous instruction's last bus access -- a level
-    /// that rises during an instruction's trailing internal cycles is not
-    /// seen until one instruction later (Moira models the same points as
-    /// POLL_IPL). `refresh_irq_line` consumes this latch.
+    /// Refresh the boundary-qualified and operand-poll candidates during a
+    /// CPU bus access. The bus applies recognition-deadline eligibility at
+    /// each candidate's poll point; the core's poll marker selects which one
+    /// `refresh_irq_line` consumes.
     #[inline]
     fn sample_ipl(&mut self) {
         // A poll-point hold (AddressBus::ipl_hold_sample) pins the sample
@@ -5021,53 +4981,186 @@ impl CpuBus {
         if self.ipl_sample_held {
             return;
         }
-        self.sampled_irq_level = if self.bus.cartridge_nmi_pending() {
+        let nmi = self.bus.cartridge_nmi_pending();
+        let master_enabled = self.bus.paula.intena & INT_MASTER != 0;
+        if master_enabled && self.bus.cia_irq_forwarding_due() {
+            self.flush_timed_devices_dcache_coherent();
+        }
+        let qualified_lead = if self.m68000_ipl_poll { 2 } else { 0 };
+        let operand_lead = if self.m68000_ipl_poll { 4 } else { 0 };
+        self.sampled_irq_level = if nmi {
             7
-        } else if self.bus.paula.intena & INT_MASTER != 0 {
-            pending_ipl(self.bus.paula.intena & self.bus.cpu_visible_intreq())
+        } else if master_enabled {
+            pending_ipl(self.bus.paula.intena & self.bus.cpu_poll_intreq(qualified_lead))
+        } else {
+            0
+        };
+        self.sampled_operand_irq_level = if nmi {
+            7
+        } else if master_enabled {
+            pending_ipl(self.bus.paula.intena & self.bus.cpu_poll_intreq(operand_lead))
         } else {
             0
         };
     }
 
-    /// The zero-cost guest-RAM window offered to the core's batch/JIT path
-    /// (`AddressBus::fast_mem`): the largest fast-RAM bank fitted -- a
-    /// configured Zorro board, Ramsey motherboard RAM, or CPU-slot
-    /// accelerator RAM. Chip and slow RAM are never offered: their CPU
-    /// accesses arbitrate into chip-bus DMA slots and drive the shared data
-    /// bus, side effects the window contract forbids.
-    ///
-    /// Returns None while anything that intercepts plain fast-RAM accesses
-    /// is armed (cache models, memory-write debug hooks, the heat map, SMC
-    /// detection, injected bus faults) so those features keep seeing every
-    /// access; the batch path then simply routes everything through the
-    /// normal bus methods. Recomputed on every `run_batch` call, so a bank
-    /// that autoconfig places (or a RESET tears down) is picked up at the
-    /// next batch boundary.
-    ///
-    /// A 68000/68010 never gets a window at all: on the small-box machines
-    /// every CPU cycle -- fast RAM included -- drives the one bus shared
-    /// with Agnus, and `note_cpu_data_bus` must latch each transfer so
-    /// undriven (unmapped) reads float to the last driven value. Kickstart
-    /// and AROS memory sizing read exactly those floats, so bypassing the
-    /// latch wedges the boot. The 020+ run fast RAM on their own local
-    /// bus (`cpu_short_bus_cycle`), where the latch is deliberately not
-    /// driven and the window is side-effect free.
+    /// Primary local-RAM window: the bank the batch starts executing in,
+    /// else the bank covered last (a call into ROM or a chip-RAM interrupt
+    /// handler keeps its caller's bank, stack and data), else the largest.
+    /// The guest decides where code and data live -- Kickstart sizes its own
+    /// local bank ahead of any Zorro board -- so a fixed choice can cover
+    /// RAM nothing uses. Additional RAM and read-only ROM are captured
+    /// alongside it (`jit_extra_regions`). Keep this choice in save states:
+    /// machines with more banks than the region table holds still depend on
+    /// it for cache allocation and bus timing.
     fn jit_fast_mem(&mut self) -> Option<FastMem> {
-        if !self.jit_enabled
-            || !self.bus.cpu_short_bus_cycle()
-            || self.icache.is_some()
-            || self.dcache.is_some()
-            || self.dbg_memw_addr.is_some()
-            || self.bus.heat_map_armed()
-            || self.bus.smc.is_some()
-            || self.bus.bus_faults_armed()
-        {
+        if !self.jit_windows_allowed() {
+            self.jit_cache_exclusions_current = false;
             return None;
         }
-        let zorro = self.bus.mem.zorro.largest_ram_region();
-        let mb_len = self.bus.mem.mb_ram.len() as u32;
-        let accel_len = self.bus.mem.accel_ram.len() as u32;
+        let bank = self
+            .fast_ram_bank_at(self.bus.cpu_pc)
+            .or_else(|| {
+                self.jit_window_bank
+                    .and_then(|addr| self.fast_ram_bank_at(addr))
+            })
+            .or_else(|| self.largest_fast_ram_bank())?;
+        let window = self.fast_mem_for(bank);
+        if self.jit_window_bank != Some(window.base) {
+            self.jit_cache_exclusions_current = false;
+        }
+        self.jit_window_bank = Some(window.base);
+        Some(window)
+    }
+
+    /// Direct windows bypass the shared-bus data latch, so the 68000/68010
+    /// never receive them: ROM and OS memory sizing depend on the latch's
+    /// fetch/access order. Interceptors must also see every access -- memory
+    /// write hooks, heat maps, self-modifying-code detection and injected bus
+    /// faults all withhold both the primary window and additional regions.
+    ///
+    /// The primary bank and native pointers are captured again for every
+    /// batch. Cache exclusions refresh after mapping invalidation and at each
+    /// slice entry, covering autoconfig, RESET and restored/replaced backing
+    /// memory before direct access resumes.
+    fn jit_windows_allowed(&self) -> bool {
+        self.jit_enabled
+            && self.bus.cpu_short_bus_cycle()
+            && self.dbg_memw_addr.is_none()
+            && !self.bus.heat_map_armed()
+            && self.bus.smc.is_none()
+            && !self.bus.bus_faults_armed()
+    }
+
+    /// Capture only side-effect-free mappings. Shared chip/slow RAM, the
+    /// switchable overlay, WCS and device/cartridge windows stay on the bus.
+    fn jit_extra_regions(&mut self) -> [Option<FastMemRegion>; MAX_FAST_MEM_REGIONS] {
+        let mut regions = [None; MAX_FAST_MEM_REGIONS];
+        if !self.jit_windows_allowed() {
+            self.cache_free_regions.fill(None);
+            self.jit_cache_exclusions_current = false;
+            return regions;
+        }
+        let mut count = 0;
+        let mut push = |ptr, base, len, writable| {
+            if len >= 4 && count < regions.len() {
+                regions[count] = Some(FastMemRegion {
+                    ptr,
+                    base,
+                    len,
+                    writable,
+                });
+                count += 1;
+            }
+        };
+        let mem = &mut self.bus.mem;
+        if !mem
+            .zorro
+            .ram_overlaps(ROM_BASE as u32, mem.rom.len() as u32)
+        {
+            push(
+                mem.rom.as_mut_ptr(),
+                ROM_BASE as u32,
+                mem.rom.len() as u32,
+                false,
+            );
+        }
+        if !mem
+            .zorro
+            .ram_overlaps(mem.extended_rom_base as u32, mem.extended_rom.len() as u32)
+        {
+            push(
+                mem.extended_rom.as_mut_ptr(),
+                mem.extended_rom_base as u32,
+                mem.extended_rom.len() as u32,
+                false,
+            );
+        }
+        let mb_base = mem.mb_ram_base() as u32;
+        if self.jit_window_bank != Some(mb_base) {
+            push(
+                mem.mb_ram.as_mut_ptr(),
+                mb_base,
+                mem.mb_ram.len() as u32,
+                true,
+            );
+        }
+        if self.jit_window_bank != Some(ACCEL_RAM_BASE as u32) {
+            push(
+                mem.accel_ram.as_mut_ptr(),
+                ACCEL_RAM_BASE as u32,
+                mem.accel_ram.len() as u32,
+                true,
+            );
+        }
+        // Copy descriptors, not allocations; no heap work in the batch path.
+        let mut banks = [None; MAX_FAST_MEM_REGIONS];
+        for (slot, bank) in banks.iter_mut().zip(mem.zorro.fast_ram_windows()) {
+            *slot = Some(bank);
+        }
+        for (base, len, idx) in banks.into_iter().flatten() {
+            if self.jit_window_bank != Some(base) {
+                push(mem.zorro.board_ram_mut(idx).as_mut_ptr(), base, len, true);
+            }
+        }
+        let ranges = regions.map(|r| r.map(|r| (r.base, r.len)));
+        if ranges != self.cache_free_regions {
+            for (base, len) in ranges.into_iter().flatten() {
+                for cache in [self.icache.as_deref_mut(), self.dcache.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    cache.clear_range(base, len);
+                }
+            }
+            self.cache_free_regions = ranges;
+        }
+        self.window_offered |= count != 0;
+        self.jit_cache_exclusions_current = true;
+        regions
+    }
+
+    /// The fast-RAM bank holding `addr`, if any.
+    fn fast_ram_bank_at(&self, addr: u32) -> Option<FastRamBank> {
+        let mem = &self.bus.mem;
+        if addr.wrapping_sub(ACCEL_RAM_BASE as u32) < mem.accel_ram.len() as u32 {
+            return Some(FastRamBank::Accel);
+        }
+        if addr.wrapping_sub(mem.mb_ram_base() as u32) < mem.mb_ram.len() as u32 {
+            return Some(FastRamBank::Motherboard);
+        }
+        mem.zorro
+            .ram_region_containing(addr)
+            .map(|(base, len, idx)| FastRamBank::Zorro { base, len, idx })
+    }
+
+    /// The largest fitted fast-RAM bank: a Zorro board wins a tie, then
+    /// motherboard RAM.
+    fn largest_fast_ram_bank(&self) -> Option<FastRamBank> {
+        let mem = &self.bus.mem;
+        let zorro = mem.zorro.largest_ram_region();
+        let mb_len = mem.mb_ram.len() as u32;
+        let accel_len = mem.accel_ram.len() as u32;
         let zorro_len = zorro.map_or(0, |(_, len, _)| len);
         let best = zorro_len.max(mb_len).max(accel_len);
         if best == 0 {
@@ -5075,36 +5168,187 @@ impl CpuBus {
         }
         if best == zorro_len {
             let (base, len, idx) = zorro?;
-            let ram = self.bus.mem.zorro.board_ram_mut(idx);
-            return Some(FastMem {
-                ptr: ram.as_mut_ptr(),
-                base,
-                len,
-            });
+            return Some(FastRamBank::Zorro { base, len, idx });
         }
         if best == mb_len {
-            let base = self.bus.mem.mb_ram_base() as u32;
-            return Some(FastMem {
-                ptr: self.bus.mem.mb_ram.as_mut_ptr(),
-                base,
-                len: mb_len,
-            });
+            return Some(FastRamBank::Motherboard);
         }
-        Some(FastMem {
-            ptr: self.bus.mem.accel_ram.as_mut_ptr(),
-            base: ACCEL_RAM_BASE as u32,
-            len: accel_len,
-        })
+        Some(FastRamBank::Accel)
+    }
+
+    fn fast_mem_for(&mut self, bank: FastRamBank) -> FastMem {
+        let mem = &mut self.bus.mem;
+        match bank {
+            FastRamBank::Zorro { base, len, idx } => FastMem {
+                ptr: mem.zorro.board_ram_mut(idx).as_mut_ptr(),
+                base,
+                len,
+            },
+            FastRamBank::Motherboard => FastMem {
+                base: mem.mb_ram_base() as u32,
+                len: mem.mb_ram.len() as u32,
+                ptr: mem.mb_ram.as_mut_ptr(),
+            },
+            FastRamBank::Accel => FastMem {
+                base: ACCEL_RAM_BASE as u32,
+                len: mem.accel_ram.len() as u32,
+                ptr: mem.accel_ram.as_mut_ptr(),
+            },
+        }
+    }
+
+    /// Keep the cache models coherent with a fastmem window the core is
+    /// about to capture. The core reads and writes the window directly,
+    /// so a write there never reaches `invalidate_write` and a line held
+    /// for the window would serve stale data to any later access that
+    /// does come through `CpuBus` (an instruction the batch hands to the
+    /// full dispatcher, an extension word, an exception frame). The models
+    /// therefore hold no lines inside the window while the core has it:
+    /// lines already there are dropped when a window is first captured,
+    /// and `cache_fill_after_miss` allocates none inside it. Lookups need
+    /// no check -- an address with no line can only miss. The lines go
+    /// only once per window: an unchanged window across batches costs one
+    /// compare.
+    fn keep_caches_out_of_window(&mut self, base: u32, len: u32) {
+        self.window_offered = true;
+        if self.cache_free_window == Some((base, len)) {
+            return;
+        }
+        for cache in [self.icache.as_deref_mut(), self.dcache.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            cache.clear_range(base, len);
+        }
+        self.cache_free_window = Some((base, len));
+    }
+
+    /// Whether a `size`-byte access at `addr` touches a longword inside
+    /// the window the cache models currently keep out of
+    /// (`keep_caches_out_of_window`).
+    #[inline]
+    fn in_cache_free_window(&self, addr: u32, size: usize) -> bool {
+        let first = addr & !3;
+        let last = addr.wrapping_add(size.max(1) as u32 - 1) | 3;
+        self.cache_free_window
+            .into_iter()
+            .chain(self.cache_free_regions.iter().flatten().copied())
+            .any(|(base, len)| range_contains(base, len, first) || range_contains(base, len, last))
+    }
+
+    /// Set the cache models' enable and freeze state from `cacr` and run
+    /// the clear strobes in `ops` (a `CpuCore::cacr_pending_ops` value).
+    fn apply_cache_control(&mut self, cacr: u32, caar: u32, ops: u32) {
+        use m68k::{
+            CACR_040_DE, CACR_040_IE, CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI,
+            CACR_FD, CACR_FI,
+        };
+        // The 68040/68060 CACR uses different enable bits (IE/DE - the 060's
+        // EIC/EDC sit at the same positions) and has no freeze or CACR clear
+        // strobes - invalidation arrives through CINV/CPUSH, which decode.rs
+        // surfaces as the CACR_CI/CACR_CD pending ops below. The 060's
+        // branch-cache strobes (CABC/CUBC) are consumed inside the core.
+        if self.cacr_040_layout {
+            if let Some(icache) = self.icache.as_deref_mut() {
+                icache.enabled = cacr & CACR_040_IE != 0;
+                icache.frozen = false;
+                if ops & CACR_CI != 0 {
+                    icache.clear_all();
+                }
+            }
+            if let Some(dcache) = self.dcache.as_deref_mut() {
+                dcache.enabled = cacr & CACR_040_DE != 0;
+                dcache.frozen = false;
+                if ops & CACR_CD != 0 {
+                    dcache.clear_all();
+                }
+            }
+            return;
+        }
+        if let Some(icache) = self.icache.as_deref_mut() {
+            icache.enabled = cacr & CACR_EI != 0;
+            icache.frozen = cacr & CACR_FI != 0;
+            if ops & CACR_CI != 0 {
+                icache.clear_all();
+            }
+            if ops & CACR_CEI != 0 {
+                icache.clear_entry_by_index(caar);
+            }
+        }
+        if let Some(dcache) = self.dcache.as_deref_mut() {
+            dcache.enabled = cacr & CACR_ED != 0;
+            dcache.frozen = cacr & CACR_FD != 0;
+            if ops & CACR_CD != 0 {
+                dcache.clear_all();
+            }
+            if ops & CACR_CED != 0 {
+                dcache.clear_entry_by_index(caar);
+            }
+        }
     }
 }
 
+/// Whether `cpu_type` has the 68040/060 CACR layout (IE/DE enables,
+/// invalidation by CINV/CPUSH) rather than the 68020/030 one.
+fn cacr_040_layout(cpu_type: CpuType) -> bool {
+    matches!(
+        cpu_type,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060
+    )
+}
+
 impl AddressBus for CpuBus {
+    fn batch_boundary(&mut self, retired: u32, pc: u32, sr: u16) -> bool {
+        self.note_jit_batch_boundary(retired, pc, sr)
+    }
+
+    fn wants_batch_boundaries(&mut self) -> bool {
+        self.jit_batch_wants_boundaries()
+    }
+
     fn last_fetch_was_cached(&self) -> bool {
         self.last_fetch_cache_hit
     }
 
     fn fast_mem(&mut self) -> Option<FastMem> {
-        self.jit_fast_mem()
+        let window = self.jit_fast_mem()?;
+        self.keep_caches_out_of_window(window.base, window.len);
+        // A single instruction cannot run a native trace. Avoid capturing and
+        // validating direct pointers for each shared-bus fetch, but preserve
+        // the cache exclusions used by adjacent batches that do run directly.
+        (!self.jit_single_instruction_batch()).then_some(window)
+    }
+
+    fn fast_mem_regions(&mut self) -> [Option<FastMemRegion>; MAX_FAST_MEM_REGIONS] {
+        if self.jit_single_instruction_batch() {
+            // A single instruction cannot use native windows. Keep the cache
+            // exclusions, but rebuild them only when this slice's mappings or
+            // selected bank might have changed. No raw pointers are reused.
+            if self.icache.is_some() || self.dcache.is_some() {
+                if self.jit_cache_exclusions_current {
+                    self.window_offered |= self.cache_free_regions.iter().any(Option::is_some);
+                } else {
+                    self.jit_extra_regions();
+                }
+            }
+            return [None; MAX_FAST_MEM_REGIONS];
+        }
+        self.jit_extra_regions()
+    }
+
+    /// A CACR write or CINV/CPUSH inside a JIT batch takes effect before
+    /// the next fetch, as on the CPU: the batch would otherwise keep
+    /// serving lines the guest has just invalidated (code it rewrote and
+    /// is about to run) until the batch ends. The precise loop never gets
+    /// here; it syncs after every instruction (`apply_cacr_updates`),
+    /// which also catches up `last_cacr` after a batch.
+    fn cache_control(&mut self, cacr: u32, caar: u32, strobes: u32) -> bool {
+        self.flush_jit_batch_prefix();
+        if self.icache.is_none() && self.dcache.is_none() {
+            return false;
+        }
+        self.apply_cache_control(cacr, caar, strobes);
+        true
     }
 
     fn begin_instruction_fetches(&mut self) {
@@ -5257,6 +5501,21 @@ impl AddressBus for CpuBus {
         self.ipl_sample_held = true;
     }
 
+    fn ipl_hold_operand_sample(&mut self) {
+        // Operand reads use the separate 68000 poll candidate captured at
+        // their start; the boundary sample above remains eligible only at
+        // its own bus-poll qualification point.
+        self.sampled_irq_level = self.sampled_operand_irq_level;
+        self.ipl_sample_held = true;
+    }
+
+    fn ipl_poll_internal(&mut self) {
+        // A divider microcode poll can precede its final prefetch. Sample
+        // the pins now, rather than holding the preceding operand access.
+        self.sample_ipl();
+        self.ipl_sample_held = true;
+    }
+
     fn ipl_release_sample(&mut self) {
         // Exception dispatch: the handler-entry refill is a fresh poll
         // point, so drop any hold from the faulted instruction.
@@ -5264,6 +5523,7 @@ impl AddressBus for CpuBus {
     }
 
     fn interrupt_acknowledge(&mut self, level: u8) -> u32 {
+        self.flush_jit_batch_prefix();
         // A freezer cartridge's level-7 interrupt: consumed at its
         // acknowledge, so the monitor is entered exactly once per press
         // (the 68000 recognises level 7 on its transition). The vector the
@@ -5303,10 +5563,21 @@ impl AddressBus for CpuBus {
                 );
             }
         }
-        AUTOVECTOR_SENTINEL
+        if !self.bus.cpu_short_bus_cycle() {
+            // On the 68000 motherboard bus the CPU-space IACK address
+            // selects the ROM tail. The low byte supplies the vector;
+            // words 24..31 in a normal Kickstart emulate autovectors.
+            // Do not substitute a vector when a custom ROM omits them.
+            u32::from(self.bus.peek_word_any(0x00ff_fff0 + u32::from(level) * 2) & 0xff)
+        } else {
+            AUTOVECTOR_SENTINEL
+        }
     }
 
     fn reset_devices(&mut self) {
+        self.jit_cache_exclusions_current = false;
+        self.flush_jit_batch_prefix();
+        self.jit_bus_boundary |= self.jit_batch.is_some();
         self.bus.reset_custom_chips_from_cpu_reset();
     }
 }
@@ -5516,7 +5787,7 @@ mod tests {
     }
 
     fn reset_rom(sp: u32, pc: u32) -> Vec<u8> {
-        let mut rom = vec![0; ROM_SIZE];
+        let mut rom = crate::memory::test_rom_with_interrupt_vectors();
         rom[0..4].copy_from_slice(&sp.to_be_bytes());
         rom[4..8].copy_from_slice(&pc.to_be_bytes());
         rom
@@ -5754,6 +6025,134 @@ mod tests {
         Ok(machine)
     }
 
+    #[test]
+    fn cia_timer_irqs_preserve_movem_sample_phase() -> Result<()> {
+        const BASE: u32 = 0x0003_0000;
+        const SAMPLE: usize = 0x0003_1000;
+        const L2_COUNT: usize = 0x0003_2000;
+        const L6_COUNT: usize = 0x0003_2002;
+        const DONE: usize = 0x0003_2004;
+        const MAGIC: [u8; 4] = *b"CIAR";
+
+        fn read_word(mem: &[u8], at: usize) -> u16 {
+            u16::from_be_bytes([mem[at], mem[at + 1]])
+        }
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+            })
+        }
+        fn run_phase(phase: u16) -> Result<(u16, u16, u64, Vec<u8>)> {
+            let fixture = include_bytes!("../timing-test/cia-movem-irq.bin");
+            let mut image = fixture.to_vec();
+            let phase_guards = [0xc1, 0xa1, 0xc0, 0xde, 0, 0, 0xde, 0xad, 0xfe, 0xed];
+            let guard_start = image
+                .windows(10)
+                .position(|window| window == phase_guards)
+                .expect("guarded phase word in fixture");
+            assert_eq!(
+                image
+                    .windows(10)
+                    .filter(|window| *window == phase_guards)
+                    .count(),
+                1,
+                "fixture has a unique phase patch site"
+            );
+            image[guard_start + 4..guard_start + 6].copy_from_slice(&(phase & 15).to_be_bytes());
+
+            let mut bus = test_bus_with_pc(BASE);
+            bus.irq_latency_setting = 6;
+            bus.set_cpu_bus_arbitration_enabled(true);
+            let words = image
+                .chunks_exact(2)
+                .map(|word| u16::from_be_bytes([word[0], word[1]]))
+                .collect::<Vec<_>>();
+            write_program(&mut bus, BASE, &words);
+            let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+            machine.bus_mut().agnus.hpos = 0x21;
+            let mut completed = false;
+            for _ in 0..250_000 {
+                machine.step_slice(1)?;
+                if machine.stopped() {
+                    machine.bus_mut().advance_cpu_idle_devices(1);
+                }
+                let mem = &machine.bus.bus.mem.chip_ram;
+                if mem[DONE..DONE + 4] == MAGIC {
+                    completed = true;
+                    break;
+                }
+            }
+            let mem = &machine.bus.bus.mem.chip_ram;
+            assert!(
+                completed,
+                "phase {phase}: fixture failed to complete; PC={:#010x}",
+                machine.cpu.pc
+            );
+            let l2 = read_word(mem, L2_COUNT);
+            let l6 = read_word(mem, L6_COUNT);
+            let bytes = mem[SAMPLE..SAMPLE + 600].to_vec();
+            assert!(
+                l2 > 0 && l6 >= 2,
+                "phase {phase}: STOP wake and loop should observe CIA IRQs, got L2={l2} L6={l6}"
+            );
+            assert_eq!(
+                machine.a(7),
+                0x0007_fffe,
+                "phase {phase}: balanced MOVEM/RTE stack"
+            );
+            assert_eq!(
+                machine.a(1),
+                SAMPLE as u32,
+                "phase {phase}: exactly 600 predecrement stores"
+            );
+            assert!(
+                bytes.iter().all(|byte| *byte != 0xa5),
+                "phase {phase}: sample loop did not overwrite all 600 bytes"
+            );
+            Ok((l2, l6, fnv1a(&bytes), bytes))
+        }
+
+        // Software snapshots with the phase-aware CIA output/Paula input
+        // pipeline; these are not hardware goldens. The electrical/readback
+        // acceptance lives in amiga-hardware-probes' cia-recognition and
+        // cia-request references. Phases 0 and 11..15 change from the former
+        // immediate INTREQ/no-lead model; retain exact samples and boundaries
+        // as regression guards alongside the independent Voyage loader smoke.
+        let expected: [(u16, u16, u64); 16] = [
+            (1, 2, 12_979_002_978_527_788_998),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_119_320_034_064_197_141),
+            (1, 2, 15_276_924_133_496_768_066),
+            (1, 2, 15_276_924_133_496_768_066),
+            (1, 2, 15_276_924_133_496_768_066),
+        ];
+        let mut observed = Vec::new();
+        for phase in 0..16 {
+            let result = run_phase(phase)?;
+            observed.push((result.0, result.1, result.2));
+            if [0, 7, 11, 12, 15].contains(&phase) {
+                let repeated = run_phase(phase)?;
+                assert_eq!(result, repeated, "phase {phase} must replay byte-for-byte");
+            }
+        }
+        assert_eq!(
+            observed.as_slice(),
+            expected.as_slice(),
+            "CIA IRQ/MOVEM sample differs from frozen software baseline"
+        );
+        Ok(())
+    }
+
     fn run_one_instruction_at(pc: u32, words: &[u16]) -> Result<CpuStepSlice> {
         let mut machine = machine_with_program(pc, words)?;
         machine.step_slice(1)
@@ -5934,9 +6333,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
 
         assert_eq!(bus.read_long(0), 0x1111_4EF9);
@@ -5964,9 +6373,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         // Start on a refresh slot (0x003) so the fetch both waits for and then
@@ -6005,9 +6424,19 @@ mod tests {
                 last_fetch_cache_hit: false,
                 instruction_fetches_cached: false,
                 sampled_irq_level: 0,
+                sampled_operand_irq_level: 0,
+                m68000_ipl_poll: false,
                 ipl_sample_held: false,
                 diag_current_pc: 0,
                 jit_enabled: false,
+                cache_free_window: None,
+                cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+                window_offered: false,
+                jit_window_bank: None,
+                cacr_040_layout: false,
+                jit_batch: None,
+                jit_cache_exclusions_current: false,
+                jit_bus_boundary: false,
             };
             bus.bus
                 .set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
@@ -6061,9 +6490,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         // INTENA/INTREQ, whose read ports INTENAR ($01C) and INTREQR ($01E) are
         // adjacent and beam-independent, so the pair reads back deterministically.
@@ -6105,9 +6544,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         let base = CHIP_RAM_BASE as u32;
         write_chip_long(&mut bus.bus, base, 0x1122_3344);
@@ -6145,9 +6594,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
 
@@ -6194,9 +6653,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
 
         // Warm the opcode longword and a separate extension longword.
@@ -6404,9 +6873,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         let fast = FAST_RAM_BASE as u32 + 0x40;
@@ -6464,9 +6943,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
 
@@ -6600,9 +7089,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         let before = bus.read_long(ROM_BASE as u32);
         bus.write_long(ROM_BASE as u32, 0xDEAD_BEEF);
@@ -6629,9 +7128,19 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         };
         // $F00000 with no extended ROM fitted is genuinely undecoded (the
         // chip-register space at $C00000-$DFFFFF is not: Gary mirrors the
@@ -6651,6 +7160,32 @@ mod tests {
         assert_eq!(bus.read_long(addr), 0xA53C_A53C);
     }
 
+    #[test]
+    fn ipl_poll_applies_a_due_cia_input_without_advancing_time() {
+        let mut bus = test_bus(reset_rom(0, 0));
+        bus.irq_latency_setting = 6;
+        bus.paula.intena = INT_MASTER | INT_PORTS;
+        bus.cia_a.write(REG_TALO, 0);
+        bus.cia_a.write(REG_TAHI, 0);
+        bus.cia_a.write(REG_ICR, 0x81);
+        bus.cia_a.write(REG_CRA, 0x09);
+        bus.advance_devices(20);
+        bus.set_cpu_bus_arbitration_enabled(true);
+        bus.sync_cpu_internal_clocks(2);
+        assert_eq!(bus.emulated_cck(), 21);
+        assert_eq!(bus.paula.intreq & INT_PORTS, 0);
+        assert!(bus.cia_irq_forwarding_due());
+
+        let mut cpu = cpu_bus(bus);
+        cpu.m68000_ipl_poll = true;
+        cpu.sample_ipl();
+        assert_eq!(cpu.bus.emulated_cck(), 21);
+        assert_ne!(cpu.bus.paula.intreq & INT_PORTS, 0);
+        assert_eq!(cpu.sampled_operand_irq_level, 2);
+        assert_eq!(cpu.sampled_irq_level, 0);
+        assert!(!cpu.bus.cia_irq_forwarding_due());
+    }
+
     fn cpu_bus(bus: Bus) -> CpuBus {
         CpuBus {
             bus,
@@ -6664,10 +7199,51 @@ mod tests {
             last_fetch_cache_hit: false,
             instruction_fetches_cached: false,
             sampled_irq_level: 0,
+            sampled_operand_irq_level: 0,
+            m68000_ipl_poll: false,
             ipl_sample_held: false,
             diag_current_pc: 0,
             jit_enabled: false,
+            cache_free_window: None,
+            cache_free_regions: [None; MAX_FAST_MEM_REGIONS],
+            window_offered: false,
+            jit_window_bank: None,
+            cacr_040_layout: false,
+            jit_batch: None,
+            jit_cache_exclusions_current: false,
+            jit_bus_boundary: false,
         }
+    }
+
+    #[test]
+    fn motherboard_iack_uses_rom_tail_vector_byte() {
+        let mut bus = cpu_bus(test_bus_with_pc(0x100));
+        for level in 1..=7 {
+            assert_eq!(bus.interrupt_acknowledge(level), u32::from(24 + level));
+        }
+        // High data bits do not participate in the 68000 vector number.
+        let offset = ROM_SIZE - 16 + 2 * 2;
+        bus.bus.mem.rom[offset..offset + 2].copy_from_slice(&[0xab, 0x40]);
+        assert_eq!(bus.interrupt_acknowledge(2), 0x40);
+        bus.bus.mem.rom[offset..offset + 2].fill(0);
+        assert_eq!(bus.interrupt_acknowledge(2), 0);
+    }
+
+    #[test]
+    fn missing_rom_iack_word_dispatches_vector_zero() -> Result<()> {
+        let mut bus = test_bus_with_pc(0x100);
+        write_program(&mut bus, 0x100, &[0x4e72, 0x2000, 0x60fe]);
+        write_program(&mut bus, 0x200, &[0x7007, 0x60fe]);
+        write_chip_long(&mut bus, 0, 0x200);
+        bus.mem.rom[ROM_SIZE - 12..ROM_SIZE - 10].fill(0);
+        bus.paula.intena = INT_MASTER | INT_PORTS;
+        bus.irq_latency_setting = 0;
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+        machine.step_slice(1)?;
+        machine.bus_mut().paula.intreq = INT_PORTS;
+        machine.step_slice(20)?;
+        assert_eq!(machine.d(0), 7);
+        Ok(())
     }
 
     /// `getreg`/`putreg` as every AmigaOS clock probe writes them: the
@@ -7329,6 +7905,100 @@ mod tests {
         Ok(())
     }
 
+    fn cpu_bus_before_final_d_only_blitter_write(initial_word: u16) -> CpuBus {
+        const BLITTER_DMA_ENABLE: u16 = 1 << 6;
+
+        let mut bus = test_bus_with_pc(0x100);
+        bus.agnus.hpos = 0x20;
+        bus.agnus.dmacon = DMACON_DMAEN | BLITTER_DMA_ENABLE;
+        write_chip_word(&mut bus, 0x0400, initial_word);
+        // D-only clear.
+        bus.blitter.bltcon0 = 0x0100;
+
+        // The first D1 slot writes 0x03FE; the terminal F flush writes
+        // 0x0400, after the CPU samples that address during E.
+        bus.blitter.bltdpt = 0x03FE;
+        bus.blitter.start_scheduled((1 << 6) | 2, &bus.mem.chip_ram);
+
+        // D-only, two-word clear: STRT, INIT, A0, D0, A1, D1. E is the
+        // next internal phase; a CPU grant there advances E -> F, then the
+        // bus-cycle tail gives the blitter its final D slot.
+        for _ in 0..6 {
+            bus.advance_chipset(1);
+        }
+        assert_eq!(bus.blitter.current_slot_label(), "E");
+        assert!(!bus.blitter.current_slot_needs_bus());
+        assert_eq!(read_chip_word(&bus, 0x0400), initial_word);
+
+        let mut bus = cpu_bus(bus);
+        bus.bus.set_cpu_bus_arbitration_enabled(true);
+        bus
+    }
+
+    #[test]
+    fn chip_ram_writes_land_before_final_blitter_d_tail_write() {
+        for (size, value) in [(1, 0x55), (2, 0x5555), (4, 0x5555_3344)] {
+            let mut bus = cpu_bus_before_final_d_only_blitter_write(0xABCD);
+            bus.write_sized_unobserved(0x0400, size, value);
+            assert_eq!(read_chip_word(&bus.bus, 0x0400), 0);
+            assert!(!bus.bus.blitter.busy);
+            if size == 4 {
+                assert_eq!(read_chip_word(&bus.bus, 0x0402), 0x3344);
+            }
+        }
+    }
+
+    #[test]
+    fn chip_ram_byte_read_samples_before_final_blitter_d_tail_write() {
+        let mut bus = cpu_bus_before_final_d_only_blitter_write(0xABCD);
+
+        let value = bus.read_sized_uncached(0x0400, 1, CpuBusAccessKind::Read);
+
+        assert_eq!(value, 0xAB);
+        assert_eq!(read_chip_word(&bus.bus, 0x0400), 0x0000);
+        assert!(!bus.bus.blitter.busy);
+    }
+
+    #[test]
+    fn chip_ram_word_read_samples_before_final_blitter_d_tail_write() {
+        let mut bus = cpu_bus_before_final_d_only_blitter_write(0xABCD);
+
+        let value = bus.read_sized_uncached(0x0400, 2, CpuBusAccessKind::Read);
+
+        assert_eq!(value, 0xABCD);
+        assert_eq!(read_chip_word(&bus.bus, 0x0400), 0x0000);
+        assert!(!bus.bus.blitter.busy);
+    }
+
+    #[test]
+    fn chip_ram_long_read_samples_each_word_on_its_own_grant() {
+        let mut bus = cpu_bus_before_final_d_only_blitter_write(0xABCD);
+        write_chip_word(&mut bus.bus, 0x0402, 0x1234);
+
+        let value = bus.read_sized_uncached(0x0400, 4, CpuBusAccessKind::Read);
+
+        assert_eq!(value, 0xABCD_1234);
+        assert_eq!(read_chip_word(&bus.bus, 0x0400), 0x0000);
+        assert_eq!(read_chip_word(&bus.bus, 0x0402), 0x1234);
+        assert!(!bus.bus.blitter.busy);
+    }
+
+    #[test]
+    fn aga_68000_chip_ram_long_read_samples_all_four_bytes_in_one_grant() {
+        use crate::chipset::agnus::AgnusRevision;
+        use crate::chipset::denise::DeniseRevision;
+
+        let mut bus = cpu_bus(test_bus(reset_rom(0, 0)));
+        bus.bus
+            .set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
+        bus.bus.set_cpu_bus_arbitration_enabled(true);
+        bus.bus.mem.chip_ram[0x0400..0x0404].copy_from_slice(&0xABCD_1234u32.to_be_bytes());
+
+        let value = bus.read_sized_uncached(0x0400, 4, CpuBusAccessKind::Read);
+
+        assert_eq!(value, 0xABCD_1234);
+    }
+
     #[test]
     fn external_accesses_advance_bus_time_without_chip_slots() -> Result<()> {
         // External regions (fast RAM, slow RAM, ROM, CIA) no longer take a
@@ -7792,6 +8462,147 @@ mod tests {
     /// must be raised as real hardware exceptions, mirroring the precise
     /// path's no-op HLE policy.
     #[test]
+    fn jit_mmio_after_native_prefix_observes_elapsed_chipset_time() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let mut program = vec![0x4e71; 512];
+        program.extend([0x3039, 0x00df, 0xf006, 0x60fe]); // VHPOSR -> D0
+        let run = |chunk: usize| -> Result<(u32, u64)> {
+            let mut machine = machine_with_program_model(pc, &program, CpuModel::M68040)?;
+            machine.set_jit_enabled(true);
+            let mut retired = 0;
+            while retired < 513 {
+                retired += machine.step_slice(chunk.min(513 - retired))?.instructions;
+            }
+            Ok((machine.d(0), machine.bus().emulated_cck()))
+        };
+        let single = run(1)?;
+        assert_ne!(single.0, 0, "beam must advance before the register read");
+        assert_eq!(
+            run(4096)?,
+            single,
+            "native prefix must precede the MMIO read"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn jit_cia_deadline_and_mid_batch_timer_start_match_instruction_boundaries() -> Result<()> {
+        use crate::chipset::paula::INT_PORTS;
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let handler = FAST_RAM_BASE as u32 + 0x1000;
+        for start_in_guest in [false, true] {
+            for factor in [1.0, 4.0, 80.0] {
+                let run = |chunk: usize| -> Result<(u64, u32, u32)> {
+                    let mut bus = test_bus_with_pc(pc);
+                    let mut program = vec![0x4e71; 128];
+                    if start_in_guest {
+                        program.extend([0x13fc, 0x0011, 0x00bf, 0xee01]); // CIA-A CRA
+                    }
+                    program.push(0x60fe);
+                    write_program(&mut bus, pc, &program);
+                    write_program(&mut bus, handler, &[0x702a, 0x4e72, 0x2700]);
+                    set_autovector(&mut bus, 2, handler);
+                    bus.irq_latency_setting = 0;
+                    bus.paula.intena = INT_MASTER | INT_PORTS;
+                    bus.cia_a.write(4, 10);
+                    bus.cia_a.write(5, 0);
+                    bus.cia_a.write(13, 0x81);
+                    if !start_in_guest {
+                        bus.cia_a.write(14, 0x11);
+                    }
+                    let mut machine = M68kMachine::new(bus, CpuModel::M68040, true)?;
+                    machine.set_jit_enabled(true);
+                    machine.set_jit_speed_factor(factor);
+                    machine.cpu.set_sr(0x2000);
+                    for _ in 0..100_000 {
+                        if machine.step_slice(chunk)?.stopped {
+                            assert_eq!(machine.d(0), 42);
+                            return Ok((machine.bus().emulated_cck(), machine.pc(), machine.a(7)));
+                        }
+                    }
+                    panic!("CIA interrupt did not reach its handler");
+                };
+                assert_eq!(
+                    run(4096)?,
+                    run(1)?,
+                    "guest_start={start_in_guest} factor={factor}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn jit_pending_irq_after_sr_unmask_matches_instruction_boundaries() -> Result<()> {
+        use crate::chipset::paula::INT_SOFT;
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let handler = FAST_RAM_BASE as u32 + 0x1000;
+        let run = |chunk: usize| -> Result<(u64, u32, u32)> {
+            let mut bus = test_bus_with_pc(pc);
+            let mut program = vec![0x4e71; 128];
+            program.extend([0x46fc, 0x2000, 0x5280, 0x60fe]); // unmask, then ADDQ D0
+            write_program(&mut bus, pc, &program);
+            write_program(&mut bus, handler, &[0x742a, 0x4e72, 0x2700]);
+            set_autovector(&mut bus, 1, handler);
+            bus.irq_latency_setting = 0;
+            bus.paula.intena = INT_MASTER | INT_SOFT;
+            bus.paula.intreq = INT_SOFT;
+            let mut machine = M68kMachine::new(bus, CpuModel::M68040, true)?;
+            machine.set_jit_enabled(true);
+            machine.cpu.set_sr(0x2700);
+            for _ in 0..1024 {
+                if machine.step_slice(chunk)?.stopped {
+                    assert_eq!(
+                        machine.d(0),
+                        0,
+                        "IRQ precedes the instruction after unmasking"
+                    );
+                    assert_eq!(machine.d(2), 42);
+                    return Ok((machine.bus().emulated_cck(), machine.pc(), machine.a(7)));
+                }
+            }
+            panic!("pending interrupt did not reach its handler");
+        };
+        assert_eq!(run(4096)?, run(1)?);
+        Ok(())
+    }
+
+    /// Code fetched from chip RAM runs in lump-billed batches with no boundary
+    /// checks, so a level unmasked inside one is recognized when it ends.
+    #[test]
+    fn jit_chip_resident_lump_recognizes_interrupts_between_batches() -> Result<()> {
+        use crate::chipset::paula::INT_SOFT;
+        let pc = 0x1000u32;
+        let handler = 0x2000u32;
+        let run = |chunk: usize| -> Result<u32> {
+            let mut bus = test_bus_with_pc(pc);
+            let mut program = vec![0x4e71; 8];
+            program.extend([0x46fc, 0x2000]); // unmask
+            program.extend([0x5280; 8]); // ADDQ.L #1,D0
+            program.push(0x60fe);
+            write_program(&mut bus, pc, &program);
+            write_program(&mut bus, handler, &[0x742a, 0x4e72, 0x2700]);
+            set_autovector(&mut bus, 1, handler);
+            bus.irq_latency_setting = 0;
+            bus.paula.intena = INT_MASTER | INT_SOFT;
+            bus.paula.intreq = INT_SOFT;
+            let mut machine = M68kMachine::new(bus, CpuModel::M68020, true)?;
+            machine.set_jit_enabled(true);
+            machine.cpu.set_sr(0x2700);
+            for _ in 0..1024 {
+                if machine.step_slice(chunk)?.stopped {
+                    assert_eq!(machine.d(2), 42);
+                    return Ok(machine.d(0));
+                }
+            }
+            panic!("pending interrupt did not reach its handler");
+        };
+        assert_eq!(run(1)?, 0, "one-instruction slices take it at once");
+        assert_eq!(run(4096)?, 8, "the lump finishes before the handler");
+        Ok(())
+    }
+
+    #[test]
     fn jit_slice_takes_trap_exceptions() -> Result<()> {
         let pc = FAST_RAM_BASE as u32 + 0x100;
         let mut bus = test_bus_with_pc(pc);
@@ -7923,34 +8734,46 @@ mod tests {
     fn jit_speed_factor_divides_the_billed_cpu_clocks() -> Result<()> {
         let program = [0x4E71u16, 0x60FC]; // nop; bra.s <nop>
         let pc = FAST_RAM_BASE as u32 + 0x100;
-        let run = |factor: f64| -> Result<(u32, u32, f64)> {
+        let run = |factor: f64, chunk: usize| -> Result<(u32, u32, f64)> {
             let mut machine = machine_with_program_model(pc, &program, CpuModel::M68030)?;
             machine.set_jit_enabled(true);
             machine.set_jit_speed_factor(factor);
             let (mut clocks, mut cck) = (0u32, 0u32);
-            for _ in 0..10 {
-                let slice = machine.step_slice(4096)?;
-                assert_eq!(slice.instructions, 4096);
+            let mut remaining = 40_960;
+            while remaining != 0 {
+                let budget = chunk.min(remaining);
+                let slice = machine.step_slice(budget)?;
+                assert_eq!(slice.instructions, budget);
+                remaining -= slice.instructions;
                 clocks += slice.cpu_cycles;
                 cck += slice.cpu_cck;
             }
             Ok((clocks, cck, machine.jit_speed_factor()))
         };
-        let (fixed_clocks, fixed_cck, fixed_factor) = run(1.0)?;
+        let (fixed_clocks, fixed_cck, fixed_factor) = run(1.0, 4096)?;
         assert_eq!(fixed_clocks, 40_960, "one clock per instruction");
         assert_eq!(fixed_factor, 1.0);
-        let (fast_clocks, fast_cck, fast_factor) = run(4.0)?;
+        let (fast_clocks, fast_cck, fast_factor) = run(4.0, 4096)?;
         assert_eq!(fast_factor, 4.0);
         assert_eq!(fast_clocks * 4, fixed_clocks);
         assert_eq!(fast_cck * 4, fixed_cck);
-        let (third_clocks, _, _) = run(3.0)?;
+        let (third_clocks, _, _) = run(3.0, 4096)?;
         assert!(
             third_clocks.abs_diff(fixed_clocks / 3) <= 1,
             "{third_clocks} clocks at factor 3"
         );
-        // Out-of-range factors fall back to the fixed clock.
-        for factor in [0.5, f64::NAN, f64::INFINITY] {
-            assert_eq!(run(factor)?.0, fixed_clocks, "factor {factor}");
+        assert_eq!(
+            run(0.5, 4096)?.0,
+            fixed_clocks * 2,
+            "overload backoff bills twice the clocks"
+        );
+        // Invalid factors fall back to the fixed clock.
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(run(factor, 4096)?.0, fixed_clocks, "factor {factor}");
+        }
+        for factor in [0.5, 1.0, 1.5, 3.0, 80.0] {
+            assert_eq!(run(factor, 1)?, run(factor, 4096)?, "factor={factor}");
+            assert_eq!(run(factor, 63)?, run(factor, 4096)?, "factor={factor}");
         }
         Ok(())
     }
@@ -8018,14 +8841,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn jit_spare_slice_yields_on_device_access_and_restores_fractional_clocks() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let mut m = machine_with_program_model(
+            pc,
+            &[0x5280, 0x33fc, 0x00f0, 0x00df, 0xf180, 0x60f4],
+            CpuModel::M68030,
+        )?;
+        m.set_jit_enabled(true);
+        assert!(m.jit_batch_path_active());
+        m.set_jit_speed_factor(0.5);
+        m.jit_clock_carry_q16 = 123;
+        m.cpu_clock_carry = 1;
+        let before = m.bus().emulated_cck();
+        let burst = m.step_jit_spare_slice(4096)?;
+        assert_eq!(
+            burst.instructions, 2,
+            "return after the first MMIO instruction"
+        );
+        assert!(burst.bus_advanced_cck > 0);
+        assert!(m.bus().emulated_cck() > before);
+        assert_eq!(m.bus().denise.palette[0], 0x00f0);
+        assert_eq!(m.jit_speed_factor(), 0.5);
+        assert_eq!(m.jit_clock_carry_q16, 123);
+        assert_eq!(m.cpu_clock_carry, 1);
+        let before = m.bus().emulated_cck();
+        assert!(m.step_slice(128)?.instructions > 0);
+        assert!(m.bus().emulated_cck() > before, "ordinary billing resumes");
+        Ok(())
+    }
+
+    #[test]
+    fn jit_spare_slice_stop_does_not_fast_forward_timers() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let mut m = machine_with_program_model(pc, &[0x4e72, 0x2700], CpuModel::M68030)?;
+        m.set_jit_enabled(true);
+        assert!(m.jit_batch_path_active());
+        m.cpu.set_sr(0x2700);
+        let cck = m.bus().emulated_cck();
+        let cia = bincode::serialize(&m.bus().cia_a)?;
+        let run = m.step_jit_spare_slice(4096)?;
+        assert!(run.stopped);
+        assert_eq!(run.instructions, 1);
+        assert_eq!(m.bus().emulated_cck(), cck);
+        assert_eq!(bincode::serialize(&m.bus().cia_a)?, cia);
+        Ok(())
+    }
+
     /// The fastmem window is only offered while nothing intercepts plain
-    /// fast-RAM accesses, and covers the largest fitted fast bank.
+    /// fast-RAM accesses. It covers the bank the code runs from, keeps that
+    /// bank while code runs outside fast RAM, and covers the largest bank
+    /// until code has run from one.
     #[test]
     fn jit_fast_mem_window_gates_and_bank_choice() -> Result<()> {
         let mut machine = machine_with_program_model(0x0100, &[0x4E71], CpuModel::M68020)?;
         // Not offered until JIT mode is on.
         assert!(machine.bus.jit_fast_mem().is_none());
         machine.set_jit_enabled(true);
+        machine.bus.bus.cpu_pc = 0x0100;
         let window = machine.bus.jit_fast_mem().expect("zorro fast RAM window");
         assert_eq!(window.base, FAST_RAM_BASE as u32);
         assert_eq!(window.len, 64 * 1024);
@@ -8034,11 +8908,666 @@ mod tests {
         machine.bus.dbg_memw_addr = Some(0x1234);
         assert!(machine.bus.jit_fast_mem().is_none());
         machine.bus.dbg_memw_addr = None;
-        // A bigger motherboard bank wins.
+        // A bigger motherboard bank does not take the window while code
+        // still runs from chip RAM: the window keeps the bank it covered.
         machine.bus.bus.mem.fit_mb_ram(2 * 1024 * 1024);
-        let window = machine.bus.jit_fast_mem().expect("motherboard window");
+        let window = machine.bus.jit_fast_mem().expect("zorro window kept");
+        assert_eq!(window.base, FAST_RAM_BASE as u32);
+        // Code running from motherboard RAM moves the window there, and a
+        // call into ROM keeps it.
+        for pc in [0x07E0_1000, ROM_BASE as u32 + 0x100] {
+            machine.bus.bus.cpu_pc = pc;
+            let window = machine.bus.jit_fast_mem().expect("motherboard window");
+            assert_eq!(window.base, 0x07E0_0000, "pc {pc:#X}");
+            assert_eq!(window.len, 2 * 1024 * 1024, "pc {pc:#X}");
+        }
+        // Code in the Zorro board takes it back although that bank is
+        // smaller.
+        machine.bus.bus.cpu_pc = FAST_RAM_BASE as u32 + 0x40;
+        let window = machine.bus.jit_fast_mem().expect("zorro window");
+        assert_eq!(window.base, FAST_RAM_BASE as u32);
+        // Before any code has run from fast RAM, the largest bank.
+        machine.bus.jit_window_bank = None;
+        machine.bus.bus.cpu_pc = 0x0100;
+        let window = machine.bus.jit_fast_mem().expect("largest bank");
         assert_eq!(window.base, 0x07E0_0000);
-        assert_eq!(window.len, 2 * 1024 * 1024);
+        Ok(())
+    }
+
+    /// The boundary hook runs before every decoded instruction and compares
+    /// a cached interrupt level. Local instructions cannot change it; a
+    /// prefix flush (which ticks devices) or a shared-bus access must refresh
+    /// it before the next comparison.
+    #[test]
+    fn jit_boundary_hook_refreshes_interrupt_state_after_flushes_and_bus_access() -> Result<()> {
+        use crate::chipset::paula::INT_SOFT;
+        let mut machine =
+            machine_with_program_model(FAST_RAM_BASE as u32 + 0x100, &[0x4e71], CpuModel::M68040)?;
+        let bus = &mut machine.bus;
+        bus.bus.irq_latency_setting = 0;
+        bus.bus.paula.intena = INT_MASTER | INT_SOFT;
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+
+        bus.begin_test_jit_batch();
+        assert!(!bus.note_jit_batch_boundary(1, pc, 0x2000));
+        bus.bus.paula.intreq = INT_SOFT;
+        assert!(
+            !bus.note_jit_batch_boundary(2, pc, 0x2000),
+            "cached: a local instruction cannot raise INTREQ"
+        );
+        bus.flush_jit_batch_prefix();
+        assert!(
+            bus.note_jit_batch_boundary(2, pc, 0x2000),
+            "a flush refreshes it"
+        );
+        assert!(
+            !bus.note_jit_batch_boundary(2, pc, 0x2700),
+            "SR masks it per call"
+        );
+
+        bus.bus.paula.intreq = 0;
+        bus.begin_test_jit_batch();
+        assert!(!bus.note_jit_batch_boundary(1, pc, 0x2000));
+        bus.flush_jit_batch_prefix();
+        assert!(!bus.note_jit_batch_boundary(1, pc, 0x2000));
+        bus.bus.paula.intreq = INT_SOFT;
+        // An opcode fetched from chip RAM with no new prefix to bill: only the
+        // access itself can mark the cached state stale.
+        bus.note_jit_bus_access(0x0000_0100, 2, true);
+        assert!(
+            bus.note_jit_batch_boundary(1, pc, 0x2000),
+            "a shared-bus access refreshes it"
+        );
+        bus.jit_batch = None;
+        Ok(())
+    }
+
+    /// A native batch that branches into shared-bus RAM finishes the first
+    /// instruction fetched there before returning to the host. Yielding
+    /// between that fetch and its dispatch would make the core fetch the
+    /// opcode again, arbitrating a second chip-bus cycle for it. Slow RAM
+    /// sits above fast RAM, so the forward jump starts no trace recording
+    /// (whose code reads would also use the bus).
+    #[test]
+    fn jit_batch_entering_shared_ram_fetches_each_opcode_once() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let slow = SLOW_RAM_BASE as u32 + 0x100;
+        let mut program = vec![0x4e71; 64];
+        program.push(0x4ef9); // JMP slow
+        program.extend([(slow >> 16) as u16, slow as u16]);
+        let run = |chunk: usize| -> Result<(u32, u32, u64)> {
+            let mut machine = machine_with_program_model(pc, &program, CpuModel::M68030)?;
+            // MOVEQ #5,D0; ADDQ.L #1,D0; STOP #$2700
+            write_program(
+                &mut machine.bus.bus,
+                slow,
+                &[0x7005, 0x5280, 0x4e72, 0x2700],
+            );
+            machine.set_jit_enabled(true);
+            for _ in 0..1024 {
+                if machine.step_slice(chunk)?.stopped {
+                    return Ok((machine.d(0), machine.pc(), machine.bus().emulated_cck()));
+                }
+            }
+            panic!("program did not reach STOP");
+        };
+        let single = run(1)?;
+        assert_eq!(single.0, 6);
+        assert_eq!(run(4096)?, single);
+        Ok(())
+    }
+
+    #[test]
+    fn jit_single_instruction_batches_preserve_local_memory_cache_exclusions() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let run = |chunk, caches| -> Result<(u32, u32, u32, u64)> {
+            let mut machine = machine_with_program_model(
+                pc,
+                &[
+                    0x2039, 0x00f8, 0x0000, // MOVE.L ROM,D0
+                    0x23c0, 0x07e0, 0x0000, // MOVE.L D0,motherboard RAM
+                    0x2239, 0x07e0, 0x0000, // MOVE.L motherboard RAM,D1
+                    0x4e72, 0x2700,
+                ],
+                CpuModel::M68030,
+            )?;
+            machine.bus.bus.mem.fit_mb_ram(2 * 1024 * 1024);
+            let mb = machine.bus.bus.mem.mb_ram_base() as u32;
+            assert_eq!(mb, 0x07e0_0000);
+            machine.bus.bus.mem.rom[..4].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+            if caches {
+                machine.set_cache_emulation(true, true);
+                machine.cpu.cacr = CACR_ED | CACR_EI;
+                machine.apply_cacr_updates();
+                machine.bus.read_long(mb);
+                assert!(machine
+                    .bus
+                    .cache_read(mb, 4, CpuBusAccessKind::Read)
+                    .is_some());
+            }
+            machine.set_jit_enabled(true);
+            for _ in 0..8 {
+                if machine.step_slice(chunk)?.stopped {
+                    assert_eq!(machine.d(0), 0x1234_5678);
+                    assert_eq!(machine.d(1), machine.d(0));
+                    if caches {
+                        assert!(machine.bus.in_cache_free_window(mb, 4));
+                    }
+                    assert!(machine
+                        .bus
+                        .cache_read(mb, 4, CpuBusAccessKind::Read)
+                        .is_none());
+                    return Ok((
+                        machine.d(0),
+                        machine.d(1),
+                        machine.pc(),
+                        machine.bus().emulated_cck(),
+                    ));
+                }
+            }
+            panic!("program did not reach STOP");
+        };
+        for caches in [false, true] {
+            assert_eq!(run(1, caches)?, run(4096, caches)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn jit_chip_code_refreshes_cache_exclusions_after_guest_autoconfig() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let mut machine = machine_with_program_model(
+            0x100,
+            &[
+                0x4e71, // NOP captures the original exclusions
+                0x13fc, 0x0040, 0x00e8, 0x0048, // configure the new Z2 board at $400000
+                0x2039, 0x0040, 0x0000, // MOVE.L newly mapped RAM,D0
+                0x60fe, // BRA.S *
+            ],
+            CpuModel::M68030,
+        )?;
+        machine.bus.bus.mem.zorro.add_board_with_rom(
+            BoardSpec::fast_ram(64 * 1024),
+            &0x1234_5678u32.to_be_bytes(),
+        )?;
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = CACR_ED | CACR_EI;
+        machine.apply_cacr_updates();
+        machine.bus.jit_window_bank = Some(FAST_RAM_BASE as u32);
+        machine.set_jit_enabled(true);
+        machine.step_slice(64)?;
+        assert_eq!(machine.d(0), 0x1234_5678);
+        // A lump captures its direct regions when it starts, so the new board
+        // reaches the exclusions when the next batch captures them.
+        machine.step_slice(64)?;
+        assert!(machine.bus.in_cache_free_window(0x0040_0000, 4));
+        assert!(machine
+            .bus
+            .cache_read(0x0040_0000, 4, CpuBusAccessKind::Read)
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn jit_chip_code_refreshes_cache_exclusions_after_backing_memory_replacement() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let mut machine = machine_with_program_model(
+            0x100,
+            &[0x2010, 0x60fc], // MOVE.L (A0),D0; BRA back
+            CpuModel::M68030,
+        )?;
+        machine.bus.bus.mem.fit_mb_ram(2 * 1024 * 1024);
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = CACR_ED | CACR_EI;
+        machine.apply_cacr_updates();
+        machine.bus.jit_window_bank = Some(FAST_RAM_BASE as u32);
+        machine.set_jit_enabled(true);
+        machine.cpu.dar[8] = machine.bus.bus.mem.mb_ram_base() as u32;
+        machine.step_slice(64)?;
+        machine.bus.bus.mem.fit_mb_ram(4 * 1024 * 1024);
+        let mb = machine.bus.bus.mem.mb_ram_base() as u32;
+        machine.bus.bus.mem.mb_ram[..4].copy_from_slice(&0x8765_4321u32.to_be_bytes());
+        machine.cpu.dar[8] = mb;
+        machine.step_slice(64)?;
+        assert_eq!(machine.d(0), 0x8765_4321);
+        assert!(machine.bus.in_cache_free_window(mb, 4));
+        assert!(machine
+            .bus
+            .cache_read(mb, 4, CpuBusAccessKind::Read)
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn jit_extra_windows_keep_rom_readonly_and_other_banks_cache_coherent() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let mut machine = machine_with_program_model(0x0100, &[0x4E71], CpuModel::M68030)?;
+        machine.bus.bus.mem.fit_mb_ram(2 * 1024 * 1024);
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = CACR_ED | CACR_EI;
+        machine.apply_cacr_updates();
+        machine.set_jit_enabled(true);
+        machine.bus.bus.cpu_pc = FAST_RAM_BASE as u32;
+        machine.bus.fast_mem().unwrap();
+        let mb = machine.bus.bus.mem.mb_ram_base() as u32;
+        machine.bus.read_long(mb);
+        assert!(machine
+            .bus
+            .cache_read(mb, 4, CpuBusAccessKind::Read)
+            .is_some());
+        let regions = machine.bus.fast_mem_regions();
+        assert!(regions
+            .iter()
+            .flatten()
+            .any(|r| r.base == ROM_BASE as u32 && !r.writable));
+        assert!(regions.iter().flatten().any(|r| r.base == mb && r.writable));
+        assert!(!regions.iter().flatten().any(|r| r.base == 0));
+        assert!(machine
+            .bus
+            .cache_read(mb, 4, CpuBusAccessKind::Read)
+            .is_none());
+        machine.bus.read_long(mb);
+        assert!(machine
+            .bus
+            .cache_read(mb, 4, CpuBusAccessKind::Read)
+            .is_none());
+        machine.bus.dbg_memw_addr = Some(mb);
+        assert!(machine.bus.fast_mem_regions().iter().all(Option::is_none));
+        Ok(())
+    }
+
+    /// Code that alternates between two fast-RAM banks moves the window
+    /// with it, and the cache models stay coherent across each move. The
+    /// program reads a longword in the Zorro board while running from
+    /// motherboard RAM (the data cache takes a line for it), jumps into
+    /// the Zorro board, which rewrites that longword through the window,
+    /// and jumps back to read it again. A line kept from the first read
+    /// would serve the old value. One-instruction batches make the window
+    /// follow every jump.
+    #[test]
+    fn jit_window_follows_code_across_banks_and_matches_precise_core() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let mb_code = 0x07E0_0100u32;
+        let mb_data = 0x07E0_0800u32;
+        let z_code = FAST_RAM_BASE as u32 + 0x100;
+        let z_data = FAST_RAM_BASE as u32 + 0x800;
+        let hi = |v: u32| (v >> 16) as u16;
+        let lo = |v: u32| v as u16;
+        let back = mb_code + 30;
+        let mb_program = [
+            0x207C,
+            hi(z_data),
+            lo(z_data), // movea.l #z_data,a0
+            0x267C,
+            hi(mb_data),
+            lo(mb_data), // movea.l #mb_data,a3
+            0x227C,
+            0x0000,
+            0x2000, // movea.l #$2000,a1 (chip RAM)
+            0x2290, // move.l (a0),(a1)
+            0x2A13, // move.l (a3),d5
+            0x4EF9,
+            hi(z_code),
+            lo(z_code), // jmp z_code
+            0x4E71,     // nop (padding)
+            0x2350,
+            0x0004, // back: move.l (a0),4(a1)
+            0x2353,
+            0x0008, // move.l (a3),8(a1)
+            0x60FE, // bra.s *
+        ];
+        let z_program = [
+            0x20BC,
+            0x2222,
+            0x2222, // move.l #$22222222,(a0)
+            0x26BC,
+            0x3333,
+            0x3333, // move.l #$33333333,(a3)
+            0x4EF9,
+            hi(back),
+            lo(back), // jmp back
+        ];
+        let run = |jit: bool| -> Result<(u32, u32, u32)> {
+            let mut bus = test_bus_with_pc(mb_code);
+            bus.mem.fit_mb_ram(2 * 1024 * 1024);
+            let mb_base = bus.mem.mb_ram_base() as u32;
+            write_words(
+                &mut bus.mem.mb_ram,
+                (mb_code - mb_base) as usize,
+                &mb_program,
+            );
+            write_words(
+                &mut bus.mem.mb_ram,
+                (mb_data - mb_base) as usize,
+                &[0x5555, 0x5555],
+            );
+            write_program(&mut bus, z_code, &z_program);
+            write_program(&mut bus, z_data, &[0x1111, 0x1111]);
+            let mut machine = M68kMachine::new(bus, CpuModel::M68030, false)?;
+            machine.bus_mut().agnus.hpos = 0x21;
+            machine.set_cache_emulation(true, true);
+            machine.cpu.cacr = CACR_EI | CACR_ED;
+            machine.apply_cacr_updates();
+            machine.set_jit_enabled(jit);
+            for _ in 0..16 {
+                machine.step_slice(1)?;
+            }
+            Ok((
+                read_chip_long(machine.bus(), 0x2000),
+                read_chip_long(machine.bus(), 0x2004),
+                read_chip_long(machine.bus(), 0x2008),
+            ))
+        };
+        let expected = (0x1111_1111, 0x2222_2222, 0x3333_3333);
+        assert_eq!(run(false)?, expected, "precise");
+        assert_eq!(run(true)?, expected, "jit");
+        Ok(())
+    }
+
+    /// The window bank kept while code runs outside fast RAM is emulated
+    /// state: fast-RAM fetches outside the window take instruction-cache
+    /// lines and can evict chip-RAM code, while fetches through it take
+    /// none, so the bank decides which chip fetches hit. A JMP loop runs
+    /// through chip RAM, the Zorro board and ROM with the instruction
+    /// cache on; a snapshot taken at the ROM PC, with the window still on
+    /// the Zorro bank, must resume on the same bank and the same chip-bus
+    /// timing, whether it lands in a fresh machine or one that has since
+    /// moved its window elsewhere.
+    #[test]
+    fn jit_window_bank_survives_save_restore_outside_fast_ram() -> Result<()> {
+        use m68k::CACR_EI;
+        let chip_code = 0x0100u32;
+        let z_code = FAST_RAM_BASE as u32 + 0x100;
+        let rom_code = ROM_BASE as u32 + 0x180;
+        let jump = |addr: u32| [0x4EF9, (addr >> 16) as u16, addr as u16];
+        let make = || -> Result<M68kMachine> {
+            let mut bus = test_bus_with_pc(chip_code);
+            bus.mem.fit_mb_ram(2 * 1024 * 1024);
+            write_program(&mut bus, chip_code, &jump(z_code));
+            write_program(&mut bus, z_code, &jump(rom_code));
+            write_program(&mut bus, rom_code, &jump(chip_code));
+            let mut machine = M68kMachine::new(bus, CpuModel::M68030, false)?;
+            machine.bus_mut().agnus.hpos = 0x21;
+            machine.set_cache_emulation(true, true);
+            machine.cpu.cacr = CACR_EI;
+            machine.apply_cacr_updates();
+            machine.set_jit_enabled(true);
+            Ok(machine)
+        };
+        let mut live = make()?;
+        live.step_slice(1)?; // chip -> Zorro; the chip code takes a cache line
+        live.step_slice(1)?; // Zorro -> ROM; the window now covers the Zorro bank
+        assert_eq!(live.pc(), rom_code);
+        assert_eq!(live.bus.jit_window_bank, Some(FAST_RAM_BASE as u32));
+        let mut saved = Vec::new();
+        live.write_state(&mut saved)?;
+
+        let mut fresh = make()?;
+        fresh.apply_state(&mut &saved[..])?;
+        let mut moved = make()?;
+        moved.bus.jit_window_bank = Some(0x07E0_0000);
+        moved.apply_state(&mut &saved[..])?;
+        for resumed in [&fresh, &moved] {
+            assert_eq!(resumed.bus.jit_window_bank, Some(FAST_RAM_BASE as u32));
+        }
+
+        let live_result = live.step_slice(6)?;
+        for (name, resumed) in [("fresh", &mut fresh), ("moved", &mut moved)] {
+            let resumed_result = resumed.step_slice(6)?;
+            assert_eq!(resumed.pc(), live.pc(), "{name}");
+            assert_eq!(
+                resumed_result.bus_advanced_cck, live_result.bus_advanced_cck,
+                "{name}: restoring a JIT snapshot in ROM changed chip-bus fetch timing"
+            );
+        }
+        Ok(())
+    }
+
+    /// A compiled ROM loop touches three independently allocated fast banks.
+    /// Restoring into a fresh CPU must rebuild every pointer/cache exclusion,
+    /// while preserving the remembered primary bank and device clock carries.
+    #[test]
+    fn jit_multiple_regions_survive_fresh_save_restore() -> Result<()> {
+        use crate::memory::ACCEL_RAM_BASE;
+        use m68k::{CACR_ED, CACR_EI};
+        let rom = ROM_BASE as u32 + 0x100;
+        let make = || -> Result<M68kMachine> {
+            let mut bus = test_bus_with_pc(rom);
+            bus.mem.fit_mb_ram(2 * 1024 * 1024);
+            bus.mem.fit_accel_ram(2 * 1024 * 1024);
+            // MOVE.L (A0),D0; ADDQ.L #1,D0; MOVE.L D0,(A0)/(A1)/(A2); BRA.
+            write_program(
+                &mut bus,
+                rom,
+                &[0x2010, 0x5280, 0x2080, 0x2280, 0x2480, 0x60f4],
+            );
+            let mb = bus.mem.mb_ram_base() as u32;
+            let mut machine = M68kMachine::new(bus, CpuModel::M68030, false)?;
+            machine.cpu.set_a(0, FAST_RAM_BASE as u32 + 0x800);
+            machine.cpu.set_a(1, mb + 0x800);
+            machine.cpu.set_a(2, ACCEL_RAM_BASE as u32 + 0x800);
+            machine.set_cache_emulation(true, true);
+            machine.cpu.cacr = CACR_EI | CACR_ED;
+            machine.apply_cacr_updates();
+            machine.set_jit_enabled(true);
+            Ok(machine)
+        };
+        let mut live = make()?;
+        live.step_slice(6 * 2048)?;
+        assert_eq!(live.pc(), rom);
+        assert_eq!(live.d(0), 2048);
+        let mut state = Vec::new();
+        live.write_state(&mut state)?;
+        let mut fresh = make()?;
+        fresh.apply_state(&mut &state[..])?;
+        assert!(fresh.bus.cache_free_regions.iter().all(Option::is_none));
+        for budget in [512, 513, 1024] {
+            let expected = live.step_slice(budget)?;
+            let actual = fresh.step_slice(budget)?;
+            assert_eq!(actual.bus_advanced_cck, expected.bus_advanced_cck);
+            assert_eq!(fresh.bus().emulated_cck(), live.bus().emulated_cck());
+            assert_eq!(fresh.pc(), live.pc());
+            assert_eq!(fresh.cpu.dar, live.cpu.dar);
+            assert_eq!(fresh.cpu.get_sr(), live.cpu.get_sr());
+            assert_eq!(fresh.bus().mem.mb_ram, live.bus().mem.mb_ram);
+            assert_eq!(fresh.bus().mem.accel_ram, live.bus().mem.accel_ram);
+            assert_eq!(
+                fresh.bus().mem.zorro.board_ram(0),
+                live.bus().mem.zorro.board_ram(0)
+            );
+            assert_eq!(fresh.bus.jit_window_bank, live.bus.jit_window_bank);
+        }
+        Ok(())
+    }
+
+    /// A save from before the window bank was carried has no
+    /// `jit_window_bank` field and reads as None: the largest bank until
+    /// code runs from a fast bank.
+    #[test]
+    fn machine_runtime_state_without_window_bank_reads_none() -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct OlderMachineRuntimeState {
+            last_cacr: u32,
+            sync_cck_on: bool,
+            cpu_clocks_per_cck: u32,
+            cpu_clock_carry: u32,
+        }
+        let older = OlderMachineRuntimeState {
+            last_cacr: 0x0101,
+            sync_cck_on: true,
+            cpu_clocks_per_cck: 4,
+            cpu_clock_carry: 1,
+        };
+        let mut bytes = Vec::new();
+        chunk::encode(&older, &mut bytes)?;
+        let state: MachineRuntimeState = chunk::decode(&bytes)?;
+        assert_eq!(state.last_cacr, 0x0101);
+        assert_eq!(state.cpu_clock_carry, 1);
+        assert_eq!(state.jit_window_bank, None);
+        Ok(())
+    }
+
+    /// The cache models do not withhold the fastmem window. A window
+    /// capture drops the lines the models hold inside it and keeps them
+    /// from allocating there while the core writes it directly, so a later
+    /// access that does come through the bus reads memory, not a stale
+    /// line. Chip RAM, which the window never covers, stays cached.
+    #[test]
+    fn jit_window_capture_keeps_cache_models_out_of_the_window() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let mut machine = machine_with_program_model(0x0100, &[0x4E71], CpuModel::M68030)?;
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = CACR_EI | CACR_ED;
+        machine.apply_cacr_updates();
+        machine.set_jit_enabled(true);
+        let data = FAST_RAM_BASE as u32 + 0x800;
+        write_program(machine.bus_mut(), data, &[0x1111, 0x1111, 0x4E71, 0x4E71]);
+        let cached = |machine: &M68kMachine, addr: u32, kind: CpuBusAccessKind| {
+            machine.bus.cache_read(addr, 4, kind).is_some()
+        };
+
+        // Until a batch captures the window, fast RAM caches as on silicon.
+        assert_eq!(machine.bus.read_long(data), 0x1111_1111);
+        assert_eq!(machine.bus.read_immediate_long(data + 4), 0x4E71_4E71);
+        assert!(cached(&machine, data, CpuBusAccessKind::Read));
+        assert!(cached(&machine, data + 4, CpuBusAccessKind::Fetch));
+
+        let window = machine
+            .bus
+            .fast_mem()
+            .expect("the window is offered with cache models present");
+        assert_eq!(window.base, FAST_RAM_BASE as u32);
+        assert!(!cached(&machine, data, CpuBusAccessKind::Read));
+        assert!(!cached(&machine, data + 4, CpuBusAccessKind::Fetch));
+
+        // A store the core makes straight into the window...
+        write_program(machine.bus_mut(), data, &[0x2222, 0x2222]);
+        // ...is what the next bus read sees, and no line is allocated.
+        assert_eq!(machine.bus.read_long(data), 0x2222_2222);
+        assert_eq!(machine.bus.read_immediate_long(data + 4), 0x4E71_4E71);
+        assert!(!cached(&machine, data, CpuBusAccessKind::Read));
+        assert!(!cached(&machine, data + 4, CpuBusAccessKind::Fetch));
+
+        // Chip RAM is outside the window and keeps its instruction cache.
+        assert_eq!(machine.bus.read_immediate_long(0x0100), 0x4E71_0000);
+        assert!(cached(&machine, 0x0100, CpuBusAccessKind::Fetch));
+        Ok(())
+    }
+
+    /// A JIT batch that runs without the window (here the heat map
+    /// withholds it) sends every access through the bus, so the window
+    /// bank may cache again;
+    /// the next batch that gets the window drops those lines before the
+    /// core writes it.
+    #[test]
+    fn jit_batch_without_window_lets_the_bank_cache_until_the_next_capture() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let mut machine = machine_with_program_model(pc, &[0x60FE], CpuModel::M68030)?; // bra.s *
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = CACR_EI | CACR_ED;
+        machine.apply_cacr_updates();
+        machine.set_jit_enabled(true);
+        let data = FAST_RAM_BASE as u32 + 0x800;
+        let window = Some((FAST_RAM_BASE as u32, 64 * 1024));
+
+        machine.step_slice(8)?;
+        assert_eq!(machine.bus.cache_free_window, window);
+
+        machine.bus.bus.set_heat_map(Some((0, 0x0100_0000)));
+        machine.step_slice(8)?;
+        assert_eq!(machine.bus.cache_free_window, None);
+        machine.bus.read_long(data);
+        assert!(machine
+            .bus
+            .cache_read(data, 4, CpuBusAccessKind::Read)
+            .is_some());
+
+        machine.bus.bus.set_heat_map(None);
+        machine.step_slice(8)?;
+        assert_eq!(machine.bus.cache_free_window, window);
+        assert!(machine
+            .bus
+            .cache_read(data, 4, CpuBusAccessKind::Read)
+            .is_none());
+        Ok(())
+    }
+
+    /// End to end: with the 68030 caches enabled, a JIT run that keeps
+    /// fast-RAM data and code in the fastmem window must match the precise
+    /// core. The program caches a fast-RAM longword through an instruction
+    /// the batch runs on the bus (its destination is chip RAM), overwrites
+    /// it with a store the batch makes through the window, then copies it
+    /// again; and it rewrites the immediate of an instruction it has
+    /// already run, clears the instruction cache through CACR as
+    /// self-modifying code must, and runs it again. A cache line left
+    /// inside the window would serve the old longword and the old
+    /// immediate to the second pass (the batch only syncs CACR strobes to
+    /// the models at its end, so the clear lands too late to help).
+    #[test]
+    fn jit_window_with_cache_models_matches_precise_core() -> Result<()> {
+        use m68k::{CACR_ED, CACR_EI};
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let data = FAST_RAM_BASE as u32 + 0x800;
+        let imm = pc + 34; // the mulu.l immediate
+        let hi = |v: u32| (v >> 16) as u16;
+        let lo = |v: u32| v as u16;
+        let program = [
+            0x207C,
+            hi(data),
+            lo(data), // movea.l #data,a0
+            0x227C,
+            0x0000,
+            0x2000, // movea.l #$2000,a1 (chip RAM)
+            0x2290, // move.l (a0),(a1)
+            0x243C,
+            0x2222,
+            0x2222, // move.l #$22222222,d2
+            0x2082, // move.l d2,(a0)
+            0x2350,
+            0x0004, // move.l (a0),4(a1)
+            0x7801, // moveq #1,d4
+            0x7601, // loop: moveq #1,d3
+            0x4C3C,
+            0x3000,
+            0x3333,
+            0x3333, // mulu.l #$33333333,d3
+            0x247C,
+            hi(imm),
+            lo(imm), // movea.l #imm,a2
+            0x24BC,
+            0x4444,
+            0x4444, // move.l #$44444444,(a2)
+            0x203C,
+            0x0000,
+            0x0109, // move.l #(ED|CI|EI),d0
+            0x4E7B,
+            0x0002, // movec d0,cacr
+            0x51CC,
+            0xFFDE, // dbra d4,loop
+            0x60FE, // bra.s *
+        ];
+        let run = |jit: bool| -> Result<(u32, u32, u32)> {
+            let mut machine = machine_with_program_model(pc, &program, CpuModel::M68030)?;
+            write_program(machine.bus_mut(), data, &[0x1111, 0x1111]);
+            machine.set_cache_emulation(true, true);
+            machine.cpu.cacr = CACR_EI | CACR_ED;
+            machine.apply_cacr_updates();
+            machine.set_jit_enabled(jit);
+            let mut retired = 0usize;
+            while retired < 64 {
+                retired += machine.step_slice(64 - retired)?.instructions;
+            }
+            Ok((
+                read_chip_long(machine.bus(), 0x2000),
+                read_chip_long(machine.bus(), 0x2004),
+                machine.d(3),
+            ))
+        };
+        let expected = (0x1111_1111, 0x2222_2222, 0x4444_4444);
+        assert_eq!(run(false)?, expected, "precise");
+        assert_eq!(run(true)?, expected, "jit");
         Ok(())
     }
 
@@ -8053,6 +9582,213 @@ mod tests {
             let mut machine = machine_with_program_model(0x0100, &[0x4E71], model)?;
             machine.set_jit_enabled(true);
             assert!(machine.bus.jit_fast_mem().is_none(), "{model:?}");
+        }
+        Ok(())
+    }
+
+    /// With the fastmem window offered (cache models off), the core
+    /// compiles traces that record through a subroutine call. When a JIT
+    /// batch boundary closes such a recording right after the callee's
+    /// RTS, and the return address already heads a compiled loop, the
+    /// trace links into that loop and must resume AT the return address.
+    /// Resuming one word past the RTS runs callee code on the caller's
+    /// frame: Kickstart 3.2's LoadSeg relocation loop on an A3000 with
+    /// caches off returned through its caller's frame into low memory and
+    /// died with an illegal-instruction alert. Here the code after the
+    /// RTS marks D5, and every slice ends right after the RTS.
+    #[test]
+    fn jit_fastmem_call_trace_resumes_at_its_return_address() -> Result<()> {
+        let pc = FAST_RAM_BASE as u32 + 0x100;
+        let stack = FAST_RAM_BASE as u32 + 0x8000;
+        let program = [
+            0x4FF9u16, // lea stack,a7
+            (stack >> 16) as u16,
+            stack as u16,
+            0x7A00, // moveq #0,d5
+            0x7400, // moveq #0,d2
+            0x6106, // head: bsr.s leaf
+            0x5347, // ret: subq.w #1,d7
+            0x66FC, // bne.s ret
+            0x60F8, // bra.s head
+            0x7E28, // leaf: moveq #40,d7
+            0x5282, // addq.l #1,d2
+            0x4E75, // rts
+            0x7AFF, // moveq #-1,d5 (reached only past the rts)
+            0x60FE, // bra.s *
+        ];
+        const ITERATIONS: u32 = 40;
+        let mut machine = machine_with_program_model(pc, &program, CpuModel::M68030)?;
+        machine.set_jit_enabled(true);
+        assert!(
+            machine.bus.jit_fast_mem().is_some(),
+            "the window is offered"
+        );
+        let mut step = |count: usize| -> Result<()> {
+            let slice = machine.step_slice(count)?;
+            assert_eq!(slice.instructions, count);
+            Ok(())
+        };
+        // Setup plus the first call, ending right after the RTS.
+        step(3 + 4)?;
+        for _ in 1..ITERATIONS {
+            // Countdown (40 x SUBQ/BNE) and the branch back to the call.
+            step(81)?;
+            // BSR, MOVEQ, ADDQ, RTS.
+            step(4)?;
+        }
+        assert_eq!(machine.d(5), 0, "no callee code ran past its RTS");
+        assert_eq!(machine.d(2), ITERATIONS, "one leaf call per iteration");
+        assert_eq!(
+            machine.pc(),
+            pc + 12,
+            "every slice ended at the return address"
+        );
+        Ok(())
+    }
+
+    /// A 68030 with its MMU on answers repeat accesses to a page from its
+    /// address translation cache, so a loop under an identity map costs the
+    /// chip clocks it costs untranslated, give or take its first table
+    /// searches. Without the cache every instruction fetch re-read a page
+    /// descriptor from chip RAM, and an MMU-on 030 (bundled AROS turns the
+    /// MMU on at boot) ran a CPU-bound loop about twelve times slower.
+    #[test]
+    fn mmu_030_loop_pays_for_table_searches_only_on_atc_misses() -> Result<()> {
+        let program = [
+            0x7263u16, // moveq #99,d1
+            0x4E71,    // nop
+            0x51C9, 0xFFFC, // dbra d1,<nop>
+            0x60FE, // bra.s *
+        ];
+        let run = |mmu: bool| -> Result<u32> {
+            let mut machine = machine_with_program_model(0x1000, &program, CpuModel::M68030)?;
+            if mmu {
+                // One level of 4096 short page descriptors mapping every
+                // 4 KB page to itself: TC = E, PS 4 KB, IS 8, TIA 12.
+                let table = 0x4_0000usize;
+                let chip = &mut machine.bus_mut().mem.chip_ram;
+                for page in 0..4096u32 {
+                    let at = table + page as usize * 4;
+                    chip[at..at + 4].copy_from_slice(&((page << 12) | 1).to_be_bytes());
+                }
+                machine.cpu.mmu_crp_limit = 2;
+                machine.cpu.mmu_crp_aptr = table as u32;
+                machine.cpu.mmu_tc = 0x80C8_C000;
+                machine.cpu.pmmu_enabled = true;
+            }
+            // Elapsed chipset time. On the 020+ the slice's bus advance
+            // already includes the execution time `cpu_cck` reports (it is
+            // charged through `advance_cpu_internal_cycles`), so it alone
+            // is the total.
+            let mut retired = 0usize;
+            let mut cck = 0u32;
+            while retired < 220 {
+                let slice = machine.step_slice(220 - retired)?;
+                retired += slice.instructions;
+                cck += slice.bus_advanced_cck;
+            }
+            Ok(cck)
+        };
+        let plain = run(false)?;
+        let translated = run(true)?;
+        assert!(
+            translated <= plain + 16,
+            "an identity-mapped loop took {translated} cck under the MMU, {plain} without it"
+        );
+        Ok(())
+    }
+
+    /// Run a self-modifying chip-RAM program at $1000 with the cache
+    /// models installed and `cacr` written, precise or under JIT, and
+    /// return d3. The program runs `mulu.l #$33333333,d3` (immediate at
+    /// $1008), stores $44444444 over that immediate, invalidates the
+    /// instruction cache with `strobe` (the words placed at $1018), and
+    /// loops to run the patched instruction again. The first 64
+    /// instructions cover both passes, so under JIT the store, the
+    /// invalidation and the rerun all fall inside one batch.
+    fn run_chip_smc_after_cache_invalidate(
+        model: CpuModel,
+        cacr: u32,
+        strobe: &[u16],
+        jit: bool,
+    ) -> Result<u32> {
+        let mut program = vec![
+            0x7801u16, // $1000: moveq #1,d4
+            0x7601,    // $1002: loop: moveq #1,d3
+            0x4C3C, 0x3000, 0x3333, 0x3333, // $1004: mulu.l #$33333333,d3
+            0x247C, 0x0000, 0x1008, // $100C: movea.l #$1008,a2
+            0x24BC, 0x4444, 0x4444, // $1012: move.l #$44444444,(a2)
+        ];
+        program.extend_from_slice(strobe);
+        // dbra d4,loop: back to $1002 from the displacement word.
+        let disp_at = 0x1018 + 2 * strobe.len() as u32 + 2;
+        program.extend_from_slice(&[0x51CC, 0x1002u32.wrapping_sub(disp_at) as u16]);
+        program.push(0x60FE); // bra.s *
+        let mut bus = test_bus_with_pc(0x1000);
+        write_program(&mut bus, 0x1000, &program);
+        let mut machine = M68kMachine::new(bus, model, true)?;
+        machine.bus_mut().agnus.hpos = 0x21;
+        machine.set_cache_emulation(true, true);
+        machine.cpu.cacr = cacr;
+        machine.apply_cacr_updates();
+        machine.set_jit_enabled(jit);
+        assert!(
+            !jit || machine.jit_fast_path_ok(),
+            "{model:?} takes the batch path"
+        );
+        let mut retired = 0usize;
+        while retired < 64 {
+            retired += machine.step_slice(64 - retired)?.instructions;
+        }
+        Ok(machine.d(3))
+    }
+
+    /// A 68020/030 MOVEC that sets the CACR clear-instruction-cache strobe
+    /// empties the cache before the next fetch, so a rewritten instruction
+    /// run straight after it executes the new bytes. Under JIT the strobe
+    /// must reach the cache models before the batch fetches again, not at
+    /// its end, or the rerun is served the stale line. The code is in chip
+    /// RAM, which the fastmem window never covers.
+    #[test]
+    fn jit_movec_cacr_clear_invalidates_icache_before_the_next_fetch() -> Result<()> {
+        use m68k::{CACR_CI, CACR_ED, CACR_EI};
+        let strobe = [
+            0x203C,
+            0x0000,
+            (CACR_ED | CACR_CI | CACR_EI) as u16, // move.l #(ED|CI|EI),d0
+            0x4E7B,
+            0x0002, // movec d0,cacr
+        ];
+        for model in [CpuModel::M68020, CpuModel::M68030] {
+            for jit in [false, true] {
+                assert_eq!(
+                    run_chip_smc_after_cache_invalidate(model, CACR_EI | CACR_ED, &strobe, jit)?,
+                    0x4444_4444,
+                    "{model:?} jit={jit}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The 68040/060 invalidate through CINV/CPUSH instead of a CACR
+    /// strobe. Under JIT the invalidation must likewise reach the cache
+    /// models before the batch fetches again.
+    #[test]
+    fn jit_cinv_and_cpush_invalidate_icache_before_the_next_fetch() -> Result<()> {
+        use m68k::{CACR_040_DE, CACR_040_IE};
+        for model in [CpuModel::M68040, CpuModel::M68060] {
+            // cinva ic, and cpusha bc (what CacheClearU issues on these parts)
+            for strobe in [0xF498u16, 0xF4F8] {
+                for jit in [false, true] {
+                    let cacr = CACR_040_IE | CACR_040_DE;
+                    assert_eq!(
+                        run_chip_smc_after_cache_invalidate(model, cacr, &[strobe], jit)?,
+                        0x4444_4444,
+                        "{model:?} {strobe:#06X} jit={jit}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -8264,11 +10000,118 @@ mod tests {
     }
 
     #[test]
+    fn internal_ipl_poll_samples_fresh_and_holds_until_release() {
+        let mut bus = test_bus_with_pc(0x100);
+        bus.paula.intena = INT_MASTER | INT_VERTB;
+        bus.irq_latency_setting = 0;
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false).unwrap();
+
+        let rom = ROM_BASE as u32 + 0x100;
+        machine.bus.read_word(rom);
+        assert_eq!(machine.bus.sampled_irq_level, 0);
+
+        machine.bus.bus.paula.intreq = INT_VERTB;
+        AddressBus::ipl_poll_internal(&mut machine.bus);
+        assert_eq!(machine.bus.sampled_irq_level, 3);
+        assert!(machine.bus.ipl_sample_held);
+
+        machine.bus.bus.paula.intreq = 0;
+        machine.bus.read_word(rom);
+        assert_eq!(machine.bus.sampled_irq_level, 3);
+
+        AddressBus::ipl_release_sample(&mut machine.bus);
+        machine.bus.read_word(rom);
+        assert_eq!(machine.bus.sampled_irq_level, 0);
+        assert!(!machine.bus.ipl_sample_held);
+    }
+
+    #[test]
+    fn m68000_operand_and_qualified_poll_samples_use_distinct_deadlines() -> Result<()> {
+        let mut bus = test_bus_with_pc(0x100);
+        bus.paula.intena = INT_MASTER | INT_VERTB;
+        bus.paula.intreq = INT_VERTB;
+        bus.irq_latency_setting = 6;
+        // Let Paula's asserted source arm its recognition deadline, then place
+        // the next ROM read exactly four CCKs before that deadline. The ROM
+        // access itself consumes two CCKs on the stock 68000 bus.
+        bus.advance_devices(1);
+        let remaining = bus.next_irq_visible_cck().expect("IRQ latency armed");
+        assert!(remaining >= 4);
+        bus.advance_devices(remaining - 4);
+        assert_eq!(bus.cpu_visible_intreq() & INT_VERTB, 0);
+
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+        machine.bus.bus.set_cpu_bus_arbitration_enabled(true);
+        let rom = ROM_BASE as u32 + 0x100;
+        machine.bus.read_word(rom);
+        assert_eq!(machine.bus.sampled_irq_level, 0);
+        assert_eq!(machine.bus.sampled_operand_irq_level, 3);
+        assert_eq!(machine.bus.bus.cpu_visible_intreq() & INT_VERTB, 0);
+
+        // The operand poll hook uses the value captured at read start even
+        // though the read has advanced time. It can qualify four CCKs ahead
+        // while the instruction-boundary sample remains two CCKs ahead.
+        AddressBus::ipl_hold_operand_sample(&mut machine.bus);
+        assert_eq!(machine.bus.sampled_irq_level, 3);
+        assert!(machine.bus.ipl_sample_held);
+        assert_eq!(machine.bus.bus.cpu_visible_intreq() & INT_VERTB, 0);
+
+        AddressBus::ipl_release_sample(&mut machine.bus);
+        let remaining = machine
+            .bus
+            .bus
+            .next_irq_visible_cck()
+            .expect("IRQ remains in its recognition delay");
+        assert!(remaining >= 2);
+        machine.bus.bus.advance_devices(remaining - 2);
+        assert_eq!(machine.bus.bus.cpu_visible_intreq() & INT_VERTB, 0);
+        machine.bus.read_word(rom);
+        assert_eq!(machine.bus.sampled_irq_level, 3);
+        assert_eq!(machine.bus.bus.cpu_visible_intreq() & INT_VERTB, INT_VERTB);
+        Ok(())
+    }
+
+    #[test]
+    fn early_ipl_poll_is_limited_to_stock_m68000_and_zero_latency_is_raw() -> Result<()> {
+        let delayed_bus = || {
+            let mut bus = test_bus_with_pc(0x100);
+            bus.paula.intena = INT_MASTER | INT_VERTB;
+            bus.paula.intreq = INT_VERTB;
+            bus.irq_latency_setting = 6;
+            bus.advance_devices(1);
+            let remaining = bus.next_irq_visible_cck().expect("IRQ latency armed");
+            assert!(remaining >= 2);
+            bus.advance_devices(remaining - 2);
+            bus
+        };
+
+        let bus = delayed_bus();
+        assert_eq!(bus.cpu_visible_intreq() & INT_VERTB, 0);
+        let mut m68010 = M68kMachine::new(bus, CpuModel::M68010, false)?;
+        m68010.bus.bus.set_cpu_bus_arbitration_enabled(true);
+        assert!(!m68010.bus.m68000_ipl_poll);
+        m68010.bus.read_word(ROM_BASE as u32 + 0x100);
+        assert_eq!(m68010.bus.sampled_irq_level, 0);
+
+        let mut raw_bus = test_bus_with_pc(0x100);
+        raw_bus.paula.intena = INT_MASTER | INT_VERTB;
+        raw_bus.paula.intreq = INT_VERTB;
+        raw_bus.irq_latency_setting = 0;
+        raw_bus.advance_devices(1);
+        let mut raw = M68kMachine::new(raw_bus, CpuModel::M68000, false)?;
+        raw.bus.bus.set_cpu_bus_arbitration_enabled(true);
+        raw.bus.read_word(ROM_BASE as u32 + 0x100);
+        assert_eq!(raw.bus.sampled_irq_level, 3);
+        assert_eq!(raw.bus.sampled_operand_irq_level, 3);
+        Ok(())
+    }
+
+    #[test]
     fn irq_recognition_uses_previous_instruction_ipl_sample() -> Result<()> {
-        // The 68000 latches its IPL pins during bus cycles: a level that
-        // rises AFTER an instruction's last bus access is not seen at the
-        // next instruction boundary -- it is recognized one instruction
-        // later, once a bus access has sampled the new level.
+        // The instruction-boundary decision uses the previous instruction's
+        // qualified sample: a source that becomes pending AFTER the final
+        // bus access is ineligible at the next boundary and is recognized
+        // after a later access takes a fresh sample.
         let mut bus = test_bus_with_pc(0x0000_0100);
         write_program(
             &mut bus,
@@ -8364,7 +10207,9 @@ mod tests {
         write_program(&mut bus, 0x0000_0200, &[0x7055]); // MOVEQ #$55,D0
         set_autovector(&mut bus, 2, 0x0000_0200);
         bus.paula.intena = INT_MASTER | INT_PORTS;
-        let _ = bus.cia_a.write(REG_TALO, 1);
+        // Let the explicit CIA-output/Paula-input stages complete inside
+        // MOVE.L. This fixture tests the slice barrier, not propagation.
+        let _ = bus.cia_a.write(REG_TALO, 0);
         let _ = bus.cia_a.write(REG_TAHI, 0);
         let _ = bus.cia_a.write(REG_ICR, 0x80 | 0x01);
         let _ = bus.cia_a.write(REG_CRA, 0x11);
@@ -8381,10 +10226,9 @@ mod tests {
 
         assert_eq!(slice.instructions, 3);
         assert_eq!(machine.d(0), 0x55);
-        // The cycle-exact core keeps a two-word prefetch queue filled ahead of
-        // the program counter, so after the handler's one-word MOVEQ #$55 at
-        // $0200 the reported PC is $0200 + 2 (executed) + 4 (queued ahead).
-        assert_eq!(machine.pc(), 0x0000_0206);
+        // Only the handler's MOVEQ has retired after the two mainline
+        // instructions. Prefetch does not advance the architectural PC.
+        assert_eq!(machine.pc(), 0x0000_0202);
         assert_ne!(machine.bus().paula.intreq & INT_PORTS, 0);
         assert_eq!(machine.bus().delivered_irq_pending & INT_PORTS, INT_PORTS);
         Ok(())
@@ -8463,6 +10307,125 @@ mod tests {
             0xFF,
             "the reboot after RESET reads as warm"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_irq_refresh_does_not_advance_time_or_consume_poll_wait() -> Result<()> {
+        let mut bus = test_bus_with_pc(0x100);
+        write_program(&mut bus, 0x100, &[0x4e72, 0x2000]);
+        write_program(&mut bus, 0x200, &[0x4e71]);
+        set_autovector(&mut bus, 1, 0x200);
+        bus.paula.intena = INT_MASTER | 4;
+        bus.irq_latency_setting = 6;
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+        machine.step_slice(1)?;
+        machine.bus_mut().paula.intreq = 4;
+        for _ in 0..7 {
+            machine.bus_mut().advance_cpu_idle_devices(1);
+        }
+        let before = machine.bus().emulated_cck();
+        assert_eq!(machine.refresh_irq_line(), 0);
+        assert_eq!(machine.bus().emulated_cck(), before);
+        assert_eq!(machine.bus().slice_bus_advanced_cck(), 0);
+        let mut checkpoint = Vec::new();
+        machine.write_state(&mut checkpoint)?;
+        let run = machine.step_slice(1)?;
+        assert!(!machine.stopped());
+        assert_eq!(
+            machine.bus().emulated_cck() - before,
+            u64::from(run.bus_advanced_cck)
+        );
+        assert_ne!(run.bus_advanced_cck, 0);
+        let automatic_time = machine.bus().emulated_cck();
+        let automatic_pc = machine.pc();
+        machine.apply_state(&mut std::io::Cursor::new(checkpoint))?;
+        machine.bus_mut().advance_cpu_idle_devices(1);
+        let aligned = machine.step_slice(1)?;
+        assert_eq!(machine.bus().emulated_cck(), automatic_time);
+        assert_eq!(machine.pc(), automatic_pc);
+        assert_eq!(run.bus_advanced_cck, aligned.bus_advanced_cck + 1);
+        assert_eq!(run.cpu_cck, aligned.cpu_cck + 1);
+        assert_eq!(run.cpu_cycles, aligned.cpu_cycles + 2);
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_cpu_poll_phase_survives_restore_between_polls() -> Result<()> {
+        let mut bus = test_bus_with_pc(0x100);
+        write_program(&mut bus, 0x100, &[0x4e72, 0x2000]);
+        write_program(&mut bus, 0x200, &[0x3b6e, 0x0006, 0x0000]);
+        set_autovector(&mut bus, 1, 0x200);
+        bus.paula.intena = INT_MASTER | 4;
+        bus.irq_latency_setting = 6;
+        let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+        machine.cpu.dar[13] = 0x400;
+        machine.cpu.dar[14] = CUSTOM_BASE;
+        machine.step_slice(1)?;
+        let phase = machine.stop_poll_phase;
+        machine.bus_mut().advance_cpu_idle_devices(1);
+        machine.bus_mut().paula.intreq = 4;
+        machine.bus_mut().advance_cpu_idle_devices(6);
+        let mut checkpoint = Vec::new();
+        machine.write_state(&mut checkpoint)?;
+        machine.step_slice(1)?;
+        let expected_beam = machine.bus().peek_word_any(0x400);
+        let expected_time = machine.bus().emulated_cck();
+        machine.apply_state(&mut std::io::Cursor::new(&checkpoint))?;
+        assert_eq!(machine.stop_poll_phase, phase);
+        machine.step_slice(1)?;
+        assert_eq!(machine.bus().peek_word_any(0x400), expected_beam);
+        assert_eq!(machine.bus().emulated_cck(), expected_time);
+        Ok(())
+    }
+
+    #[test]
+    fn copper_softint_wakes_stop_at_a500_hardware_beam_positions() -> Result<()> {
+        // amiga-hardware-probes: WAIT line 64 at sixteen horizontal phases, then
+        // MOVE SET|SOFTINT to INTREQ. The first handler instruction copies
+        // VHPOSR, exactly as on the physical 512K-chip/512K-slow A500.
+        for phase in 0..16 {
+            let target_h = 0x40 + phase * 2;
+            let mut bus = test_bus_with_pc(0x100);
+            bus.set_agnus_revision(crate::chipset::agnus::AgnusRevision::Ecs8372Rev4);
+            write_program(&mut bus, 0x100, &[0x4e72, 0x2000]); // STOP #$2000
+            write_program(&mut bus, 0x200, &[0x3b6e, 0x0006, 0x0000]);
+            write_program(
+                &mut bus,
+                0x300,
+                &[
+                    0x4001 | target_h,
+                    0xfffe,
+                    0x009c,
+                    0x8004, // SET|SOFTINT
+                    0xffff,
+                    0xfffe,
+                ],
+            );
+            set_autovector(&mut bus, 1, 0x200);
+            bus.paula.intena = INT_MASTER | 0x0004;
+            bus.agnus.dmacon = DMACON_DMAEN | DMACON_COPEN;
+            bus.copper.jump(0x300);
+            bus.irq_latency_setting = 6;
+            let mut machine = M68kMachine::new(bus, CpuModel::M68000, false)?;
+            machine.cpu.dar[13] = 0x400;
+            machine.cpu.dar[14] = 0x00df_f000;
+            machine.step_slice(1)?;
+            assert!(machine.stopped());
+            for _ in 0..20_000 {
+                machine.step_slice(1)?;
+                if !machine.stopped() {
+                    break;
+                }
+                machine.bus_mut().advance_cpu_idle_devices(1);
+            }
+            assert!(!machine.stopped(), "SOFTINT must wake STOP");
+            assert_eq!(
+                machine.bus().peek_word_any(0x400),
+                0x4000 | (target_h + 37),
+                "hardware VHPOSR capture at phase {phase}"
+            );
+        }
         Ok(())
     }
 

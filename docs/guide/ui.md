@@ -391,9 +391,9 @@ from. The changes also show on the
 opened during the session, so **Save As** and **Save default** include them.
 
 A session started from a file you named -- `--config`, or a
-`copperline.toml` in the working directory -- leaves that file alone, as does
-a `--factory` run: their menu changes last for the session, and the
-configuration screen's **Save As** keeps them. A machine started from the
+`copperline.toml` in the working directory or beside the executable -- leaves
+that file alone, as does a `--factory` run: their menu changes last for the
+session, and the configuration screen's **Save As** keeps them. A machine started from the
 configuration screen writes to the saved default even when **Load...** brought
 another file in; the loaded file itself is never rewritten. Scheduled headless
 runs never write the default.
@@ -782,8 +782,9 @@ The Keyboard Shortcuts window.
 (machine-configuration-screen)=
 ## Machine configuration screen
 
-Starting Copperline with no machine specified -- no `./copperline.toml`, no
-`--config`, no ROM or override, and not a headless run -- opens the
+Starting Copperline with no machine specified -- no `./copperline.toml` or
+`copperline.toml` beside the executable, no `--config`, no ROM or override,
+and not a headless run -- opens the
 configuration screen instead of booting. It is also available any time from the
 menu's **Machine Configuration...** item, seeded with the running machine's
 settings.
@@ -936,12 +937,21 @@ The layout is:
     - **Emulation**: power on at startup; run on startup (`[emulation]
       auto_launch`, which runs an opened configuration at once); realtime
       priority; pacing budget; warp speed; warp boot and its storage-idle
-      threshold; and the **WHDLoad** switch, which removes the WHDLoad tab
-      and everything behind it when off.
+      threshold; **Hard drive timing** (Instant, Period, or any built-in or
+      `[[drive_profile]]` drive, written as the `timing` of every fitted
+      `[ide]`/`[scsi]`/`[lide]` section -- see
+      [Drive timing](configuration.md#drive-timing)) and **Drive spin-up**;
+      and the **WHDLoad** switch, which removes the WHDLoad tab and
+      everything behind it when off. A configuration whose sections time
+      their drives differently keeps them as written until the row is
+      changed.
     - **Paths**: the `[paths]` section of the configuration (see
       [](configuration.md)): the base folder on top, then one row per
       folder. The **ROMs**, **Floppies**, **Hard drives** and **CD images**
-      rows set where file dialogs open rather than where output goes. A row
+      rows set where file dialogs open, and where a relative media path is
+      looked for (see
+      [Relative media paths](configuration.md#relative-media-paths)),
+      rather than where output goes. A row
       reads `(default)` until a folder is chosen for it; **Browse** picks
       one and a **Reset** button then appears to put the row back to
       inheriting. The base folder always shows its full path, and swaps
@@ -1012,7 +1022,7 @@ The layout is:
   **Save default** saves the running configuration as the one Copperline
   starts with, including settings changed from the menu during the session:
   this screen opens showing it, and a run with no `--config`
-  and no `./copperline.toml` boots it (see [](configuration.md));
+  and no `copperline.toml` boots it (see [](configuration.md));
   `--factory` ignores it for one run. **Reset default** deletes that saved
   default after an "Are you sure?", returning Copperline to factory
   settings. The close gadget, or a click anywhere else, puts the dialog
@@ -1415,7 +1425,9 @@ of the folders above -- plus gamepad calibration, keyboard mappings, the
 default WHDLoad library and other per-user host data -- live inside it, so
 the whole installation moves as one folder. Delete `portable.txt` to return
 to the platform location above; Copperline does not move existing files in
-either direction.
+either direction. An installation can also carry its own machine: a
+`copperline.toml` in the same folder boots straight into that machine,
+skipping the configuration screen (see [](configuration.md)).
 
 (controller-ports)=
 ## Controller ports
@@ -1452,8 +1464,17 @@ fullscreen, where there is no desktop to reach for. An explicit
 
 Uncaptured, host cursor motion over the display still drives the
 emulated mouse, and `[input] mouse_sensitivity` scales it the same way
-it scales captured motion. At the default setting the factor is 1.0 and
-the pointer tracks the host cursor one-for-one.
+it scales captured motion. Captured movement compensates for the picture's
+horizontal and vertical magnification in logical host pixels, including
+fullscreen, autocrop, and RTG placement. This keeps its speed steady when
+enlarging the picture or moving between monitors with different DPI settings.
+RTG uses the board's native pixel grid for this conversion. Fractional
+movement accumulates, allowing precise adjustments at large scales.
+The default sensitivity is a neutral multiplier; the guest's mouse speed and
+acceleration still affect its pointer. On Windows, X11, and Wayland, captured
+motion is unaccelerated, while uncaptured motion follows the host desktop
+cursor, so host acceleration can make them feel different. On macOS, both
+follow the system's accelerated pointer motion.
 
 The JOYxDAT counters are eight bits wide, and the guest works out how far
 the mouse moved from the difference between two reads, normally once a

@@ -20,6 +20,11 @@ mod fastest;
 
 const INSTRUCTIONS_PER_SLICE: usize = 32_000;
 const INSTRUCTIONS_PER_REALTIME_SLICE: usize = 8_192;
+/// About 72 microseconds of chipset time per spare phase. Occasional OS
+/// register accesses may resume local work, but a polling loop cannot spend
+/// the whole host deadline advancing devices. Checked between instructions,
+/// so the final bus transaction (including DMA contention) may cross the cap.
+const SPARE_CHIPSET_BUDGET_CCK: u64 = 256;
 /// Longest blind STOP-state fast-forward, in colour clocks, while a serial
 /// sink with a live host input side is attached (see the cap site in
 /// `idle_fast_forward_chunk`). 256 cck is about 72 microseconds: well under
@@ -451,8 +456,8 @@ pub struct EmuStats {
 pub struct PerfCounters {
     pub busy: Duration,
     pub pacer_slips: u32,
-    /// The effective JIT clock in MHz under `[cpu] speed = "fastest"`
-    /// (a level, not a counter); `None` at a fixed clock.
+    /// Measured JIT throughput in equivalent MHz under `speed = "fastest"`,
+    /// including spare bursts (a level, not a counter); None at a fixed clock.
     pub jit_mhz: Option<f64>,
 }
 
@@ -568,8 +573,8 @@ impl Emulator {
         let floor_mhz = self.configured_cpu_mhz();
         self.fastest = Some(fastest::SpeedGovernor::new(floor_mhz));
         log::warn!(
-            "cpu speed: fastest -- the JIT clock adapts to the host from \
-             {floor_mhz:.2} MHz while paced to real time; NOT cycle-exact and \
+            "cpu speed: fastest -- spare host time runs CPU bursts after a \
+             {floor_mhz:.2} MHz minimum clock (adapted to host load) while paced to real time; NOT cycle-exact and \
              NOT reproducible (runs differ from run to run and host to host; \
              unpaced headless runs stay at {floor_mhz:.2} MHz)"
         );
@@ -594,8 +599,8 @@ impl Emulator {
         }
     }
 
-    /// The effective JIT clock in MHz while `[cpu] speed = "fastest"` is
-    /// active, `None` for the fixed clock.
+    /// Measured JIT throughput expressed as equivalent MHz (one instruction
+    /// per clock), including spare bursts; None for the fixed clock.
     pub fn jit_effective_mhz(&self) -> Option<f64> {
         self.fastest
             .as_ref()
@@ -612,6 +617,7 @@ impl Emulator {
         busy: Duration,
         emulated_before: f64,
         retired_before: u64,
+        regular_instructions: u64,
         precise_stepping: bool,
     ) {
         if self.fastest.is_none() {
@@ -630,6 +636,7 @@ impl Emulator {
             gap,
             emulated_seconds: self.bus().emulated_seconds() - emulated_before,
             instructions: self.retired_instructions.saturating_sub(retired_before),
+            regular_instructions,
             jit_active: !precise_stepping && self.machine.jit_batch_path_active(),
         };
         let Some(governor) = self.fastest.as_mut() else {
@@ -1632,7 +1639,7 @@ impl Emulator {
         let floor_mhz = self.configured_cpu_mhz();
         if let Some(governor) = self.fastest.as_mut() {
             governor.rebase(floor_mhz);
-            let factor = governor.factor();
+            let factor = governor.factor_for_pacing(self.paced);
             self.machine.set_jit_speed_factor(factor);
         }
     }
@@ -2440,6 +2447,10 @@ impl Emulator {
             return;
         }
         self.paced = paced;
+        if let Some(governor) = self.fastest.as_ref() {
+            let factor = governor.factor_for_pacing(paced);
+            self.machine.set_jit_speed_factor(factor);
+        }
         if paced {
             self.reanchor_realtime_clock();
         }
@@ -2925,6 +2936,28 @@ impl Emulator {
         }
         self.realtime_quantum_remaining = remaining;
         self.realtime_quantum_cpu_idle = remaining != 0 && cpu_idle;
+        let baseline_busy = busy_started.elapsed();
+        let baseline_retired = self.retired_instructions;
+        if pc_outside.is_none()
+            && self.fastest.is_some()
+            && self.paces_realtime()
+            && !self.runahead_phase
+            && self.tt_ring.is_none()
+            && !self.machine.ui_debug_stop_pending()
+        {
+            if let Some(started) = self.stats.started_at {
+                let emulated_now = self.bus().emulated_seconds();
+                let seconds = fastest_baseline.map_or(0.0, |(before, _)| emulated_now - before);
+                let target = realtime_device_time_target(
+                    started,
+                    emulated_now,
+                    self.bus().live_audio_output_lead_seconds(),
+                );
+                if let Some(deadline) = target.and_then(|t| fastest::spare_deadline(t, seconds)) {
+                    self.run_spare_cpu_while(|| Instant::now() < deadline)?;
+                }
+            }
+        }
         // Pace presentation to wall-clock only for the interactive window;
         // headless runs advance the deterministic core unthrottled. During a
         // run-ahead burst the sleep is deferred to the burst's anchor target
@@ -2939,13 +2972,39 @@ impl Emulator {
         if let Some((emulated_before, retired_before)) = fastest_baseline {
             self.govern_fastest(
                 busy_started,
-                busy,
+                baseline_busy,
                 emulated_before,
                 retired_before,
+                baseline_retired.saturating_sub(retired_before),
                 pc_outside.is_some(),
             );
         }
         Ok(reached)
+    }
+
+    /// The closure is the host deadline in production and a bounded budget
+    /// in tests. Each shared-bus access yields to interrupt recognition, then
+    /// another burst may run within the same fixed host deadline. Bound their
+    /// cumulative chipset advance so polling cannot extend the spare phase.
+    fn run_spare_cpu_while(&mut self, mut has_time: impl FnMut() -> bool) -> Result<()> {
+        let mut chipset_cck = 0u64;
+        while self.machine.jit_batch_path_active()
+            && !self.machine.stopped()
+            && !self.machine.ui_debug_stop_pending()
+            && has_time()
+        {
+            let run = self.execute_cpu_slice_mode(INSTRUCTIONS_PER_REALTIME_SLICE, true)?;
+            self.machine.refresh_irq_line();
+            chipset_cck += u64::from(run.bus_advanced_cck);
+            if run.actual_instructions == 0
+                || run.cpu_stopped
+                || self.bus().slice_preempted
+                || chipset_cck >= SPARE_CHIPSET_BUDGET_CCK
+            {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn reset_realtime_quantum(&mut self) {
@@ -2986,7 +3045,7 @@ impl Emulator {
         idle_cap: usize,
         force_precise: bool,
     ) -> Result<RealSliceAccounting> {
-        let chunk = if *cpu_idle {
+        let (chunk, idle_event_cck) = if *cpu_idle {
             self.idle_fast_forward_chunk(idle_cap)
         } else if self.cpu_jit && !force_precise {
             // JIT mode hands the machine a fixed multi-instruction slice;
@@ -2995,12 +3054,12 @@ impl Emulator {
             // caller's budget remainder -- keeps the batch boundaries, and
             // therefore interrupt delivery, identical for every caller that
             // replays the same machine state.
-            INSTRUCTIONS_PER_REALTIME_SLICE
+            (INSTRUCTIONS_PER_REALTIME_SLICE, None)
         } else {
-            1
+            (1, None)
         };
         let run = self.execute_cpu_slice(chunk)?;
-        let accounting = real_slice_accounting(
+        let mut accounting = real_slice_accounting(
             &run,
             chunk,
             self.cpu_cycles_per_instruction,
@@ -3011,7 +3070,20 @@ impl Emulator {
             // and timed devices through the idle period. (A running slice
             // needs nothing here: the cycle-exact core already advanced
             // its full device time through sync/grant as it executed.)
-            let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
+            // The instruction-budget conversion can round a three-CCK
+            // event horizon up to four. Preserve the actual device deadline;
+            // CPU STOP polling still decides when the interrupt is accepted.
+            let idle_cck = bounded_idle_cck(
+                accounting.slice_cck.saturating_sub(run.bus_advanced_cck),
+                idle_event_cck,
+                run.bus_advanced_cck,
+            );
+            accounting.device_cck = accounting
+                .device_cck
+                .min(idle_cck.saturating_add(run.bus_advanced_cck));
+            accounting.slice_cck = accounting
+                .slice_cck
+                .min(idle_cck.saturating_add(run.bus_advanced_cck));
             self.bus_mut().advance_cpu_idle_devices(idle_cck);
         }
         // `refresh_irq_line` applies any deferred timed-device color clocks
@@ -3037,22 +3109,18 @@ impl Emulator {
     /// to the frame boundary) so the chipset advances only up to that
     /// event -- the CPU then wakes at the correct beam position and the
     /// handler is cycle-stepped from there.
-    fn idle_fast_forward_chunk(&self, remaining: usize) -> usize {
+    fn idle_fast_forward_chunk(&self, remaining: usize) -> (usize, Option<u32>) {
         let mut chunk = remaining
             .min(INSTRUCTIONS_PER_SLICE)
             .min(INSTRUCTIONS_PER_REALTIME_SLICE);
         let bus = self.bus();
-        let cap_cck = |cck: u32, chunk: &mut usize| {
+        let mut event_cck = None;
+        let mut cap_cck = |cck: u32, chunk: &mut usize| {
+            event_cck = Some(event_cck.map_or(cck, |earliest: u32| earliest.min(cck)));
             *chunk = (*chunk).min(self.instructions_for_cck(cck).max(1));
         };
-        if let Some(ticks) = bus
-            .cia_a
-            .next_underflow_ticks()
-            .into_iter()
-            .chain(bus.cia_b.next_underflow_ticks())
-            .min()
-        {
-            chunk = chunk.min(self.instructions_for_cia_ticks(ticks).max(1));
+        if let Some(cck) = bus.next_cia_event_cck() {
+            cap_cck(cck, &mut chunk);
         }
         // An interrupt already latched in INTREQ but still inside its
         // IPL-pin recognition pipe is invisible to the CPU right now, and a
@@ -3077,7 +3145,13 @@ impl Emulator {
         if let Some(cck) = bus.next_blitter_completion_cck() {
             cap_cck(cck, &mut chunk);
         }
+        if let Some(cck) = bus.next_blitter_irq_cck() {
+            cap_cck(cck, &mut chunk);
+        }
         if let Some(cck) = bus.next_serial_event_cck() {
+            cap_cck(cck, &mut chunk);
+        }
+        if let Some(cck) = bus.next_storage_event_cck() {
             cap_cck(cck, &mut chunk);
         }
         // A serial sink wired to a live host byte source (TCP, pty, the
@@ -3106,7 +3180,7 @@ impl Emulator {
         if let Some(cck) = bus.next_cia_b_tod_alarm_cck() {
             cap_cck(cck, &mut chunk);
         }
-        chunk.max(1)
+        (chunk.max(1), event_cck)
     }
 
     pub fn report_stats(&self) {
@@ -3136,10 +3210,6 @@ impl Emulator {
     fn instruction_budget(&mut self) -> usize {
         let (quantum, _target) = realtime_budget(self.cpu_cycles_per_instruction);
         quantum
-    }
-
-    fn instructions_for_cia_ticks(&self, ticks: u32) -> usize {
-        self.instructions_for_cck(ticks.saturating_mul(5))
     }
 
     fn instructions_for_cck(&self, cck: u32) -> usize {
@@ -3203,7 +3273,15 @@ impl Emulator {
     }
 
     fn execute_cpu_slice(&mut self, chunk: usize) -> Result<ExecutedSlice> {
-        let run = self.machine.step_slice(chunk)?;
+        self.execute_cpu_slice_mode(chunk, false)
+    }
+
+    fn execute_cpu_slice_mode(&mut self, chunk: usize, spare: bool) -> Result<ExecutedSlice> {
+        let run = if spare {
+            self.machine.step_jit_spare_slice(chunk)?
+        } else {
+            self.machine.step_slice(chunk)?
+        };
         self.stats.slices += 1;
         let actual_instructions = run.instructions;
         let actual_cpu_cycles = run.cpu_cycles;
@@ -3334,6 +3412,14 @@ fn cck_for_instructions(instructions: usize, cpu_cycles_per_instruction: f64) ->
 fn instructions_for_cck_value(cck: u32, cpu_cycles_per_instruction: f64) -> usize {
     ((cck as f64 * CPU_CYCLES_PER_COLOR_CLOCK / cpu_cycles_per_instruction).ceil())
         .clamp(0.0, usize::MAX as f64) as usize
+}
+
+fn bounded_idle_cck(bulk_cck: u32, event_cck: Option<u32>, already_advanced_cck: u32) -> u32 {
+    event_cck
+        // A due event still needs a clock to retire (for example a matched
+        // Copper WAIT). A zero horizon must not freeze a stopped CPU forever.
+        .map(|deadline| bulk_cck.min(deadline.max(1).saturating_sub(already_advanced_cck)))
+        .unwrap_or(bulk_cck)
 }
 
 #[cfg(test)]
@@ -3771,6 +3857,40 @@ fn open_ide_target(
     }
 }
 
+/// Give the drive in an `[ide]`/`[lide]` slot the period mechanics its
+/// `timing` asks for (`None`, an instant drive, by default).
+fn timed_ata(
+    device: impl Into<crate::ata::AtaDevice>,
+    cfg: &Config,
+    slot: crate::config::DriveSlot,
+) -> crate::ata::AtaDevice {
+    let device = device
+        .into()
+        .with_mechanics(|total| cfg.drive_mechanics(slot, total));
+    if let crate::ata::AtaDevice::Disk(drive) = &device {
+        if let Some(mechanics) = drive.mechanics() {
+            info!("{slot:?}: timed as {}", mechanics.label());
+        }
+    }
+    device
+}
+
+/// Give the disk on a SCSI unit the period mechanics its `timing` asks for.
+fn timed_scsi(
+    target: impl Into<crate::scsi::ScsiTarget>,
+    cfg: &Config,
+    unit: usize,
+) -> crate::scsi::ScsiTarget {
+    let slot = crate::config::DriveSlot::Scsi(unit);
+    let target = target
+        .into()
+        .with_mechanics(|total| cfg.drive_mechanics(slot, total));
+    if let Some(mechanics) = target.mechanics() {
+        info!("{slot:?}: timed as {}", mechanics.label());
+    }
+    target
+}
+
 /// Open every drive the config bridges to real hardware.
 ///
 /// Failing to open one is fatal rather than a warning: a bay configured as a
@@ -4012,10 +4132,12 @@ fn build_machine_inner(
                 let mut board = crate::a2091::A2091::new(rom)?;
                 for (unit, drive) in cfg.scsi.units.iter().enumerate() {
                     let Some(drive) = drive else { continue };
-                    board.attach_drive(unit, open_scsi_target(drive, unit)?);
+                    board.attach_drive(unit, timed_scsi(open_scsi_target(drive, unit)?, cfg, unit));
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                attach_scsi_host_disks(cfg, |unit, target| board.attach_drive(unit, target));
+                attach_scsi_host_disks(cfg, |unit, target| {
+                    board.attach_drive(unit, timed_scsi(target, cfg, unit))
+                });
                 zorro.add_board(crate::zorro::BoardSpec::a2091(slot))?;
                 info!(
                     "scsi: A2091 controller on the Zorro chain (slot {slot}), ROM {}",
@@ -4043,10 +4165,12 @@ fn build_machine_inner(
                 let mut board = crate::a4091::A4091::new(rom)?;
                 for (unit, drive) in cfg.scsi.units.iter().enumerate() {
                     let Some(drive) = drive else { continue };
-                    board.attach_drive(unit, open_scsi_target(drive, unit)?);
+                    board.attach_drive(unit, timed_scsi(open_scsi_target(drive, unit)?, cfg, unit));
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                attach_scsi_host_disks(cfg, |unit, target| board.attach_drive(unit, target));
+                attach_scsi_host_disks(cfg, |unit, target| {
+                    board.attach_drive(unit, timed_scsi(target, cfg, unit))
+                });
                 zorro.add_board(crate::zorro::BoardSpec::a4091(slot))?;
                 info!(
                     "scsi: A4091 controller on the Zorro chain (slot {slot}), ROM {}",
@@ -4107,14 +4231,19 @@ fn build_machine_inner(
                 drive.boot_pri,
                 drive.filesystem,
             )?;
-            board.attach_drive(ch, unit, target);
+            board.attach_drive(
+                ch,
+                unit,
+                timed_ata(target, cfg, crate::config::DriveSlot::Lide(idx)),
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         attach_lide_host_disks(cfg, |ch, unit, drive| {
             if ch >= channels {
                 return; // config validation already rejects this; defensive only
             }
-            board.attach_drive(ch, unit, drive);
+            let slot = crate::config::DriveSlot::Lide(ch * 2 + unit);
+            board.attach_drive(ch, unit, timed_ata(drive, cfg, slot));
         });
         zorro.add_board(crate::zorro::BoardSpec::lide(cfg.lide.board, slot, has_rom))?;
         info!(
@@ -4536,35 +4665,48 @@ fn build_machine_inner(
     if let Some(id) = cfg.gate_array.gayle_id() {
         let mut gayle = crate::gayle::Gayle::new(id);
         if let Some(drive) = &cfg.ide.master {
+            info!("ide: master {}", drive.path.display());
             gayle.attach_drive(
                 0,
-                open_ide_target(
-                    &drive.path,
-                    0,
-                    drive.volume_name.as_deref(),
-                    drive.boot_pri,
-                    drive.filesystem,
-                )?,
+                timed_ata(
+                    open_ide_target(
+                        &drive.path,
+                        0,
+                        drive.volume_name.as_deref(),
+                        drive.boot_pri,
+                        drive.filesystem,
+                    )?,
+                    cfg,
+                    crate::config::DriveSlot::Ide(0),
+                ),
             );
-            info!("ide: master {}", drive.path.display());
         }
         if let Some(drive) = &cfg.ide.slave {
+            info!("ide: slave {}", drive.path.display());
             gayle.attach_drive(
                 1,
-                open_ide_target(
-                    &drive.path,
-                    1,
-                    drive.volume_name.as_deref(),
-                    drive.boot_pri,
-                    drive.filesystem,
-                )?,
+                timed_ata(
+                    open_ide_target(
+                        &drive.path,
+                        1,
+                        drive.volume_name.as_deref(),
+                        drive.boot_pri,
+                        drive.filesystem,
+                    )?,
+                    cfg,
+                    crate::config::DriveSlot::Ide(1),
+                ),
             );
-            info!("ide: slave {}", drive.path.display());
         }
         // Real host disks last, so an image in the same slot has already been
         // refused by configuration validation rather than silently replaced.
         #[cfg(not(target_arch = "wasm32"))]
-        attach_ide_host_disks(cfg, |slot, drive| gayle.attach_drive(slot, drive));
+        attach_ide_host_disks(cfg, |slot, drive| {
+            gayle.attach_drive(
+                slot,
+                timed_ata(drive, cfg, crate::config::DriveSlot::Ide(slot)),
+            )
+        });
         // The PCMCIA common-memory window ($600000-$9FFFFF) is Zorro II
         // space: with more than 4 MiB of fast RAM configured there Gayle's
         // slot decode gives way to the RAM board, as on a real A1200 where
@@ -4601,23 +4743,32 @@ fn build_machine_inner(
         let mut ide = crate::ide_a4000::IdeA4000::new();
         for (slot, drive) in [(0, &cfg.ide.master), (1, &cfg.ide.slave)] {
             let Some(drive) = drive else { continue };
-            ide.attach_drive(
-                slot,
-                open_ide_target(
-                    &drive.path,
-                    slot,
-                    drive.volume_name.as_deref(),
-                    drive.boot_pri,
-                    drive.filesystem,
-                )?,
-            );
             let which = if slot == 0 { "master" } else { "slave" };
             info!("ide: {which} {}", drive.path.display());
+            ide.attach_drive(
+                slot,
+                timed_ata(
+                    open_ide_target(
+                        &drive.path,
+                        slot,
+                        drive.volume_name.as_deref(),
+                        drive.boot_pri,
+                        drive.filesystem,
+                    )?,
+                    cfg,
+                    crate::config::DriveSlot::Ide(slot),
+                ),
+            );
         }
         // The A4000's interface takes a real disk exactly as Gayle's does;
         // configuration accepts one for either, so both must wire it up.
         #[cfg(not(target_arch = "wasm32"))]
-        attach_ide_host_disks(cfg, |slot, drive| ide.attach_drive(slot, drive));
+        attach_ide_host_disks(cfg, |slot, drive| {
+            ide.attach_drive(
+                slot,
+                timed_ata(drive, cfg, crate::config::DriveSlot::Ide(slot)),
+            )
+        });
         bus.attach_ide_a4000(ide);
         info!("ide: A4000 motherboard interface at $DD2020");
     }
@@ -4643,13 +4794,14 @@ fn build_machine_inner(
         if cfg.scsi.controller == crate::config::ScsiController::A3000 {
             for (unit, drive) in cfg.scsi.units.iter().enumerate() {
                 let Some(drive) = drive else { continue };
-                sdmac.attach_drive(unit, open_scsi_target(drive, unit)?);
+                sdmac.attach_drive(unit, timed_scsi(open_scsi_target(drive, unit)?, cfg, unit));
                 drives += 1;
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                drives +=
-                    attach_scsi_host_disks(cfg, |unit, target| sdmac.attach_drive(unit, target));
+                drives += attach_scsi_host_disks(cfg, |unit, target| {
+                    sdmac.attach_drive(unit, timed_scsi(target, cfg, unit))
+                });
             }
         }
         bus.attach_sdmac(sdmac);
@@ -5343,9 +5495,8 @@ mod tests {
         let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
         let floor = emu.jit_effective_mhz().expect("governor armed");
         assert!((floor - 24.83).abs() < 0.01, "{floor}");
-        // A whole window in one sample: 10 ms of host time for 100 ms of
-        // emulated time (load 0.1) at 100 MIPS -- clock-bound with
-        // headroom to spare.
+        // A whole light window: 10 ms host time for 100 ms emulated
+        // at 100 MIPS, allowing a rise in the regular CPU clock.
         emu.retired_instructions = 10_000_000;
         let emulated_before = emu.bus().emulated_seconds() - 0.1;
         let quantum = |emu: &mut super::Emulator, precise: bool| {
@@ -5354,6 +5505,7 @@ mod tests {
                 Duration::from_millis(10),
                 emulated_before,
                 0,
+                emu.retired_instructions,
                 precise,
             );
         };
@@ -5365,11 +5517,11 @@ mod tests {
         quantum(&mut emu, false);
         assert!(
             (emu.machine.jit_speed_factor() - 1.25).abs() < 1e-3,
-            "paced JIT quantum raises the clock one step: {}",
+            "paced CPU-bound work raises the baseline: {}",
             emu.machine.jit_speed_factor()
         );
         let mhz = emu.jit_effective_mhz().unwrap();
-        assert!((mhz - floor * 1.25).abs() < 1e-9);
+        assert!((mhz - 100.0).abs() < 1e-9, "reports measured throughput");
         assert_eq!(emu.perf_counters().jit_mhz, Some(mhz));
     }
 
@@ -5381,7 +5533,7 @@ mod tests {
     fn fastest_governor_does_not_count_presentation_waits_as_load() {
         use crate::timebase::{Duration, Instant};
         // 3 ms of emulation and 14 ms between quanta per 1/60 s quantum:
-        // with the gap counted the load is ~1.0, so the clock must hold.
+        // with the gap counted the load is ~1.0, so the baseline stays at its floor.
         let run = |reported_wait: Duration| {
             let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
             emu.set_paced(true);
@@ -5396,12 +5548,13 @@ mod tests {
                     Duration::from_millis(3),
                     emu.bus().emulated_seconds() - quantum,
                     n * 1_000_000,
+                    1_000_000,
                     false,
                 );
             }
             emu.machine.jit_speed_factor()
         };
-        assert_eq!(run(Duration::ZERO), 1.0, "a busy frontend holds the clock");
+        assert_eq!(run(Duration::ZERO), 1.0, "a busy frontend holds the floor");
         assert!(
             run(Duration::from_millis(13)) > 1.0,
             "a presenter blocked on vsync is headroom, not load"
@@ -5462,7 +5615,8 @@ mod tests {
         let floor = emu.jit_effective_mhz().unwrap();
         assert!((floor - 14.19).abs() < 0.01, "{floor}");
 
-        // Adapted (a paced window raised it): the reached clock is kept.
+        // A light paced window raises the baseline. Loading a slower configured
+        // clock keeps the adapted rate, even above that clock; telemetry restarts.
         let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
         emu.set_paced(true);
         emu.retired_instructions = 10_000_000;
@@ -5471,13 +5625,167 @@ mod tests {
             crate::timebase::Duration::from_millis(10),
             emu.bus().emulated_seconds() - 0.1,
             0,
+            emu.retired_instructions,
             false,
         );
-        let reached = emu.jit_effective_mhz().unwrap();
-        assert!(reached > 24.9, "{reached}");
+        let baseline = emu.machine.jit_speed_factor() * emu.configured_cpu_mhz();
+        assert!(baseline > 25.0);
         emu.load_state_bytes(&slower).unwrap();
-        assert_eq!(emu.jit_effective_mhz(), Some(reached));
+        assert!((emu.jit_effective_mhz().unwrap() - baseline).abs() < 0.001);
         assert!(emu.machine.jit_speed_factor() > 1.0);
+    }
+
+    #[test]
+    fn fastest_warp_uses_at_least_the_configured_clock_and_restores_the_baseline() {
+        let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
+        emu.set_paced(true);
+        emu.govern_fastest(
+            crate::timebase::Instant::now(),
+            crate::timebase::Duration::from_millis(200),
+            emu.bus().emulated_seconds() - 0.1,
+            0,
+            emu.retired_instructions,
+            false,
+        );
+        let baseline = emu.machine.jit_speed_factor();
+        assert_eq!(baseline, 1.0);
+        emu.set_paced(false);
+        assert_eq!(
+            emu.machine.jit_speed_factor(),
+            1.0,
+            "idle telemetry cannot slow warp"
+        );
+        emu.set_paced(true);
+        assert_eq!(emu.machine.jit_speed_factor(), baseline);
+    }
+
+    #[test]
+    fn fastest_state_load_during_warp_preserves_the_configured_floor() {
+        let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
+        emu.step_frame().unwrap();
+        let state = emu.save_state_bytes().unwrap();
+        emu.set_paced(true);
+        emu.govern_fastest(
+            crate::timebase::Instant::now(),
+            crate::timebase::Duration::from_millis(200),
+            emu.bus().emulated_seconds() - 0.1,
+            emu.retired_instructions,
+            0,
+            false,
+        );
+        emu.set_paced(false);
+        assert!(emu.machine.jit_speed_factor() >= 1.0);
+        emu.load_state_bytes(&state).unwrap();
+        assert!(!emu.paced());
+        assert!(emu.machine.jit_speed_factor() >= 1.0);
+    }
+
+    #[test]
+    fn spare_cpu_budget_runs_native_work_without_advancing_device_time() {
+        let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
+        emu.step_frame().unwrap();
+        let cck = emu.bus().emulated_cck();
+        let retired = emu.retired_instructions;
+        let factor = emu.machine.jit_speed_factor();
+        let mut bursts = 0;
+        emu.run_spare_cpu_while(|| {
+            bursts += 1;
+            bursts <= 3
+        })
+        .unwrap();
+        assert_eq!(emu.retired_instructions - retired, 3 * 4096);
+        assert_eq!(emu.bus().emulated_cck(), cck);
+        assert_eq!(emu.machine.jit_speed_factor(), factor);
+        let before = emu.retired_instructions;
+        emu.run_spare_cpu_while(|| false).unwrap();
+        assert_eq!(
+            emu.retired_instructions, before,
+            "expired deadline does no work"
+        );
+        emu.machine.set_jit_enabled(false);
+        emu.run_spare_cpu_while(|| true).unwrap();
+        assert_eq!(
+            emu.retired_instructions, before,
+            "precise mode cannot burst"
+        );
+    }
+
+    fn spare_cpu_program(words: &[u16]) -> super::Emulator {
+        let mut emu = jit_counting_emulator(crate::config::CpuSpeed::Fastest);
+        for (index, word) in words.iter().enumerate() {
+            let offset = 0x10 + index * 2;
+            emu.bus_mut().mem.rom[offset..offset + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        emu
+    }
+
+    #[test]
+    fn spare_cpu_resumes_after_device_access_and_stops_at_stop() {
+        let mut emu = spare_cpu_program(&[
+            0x33fc, 0x00f0, 0x00df, 0xf180, // MOVE.W #$f0,COLOR00
+            0x5280, // ADDQ.L #1,D0
+            0x4e72, 0x2700, // STOP
+        ]);
+        emu.run_spare_cpu_while(|| true).unwrap();
+        assert_eq!(emu.bus().denise.palette[0], 0x00f0);
+        assert_eq!(emu.machine.d(0), 1, "resume local work after MMIO");
+        assert!(emu.machine.stopped());
+    }
+
+    #[test]
+    fn spare_cpu_bounds_chipset_advance_in_a_device_polling_loop() {
+        let mut emu = spare_cpu_program(&[
+            0x3039, 0x00df, 0xf006, // MOVE.W VHPOSR,D0
+            0x5281, // ADDQ.L #1,D1
+            0x60f6, // BRA.S back to VHPOSR read
+        ]);
+        let before = emu.bus().emulated_cck();
+        let mut bursts = 0;
+        emu.run_spare_cpu_while(|| {
+            bursts += 1;
+            bursts < 10_000
+        })
+        .unwrap();
+        let advanced = emu.bus().emulated_cck() - before;
+        assert!(
+            advanced >= super::SPARE_CHIPSET_BUDGET_CCK,
+            "polling must resume: {advanced}"
+        );
+        assert!(
+            advanced < super::SPARE_CHIPSET_BUDGET_CCK + 16,
+            "stop after the last bus instruction: {advanced}"
+        );
+        assert!(
+            bursts < 10_000,
+            "chipset budget, not host deadline, stops polling"
+        );
+        assert!(emu.machine.d(1) > 1);
+    }
+
+    #[test]
+    fn spare_cpu_delivers_enabled_interrupt_before_resuming_local_work() {
+        let mut emu = spare_cpu_program(&[
+            0x33fc, 0xc004, 0x00df, 0xf09a, // MOVE.W #master+SOFT,INTENA
+            0x7001, // MOVEQ #1,D0: must not run before the handler
+            0x4e72, 0x2700,
+        ]);
+        emu.bus_mut().mem.rom[0x40..0x46].copy_from_slice(&[0x72, 0x07, 0x4e, 0x72, 0x27, 0x00]); // MOVEQ #7,D1; STOP
+        emu.bus_mut().mem.chip_ram[25 * 4..25 * 4 + 4]
+            .copy_from_slice(&0x00f8_0040u32.to_be_bytes());
+        emu.machine.debug_set_register(15, 0x4000);
+        emu.machine.debug_set_register(16, 0x2000);
+        // Isolate recognition between bursts from Paula's propagation delay;
+        // the request is immediately eligible when INTENA enables it.
+        emu.bus_mut().irq_latency_setting = 0;
+        emu.bus_mut().custom_write(0x09c, 2, 0x8004); // pending SOFT
+        emu.run_spare_cpu_while(|| true).unwrap();
+        assert_eq!(emu.machine.d(1), 7, "the next burst services the interrupt");
+        assert_eq!(
+            emu.machine.d(0),
+            0,
+            "IRQ precedes the next ordinary instruction"
+        );
+        assert!(emu.machine.stopped());
     }
 
     /// The mode needs the JIT: without it the governor is never armed.
@@ -5659,7 +5967,7 @@ mod tests {
     }
 
     fn emulator_with_call_program() -> super::Emulator {
-        let mut rom = vec![0u8; crate::memory::ROM_SIZE];
+        let mut rom = crate::memory::test_rom_with_interrupt_vectors();
         let put = |mem: &mut [u8], off: usize, word: u16| {
             mem[off..off + 2].copy_from_slice(&word.to_be_bytes());
         };
@@ -5778,7 +6086,7 @@ mod tests {
     /// interrupt mask at 0 so VERTB (level 3) wakes the CPU, `$2700`
     /// masks every interrupt so nothing ever does.
     fn emulator_stopped_waiting_for_vblank(stop_sr: u16) -> super::Emulator {
-        let mut rom = vec![0u8; crate::memory::ROM_SIZE];
+        let mut rom = crate::memory::test_rom_with_interrupt_vectors();
         let put = |mem: &mut [u8], off: usize, word: u16| {
             mem[off..off + 2].copy_from_slice(&word.to_be_bytes());
         };
@@ -5836,6 +6144,121 @@ mod tests {
         emu.debug_step_instructions(2).unwrap();
         assert!(emu.machine.stopped(), "the program should be in STOP");
         emu
+    }
+
+    #[test]
+    fn stopped_cpu_due_deadlines_allow_progress_without_overshooting() {
+        assert_eq!(super::bounded_idle_cck(4, Some(0), 0), 1);
+        assert_eq!(super::bounded_idle_cck(4, Some(0), 1), 0);
+        assert_eq!(super::bounded_idle_cck(4, Some(3), 0), 3);
+        assert_eq!(super::bounded_idle_cck(4, Some(3), 1), 2);
+    }
+
+    #[test]
+    fn stopped_cpu_progresses_past_a_matched_copper_wait() {
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2700);
+        {
+            let bus = emu.machine.bus_mut();
+            for (offset, word) in [0x4061u16, 0xfffe, 0xffff, 0xfffe].into_iter().enumerate() {
+                let address = 0x1000 + offset * 2;
+                bus.mem.chip_ram[address..address + 2].copy_from_slice(&word.to_be_bytes());
+            }
+            for (offset, value) in [
+                (0x100, 0xc200),
+                (0x08e, 0x2c81),
+                (0x090, 0x2cc1),
+                (0x092, 0x003c),
+                (0x094, 0x00d4),
+                (0x080, 0),
+                (0x082, 0x1000),
+                (0x096, 0x8380),
+                (0x088, 0),
+            ] {
+                bus.custom_write(0x00df_f000 + offset, 2, value);
+            }
+            for _ in 0..400_000 {
+                if bus.next_copper_wakeup_cck() == Some(0) {
+                    break;
+                }
+                bus.advance_cpu_idle_devices(1);
+            }
+            assert_eq!(bus.next_copper_wakeup_cck(), Some(0));
+        }
+        let before = emu.bus().emulated_cck();
+        let mut idle = true;
+        for _ in 0..64 {
+            emu.run_one_step_mode(&mut idle, super::INSTRUCTIONS_PER_REALTIME_SLICE, true)
+                .unwrap();
+        }
+        assert!(emu.bus().emulated_cck() >= before + 64);
+        assert!(emu.machine.stopped());
+    }
+
+    #[test]
+    fn stopped_cpu_does_not_round_past_a_cia_event() {
+        use crate::chipset::cia::{REG_CRA, REG_ICR, REG_TAHI, REG_TALO};
+
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2700);
+        {
+            let bus = emu.machine.bus_mut();
+            bus.cia_b.write(REG_TALO, 3);
+            bus.cia_b.write(REG_TAHI, 0);
+            bus.cia_b.write(REG_ICR, 0x81);
+            bus.cia_b.write(REG_CRA, 0x09);
+            for _ in 0..64 {
+                if bus.next_cia_event_cck() == Some(3) {
+                    break;
+                }
+                bus.advance_cpu_idle_devices(1);
+            }
+            assert_eq!(bus.next_cia_event_cck(), Some(3));
+        }
+
+        let cap = super::INSTRUCTIONS_PER_REALTIME_SLICE;
+        let (chunk, deadline) = emu.idle_fast_forward_chunk(cap);
+        assert!(chunk > 1, "exercise the rounded bulk-idle path");
+        assert_eq!(deadline, Some(3));
+        let before = emu.bus().emulated_cck();
+        let retired = emu.retired_instructions();
+        let mut idle = true;
+        let accounting = emu.run_one_step_mode(&mut idle, cap, true).unwrap();
+
+        assert_eq!(emu.bus().emulated_cck() - before, 3);
+        assert_eq!(accounting.slice_cck, 3);
+        assert_eq!(accounting.device_cck, 3);
+        assert_eq!(emu.retired_instructions(), retired);
+        assert!(emu.machine.stopped());
+    }
+
+    #[test]
+    fn stopped_cpu_fast_forward_is_bounded_by_pending_blitter_irq() {
+        let mut emu = emulator_stopped_waiting_for_vblank(0x2700);
+        {
+            let bus = emu.machine.bus_mut();
+            bus.agnus.hpos = 0x20;
+            bus.agnus.dmacon = crate::chipset::agnus::DMACON_DMAEN | (1 << 6);
+            bus.blitter.bltcon0 = 0x0100; // D-only clear.
+            bus.blitter.bltdpt = 0x0400;
+            bus.blitter.start_scheduled((1 << 6) | 2, &bus.mem.chip_ram);
+
+            // E arms the delayed interrupt; the next F slot finishes the
+            // engine while one clock of the IRQ delay is still pending.
+            for _ in 0..8 {
+                bus.advance_chipset(1);
+            }
+            assert!(!bus.blitter.busy);
+            assert_eq!(bus.next_blitter_completion_cck(), None);
+            assert_eq!(bus.next_blitter_irq_cck(), Some(1));
+            assert_eq!(bus.paula.intreq & crate::chipset::paula::INT_BLIT, 0);
+        }
+
+        let irq_instructions = emu.instructions_for_cck(1).max(1);
+        let (chunk, deadline) = emu.idle_fast_forward_chunk(super::INSTRUCTIONS_PER_REALTIME_SLICE);
+        assert_eq!(
+            chunk, irq_instructions,
+            "a stopped CPU must nap only as far as the pending INTREQ.BLIT assertion"
+        );
+        assert_eq!(deadline, Some(1));
     }
 
     #[test]
