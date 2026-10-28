@@ -36,6 +36,12 @@ pub mod trace;
 #[cfg(feature = "c3d")]
 pub mod render;
 
+/// The `CAP_PROGRAMMABLE` tier's GLSL ES 1.00 -> naga compile step. Gated
+/// with [`render`] for the same reason: it is GPU-backend work (naga's
+/// shader-compiler internals), not pure protocol logic.
+#[cfg(feature = "c3d")]
+pub mod glsl;
+
 /// The board itself -- autoconfig, register decode, the doorbell path --
 /// gated with `render` since it is meaningless without a renderer to
 /// drive.

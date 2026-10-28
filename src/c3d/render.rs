@@ -129,11 +129,12 @@
 //! `tests/README.md`'s asset-gated pattern.
 
 use super::dispatch::{DrawVertices, QueryResult, RenderOp};
+use super::glsl;
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
     self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
-    PolygonMode, PrimitiveType, ShadeModel, State, Surface, SurfaceFormat as WireSurfaceFormat,
-    TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
+    PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
+    SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -2595,6 +2596,44 @@ pub struct Renderer {
     /// doc comment for why, e.g. Metal has no native polygon-mode point).
     polygon_mode_line_supported: bool,
     polygon_mode_point_supported: bool,
+    /// `CAP_PROGRAMMABLE`'s compiled shader state, by shader id -- the
+    /// renderer-side counterpart to `state::ShaderObject`'s metadata-only
+    /// record, exactly as `textures` holds pixel data `state::
+    /// TextureObject` never does. See [`ShaderSlot`].
+    shaders: HashMap<u32, ShaderSlot>,
+    /// `CAP_PROGRAMMABLE`'s link/validate results and bound attribute
+    /// locations, by program id. See [`ProgramSlot`].
+    programs: HashMap<u32, ProgramSlot>,
+}
+
+/// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
+/// "Shaders and programs"). `source`/`compiled` are `None` until the
+/// corresponding command actually runs -- a shader with no source has
+/// never compiled, and `SHADER_SOURCE` clears any previous compile
+/// result, per the spec.
+#[derive(Default)]
+struct ShaderSlot {
+    source: Option<String>,
+    compiled: Option<glsl::CompileResult>,
+}
+
+/// One program object's renderer-owned state. `bound_attrib_locations` is
+/// populated by `PROGRAM_BIND_ATTRIB_LOCATION` and consulted (but not
+/// enforced beyond existence -- this milestone does not yet build a GPU
+/// pipeline from a linked program) at the next `PROGRAM_LINK`.
+#[derive(Default)]
+struct ProgramSlot {
+    bound_attrib_locations: std::collections::BTreeMap<String, u32>,
+    link_status: bool,
+    validate_status: bool,
+    info_log: String,
+}
+
+fn shader_stage(kind: ShaderKind) -> naga::ShaderStage {
+    match kind {
+        ShaderKind::Vertex => naga::ShaderStage::Vertex,
+        ShaderKind::Fragment => naga::ShaderStage::Fragment,
+    }
 }
 
 /// Ranks a [`wgpu::AdapterInfo`]'s device type for adapter selection:
@@ -2889,6 +2928,8 @@ impl Renderer {
             clear_rect_pipelines: HashMap::new(),
             polygon_mode_line_supported,
             polygon_mode_point_supported,
+            shaders: HashMap::new(),
+            programs: HashMap::new(),
         })
     }
 
@@ -3572,6 +3613,24 @@ impl Renderer {
                 *x, *y, *w, *h, *format, *row_bytes, *flags, *dest, state, mem,
             ),
             RenderOp::Query { dest, result } => self.op_query(*dest, *result, mem),
+
+            RenderOp::ShaderSource { id, source } => self.op_shader_source(*id, *source, mem),
+            RenderOp::ShaderCompile { id, kind } => self.op_shader_compile(*id, *kind),
+            RenderOp::ProgramBindAttribLocation {
+                program,
+                index,
+                name,
+            } => self.op_program_bind_attrib_location(*program, *index, *name, mem),
+            RenderOp::ProgramLink {
+                program,
+                vertex,
+                fragment,
+            } => self.op_program_link(*program, *vertex, *fragment),
+            RenderOp::ProgramValidate { program } => self.op_program_validate(*program),
+            RenderOp::ShaderStatus { shader, dest } => self.op_shader_status(*shader, *dest, mem),
+            RenderOp::ProgramStatus { program, dest } => {
+                self.op_program_status(*program, *dest, mem)
+            }
         }
     }
 
@@ -5075,6 +5134,143 @@ impl Renderer {
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
             return Err(RenderError::BadMemory(format!("QUERY write to {loc:?}")));
+        }
+        Ok(())
+    }
+
+    /// `SHADER_SOURCE`: reads the UTF-8 source text named by `source` and
+    /// replaces the shader's previous source and compile result, per the
+    /// spec ("replacing any previous source"). Non-UTF-8 bytes are
+    /// replaced with the Unicode replacement character rather than
+    /// failing the command outright -- the eventual `SHADER_COMPILE` will
+    /// fail to parse the mangled text anyway, with a real diagnostic, and
+    /// that is a better guest-visible error than a protocol-level one for
+    /// what is fundamentally malformed *content*, not a malformed
+    /// *command*.
+    fn op_shader_source(&mut self, id: u32, source: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(source);
+        let bytes = mem
+            .read(loc, source.length as usize)
+            .ok_or_else(|| RenderError::BadMemory(format!("SHADER_SOURCE read from {loc:?}")))?;
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let slot = self.shaders.entry(id).or_default();
+        slot.source = Some(text);
+        slot.compiled = None;
+        Ok(())
+    }
+
+    /// `SHADER_COMPILE`: compiles the shader's current source (empty if
+    /// none was ever set via `SHADER_SOURCE`, which naga reports as a
+    /// real parse failure -- "no main function" -- rather than this
+    /// module inventing a special case for it).
+    fn op_shader_compile(&mut self, id: u32, kind: ShaderKind) -> Result<(), RenderError> {
+        let source = self
+            .shaders
+            .get(&id)
+            .and_then(|s| s.source.clone())
+            .unwrap_or_default();
+        let result = glsl::compile(&source, shader_stage(kind));
+        self.shaders.entry(id).or_default().compiled = Some(result);
+        Ok(())
+    }
+
+    /// `PROGRAM_BIND_ATTRIB_LOCATION`: reads the UTF-8 attribute name and
+    /// records the requested location, consulted at the next
+    /// `PROGRAM_LINK`. See [`ShaderSlot`]'s note on the UTF-8 leniency
+    /// above, same reasoning.
+    fn op_program_bind_attrib_location(
+        &mut self,
+        program: u32,
+        index: u32,
+        name: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(name);
+        let bytes = mem.read(loc, name.length as usize).ok_or_else(|| {
+            RenderError::BadMemory(format!("PROGRAM_BIND_ATTRIB_LOCATION read from {loc:?}"))
+        })?;
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        self.programs
+            .entry(program)
+            .or_default()
+            .bound_attrib_locations
+            .insert(text, index);
+        Ok(())
+    }
+
+    /// `PROGRAM_LINK`: a program links only if both a vertex and a
+    /// fragment shader are attached and each compiled successfully.
+    /// There is no cross-stage varying/interface check yet (a real GLES2
+    /// link also requires the two stages' varyings to agree) -- that
+    /// needs comparing naga modules' I/O, deferred to the milestone that
+    /// actually builds a GPU pipeline from a linked program, since it is
+    /// meaningless to get right in isolation from that.
+    fn op_program_link(
+        &mut self,
+        program: u32,
+        vertex: Option<u32>,
+        fragment: Option<u32>,
+    ) -> Result<(), RenderError> {
+        let compiled = |id: Option<u32>| -> Option<bool> {
+            let id = id?;
+            match self.shaders.get(&id)?.compiled.as_ref()? {
+                glsl::CompileResult::Ok(_) => Some(true),
+                glsl::CompileResult::Err(_) => Some(false),
+            }
+        };
+        let (link_status, info_log) = match (vertex, compiled(vertex), fragment, compiled(fragment)) {
+            (Some(_), Some(true), Some(_), Some(true)) => (true, String::new()),
+            (None, _, _, _) => (false, "no vertex shader attached".to_string()),
+            (_, _, None, _) => (false, "no fragment shader attached".to_string()),
+            (_, Some(false), _, _) => (false, "vertex shader did not compile successfully".to_string()),
+            (_, _, _, Some(false)) => (false, "fragment shader did not compile successfully".to_string()),
+            _ => (false, "attached shader has not been compiled".to_string()),
+        };
+        let slot = self.programs.entry(program).or_default();
+        slot.link_status = link_status;
+        slot.validate_status = false; // a new link invalidates any previous validation
+        slot.info_log = info_log;
+        Ok(())
+    }
+
+    /// `PROGRAM_VALIDATE`. This milestone has no pipeline-level validation
+    /// to perform (no GPU pipeline is built from a linked program yet),
+    /// so validation succeeds exactly when the program is linked --
+    /// matching GLES2's own "undefined... if not successfully linked"
+    /// language, made concrete as "false".
+    fn op_program_validate(&mut self, program: u32) -> Result<(), RenderError> {
+        let slot = self.programs.entry(program).or_default();
+        slot.validate_status = slot.link_status;
+        Ok(())
+    }
+
+    fn op_shader_status(&mut self, shader: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let (compile_status, log) = match self.shaders.get(&shader).and_then(|s| s.compiled.as_ref()) {
+            Some(glsl::CompileResult::Ok(_)) => (1u32, String::new()),
+            Some(glsl::CompileResult::Err(log)) => (0u32, log.clone()),
+            None => (0u32, "not compiled".to_string()),
+        };
+        let mut bytes = Vec::with_capacity(8 + log.len());
+        bytes.extend_from_slice(&compile_status.to_be_bytes());
+        bytes.extend_from_slice(&(log.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(log.as_bytes());
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &bytes) {
+            return Err(RenderError::BadMemory(format!("SHADER_STATUS write to {loc:?}")));
+        }
+        Ok(())
+    }
+
+    fn op_program_status(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let slot = self.programs.entry(program).or_default();
+        let mut bytes = Vec::with_capacity(12 + slot.info_log.len());
+        bytes.extend_from_slice(&(slot.link_status as u32).to_be_bytes());
+        bytes.extend_from_slice(&(slot.validate_status as u32).to_be_bytes());
+        bytes.extend_from_slice(&(slot.info_log.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(slot.info_log.as_bytes());
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &bytes) {
+            return Err(RenderError::BadMemory(format!("PROGRAM_STATUS write to {loc:?}")));
         }
         Ok(())
     }

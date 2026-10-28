@@ -122,6 +122,10 @@ pub struct DeviceConfig {
     /// `CAP_SURFACE_GUESTADDR`: required for `SURFACE_DEFINE`'s
     /// guest-address `flags` bit.
     pub surface_guestaddr: bool,
+    /// `CAP_PROGRAMMABLE`: gates `0x09xx`/`0x0Dxx` (see this module's doc
+    /// comment and `proto::CAP_PROGRAMMABLE`'s note on why this is not yet
+    /// in the board's fitted `CAPS0`).
+    pub programmable: bool,
 
     // Limits (`c3d-global-registers`).
     pub aperture_size: u32,
@@ -133,6 +137,10 @@ pub struct DeviceConfig {
     pub max_texture_size: u32,
     pub max_surface_width: u32,
     pub max_surface_height: u32,
+    /// `MAX_SHADERS`/`MAX_PROGRAMS`, `CAP_PROGRAMMABLE`'s object limits
+    /// for the opcode groups implemented so far.
+    pub max_shaders: u32,
+    pub max_programs: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -171,6 +179,7 @@ impl Default for DeviceConfig {
             transform: true,
             multitexture: true,
             surface_guestaddr: true,
+            programmable: true,
             aperture_size: proto::APERTURE_SIZE_DEFAULT,
             max_texture_units: 2,
             max_textures: 2048,
@@ -180,6 +189,8 @@ impl Default for DeviceConfig {
             max_texture_size: 1024,
             max_surface_width: 1024,
             max_surface_height: 768,
+            max_shaders: 64,
+            max_programs: 64,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9), // I8_INDEXED: TEX_PALETTE itself
@@ -444,11 +455,37 @@ impl<'a> RingCursor<'a> {
         )
     }
 
+    /// Whether `opcode` needs `CAP_PROGRAMMABLE`: every `0x09xx`/`0x0Dxx`
+    /// opcode implemented so far (see this module's doc comment).
+    fn opcode_needs_programmable(opcode: u16) -> bool {
+        use proto::*;
+        matches!(
+            opcode,
+            OP_SHADER_CREATE
+                | OP_SHADER_DESTROY
+                | OP_SHADER_SOURCE
+                | OP_SHADER_COMPILE
+                | OP_PROGRAM_CREATE
+                | OP_PROGRAM_DESTROY
+                | OP_PROGRAM_ATTACH
+                | OP_PROGRAM_DETACH
+                | OP_PROGRAM_BIND_ATTRIB_LOCATION
+                | OP_PROGRAM_LINK
+                | OP_PROGRAM_VALIDATE
+                | OP_USE_PROGRAM
+                | OP_SHADER_STATUS
+                | OP_PROGRAM_STATUS
+        )
+    }
+
     /// Decodes the payload of a structurally-framed command (length
     /// already validated against the ring/tail bounds). `body` is the
     /// command's payload words, i.e. `ring[start+4 .. start+length*4]`.
     fn decode_body(&mut self, opcode: u16, start: u32, length_words: u32) -> Step<'a> {
         if !self.config.transform && Self::opcode_needs_transform(opcode) {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        if !self.config.programmable && Self::opcode_needs_programmable(opcode) {
             return self.raise(ErrorCode::BadOpcode, start);
         }
         // TEX_PALETTE is spec-optional, gated by its own TEXFMT_SUPPORTED
@@ -1208,6 +1245,113 @@ impl<'a> RingCursor<'a> {
                     flags,
                     dest,
                 }
+            }
+
+            // Shaders and programs (0x09xx), CAP_PROGRAMMABLE.
+            OP_SHADER_CREATE => {
+                fixed!(2);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_shaders, start));
+                Command::ShaderCreate {
+                    id,
+                    kind: w32(body, 1),
+                }
+            }
+            OP_SHADER_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_shaders, start));
+                Command::ShaderDestroy { id }
+            }
+            OP_SHADER_SOURCE => {
+                fixed!(3);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_shaders, start));
+                let source = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(source, start));
+                Command::ShaderSource { id, source }
+            }
+            OP_SHADER_COMPILE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_shaders, start));
+                Command::ShaderCompile { id }
+            }
+            OP_PROGRAM_CREATE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_programs, start));
+                Command::ProgramCreate { id }
+            }
+            OP_PROGRAM_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_programs, start));
+                Command::ProgramDestroy { id }
+            }
+            OP_PROGRAM_ATTACH => {
+                fixed!(2);
+                let program = w32(body, 0);
+                let shader = w32(body, 1);
+                check!(self.check_id(program, self.config.max_programs, start));
+                check!(self.check_id(shader, self.config.max_shaders, start));
+                Command::ProgramAttach { program, shader }
+            }
+            OP_PROGRAM_DETACH => {
+                fixed!(2);
+                let program = w32(body, 0);
+                let shader = w32(body, 1);
+                check!(self.check_id(program, self.config.max_programs, start));
+                check!(self.check_id(shader, self.config.max_shaders, start));
+                Command::ProgramDetach { program, shader }
+            }
+            OP_PROGRAM_BIND_ATTRIB_LOCATION => {
+                fixed!(4);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                let name = Ref::decode(w32(body, 2), w32(body, 3));
+                check!(self.validate_ref(name, start));
+                Command::ProgramBindAttribLocation {
+                    program,
+                    index: w32(body, 1),
+                    name,
+                }
+            }
+            OP_PROGRAM_LINK => {
+                fixed!(1);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                Command::ProgramLink { program }
+            }
+            OP_PROGRAM_VALIDATE => {
+                fixed!(1);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                Command::ProgramValidate { program }
+            }
+            OP_USE_PROGRAM => {
+                fixed!(1);
+                let program = w32(body, 0);
+                check!(self.check_id_or_none(program, self.config.max_programs, start));
+                Command::UseProgram { program }
+            }
+
+            // Programmable queries (0x0Dxx), CAP_PROGRAMMABLE.
+            OP_SHADER_STATUS => {
+                fixed!(3);
+                let shader = w32(body, 0);
+                check!(self.check_id(shader, self.config.max_shaders, start));
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::ShaderStatus { shader, dest }
+            }
+            OP_PROGRAM_STATUS => {
+                fixed!(3);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::ProgramStatus { program, dest }
             }
 
             // Not in the opcode map at all, or LOGIC_OP (see this module's
@@ -3291,5 +3435,63 @@ mod tests {
         let mut cursor = RingCursor::new_linear(&buf, config(true));
         assert_eq!(cursor.step(), Some(err(ErrorCode::BadOpcode, 0, false)));
         assert!(!cursor.is_halted(), "E_BAD_OPCODE is skip-class");
+    }
+
+    #[test]
+    fn every_implemented_programmable_tier_opcode_is_e_bad_opcode_without_programmable() {
+        let mut c = config(true);
+        c.programmable = false;
+        // One of each shape: no payload beyond a bare id, two ids, a ref,
+        // and a query (shader, ref). SHADER_CREATE/PROGRAM_ATTACH/
+        // PROGRAM_BIND_ATTRIB_LOCATION/SHADER_STATUS cover the group.
+        let cases: [(u16, u16); 4] = [
+            (OP_SHADER_CREATE, 2),
+            (OP_PROGRAM_ATTACH, 2),
+            (OP_PROGRAM_BIND_ATTRIB_LOCATION, 4),
+            (OP_SHADER_STATUS, 3),
+        ];
+        for (opcode, length) in cases {
+            let words = vec![header(opcode, length)]
+                .into_iter()
+                .chain(std::iter::repeat_n(0, length as usize - 1))
+                .collect::<Vec<_>>();
+            let ring = ring_with(4096, 0, &words);
+            let step = decode_one_with(&ring, 0, length as u32 * 4, c);
+            assert_eq!(
+                step,
+                err(ErrorCode::BadOpcode, 0, false),
+                "opcode {opcode:#06x} should be E_BAD_OPCODE without CAP_PROGRAMMABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn shader_create_rejects_an_id_above_max_shaders() {
+        let mut c = config(true);
+        c.max_shaders = 4;
+        let words = [header(OP_SHADER_CREATE, 3), 5, 0x8B31];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 12, c);
+        assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn shader_source_validates_its_ref_like_any_other_by_reference_command() {
+        let c = config(true);
+        // Misaligned address: E_BAD_REF, exactly as TEX_IMAGE's ref is
+        // validated.
+        let words = [header(OP_SHADER_SOURCE, 4), 1, 0x1001, 4];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 16, c);
+        assert_eq!(step, err(ErrorCode::BadRef, 0, false));
+    }
+
+    #[test]
+    fn use_program_accepts_zero_as_the_none_sentinel() {
+        let c = config(true);
+        let words = [header(OP_USE_PROGRAM, 2), 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 8, c);
+        assert_eq!(step, Step::Command(Command::UseProgram { program: 0 }));
     }
 }

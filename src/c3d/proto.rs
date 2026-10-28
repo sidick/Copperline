@@ -60,6 +60,13 @@ pub const GLOBAL_SURFFMT_SUPPORTED_LO: u32 = 0x068;
 pub const GLOBAL_SURFFMT_SUPPORTED_HI: u32 = 0x06C;
 pub const GLOBAL_MAX_SURFACE_WIDTH: u32 = 0x070;
 pub const GLOBAL_MAX_SURFACE_HEIGHT: u32 = 0x074;
+/// `CAP_PROGRAMMABLE` (`c3d-programmable-tier`). Only the shader/program
+/// object limits are implemented so far (see this tier's doc comment in
+/// `dispatch.rs`); the remaining `MAX_*` registers the spec defines for
+/// this tier (buffers, framebuffers, vertex attributes, ...) arrive with
+/// the opcode groups that need them.
+pub const GLOBAL_MAX_SHADERS: u32 = 0x078;
+pub const GLOBAL_MAX_PROGRAMS: u32 = 0x07C;
 
 /// `APERTURE_OFFSET`'s fixed reset value (`c3d-zorro-identity`'s window
 /// layout table): the data aperture always starts here.
@@ -87,6 +94,19 @@ pub const CAP_MULTITEXTURE: u32 = 1 << 3;
 pub const CAP_SURFACE_GUESTADDR: u32 = 1 << 4;
 // Bit 5 is reserved (withdrawn present-layer capability); always 0.
 pub const CAP_REF_SYNC: u32 = 1 << 6;
+/// The programmable (GLES2-shaped) tier (`c3d-programmable-tier`): shader
+/// and program objects, buffer-backed vertex attributes, framebuffer and
+/// renderbuffer objects, programmable draw, and the stencil test.
+///
+/// **Not yet set in `board.rs`'s fitted `CAPS0`.** Only `0x09xx`'s
+/// shader/program lifecycle and `0x0D00`/`0x0D01`'s status queries are
+/// implemented; per the spec's porting guidance ("set `CAP_PROGRAMMABLE`
+/// only if it implements the full ... object model"), this bit stays off
+/// in the board's advertised capabilities until buffers, framebuffers and
+/// programmable draw land too. The constant and the opcode gating below
+/// exist now so each landing opcode group is additive from here rather
+/// than needing the gating logic added later.
+pub const CAP_PROGRAMMABLE: u32 = 1 << 7;
 
 /// The `IRQ_STATUS`/`IRQ_ENABLE` bit for context `n`'s fence interrupt.
 pub const fn irq_fence_bit(context: u32) -> u32 {
@@ -265,6 +285,28 @@ pub const OP_DRAW_ELEMENTS_WIN: u16 = 0x0705;
 // Queries (0x08xx) -- `c3d-cmd-queries`.
 pub const OP_QUERY: u16 = 0x0800;
 pub const OP_READ_PIXELS: u16 = 0x0801;
+
+// Shaders and programs (0x09xx) -- `c3d-cmd-shaders-and-programs`,
+// `CAP_PROGRAMMABLE`. `UNIFORM`/`UNIFORM_SAMPLER` (`0x090C`/`0x090D`) are
+// not implemented yet -- they need `PROGRAM_INTERFACE` (`0x0D02`, also not
+// yet implemented) to hand out the locations they take as input.
+pub const OP_SHADER_CREATE: u16 = 0x0900;
+pub const OP_SHADER_DESTROY: u16 = 0x0901;
+pub const OP_SHADER_SOURCE: u16 = 0x0902;
+pub const OP_SHADER_COMPILE: u16 = 0x0903;
+pub const OP_PROGRAM_CREATE: u16 = 0x0904;
+pub const OP_PROGRAM_DESTROY: u16 = 0x0905;
+pub const OP_PROGRAM_ATTACH: u16 = 0x0906;
+pub const OP_PROGRAM_DETACH: u16 = 0x0907;
+pub const OP_PROGRAM_BIND_ATTRIB_LOCATION: u16 = 0x0908;
+pub const OP_PROGRAM_LINK: u16 = 0x0909;
+pub const OP_PROGRAM_VALIDATE: u16 = 0x090A;
+pub const OP_USE_PROGRAM: u16 = 0x090B;
+
+// Programmable queries (0x0Dxx) -- `c3d-cmd-programmable-queries`,
+// `CAP_PROGRAMMABLE`. `PROGRAM_INTERFACE` (`0x0D02`) is not implemented yet.
+pub const OP_SHADER_STATUS: u16 = 0x0D00;
+pub const OP_PROGRAM_STATUS: u16 = 0x0D01;
 
 // ---------------------------------------------------------------------
 // Protocol errors (`c3d-errors`'s "Protocol errors" table).
@@ -1037,6 +1079,63 @@ pub enum Command<'a> {
         format: u32,
         row_bytes: u32,
         flags: u32,
+        dest: Ref,
+    },
+
+    // Shaders and programs (0x09xx), `CAP_PROGRAMMABLE`. `kind` is the raw
+    // `VERTEX_SHADER`/`FRAGMENT_SHADER` enumerant -- decoding it into
+    // `state::ShaderKind` is `state`'s job (a bad value is a GL error, not
+    // a wire-layer concern; see this module's doc comment).
+    ShaderCreate {
+        id: u32,
+        kind: u32,
+    },
+    ShaderDestroy {
+        id: u32,
+    },
+    ShaderSource {
+        id: u32,
+        source: Ref,
+    },
+    ShaderCompile {
+        id: u32,
+    },
+    ProgramCreate {
+        id: u32,
+    },
+    ProgramDestroy {
+        id: u32,
+    },
+    ProgramAttach {
+        program: u32,
+        shader: u32,
+    },
+    ProgramDetach {
+        program: u32,
+        shader: u32,
+    },
+    ProgramBindAttribLocation {
+        program: u32,
+        index: u32,
+        name: Ref,
+    },
+    ProgramLink {
+        program: u32,
+    },
+    ProgramValidate {
+        program: u32,
+    },
+    UseProgram {
+        program: u32,
+    },
+
+    // Programmable queries (0x0Dxx), `CAP_PROGRAMMABLE`.
+    ShaderStatus {
+        shader: u32,
+        dest: Ref,
+    },
+    ProgramStatus {
+        program: u32,
         dest: Ref,
     },
 }

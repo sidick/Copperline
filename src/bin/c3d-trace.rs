@@ -128,6 +128,7 @@ fn cmd_info(path: &Path) -> Result<i32, String> {
             Section::Ring(r) => ("RING", r.bytes.len() as u64),
             Section::Blob(b) => ("BLOB", b.data.len() as u64),
             Section::Gold(g) => ("GOLD", g.png.len() as u64),
+            Section::Result(r) => ("RSLT", r.expected.len() as u64),
             Section::Unknown { payload, .. } => ("?", payload.len() as u64),
         };
         let e = counts.entry(tag).or_insert((0, 0));
@@ -144,7 +145,7 @@ fn cmd_info(path: &Path) -> Result<i32, String> {
         h.protocol_version,
         describe_caps(h.capability_mask)
     );
-    for tag in ["APER", "RING", "BLOB", "GOLD"] {
+    for tag in ["APER", "RING", "BLOB", "GOLD", "RSLT"] {
         if let Some((n, bytes)) = counts.get(tag) {
             println!("  {tag}: {n} section(s), {bytes} payload byte(s)");
         }
@@ -309,7 +310,7 @@ const MAX_REPLAY_CONTEXTS: usize = 256;
 fn replay(
     bytes: &[u8],
     renderer: &mut Renderer,
-) -> Result<(Vec<CapturedFrame>, Vec<String>), String> {
+) -> Result<(Vec<CapturedFrame>, Vec<String>, FlatMemory), String> {
     let mut contexts: HashMap<u32, ReplayContext> = HashMap::new();
     let mut mem = FlatMemory::new();
     let mut frames = Vec::new();
@@ -331,6 +332,7 @@ fn replay(
                 mem.put(b.space == 1, b.address, b.data)?;
             }
             Section::Gold(_) => {}
+            Section::Result(_) => {}
             Section::Unknown { .. } => {}
             Section::Ring(r) => {
                 if !contexts.contains_key(&r.context) && contexts.len() >= MAX_REPLAY_CONTEXTS {
@@ -407,6 +409,18 @@ fn replay(
                     if let RenderOp::Fence { id } = op {
                         entry.ctx.complete_fence(*id);
                         let surface_id = entry.ctx.state.draw_surface();
+                        // `0` is the spec's own "no surface" sentinel
+                        // (`c3d-cmd-surfaces`'s `SET_DRAW_SURFACE`): a
+                        // trace with nothing to render -- e.g. one
+                        // exercising only `CAP_PROGRAMMABLE`'s shader/
+                        // program status queries, checked via `RSLT`
+                        // rather than a rendered frame -- never sets a
+                        // draw surface at all, and attempting a readback
+                        // of "none" is not a capture failure worth
+                        // reporting as a trace error.
+                        if surface_id == 0 {
+                            continue;
+                        }
                         match renderer.read_surface_rgba8(surface_id) {
                             Ok((width, height, rgba)) => frames.push(CapturedFrame {
                                 context: r.context,
@@ -427,7 +441,7 @@ fn replay(
         }
     }
 
-    Ok((frames, errors))
+    Ok((frames, errors, mem))
 }
 
 fn write_frame_png(dir: &Path, frame: &CapturedFrame) -> Result<PathBuf, String> {
@@ -453,6 +467,13 @@ fn encode_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), S
     w.write_image_data(rgba)
         .map_err(|e| format!("writing PNG data to {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// A short hex dump for an `RSLT` mismatch message -- these are small,
+/// fixed-shape status records, not image data, so a hex string is the
+/// useful form to print, not a pixel-diff summary.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
 }
 
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
@@ -483,7 +504,7 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
 fn cmd_run(path: &Path, out_dir: &Path) -> Result<i32, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut renderer = new_renderer()?;
-    let (frames, errors) = replay(&bytes, &mut renderer)?;
+    let (frames, errors, _mem) = replay(&bytes, &mut renderer)?;
     for e in &errors {
         eprintln!("warning: {e}");
     }
@@ -558,22 +579,52 @@ fn compare_frame(gold: (u32, u32, &[u8]), actual: &CapturedFrame) -> Result<Comp
 fn cmd_compare(path: &Path) -> Result<i32, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut golds = Vec::new();
+    let mut rslts = Vec::new();
     for section in TraceReader::new(&bytes) {
-        if let Section::Gold(g) = section.map_err(|e| e.to_string())? {
-            golds.push((g.context, g.fence_id, g.surface_id, g.png.to_vec()));
+        match section.map_err(|e| e.to_string())? {
+            Section::Gold(g) => golds.push((g.context, g.fence_id, g.surface_id, g.png.to_vec())),
+            Section::Result(r) => {
+                rslts.push((r.context, r.fence_id, r.space, r.address, r.expected.to_vec()))
+            }
+            _ => {}
         }
     }
-    if golds.is_empty() {
-        return Err("trace has no GOLD sections to compare against".into());
+    if golds.is_empty() && rslts.is_empty() {
+        return Err("trace has no GOLD or RSLT sections to compare against".into());
     }
 
     let mut renderer = new_renderer()?;
-    let (frames, errors) = replay(&bytes, &mut renderer)?;
+    let (frames, errors, mut mem) = replay(&bytes, &mut renderer)?;
     for e in &errors {
         eprintln!("warning: {e}");
     }
 
     let mut all_passed = true;
+    for (context, fence_id, space, address, expected) in &rslts {
+        let loc = if *space == 1 {
+            MemLoc::Guest(*address)
+        } else {
+            MemLoc::Aperture(*address)
+        };
+        match mem.read(loc, expected.len()) {
+            Some(actual) if actual == expected.as_slice() => {
+                println!("PASS ctx{context} fence{fence_id} {loc:?}: {} byte(s) match", expected.len());
+            }
+            Some(actual) => {
+                println!(
+                    "FAIL ctx{context} fence{fence_id} {loc:?}: expected {} got {}",
+                    hex_bytes(expected),
+                    hex_bytes(actual)
+                );
+                all_passed = false;
+            }
+            None => {
+                println!("FAIL ctx{context} fence{fence_id} {loc:?}: could not read {} byte(s)", expected.len());
+                all_passed = false;
+            }
+        }
+    }
+
     for (context, fence_id, surface_id, png_bytes) in &golds {
         let Some(actual) = frames.iter().find(|f| {
             f.context == *context && f.fence_id == *fence_id && f.surface_id == *surface_id
@@ -615,7 +666,7 @@ fn cmd_compare(path: &Path) -> Result<i32, String> {
 fn cmd_record(path: &Path, out_path: &Path) -> Result<i32, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut renderer = new_renderer()?;
-    let (frames, errors) = replay(&bytes, &mut renderer)?;
+    let (frames, errors, _mem) = replay(&bytes, &mut renderer)?;
     for e in &errors {
         eprintln!("warning: {e}");
     }
@@ -638,6 +689,12 @@ fn cmd_record(path: &Path, out_path: &Path) -> Result<i32, String> {
                 .map_err(|e| e.to_string())?,
             Section::Blob(b) => writer
                 .blob(b.space, b.address, b.data)
+                .map_err(|e| e.to_string())?,
+            // Carried through unchanged: an RSLT's expected bytes are an
+            // author's assertion about protocol behaviour, not a render
+            // output `record` should regenerate, unlike GOLD below.
+            Section::Result(r) => writer
+                .result(r.context, r.fence_id, r.space, r.address, r.expected)
                 .map_err(|e| e.to_string())?,
             // Regenerated below instead of carried over: `record`'s whole
             // job is to replace whatever goldens the trace had (if any)
@@ -733,7 +790,7 @@ fn selftest_one(
     renderer: &mut Renderer,
     check: impl FnOnce(&[CapturedFrame], &mut Renderer) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let (frames, errors) = replay(trace_bytes, renderer)?;
+    let (frames, errors, _mem) = replay(trace_bytes, renderer)?;
     if !errors.is_empty() {
         println!("FAIL {name}: renderer errors: {errors:?}");
         return Ok(false);

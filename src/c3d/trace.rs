@@ -132,6 +132,14 @@ pub const TAG_RING: Tag = *b"RING";
 pub const TAG_BLOB: Tag = *b"BLOB";
 /// A golden image at a fence, `GOLD`.
 pub const TAG_GOLD: Tag = *b"GOLD";
+/// An expected byte-exact result-buffer region at a fence, `RSLT`.
+/// Added alongside `CAP_PROGRAMMABLE` (`docs/internals/c3d.md`'s
+/// "Programmable tier"): `GOLD` only compares a named surface's pixels
+/// with a tolerance, which can't check the new query group's status/
+/// interface records (fixed status words plus, for some records,
+/// implementation-defined trailing text such as an info log). See
+/// [`ResultSection`].
+pub const TAG_RSLT: Tag = *b"RSLT";
 
 /// The container version this build writes and reads. See the module doc
 /// comment's layout table; a version this build does not recognise is
@@ -302,6 +310,23 @@ pub struct GoldSection<'a> {
     pub png: &'a [u8],
 }
 
+/// An expected byte-exact result-buffer region at a fence (`RSLT`); see
+/// [`TAG_RSLT`]. `space`/`address` follow the same convention as
+/// [`BlobSection`] (`0` the data aperture, `1` guest memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultSection<'a> {
+    pub context: u32,
+    pub fence_id: u32,
+    pub space: u32,
+    pub address: u32,
+    /// The expected bytes, opaque to this module: carried, never
+    /// interpreted. A caller that only wants a fixed-shape record's
+    /// prefix checked (leaving implementation-defined trailing content
+    /// such as an info log unchecked) sizes this to just that prefix --
+    /// this is sizing done by the trace's author, not by this reader.
+    pub expected: &'a [u8],
+}
+
 /// One decoded section, borrowing its payload from the slice
 /// [`TraceReader`] was built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +336,7 @@ pub enum Section<'a> {
     Ring(RingSection<'a>),
     Blob(BlobSection<'a>),
     Gold(GoldSection<'a>),
+    Result(ResultSection<'a>),
     /// A tag this module does not recognise, skipped over per the
     /// forward-compatibility rule in the module doc comment.
     Unknown {
@@ -328,6 +354,7 @@ impl<'a> Section<'a> {
             Self::Ring(_) => TAG_RING,
             Self::Blob(_) => TAG_BLOB,
             Self::Gold(_) => TAG_GOLD,
+            Self::Result(_) => TAG_RSLT,
             Self::Unknown { tag, .. } => *tag,
         }
     }
@@ -519,6 +546,22 @@ impl<'a> Iterator for TraceReader<'a> {
                     png,
                 })
             }
+            TAG_RSLT => {
+                let (prefix, expected) = match Self::split_prefix(tag, at, payload, 4) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
+                };
+                Section::Result(ResultSection {
+                    context: read_u32(&prefix[0..4]),
+                    fence_id: read_u32(&prefix[4..8]),
+                    space: read_u32(&prefix[8..12]),
+                    address: read_u32(&prefix[12..16]),
+                    expected,
+                })
+            }
             _ => Section::Unknown { tag, payload },
         };
 
@@ -643,6 +686,30 @@ impl<W: Write> TraceWriter<W> {
                 &surface_id.to_be_bytes(),
             ],
             png,
+        )
+    }
+
+    /// Append an `RSLT` section: the expected byte-exact contents at
+    /// `space`/`address` once `context`'s `FENCE_COMPLETED` reaches
+    /// `fence_id`. See [`ResultSection`] and [`TAG_RSLT`].
+    pub fn result(
+        &mut self,
+        context: u32,
+        fence_id: u32,
+        space: u32,
+        address: u32,
+        expected: &[u8],
+    ) -> io::Result<()> {
+        self.require_header()?;
+        self.write_section(
+            TAG_RSLT,
+            &[
+                &context.to_be_bytes(),
+                &fence_id.to_be_bytes(),
+                &space.to_be_bytes(),
+                &address.to_be_bytes(),
+            ],
+            expected,
         )
     }
 

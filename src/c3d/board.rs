@@ -205,6 +205,8 @@ mod greg {
     pub const SURFFMT_SUPPORTED_HI: u32 = 0x06C;
     pub const MAX_SURFACE_WIDTH: u32 = 0x070;
     pub const MAX_SURFACE_HEIGHT: u32 = 0x074;
+    pub const MAX_SHADERS: u32 = 0x078;
+    pub const MAX_PROGRAMS: u32 = 0x07C;
 }
 
 // ---------------------------------------------------------------------
@@ -653,6 +655,7 @@ impl C3dBoard {
             transform: self.caps0 & proto::CAP_TRANSFORM != 0,
             multitexture: self.caps0 & proto::CAP_MULTITEXTURE != 0,
             surface_guestaddr: self.caps0 & proto::CAP_SURFACE_GUESTADDR != 0,
+            programmable: self.caps0 & proto::CAP_PROGRAMMABLE != 0,
             aperture_size: self.aperture_size(),
             ..DeviceConfig::default()
         }
@@ -739,6 +742,26 @@ impl C3dBoard {
             SURFFMT_SUPPORTED_HI => (self.device_config().surffmt_supported >> 32) as u32,
             MAX_SURFACE_WIDTH => self.device_config().max_surface_width,
             MAX_SURFACE_HEIGHT => self.device_config().max_surface_height,
+            // `0` without `CAP_PROGRAMMABLE`, per the spec's tier table --
+            // `device_config()` carries a fixed value regardless of the
+            // capability bit, so the gate is explicit here rather than
+            // baked into `DeviceConfig`.
+            MAX_SHADERS => {
+                let cfg = self.device_config();
+                if cfg.programmable {
+                    cfg.max_shaders
+                } else {
+                    0
+                }
+            }
+            MAX_PROGRAMS => {
+                let cfg = self.device_config();
+                if cfg.programmable {
+                    cfg.max_programs
+                } else {
+                    0
+                }
+            }
             _ => 0,
         }
     }

@@ -224,6 +224,42 @@ pub enum RenderOp<'a> {
     /// has actually taken effect; `submit` never advances
     /// `FENCE_COMPLETED` itself.
     Fence { id: u32 },
+
+    // -- CAP_PROGRAMMABLE: shaders and programs. See this module's doc
+    // comment above `RenderOp` -- these carry refs (source text, an
+    // attribute name) or need the renderer's own compiled-shader/program
+    // tables (link, validate), which `state.rs` has no access to, exactly
+    // as `TexImage`'s pixel bytes never reach `state.rs`.
+    /// `SHADER_SOURCE`. Replaces the shader's source text; the renderer
+    /// also clears any previous compile result, matching the spec's
+    /// "replacing any previous source".
+    ShaderSource { id: u32, source: Ref },
+    /// `SHADER_COMPILE`. `kind` is read from `state` at dispatch time (see
+    /// [`Context::apply`]) so the renderer doesn't need a `state`
+    /// parameter for this op.
+    ShaderCompile { id: u32, kind: state::ShaderKind },
+    /// `PROGRAM_BIND_ATTRIB_LOCATION`. `name` is resolved by the renderer
+    /// and kept in its own program table -- it only ever feeds
+    /// `ProgramLink`, never read back by `state.rs`.
+    ProgramBindAttribLocation { program: u32, index: u32, name: Ref },
+    /// `PROGRAM_LINK`. `vertex`/`fragment` are the program's attached
+    /// shader ids, read from `state` at dispatch time (`None` if nothing
+    /// of that kind is attached, which the renderer treats as a link
+    /// failure -- a program needs both stages).
+    ProgramLink {
+        program: u32,
+        vertex: Option<u32>,
+        fragment: Option<u32>,
+    },
+    /// `PROGRAM_VALIDATE`.
+    ProgramValidate { program: u32 },
+    /// `SHADER_STATUS`/`PROGRAM_STATUS` (`0x0D00`/`0x0D01`). Both write a
+    /// fixed-shape status record (and the two leave their own variant
+    /// rather than sharing `Query`'s `QueryResult`, which is a fixed `f32`
+    /// vector -- these records are `u32` status words plus a
+    /// variable-length UTF-8 log, a different shape entirely).
+    ShaderStatus { shader: u32, dest: Ref },
+    ProgramStatus { program: u32, dest: Ref },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -1190,6 +1226,66 @@ impl Context {
                     Err(code) => self.latch_protocol_error(code, start),
                 }
             }
+
+            // -- CAP_PROGRAMMABLE: shaders and programs --------------
+            Command::ShaderCreate { id, kind } => {
+                if let Some(kind) = self.decode_gl(state::ShaderKind::from_gl(kind)) {
+                    self.state.shader_create(id, kind);
+                }
+            }
+            Command::ShaderDestroy { id } => self.state.shader_destroy(id),
+            Command::ShaderSource { id, source } => {
+                out.push(RenderOp::ShaderSource { id, source });
+            }
+            Command::ShaderCompile { id } => {
+                if let Some(kind) = self.state.shader(id).map(|s| s.kind) {
+                    out.push(RenderOp::ShaderCompile { id, kind });
+                }
+            }
+            Command::ProgramCreate { id } => self.state.program_create(id),
+            Command::ProgramDestroy { id } => self.state.program_destroy(id),
+            Command::ProgramAttach { program, shader } => {
+                let _ = self.state.program_attach(program, shader);
+            }
+            Command::ProgramDetach { program, shader } => {
+                self.state.program_detach(program, shader)
+            }
+            Command::ProgramBindAttribLocation {
+                program,
+                index,
+                name,
+            } => out.push(RenderOp::ProgramBindAttribLocation {
+                program,
+                index,
+                name,
+            }),
+            Command::ProgramLink { program } => {
+                if let Some(prog) = self.state.program(program) {
+                    out.push(RenderOp::ProgramLink {
+                        program,
+                        vertex: prog.attached_vertex,
+                        fragment: prog.attached_fragment,
+                    });
+                }
+            }
+            Command::ProgramValidate { program } => {
+                if self.state.program(program).is_some() {
+                    out.push(RenderOp::ProgramValidate { program });
+                }
+            }
+            Command::UseProgram { program } => self.state.use_program(program),
+
+            // -- CAP_PROGRAMMABLE: programmable queries (0x0Dxx) -----
+            Command::ShaderStatus { shader, dest } => {
+                if self.state.shader(shader).is_some() {
+                    out.push(RenderOp::ShaderStatus { shader, dest });
+                }
+            }
+            Command::ProgramStatus { program, dest } => {
+                if self.state.program(program).is_some() {
+                    out.push(RenderOp::ProgramStatus { program, dest });
+                }
+            }
         }
     }
 
@@ -1492,6 +1588,59 @@ mod tests {
         assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
         // The protocol latch is untouched by a GL error.
         assert_eq!(ctx.error_code, 0);
+    }
+
+    #[test]
+    fn shader_create_with_a_bad_kind_raises_gl_invalid_enum_and_creates_nothing() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_SHADER_CREATE, &[1, 0xDEAD])]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 12, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
+        assert!(ctx.state.shader(1).is_none());
+    }
+
+    #[test]
+    fn program_attach_of_a_second_vertex_shader_is_a_pure_gl_error_with_no_render_op() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_SHADER_CREATE, &[1, 0x8B31]), // GL_VERTEX_SHADER
+            cmd(OP_SHADER_CREATE, &[2, 0x8B31]),
+            cmd(OP_PROGRAM_CREATE, &[1]),
+            cmd(OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(OP_PROGRAM_ATTACH, &[1, 2]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(out.is_empty(), "program lifecycle ops carry no refs and push no RenderOp");
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
+        assert_eq!(ctx.state.program(1).unwrap().attached_vertex, Some(1));
+    }
+
+    #[test]
+    fn shader_source_and_compile_push_render_ops_carrying_the_resolved_kind() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_SHADER_CREATE, &[1, 0x8B31]), // GL_VERTEX_SHADER
+            cmd(OP_SHADER_SOURCE, &[1, 0x0010_0000, 4]),
+            cmd(OP_SHADER_COMPILE, &[1]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], RenderOp::ShaderSource { id: 1, .. }));
+        assert!(matches!(
+            out[1],
+            RenderOp::ShaderCompile {
+                id: 1,
+                kind: state::ShaderKind::Vertex
+            }
+        ));
     }
 
     #[test]

@@ -1403,6 +1403,42 @@ pub struct Surface {
 }
 
 // ---------------------------------------------------------------------
+// Shaders and programs (CAP_PROGRAMMABLE, docs/internals/c3d.md's
+// "Shaders and programs"). Exactly like a texture's pixel data, a
+// shader's source text and compiled result, and a program's link result,
+// live on the renderer side (`render.rs`'s `Renderer::shaders`/
+// `programs`) -- this module records only the lifecycle metadata that
+// doesn't need memory resolution: whether an object exists, a shader's
+// kind, and which shaders a program has attached. See `dispatch.rs`'s
+// `CAP_PROGRAMMABLE` doc comment for the full split.
+// ---------------------------------------------------------------------
+
+gl_enum! {
+    /// `SHADER_CREATE`'s `type`.
+    ShaderKind {
+        Fragment = 0x8B30, // GL_FRAGMENT_SHADER
+        Vertex = 0x8B31,   // GL_VERTEX_SHADER
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShaderObject {
+    pub kind: ShaderKind,
+}
+
+/// A program object's attachment state (`docs/internals/c3d.md`'s
+/// "Shaders and programs"). `link_status`/`validate_status`/the info log
+/// are not here -- they are `PROGRAM_LINK`/`PROGRAM_VALIDATE`'s *result*,
+/// which needs the renderer's compiled shader data to produce and so
+/// lives in `render.rs`'s `Renderer::programs`, exactly like a linked
+/// program's GPU-side pipeline would.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramObject {
+    pub attached_vertex: Option<u32>,
+    pub attached_fragment: Option<u32>,
+}
+
+// ---------------------------------------------------------------------
 // The context state machine
 // ---------------------------------------------------------------------
 
@@ -1442,6 +1478,10 @@ pub struct State {
     surfaces: BTreeMap<u32, Surface>,
     draw_surface: u32,
 
+    shaders: BTreeMap<u32, ShaderObject>,
+    programs: BTreeMap<u32, ProgramObject>,
+    current_program: u32,
+
     pending_gl_error: Option<GlError>,
 }
 
@@ -1471,6 +1511,9 @@ impl State {
             current: CurrentVertex::new(texture_units),
             surfaces: BTreeMap::new(),
             draw_surface: 0,
+            shaders: BTreeMap::new(),
+            programs: BTreeMap::new(),
+            current_program: 0,
             pending_gl_error: None,
         }
     }
@@ -2119,6 +2162,106 @@ impl State {
         self.draw_surface
     }
 
+    // -- Shaders and programs (CAP_PROGRAMMABLE) -------------------------
+
+    /// `SHADER_CREATE`. Re-creating an existing id discards its previous
+    /// kind, source and compile result (the latter two live in
+    /// `render.rs`, which the caller is responsible for re-initialising
+    /// alongside this -- see `dispatch.rs`'s `Command::ShaderCreate` arm).
+    pub fn shader_create(&mut self, id: u32, kind: ShaderKind) {
+        self.shaders.insert(id, ShaderObject { kind });
+    }
+
+    /// `SHADER_DESTROY`: releases the object and detaches it from every
+    /// program that had it attached.
+    pub fn shader_destroy(&mut self, id: u32) {
+        self.shaders.remove(&id);
+        for program in self.programs.values_mut() {
+            if program.attached_vertex == Some(id) {
+                program.attached_vertex = None;
+            }
+            if program.attached_fragment == Some(id) {
+                program.attached_fragment = None;
+            }
+        }
+    }
+
+    pub fn shader(&self, id: u32) -> Option<&ShaderObject> {
+        self.shaders.get(&id)
+    }
+
+    /// `PROGRAM_CREATE`. Re-creating an existing id discards its previous
+    /// attachments (and, in `render.rs`, its previous link result),
+    /// exactly as `SHADER_CREATE` does for a shader.
+    pub fn program_create(&mut self, id: u32) {
+        self.programs.insert(id, ProgramObject::default());
+    }
+
+    /// `PROGRAM_DESTROY`: releases the object. If it was the current
+    /// program, the current program becomes `0`, per `PROGRAM_DESTROY`'s
+    /// spec (mirroring `SURFACE_DESTROY`'s effect on the draw surface).
+    pub fn program_destroy(&mut self, id: u32) {
+        self.programs.remove(&id);
+        if self.current_program == id {
+            self.current_program = 0;
+        }
+    }
+
+    pub fn program(&self, id: u32) -> Option<&ProgramObject> {
+        self.programs.get(&id)
+    }
+
+    /// `PROGRAM_ATTACH`. `Ok(())` and a no-op if `program` or `shader` was
+    /// never created (a defensive fallback, not a second error path --
+    /// see [`State::tex_bind`]'s identical reasoning). `Err(GL_INVALID_
+    /// OPERATION)` if a shader of the same kind is already attached, per
+    /// the spec.
+    pub fn program_attach(&mut self, program: u32, shader: u32) -> Result<(), GlError> {
+        let Some(kind) = self.shaders.get(&shader).map(|s| s.kind) else {
+            return Ok(());
+        };
+        let Some(prog) = self.programs.get_mut(&program) else {
+            return Ok(());
+        };
+        let slot = match kind {
+            ShaderKind::Vertex => &mut prog.attached_vertex,
+            ShaderKind::Fragment => &mut prog.attached_fragment,
+        };
+        if slot.is_some() {
+            self.raise_gl_error(GlError::InvalidOperation);
+            return Err(GlError::InvalidOperation);
+        }
+        *slot = Some(shader);
+        Ok(())
+    }
+
+    /// `PROGRAM_DETACH`. A no-op if `shader` was not attached to
+    /// `program` (including if either was never created).
+    pub fn program_detach(&mut self, program: u32, shader: u32) {
+        if let Some(prog) = self.programs.get_mut(&program) {
+            if prog.attached_vertex == Some(shader) {
+                prog.attached_vertex = None;
+            }
+            if prog.attached_fragment == Some(shader) {
+                prog.attached_fragment = None;
+            }
+        }
+    }
+
+    /// `USE_PROGRAM`. A no-op if `program` is nonzero and was never
+    /// created (defensive fallback, as above); `0` always succeeds
+    /// (clears the current program).
+    pub fn use_program(&mut self, program: u32) {
+        if program != 0 && !self.programs.contains_key(&program) {
+            return;
+        }
+        self.current_program = program;
+    }
+
+    pub fn current_program(&self) -> u32 {
+        self.current_program
+    }
+
     // -- Protocol errors this module is in a position to detect ---------
     //
     // Everything else in `docs/internals/c3d.md`'s "Protocol errors"
@@ -2209,6 +2352,7 @@ impl State {
         self.active_unit = 0;
         self.current = CurrentVertex::new(texture_units);
         self.draw_surface = 0;
+        self.current_program = 0;
     }
 
     /// `CTX_CONTROL.RESET` (the register bit, not the ring opcode): GL
@@ -2223,6 +2367,8 @@ impl State {
         self.reset_state();
         self.textures.clear();
         self.surfaces.clear();
+        self.shaders.clear();
+        self.programs.clear();
         self.pending_gl_error = None;
     }
 }
@@ -3445,5 +3591,85 @@ mod tests {
                 h: 1_000_000
             }
         );
+    }
+
+    // -- Shaders and programs (CAP_PROGRAMMABLE) -------------------------
+
+    #[test]
+    fn program_attach_rejects_a_second_shader_of_the_same_kind() {
+        let mut s = state();
+        s.shader_create(1, ShaderKind::Vertex);
+        s.shader_create(2, ShaderKind::Vertex);
+        s.program_create(1);
+        assert_eq!(s.program_attach(1, 1), Ok(()));
+        assert_eq!(s.program_attach(1, 2), Err(GlError::InvalidOperation));
+        assert_eq!(s.gl_error(), GlError::InvalidOperation.to_gl());
+        // The first attachment is unchanged by the rejected second one.
+        assert_eq!(s.program(1).unwrap().attached_vertex, Some(1));
+    }
+
+    #[test]
+    fn program_attach_accepts_one_of_each_kind() {
+        let mut s = state();
+        s.shader_create(1, ShaderKind::Vertex);
+        s.shader_create(2, ShaderKind::Fragment);
+        s.program_create(1);
+        assert_eq!(s.program_attach(1, 1), Ok(()));
+        assert_eq!(s.program_attach(1, 2), Ok(()));
+        assert_eq!(s.program(1).unwrap().attached_vertex, Some(1));
+        assert_eq!(s.program(1).unwrap().attached_fragment, Some(2));
+    }
+
+    #[test]
+    fn shader_destroy_detaches_it_from_every_program() {
+        let mut s = state();
+        s.shader_create(1, ShaderKind::Vertex);
+        s.program_create(1);
+        s.program_create(2);
+        s.program_attach(1, 1).unwrap();
+        s.program_attach(2, 1).unwrap();
+        s.shader_destroy(1);
+        assert_eq!(s.program(1).unwrap().attached_vertex, None);
+        assert_eq!(s.program(2).unwrap().attached_vertex, None);
+        assert!(s.shader(1).is_none());
+    }
+
+    #[test]
+    fn program_destroy_clears_the_current_program() {
+        let mut s = state();
+        s.program_create(1);
+        s.use_program(1);
+        assert_eq!(s.current_program(), 1);
+        s.program_destroy(1);
+        assert_eq!(s.current_program(), 0);
+    }
+
+    #[test]
+    fn use_program_on_a_never_created_id_is_a_defensive_no_op() {
+        let mut s = state();
+        s.use_program(1);
+        assert_eq!(s.current_program(), 0);
+    }
+
+    #[test]
+    fn reset_state_clears_the_current_program_but_not_the_objects() {
+        let mut s = state();
+        s.program_create(1);
+        s.use_program(1);
+        s.reset_state();
+        assert_eq!(s.current_program(), 0);
+        assert!(s.program(1).is_some());
+    }
+
+    #[test]
+    fn reset_all_destroys_every_shader_and_program_object() {
+        let mut s = state();
+        s.shader_create(1, ShaderKind::Vertex);
+        s.program_create(1);
+        s.use_program(1);
+        s.reset_all();
+        assert!(s.shader(1).is_none());
+        assert!(s.program(1).is_none());
+        assert_eq!(s.current_program(), 0);
     }
 }
