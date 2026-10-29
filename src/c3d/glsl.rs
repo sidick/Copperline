@@ -6,17 +6,37 @@
 //! The wire protocol mandates GLSL ES 1.00 source and deliberately
 //! standardises no backend-native shader binary (see the specification's
 //! "Programmable tier" chapter and `programmable-gpu-proposal.md`'s "Mapping
-//! onto wgpu"). `naga`'s GLSL front end, however, only parses core-profile
-//! GLSL (`in`/`out`, no `gl_FragColor`) -- GLSL ES 1.00's `attribute`/
-//! `varying`/`gl_FragColor` surface does not parse there at all. This module
-//! is the small, deliberately bounded rewrite that bridges the two: it is
-//! NOT a general GLSL-ES-to-core transpiler, just the handful of syntactic
-//! substitutions GLSL ES 1.00 vertex/fragment shaders actually use.
+//! onto wgpu"). Getting from that source to something `wgpu` can execute is
+//! a two-stage pipeline, because no single crate does both halves:
 //!
-//! This module (and its `naga` dependency) is gated behind the `c3d` cargo
-//! feature exactly like [`super::render`]: compiling a shader is GPU-backend
-//! work, not pure protocol logic, so it has no business in the
-//! always-built-everywhere `state`/`dispatch`/`ring` modules.
+//! 1. **Validate** with `glsl_lang`, a real GLSL/GLSL ES grammar-aware
+//!    parser (unlike `naga`'s own GLSL front end, which only understands
+//!    core-profile syntax -- no `attribute`/`varying`/`gl_FragColor` at
+//!    all). This is the authoritative compile-success/failure answer and
+//!    the source of `SHADER_STATUS`'s diagnostic text: a real parser
+//!    catches real GLSL ES mistakes with a real message, rather than this
+//!    module's own rewrite silently mistranslating them into something
+//!    core-profile-legal-but-wrong, or `naga` rejecting valid-but-ES-shaped
+//!    input with a confusing core-profile-flavoured error.
+//! 2. **Translate**, only once step 1 has already accepted the source: a
+//!    small, deliberately bounded textual rewrite (`attribute`->`in`,
+//!    `varying`->`in`/`out` by stage, `gl_FragColor`->a synthesised `out`
+//!    variable, `texture2D`/`textureCube`->`texture`, `precision`
+//!    statements dropped) ahead of `naga::front::glsl::Frontend::parse`,
+//!    which is what actually produces the `naga::Module` `wgpu` executes.
+//!    This is NOT a general GLSL-ES-to-core transpiler -- just the handful
+//!    of substitutions GLSL ES 1.00 vertex/fragment shaders actually use --
+//!    and it is not the thing guest-visible compile diagnostics come from
+//!    any more: if it has a gap `naga` doesn't tolerate even though step 1
+//!    already accepted the source, that is logged as this module's own
+//!    bug, not reported to the guest as an invalid shader (see
+//!    [`compile`]'s doc comment).
+//!
+//! This module (and its `naga`/`glsl_lang` dependencies) is gated behind
+//! the `c3d` cargo feature exactly like [`super::render`]: compiling a
+//! shader is GPU-backend work, not pure protocol logic, so it has no
+//! business in the always-built-everywhere `state`/`dispatch`/`ring`
+//! modules.
 
 use naga::ShaderStage;
 
@@ -167,16 +187,50 @@ impl CompileResult {
 }
 
 /// Compiles one shader stage's GLSL ES 1.00 source. Never panics on
-/// malformed guest-supplied source: a parse failure is `CompileResult::Err`
-/// with naga's diagnostic text as the info log, exactly as `SHADER_STATUS`
-/// needs it (`c3d-cmd-programmable-queries`).
+/// malformed guest-supplied source.
+///
+/// Two stages, per this module's doc comment: `glsl_lang` validates the
+/// source as real GLSL ES 1.00 first, and its diagnostic is what
+/// `CompileResult::Err` carries on failure -- the actual text
+/// `SHADER_STATUS` (`c3d-cmd-programmable-queries`) reports. Only source
+/// `glsl_lang` has already accepted is handed to the
+/// rewrite-then-`naga::front::glsl` translation step that produces the
+/// executable `naga::Module`. If that *second* step fails despite the
+/// first having accepted the source, the source itself was valid GLSL ES
+/// and the fault is this module's own rewrite -- that is logged, not
+/// reported to the guest as an invalid shader, since blaming the guest
+/// for this module's bug would be actively misleading during
+/// development (and is also just wrong).
 pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
+    use glsl_lang::ast::TranslationUnit;
+    use glsl_lang::parse::{DefaultParse, ParseOptions};
+
+    let parse_options = ParseOptions {
+        default_version: 100,
+        ..Default::default()
+    };
+    if let Err(e) = TranslationUnit::parse_with_options(source, &parse_options) {
+        return CompileResult::Err(e.to_string());
+    }
+
     let rewritten = rewrite_to_core_profile(source, stage);
     let mut frontend = naga::front::glsl::Frontend::default();
     let options = naga::front::glsl::Options::from(stage);
     match frontend.parse(&options, &rewritten) {
         Ok(module) => CompileResult::Ok(Box::new(module)),
-        Err(errors) => CompileResult::Err(errors.to_string()),
+        Err(errors) => {
+            log::error!(
+                "c3d: glsl_lang accepted this GLSL ES source but naga's \
+                 post-rewrite translation rejected it -- this is a gap in \
+                 glsl.rs's rewrite, not a guest shader error: {errors}\n\
+                 --- original source ---\n{source}\n\
+                 --- rewritten source ---\n{rewritten}"
+            );
+            CompileResult::Err(format!(
+                "internal: valid GLSL ES source failed Copperline's own \
+                 translation step ({errors})"
+            ))
+        }
     }
 }
 
@@ -237,5 +291,17 @@ mod tests {
     fn reports_a_real_parse_failure_for_malformed_source() {
         let result = compile(FRAGMENT_SRC_BAD, ShaderStage::Fragment);
         assert!(!result.is_ok());
+    }
+
+    #[test]
+    fn the_compile_error_comes_from_glsl_lang_not_naga() {
+        // glsl_lang's diagnostics are its own distinctive shape
+        // ("0:4:1: unexpected `}`, ..."); pinning this ensures the real
+        // GLSL ES validator is actually being consulted, not bypassed in
+        // favour of naga's own (core-profile-flavoured) error text.
+        let CompileResult::Err(log) = compile(FRAGMENT_SRC_BAD, ShaderStage::Fragment) else {
+            panic!("expected a compile failure");
+        };
+        assert!(log.contains("unexpected"), "{log}");
     }
 }
