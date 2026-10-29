@@ -260,6 +260,25 @@ pub enum RenderOp<'a> {
     /// variable-length UTF-8 log, a different shape entirely).
     ShaderStatus { shader: u32, dest: Ref },
     ProgramStatus { program: u32, dest: Ref },
+
+    // -- CAP_PROGRAMMABLE: buffers. `BUFFER_CREATE`/`_DESTROY` and every
+    // `VERTEX_ATTRIB_*` opcode carry no ref and are pure `state.rs`
+    // mutations with no `RenderOp` at all -- only the two that move bytes
+    // (`BUFFER_DATA`/`BUFFER_SUBDATA`) need the renderer.
+    /// `BUFFER_DATA`: (re)allocates the buffer's storage from `data`.
+    BufferData {
+        id: u32,
+        size: u32,
+        usage: u32,
+        data: Ref,
+    },
+    /// `BUFFER_SUBDATA`: replaces `size` bytes at `offset` from `data`.
+    BufferSubData {
+        id: u32,
+        offset: u32,
+        size: u32,
+        data: Ref,
+    },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -1286,6 +1305,69 @@ impl Context {
                     out.push(RenderOp::ProgramStatus { program, dest });
                 }
             }
+
+            // -- CAP_PROGRAMMABLE: buffers and vertex attributes -----
+            Command::BufferCreate { id } => self.state.buffer_create(id),
+            Command::BufferDestroy { id } => self.state.buffer_destroy(id),
+            Command::BufferData {
+                id,
+                size,
+                usage,
+                data,
+            } => {
+                if self.state.check_buffer_exists(id).is_ok() {
+                    out.push(RenderOp::BufferData {
+                        id,
+                        size,
+                        usage,
+                        data,
+                    });
+                }
+            }
+            Command::BufferSubData {
+                id,
+                offset,
+                size,
+                data,
+            } => {
+                if self.state.check_buffer_exists(id).is_ok() {
+                    out.push(RenderOp::BufferSubData {
+                        id,
+                        offset,
+                        size,
+                        data,
+                    });
+                }
+            }
+            Command::VertexAttribEnable { index, flag } => {
+                self.state.vertex_attrib_enable(index, flag != 0)
+            }
+            Command::VertexAttribPointer {
+                index,
+                size,
+                type_,
+                normalized,
+                stride_bytes,
+                offset,
+                buffer,
+            } => {
+                if let Some(type_) = self.decode_gl(state::VertexAttribType::from_gl(type_)) {
+                    self.state.vertex_attrib_pointer(
+                        index,
+                        state::VertexAttribPointer {
+                            buffer,
+                            size,
+                            type_,
+                            normalized: normalized != 0,
+                            stride_bytes,
+                            offset,
+                        },
+                    );
+                }
+            }
+            Command::VertexAttribConstant { index, x, y, z, w } => {
+                self.state.vertex_attrib_constant(index, [x, y, z, w])
+            }
         }
     }
 
@@ -1641,6 +1723,47 @@ mod tests {
                 kind: state::ShaderKind::Vertex
             }
         ));
+    }
+
+    #[test]
+    fn buffer_data_on_a_never_created_id_is_gl_invalid_operation_with_no_render_op() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_BUFFER_DATA, &[1, 256, 0x88E4, 0x0010_0000, 0])]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 24, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
+    }
+
+    #[test]
+    fn buffer_data_on_an_existing_buffer_pushes_a_render_op() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_BUFFER_CREATE, &[1]),
+            cmd(OP_BUFFER_DATA, &[1, 256, 0x88E4, 0x0010_0000, 0]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [RenderOp::BufferData { id: 1, size: 256, .. }]
+        ));
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_with_a_bad_type_raises_gl_invalid_enum_and_records_nothing() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(
+            OP_VERTEX_ATTRIB_POINTER,
+            &[0, 4, 0xDEAD, 0, 0, 0, 1],
+        )]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 32, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
+        assert!(ctx.state.vertex_attrib(0).unwrap().pointer.is_none());
     }
 
     #[test]

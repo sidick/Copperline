@@ -67,6 +67,8 @@ pub const GLOBAL_MAX_SURFACE_HEIGHT: u32 = 0x074;
 /// the opcode groups that need them.
 pub const GLOBAL_MAX_SHADERS: u32 = 0x078;
 pub const GLOBAL_MAX_PROGRAMS: u32 = 0x07C;
+pub const GLOBAL_MAX_BUFFERS: u32 = 0x080;
+pub const GLOBAL_MAX_VERTEX_ATTRIBS: u32 = 0x08C;
 
 /// `APERTURE_OFFSET`'s fixed reset value (`c3d-zorro-identity`'s window
 /// layout table): the data aperture always starts here.
@@ -302,6 +304,16 @@ pub const OP_PROGRAM_BIND_ATTRIB_LOCATION: u16 = 0x0908;
 pub const OP_PROGRAM_LINK: u16 = 0x0909;
 pub const OP_PROGRAM_VALIDATE: u16 = 0x090A;
 pub const OP_USE_PROGRAM: u16 = 0x090B;
+
+// Buffers and vertex attributes (0x0Axx) -- `c3d-cmd-buffers-and-vertex-
+// attributes`, `CAP_PROGRAMMABLE`.
+pub const OP_BUFFER_CREATE: u16 = 0x0A00;
+pub const OP_BUFFER_DESTROY: u16 = 0x0A01;
+pub const OP_BUFFER_DATA: u16 = 0x0A02;
+pub const OP_BUFFER_SUBDATA: u16 = 0x0A03;
+pub const OP_VERTEX_ATTRIB_ENABLE: u16 = 0x0A04;
+pub const OP_VERTEX_ATTRIB_POINTER: u16 = 0x0A05;
+pub const OP_VERTEX_ATTRIB_CONSTANT: u16 = 0x0A06;
 
 // Programmable queries (0x0Dxx) -- `c3d-cmd-programmable-queries`,
 // `CAP_PROGRAMMABLE`. `PROGRAM_INTERFACE` (`0x0D02`) is not implemented yet.
@@ -1127,6 +1139,47 @@ pub enum Command<'a> {
     },
     UseProgram {
         program: u32,
+    },
+
+    // Buffers and vertex attributes (0x0Axx), `CAP_PROGRAMMABLE`. `type_`,
+    // like other raw GL enumerants, is validated by `state`, not here.
+    BufferCreate {
+        id: u32,
+    },
+    BufferDestroy {
+        id: u32,
+    },
+    BufferData {
+        id: u32,
+        size: u32,
+        usage: u32,
+        data: Ref,
+    },
+    BufferSubData {
+        id: u32,
+        offset: u32,
+        size: u32,
+        data: Ref,
+    },
+    VertexAttribEnable {
+        index: u32,
+        flag: u32,
+    },
+    VertexAttribPointer {
+        index: u32,
+        size: u32,
+        type_: u32,
+        normalized: u32,
+        stride_bytes: u32,
+        offset: u32,
+        buffer: u32,
+    },
+    VertexAttribConstant {
+        index: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
     },
 
     // Programmable queries (0x0Dxx), `CAP_PROGRAMMABLE`.

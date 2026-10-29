@@ -2604,6 +2604,12 @@ pub struct Renderer {
     /// `CAP_PROGRAMMABLE`'s link/validate results and bound attribute
     /// locations, by program id. See [`ProgramSlot`].
     programs: HashMap<u32, ProgramSlot>,
+    /// `CAP_PROGRAMMABLE`'s buffer objects, by id: a real `wgpu::Buffer`
+    /// holding exactly what `BUFFER_DATA`/`BUFFER_SUBDATA` last wrote.
+    /// `state.rs` tracks only a buffer's existence (see its module doc
+    /// comment); the bytes live only here, exactly as a texture's pixel
+    /// data does.
+    buffers: HashMap<u32, wgpu::Buffer>,
 }
 
 /// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
@@ -2930,6 +2936,7 @@ impl Renderer {
             polygon_mode_point_supported,
             shaders: HashMap::new(),
             programs: HashMap::new(),
+            buffers: HashMap::new(),
         })
     }
 
@@ -3631,6 +3638,18 @@ impl Renderer {
             RenderOp::ProgramStatus { program, dest } => {
                 self.op_program_status(*program, *dest, mem)
             }
+            RenderOp::BufferData {
+                id,
+                size,
+                usage: _,
+                data,
+            } => self.op_buffer_data(*id, *size, *data, mem),
+            RenderOp::BufferSubData {
+                id,
+                offset,
+                size,
+                data,
+            } => self.op_buffer_subdata(*id, *offset, *size, *data, mem),
         }
     }
 
@@ -5272,6 +5291,73 @@ impl Renderer {
         if !mem.write(loc, &bytes) {
             return Err(RenderError::BadMemory(format!("PROGRAM_STATUS write to {loc:?}")));
         }
+        Ok(())
+    }
+
+    /// `BUFFER_DATA`: (re)allocates the buffer's storage. A null ref
+    /// (address `0`, length `0`, per the spec's "allocates uninitialised
+    /// storage") creates zeroed storage without touching `mem` at all;
+    /// otherwise `size` bytes are read from `data` and become the
+    /// buffer's initial contents, replacing whatever the id previously
+    /// held (re-inserting the `HashMap` entry, exactly as `TEX_CREATE`-
+    /// then-`TEX_IMAGE` replaces a texture's GPU resource wholesale).
+    ///
+    /// `wgpu::BufferUsages::VERTEX` is always included (the only consumer
+    /// so far is vertex-attribute sourcing); `COPY_DST` lets a later
+    /// `BUFFER_SUBDATA` update it in place without recreating it.
+    fn op_buffer_data(
+        &mut self,
+        id: u32,
+        size: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+        let buffer = if data.address == 0 && data.length == 0 {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("c3d buffer"),
+                size: size as u64,
+                usage,
+                mapped_at_creation: false,
+            })
+        } else {
+            let loc = MemLoc::from_ref(data);
+            let bytes = mem
+                .read(loc, size as usize)
+                .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_DATA read from {loc:?}")))?;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("c3d buffer"),
+                    contents: bytes,
+                    usage,
+                })
+        };
+        self.buffers.insert(id, buffer);
+        Ok(())
+    }
+
+    /// `BUFFER_SUBDATA`: replaces `size` bytes at `offset` in an existing
+    /// buffer. `GL_INVALID_OPERATION`-shaped (`UnknownObject`) if the
+    /// buffer has never had `BUFFER_DATA` allocate it -- there is nothing
+    /// to write a sub-range of yet.
+    fn op_buffer_subdata(
+        &mut self,
+        id: u32,
+        offset: u32,
+        size: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(data);
+        let bytes = mem
+            .read(loc, size as usize)
+            .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_SUBDATA read from {loc:?}")))?
+            .to_vec();
+        let buffer = self
+            .buffers
+            .get(&id)
+            .ok_or(RenderError::UnknownObject("buffer", id))?;
+        self.queue.write_buffer(buffer, offset as u64, &bytes);
         Ok(())
     }
 

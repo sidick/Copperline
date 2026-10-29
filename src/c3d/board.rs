@@ -207,6 +207,8 @@ mod greg {
     pub const MAX_SURFACE_HEIGHT: u32 = 0x074;
     pub const MAX_SHADERS: u32 = 0x078;
     pub const MAX_PROGRAMS: u32 = 0x07C;
+    pub const MAX_BUFFERS: u32 = 0x080;
+    pub const MAX_VERTEX_ATTRIBS: u32 = 0x08C;
 }
 
 // ---------------------------------------------------------------------
@@ -743,25 +745,18 @@ impl C3dBoard {
             MAX_SURFACE_WIDTH => self.device_config().max_surface_width,
             MAX_SURFACE_HEIGHT => self.device_config().max_surface_height,
             // `0` without `CAP_PROGRAMMABLE`, per the spec's tier table --
-            // `device_config()` carries a fixed value regardless of the
-            // capability bit, so the gate is explicit here rather than
-            // baked into `DeviceConfig`.
-            MAX_SHADERS => {
-                let cfg = self.device_config();
-                if cfg.programmable {
-                    cfg.max_shaders
-                } else {
-                    0
-                }
+            // same guarded-arm shape as the transform-tier limits above.
+            MAX_SHADERS | MAX_PROGRAMS | MAX_BUFFERS | MAX_VERTEX_ATTRIBS
+                if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
+            {
+                0
             }
-            MAX_PROGRAMS => {
-                let cfg = self.device_config();
-                if cfg.programmable {
-                    cfg.max_programs
-                } else {
-                    0
-                }
-            }
+            MAX_SHADERS => self.device_config().max_shaders,
+            MAX_PROGRAMS => self.device_config().max_programs,
+            MAX_BUFFERS => self.device_config().max_buffers,
+            // Like MAX_LIGHTS etc. above, reports the same value every
+            // per-context `state::Limits::default()` enforces.
+            MAX_VERTEX_ATTRIBS => state::Limits::default().max_vertex_attribs as u32,
             _ => 0,
         }
     }

@@ -137,10 +137,13 @@ pub struct DeviceConfig {
     pub max_texture_size: u32,
     pub max_surface_width: u32,
     pub max_surface_height: u32,
-    /// `MAX_SHADERS`/`MAX_PROGRAMS`, `CAP_PROGRAMMABLE`'s object limits
-    /// for the opcode groups implemented so far.
+    /// `MAX_SHADERS`/`MAX_PROGRAMS`/`MAX_BUFFERS`/`MAX_VERTEX_ATTRIBS`,
+    /// `CAP_PROGRAMMABLE`'s object/array limits for the opcode groups
+    /// implemented so far.
     pub max_shaders: u32,
     pub max_programs: u32,
+    pub max_buffers: u32,
+    pub max_vertex_attribs: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -191,6 +194,8 @@ impl Default for DeviceConfig {
             max_surface_height: 768,
             max_shaders: 64,
             max_programs: 64,
+            max_buffers: 1024,
+            max_vertex_attribs: 8,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9), // I8_INDEXED: TEX_PALETTE itself
@@ -475,6 +480,13 @@ impl<'a> RingCursor<'a> {
                 | OP_USE_PROGRAM
                 | OP_SHADER_STATUS
                 | OP_PROGRAM_STATUS
+                | OP_BUFFER_CREATE
+                | OP_BUFFER_DESTROY
+                | OP_BUFFER_DATA
+                | OP_BUFFER_SUBDATA
+                | OP_VERTEX_ATTRIB_ENABLE
+                | OP_VERTEX_ATTRIB_POINTER
+                | OP_VERTEX_ATTRIB_CONSTANT
         )
     }
 
@@ -1336,6 +1348,87 @@ impl<'a> RingCursor<'a> {
                 Command::UseProgram { program }
             }
 
+            // Buffers and vertex attributes (0x0Axx), CAP_PROGRAMMABLE.
+            OP_BUFFER_CREATE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_buffers, start));
+                Command::BufferCreate { id }
+            }
+            OP_BUFFER_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_buffers, start));
+                Command::BufferDestroy { id }
+            }
+            OP_BUFFER_DATA => {
+                fixed!(5);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_buffers, start));
+                let data = Ref::decode(w32(body, 3), w32(body, 4));
+                check!(self.validate_ref(data, start));
+                Command::BufferData {
+                    id,
+                    size: w32(body, 1),
+                    usage: w32(body, 2),
+                    data,
+                }
+            }
+            OP_BUFFER_SUBDATA => {
+                fixed!(5);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_buffers, start));
+                let data = Ref::decode(w32(body, 3), w32(body, 4));
+                check!(self.validate_ref(data, start));
+                Command::BufferSubData {
+                    id,
+                    offset: w32(body, 1),
+                    size: w32(body, 2),
+                    data,
+                }
+            }
+            OP_VERTEX_ATTRIB_ENABLE => {
+                fixed!(2);
+                let index = w32(body, 0);
+                check!(self.check_vertex_attrib_index(index, start));
+                Command::VertexAttribEnable {
+                    index,
+                    flag: w32(body, 1),
+                }
+            }
+            OP_VERTEX_ATTRIB_POINTER => {
+                fixed!(7);
+                let index = w32(body, 0);
+                check!(self.check_vertex_attrib_index(index, start));
+                let buffer = w32(body, 6);
+                // `0` is explicitly `E_BAD_ID` here, unlike `TEX_BIND`'s
+                // "0 means none": a vertex attribute's source buffer is
+                // never optional once pointed at one (disabling the slot
+                // is `VERTEX_ATTRIB_ENABLE`'s job, not this opcode's).
+                check!(self.check_id(buffer, self.config.max_buffers, start));
+                Command::VertexAttribPointer {
+                    index,
+                    size: w32(body, 1),
+                    type_: w32(body, 2),
+                    normalized: w32(body, 3),
+                    stride_bytes: w32(body, 4),
+                    offset: w32(body, 5),
+                    buffer,
+                }
+            }
+            OP_VERTEX_ATTRIB_CONSTANT => {
+                fixed!(5);
+                let index = w32(body, 0);
+                check!(self.check_vertex_attrib_index(index, start));
+                Command::VertexAttribConstant {
+                    index,
+                    x: f32b(body, 1),
+                    y: f32b(body, 2),
+                    z: f32b(body, 3),
+                    w: f32b(body, 4),
+                }
+            }
+
             // Programmable queries (0x0Dxx), CAP_PROGRAMMABLE.
             OP_SHADER_STATUS => {
                 fixed!(3);
@@ -1554,6 +1647,16 @@ impl<'a> RingCursor<'a> {
     fn check_clip_plane(&mut self, plane: u32, start: u32) -> Result<(), Step<'a>> {
         let index = plane.wrapping_sub(GL_CLIP_PLANE0);
         if index >= self.config.max_clip_planes {
+            return Err(self.raise(ErrorCode::Limit, start));
+        }
+        Ok(())
+    }
+
+    /// `index` must be below `max_vertex_attribs` (`VERTEX_ATTRIB_ENABLE`/
+    /// `_POINTER`/`_CONSTANT`'s `index`, `0..MAX_VERTEX_ATTRIBS-1` per the
+    /// spec).
+    fn check_vertex_attrib_index(&mut self, index: u32, start: u32) -> Result<(), Step<'a>> {
+        if index >= self.config.max_vertex_attribs {
             return Err(self.raise(ErrorCode::Limit, start));
         }
         Ok(())
@@ -3442,13 +3545,16 @@ mod tests {
         let mut c = config(true);
         c.programmable = false;
         // One of each shape: no payload beyond a bare id, two ids, a ref,
-        // and a query (shader, ref). SHADER_CREATE/PROGRAM_ATTACH/
-        // PROGRAM_BIND_ATTRIB_LOCATION/SHADER_STATUS cover the group.
-        let cases: [(u16, u16); 4] = [
+        // a query (shader, ref), and the buffer/vertex-attrib group.
+        // SHADER_CREATE/PROGRAM_ATTACH/PROGRAM_BIND_ATTRIB_LOCATION/
+        // SHADER_STATUS/BUFFER_CREATE/VERTEX_ATTRIB_POINTER cover it.
+        let cases: [(u16, u16); 6] = [
             (OP_SHADER_CREATE, 2),
             (OP_PROGRAM_ATTACH, 2),
             (OP_PROGRAM_BIND_ATTRIB_LOCATION, 4),
             (OP_SHADER_STATUS, 3),
+            (OP_BUFFER_CREATE, 1),
+            (OP_VERTEX_ATTRIB_POINTER, 7),
         ];
         for (opcode, length) in cases {
             let words = vec![header(opcode, length)]
@@ -3493,5 +3599,62 @@ mod tests {
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 8, c);
         assert_eq!(step, Step::Command(Command::UseProgram { program: 0 }));
+    }
+
+    #[test]
+    fn buffer_create_rejects_an_id_above_max_buffers() {
+        let mut c = config(true);
+        c.max_buffers = 4;
+        let words = [header(OP_BUFFER_CREATE, 2), 5];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 8, c);
+        assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn vertex_attrib_pointer_rejects_buffer_zero_unlike_tex_bind() {
+        // Unlike TEX_BIND, 0 is not "none" here -- the spec says
+        // E_BAD_ID if 0 or unknown.
+        let c = config(true);
+        let words = [
+            header(OP_VERTEX_ATTRIB_POINTER, 8),
+            0, // index
+            4, // size
+            0x1406, // GL_FLOAT
+            0, // normalized
+            0, // stride_bytes
+            0, // offset
+            0, // buffer == 0
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 32, c);
+        assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn vertex_attrib_enable_rejects_an_index_at_or_above_max_vertex_attribs() {
+        let mut c = config(true);
+        c.max_vertex_attribs = 4;
+        let words = [header(OP_VERTEX_ATTRIB_ENABLE, 3), 4, 1];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 12, c);
+        assert_eq!(step, err(ErrorCode::Limit, 0, false));
+    }
+
+    #[test]
+    fn buffer_data_with_a_null_ref_decodes_as_a_valid_command() {
+        let c = config(true);
+        let words = [header(OP_BUFFER_DATA, 6), 1, 256, 0x88E4, 0, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 24, c);
+        assert_eq!(
+            step,
+            Step::Command(Command::BufferData {
+                id: 1,
+                size: 256,
+                usage: 0x88E4,
+                data: Ref::decode(0, 0),
+            })
+        );
     }
 }

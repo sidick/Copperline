@@ -91,6 +91,7 @@
 use crate::c3d::proto::ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------
 // GL errors (docs/internals/c3d.md, "GL errors")
@@ -943,6 +944,8 @@ pub struct Limits {
     /// see [`Limits::max_lights`]'s note -- the same reasoning applies via
     /// [`ClipPlaneId`].
     pub max_clip_planes: usize,
+    /// `MAX_VERTEX_ATTRIBS`, `CAP_PROGRAMMABLE`. The spec requires >= 8.
+    pub max_vertex_attribs: usize,
 }
 
 impl Default for Limits {
@@ -961,6 +964,7 @@ impl Default for Limits {
             texture_depth: 16,
             max_lights: 8,
             max_clip_planes: 6,
+            max_vertex_attribs: 8,
         }
     }
 }
@@ -1439,6 +1443,60 @@ pub struct ProgramObject {
 }
 
 // ---------------------------------------------------------------------
+// Buffers and vertex attributes (CAP_PROGRAMMABLE, docs/internals/
+// c3d.md's "Buffers and vertex attributes"). A buffer object's bytes
+// live entirely on the renderer side (`render.rs`'s `Renderer::buffers`,
+// a real `wgpu::Buffer`) -- there is no protocol-visible shape to a
+// buffer beyond its existence, so unlike textures/shaders this module
+// tracks it with a plain id set rather than a per-id metadata struct.
+// ---------------------------------------------------------------------
+
+gl_enum! {
+    /// `VERTEX_ATTRIB_POINTER`'s `type`.
+    VertexAttribType {
+        Byte = 0x1400,          // GL_BYTE
+        UnsignedByte = 0x1401,  // GL_UNSIGNED_BYTE
+        Short = 0x1402,         // GL_SHORT
+        UnsignedShort = 0x1403, // GL_UNSIGNED_SHORT
+        Float = 0x1406,         // GL_FLOAT
+    }
+}
+
+/// `VERTEX_ATTRIB_POINTER`'s state for one enabled attribute slot that
+/// sources from a buffer, as opposed to its constant value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VertexAttribPointer {
+    pub buffer: u32,
+    /// Component count, `1..4`.
+    pub size: u32,
+    pub type_: VertexAttribType,
+    pub normalized: bool,
+    pub stride_bytes: u32,
+    pub offset: u32,
+}
+
+/// One vertex attribute slot's full state (`docs/internals/c3d.md`'s
+/// "Buffers and vertex attributes"): whether it's enabled, what it
+/// points at when it is, and the constant value a disabled slot takes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VertexAttrib {
+    pub enabled: bool,
+    pub pointer: Option<VertexAttribPointer>,
+    /// GLES2's initial generic-attribute value, `(0, 0, 0, 1)`.
+    pub constant: [f32; 4],
+}
+
+impl Default for VertexAttrib {
+    fn default() -> Self {
+        VertexAttrib {
+            enabled: false,
+            pointer: None,
+            constant: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // The context state machine
 // ---------------------------------------------------------------------
 
@@ -1482,6 +1540,9 @@ pub struct State {
     programs: BTreeMap<u32, ProgramObject>,
     current_program: u32,
 
+    buffers: BTreeSet<u32>,
+    vertex_attribs: Vec<VertexAttrib>,
+
     pending_gl_error: Option<GlError>,
 }
 
@@ -1514,6 +1575,8 @@ impl State {
             shaders: BTreeMap::new(),
             programs: BTreeMap::new(),
             current_program: 0,
+            buffers: BTreeSet::new(),
+            vertex_attribs: (0..limits.max_vertex_attribs).map(|_| VertexAttrib::default()).collect(),
             pending_gl_error: None,
         }
     }
@@ -2262,6 +2325,75 @@ impl State {
         self.current_program
     }
 
+    // -- Buffers and vertex attributes (CAP_PROGRAMMABLE) ----------------
+
+    /// `BUFFER_CREATE`. Re-creating an existing id is a no-op here: unlike
+    /// a texture or shader, a buffer has no protocol-visible parameters
+    /// this module tracks to reset -- its storage (which `BUFFER_DATA`
+    /// replaces wholesale, per the spec) lives only in `render.rs`.
+    pub fn buffer_create(&mut self, id: u32) {
+        self.buffers.insert(id);
+    }
+
+    /// `BUFFER_DESTROY`: releases the object and disables (reverting to
+    /// its constant value) any vertex attribute slot still pointing at
+    /// it, per the spec.
+    pub fn buffer_destroy(&mut self, id: u32) {
+        self.buffers.remove(&id);
+        for attrib in &mut self.vertex_attribs {
+            if attrib.pointer.as_ref().is_some_and(|p| p.buffer == id) {
+                attrib.pointer = None;
+            }
+        }
+    }
+
+    pub fn buffer_exists(&self, id: u32) -> bool {
+        self.buffers.contains(&id)
+    }
+
+    /// `BUFFER_DATA`/`BUFFER_SUBDATA` on a buffer that was never created
+    /// (or has been destroyed) is `GL_INVALID_OPERATION`, exactly as
+    /// `TEX_IMAGE` on an unknown texture is (`State::define_tex_level`).
+    pub fn check_buffer_exists(&mut self, id: u32) -> Result<(), GlError> {
+        if self.buffers.contains(&id) {
+            Ok(())
+        } else {
+            self.raise_gl_error(GlError::InvalidOperation);
+            Err(GlError::InvalidOperation)
+        }
+    }
+
+    pub fn vertex_attrib(&self, index: u32) -> Option<&VertexAttrib> {
+        self.vertex_attribs.get(index as usize)
+    }
+
+    /// `VERTEX_ATTRIB_ENABLE`. A no-op if `index` is out of range -- a
+    /// defensive fallback, as `ring.rs` is expected to have already
+    /// rejected it with `E_LIMIT`.
+    pub fn vertex_attrib_enable(&mut self, index: u32, enabled: bool) {
+        if let Some(a) = self.vertex_attribs.get_mut(index as usize) {
+            a.enabled = enabled;
+        }
+    }
+
+    /// `VERTEX_ATTRIB_POINTER`. Does not itself check that `buffer`
+    /// exists -- a pointer may legally be recorded against a buffer
+    /// `BUFFER_DATA` has not yet sized, and existence is only meaningful
+    /// at draw time (`render.rs`'s concern then, same as a texture unit
+    /// bound to a never-created texture).
+    pub fn vertex_attrib_pointer(&mut self, index: u32, pointer: VertexAttribPointer) {
+        if let Some(a) = self.vertex_attribs.get_mut(index as usize) {
+            a.pointer = Some(pointer);
+        }
+    }
+
+    /// `VERTEX_ATTRIB_CONSTANT`.
+    pub fn vertex_attrib_constant(&mut self, index: u32, value: [f32; 4]) {
+        if let Some(a) = self.vertex_attribs.get_mut(index as usize) {
+            a.constant = value;
+        }
+    }
+
     // -- Protocol errors this module is in a position to detect ---------
     //
     // Everything else in `docs/internals/c3d.md`'s "Protocol errors"
@@ -2353,6 +2485,9 @@ impl State {
         self.current = CurrentVertex::new(texture_units);
         self.draw_surface = 0;
         self.current_program = 0;
+        self.vertex_attribs = (0..self.limits.max_vertex_attribs)
+            .map(|_| VertexAttrib::default())
+            .collect();
     }
 
     /// `CTX_CONTROL.RESET` (the register bit, not the ring opcode): GL
@@ -2369,6 +2504,7 @@ impl State {
         self.surfaces.clear();
         self.shaders.clear();
         self.programs.clear();
+        self.buffers.clear();
         self.pending_gl_error = None;
     }
 }
@@ -3671,5 +3807,64 @@ mod tests {
         assert!(s.shader(1).is_none());
         assert!(s.program(1).is_none());
         assert_eq!(s.current_program(), 0);
+    }
+
+    // -- Buffers and vertex attributes (CAP_PROGRAMMABLE) -----------------
+
+    #[test]
+    fn vertex_attrib_defaults_to_disabled_with_the_gles2_initial_constant() {
+        let s = state();
+        let a = s.vertex_attrib(0).unwrap();
+        assert!(!a.enabled);
+        assert!(a.pointer.is_none());
+        assert_eq!(a.constant, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn buffer_destroy_disables_any_vertex_attribute_pointing_at_it() {
+        let mut s = state();
+        s.buffer_create(1);
+        s.vertex_attrib_pointer(
+            0,
+            VertexAttribPointer {
+                buffer: 1,
+                size: 4,
+                type_: VertexAttribType::Float,
+                normalized: false,
+                stride_bytes: 0,
+                offset: 0,
+            },
+        );
+        s.vertex_attrib_enable(0, true);
+        s.buffer_destroy(1);
+        let a = s.vertex_attrib(0).unwrap();
+        assert!(a.pointer.is_none());
+        // Destroying the buffer reverts the *source*, not the enable bit
+        // itself -- the spec's "reverting to its constant value" means
+        // the slot now reads its constant while still enabled.
+        assert!(a.enabled);
+        assert!(!s.buffer_exists(1));
+    }
+
+    #[test]
+    fn check_buffer_exists_raises_invalid_operation_for_an_unknown_id() {
+        let mut s = state();
+        assert_eq!(s.check_buffer_exists(1), Err(GlError::InvalidOperation));
+        assert_eq!(s.gl_error(), GlError::InvalidOperation.to_gl());
+    }
+
+    #[test]
+    fn reset_state_clears_vertex_attrib_arrays_but_reset_all_destroys_buffers() {
+        let mut s = state();
+        s.buffer_create(1);
+        s.vertex_attrib_enable(0, true);
+        s.vertex_attrib_constant(0, [1.0, 2.0, 3.0, 4.0]);
+        s.reset_state();
+        assert!(s.buffer_exists(1), "reset_state keeps objects");
+        let a = s.vertex_attrib(0).unwrap();
+        assert!(!a.enabled, "reset_state clears GL-state attrib arrays");
+        assert_eq!(a.constant, [0.0, 0.0, 0.0, 1.0]);
+        s.reset_all();
+        assert!(!s.buffer_exists(1), "reset_all destroys objects too");
     }
 }
