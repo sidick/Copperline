@@ -47,8 +47,21 @@ use naga::ShaderStage;
 /// - `precision <qualifier> <type>;` statements are dropped (naga's parser
 ///   already defaults to a working precision; GLSL ES's qualifier has no
 ///   core-profile equivalent naga understands).
-/// - `attribute` -> `in` (vertex stage only; GLSL ES only allows `attribute`
-///   in vertex shaders, so no stage ambiguity exists here).
+/// - `attribute` -> `layout(location = N) in`, `N` counting each
+///   occurrence in source order starting at `0` (vertex stage only; GLSL
+///   ES only allows `attribute` in vertex shaders, so no stage ambiguity
+///   exists here). An explicit location is required for every attribute
+///   past the first: naga's GLSL front end does not auto-increment
+///   locations for unbound `attribute`/`in` declarations the way a real
+///   GLES2 link step would -- confirmed directly, the hard way, against
+///   a two-attribute shader whose naga module tagged *both* inputs
+///   `location: 0`, which a pipeline can't bind unambiguously. Numbering
+///   by declaration order is what a guest library that never calls
+///   `PROGRAM_BIND_ATTRIB_LOCATION` has to assume anyway (GLES2 permits
+///   either), so this is also the right default, not just a workaround.
+///   `PROGRAM_BIND_ATTRIB_LOCATION` itself is not honoured by this
+///   rewrite -- it operates per shader, independent of any program --
+///   and remains a known gap; see `render.rs`'s `ProgramSlot`.
 /// - `varying` -> `out` in the vertex stage, `in` in the fragment stage.
 /// - `gl_FragColor` (fragment stage only) -> a synthesised `out vec4`
 ///   declaration, with every occurrence of `gl_FragColor` rewritten to
@@ -65,7 +78,7 @@ use naga::ShaderStage;
 /// otherwise use as an identifier.
 pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
     let mut out = strip_precision_statements(source);
-    out = replace_word(&out, "attribute", "in");
+    out = inject_attribute_locations(&out);
     out = replace_word(
         &out,
         "varying",
@@ -83,7 +96,14 @@ pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
     out = replace_word(&out, "textureCube", "texture");
     if stage == ShaderStage::Fragment && contains_word(&out, "gl_FragColor") {
         out = replace_word(&out, "gl_FragColor", "c3d_frag_color");
-        out = format!("out vec4 c3d_frag_color;\n{out}");
+        // An explicit location is required here: unlike vertex attribute
+        // inputs (which naga assigns a location to automatically, by
+        // declaration order, confirmed in this module's tests), a
+        // fragment output naga's GLSL front end leaves un-bound
+        // (`FunctionResult::binding: None`) unless one is given --
+        // confirmed directly, the hard way, against a real draw that
+        // silently produced no colour output until this was added.
+        out = format!("layout(location = 0) out vec4 c3d_frag_color;\n{out}");
     }
     out
 }
@@ -130,6 +150,27 @@ fn contains_word(source: &str, word: &str) -> bool {
 /// hand-written scan rather than a regex dependency: the grammar is just
 /// "precision", whitespace, an identifier, whitespace, an identifier,
 /// optional whitespace, `;`.
+/// Replaces each `attribute` with `layout(location = N) in`, `N`
+/// counting occurrences in source order starting at `0`. See
+/// [`rewrite_to_core_profile`]'s doc comment for why this numbering
+/// (rather than trusting naga to assign one) is necessary.
+fn inject_attribute_locations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut next_location = 0u32;
+    loop {
+        let Some(at) = find_word(rest, "attribute") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("layout(location = {next_location}) in"));
+        next_location += 1;
+        rest = &rest[at + "attribute".len()..];
+    }
+    out
+}
+
 fn strip_precision_statements(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut rest = source;
@@ -244,19 +285,101 @@ mod tests {
         "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0\n}\n";
 
     #[test]
+    fn an_unbound_attribute_gets_a_declaration_order_location() {
+        // render.rs's programmable draw depends on this exact behaviour
+        // to map VERTEX_ATTRIB_POINTER's index onto the shader's actual
+        // input when the guest never calls PROGRAM_BIND_ATTRIB_LOCATION:
+        // naga assigns locations to unbound GLSL ES attributes by
+        // declaration order, starting at 0 -- confirmed here rather than
+        // assumed.
+        let result = compile(VERTEX_SRC, ShaderStage::Vertex);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let ep = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == naga::ShaderStage::Vertex)
+            .unwrap();
+        let arg = &ep.function.arguments[0];
+        assert_eq!(arg.name, Some("position".to_string()));
+        assert_eq!(
+            arg.binding,
+            Some(naga::Binding::Location {
+                location: 0,
+                interpolation: Some(naga::Interpolation::Perspective),
+                sampling: None,
+                blend_src: None,
+                per_primitive: false,
+            })
+        );
+    }
+
+    #[test]
     fn rewrites_attribute_and_varying_by_stage() {
         let v = rewrite_to_core_profile("attribute vec4 a; varying vec4 v;", ShaderStage::Vertex);
-        assert_eq!(v, "in vec4 a; out vec4 v;");
+        assert_eq!(v, "layout(location = 0) in vec4 a; out vec4 v;");
         let f = rewrite_to_core_profile("varying vec4 v;", ShaderStage::Fragment);
         assert_eq!(f, "in vec4 v;");
     }
 
     #[test]
+    fn injects_sequential_locations_for_multiple_attributes() {
+        let v = rewrite_to_core_profile(
+            "attribute vec4 position;\nattribute vec3 normal;\nattribute vec2 uv;\n",
+            ShaderStage::Vertex,
+        );
+        assert_eq!(
+            v,
+            "layout(location = 0) in vec4 position;\n\
+             layout(location = 1) in vec3 normal;\n\
+             layout(location = 2) in vec2 uv;\n"
+        );
+    }
+
+    #[test]
     fn rewrites_gl_frag_color_to_a_synthesised_out_var() {
         let f = rewrite_to_core_profile("void main() { gl_FragColor = vec4(0); }", ShaderStage::Fragment);
-        assert!(f.starts_with("out vec4 c3d_frag_color;\n"));
+        assert!(f.starts_with("layout(location = 0) out vec4 c3d_frag_color;\n"));
         assert!(f.contains("c3d_frag_color = vec4(0);"));
         assert!(!f.contains("gl_FragColor"));
+    }
+
+    #[test]
+    fn the_synthesised_fragment_output_gets_location_zero() {
+        // naga wraps a single fragment output in a one-member struct
+        // rather than binding FunctionResult directly (the top-level
+        // `result.binding` is always None here; the location lives on
+        // the struct member instead) -- found the hard way, against a
+        // real draw that rendered nothing until `rewrite_to_core_profile`
+        // started emitting an explicit `layout(location = 0)` on the
+        // synthesised `out` variable. This pins both facts down.
+        let result = compile(FRAGMENT_SRC_OK, ShaderStage::Fragment);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let ep = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == naga::ShaderStage::Fragment)
+            .unwrap();
+        let result = ep.function.result.as_ref().unwrap();
+        assert_eq!(result.binding, None);
+        let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+            panic!("expected the fragment result to be struct-typed");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name.as_deref(), Some("c3d_frag_color"));
+        assert_eq!(
+            members[0].binding,
+            Some(naga::Binding::Location {
+                location: 0,
+                interpolation: Some(naga::Interpolation::Perspective),
+                sampling: None,
+                blend_src: None,
+                per_primitive: false,
+            })
+        );
     }
 
     #[test]

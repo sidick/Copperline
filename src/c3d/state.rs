@@ -2325,6 +2325,17 @@ impl State {
         self.current_program
     }
 
+    /// `E_NO_PROGRAM`: a programmable draw issued with no current
+    /// program bound (`USE_PROGRAM 0`, or never set). Mirrors
+    /// [`State::require_draw_surface`]'s shape exactly.
+    pub fn require_current_program(&self) -> Result<u32, ErrorCode> {
+        if self.current_program == 0 {
+            Err(ErrorCode::NoProgram)
+        } else {
+            Ok(self.current_program)
+        }
+    }
+
     // -- Buffers and vertex attributes (CAP_PROGRAMMABLE) ----------------
 
     /// `BUFFER_CREATE`. Re-creating an existing id is a no-op here: unlike

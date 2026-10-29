@@ -279,6 +279,26 @@ pub enum RenderOp<'a> {
         size: u32,
         data: Ref,
     },
+
+    // -- CAP_PROGRAMMABLE: programmable draw (0x0Cxx). Unlike the
+    // fixed-function `Draw` op, these carry no vertex data at all --
+    // everything they draw from (the current program, the enabled
+    // vertex-attribute slots, the bound draw surface) is `state` the
+    // renderer already receives in `execute`, exactly as `Clear` reads
+    // `state.raster` rather than being handed it. `E_NO_PROGRAM` is
+    // caught at dispatch time (`Context::apply`), so by the time either
+    // op reaches the renderer a current program is guaranteed to exist.
+    DrawArraysProg {
+        prim: state::PrimitiveType,
+        first: u32,
+        count: u32,
+    },
+    DrawElementsProg {
+        prim: state::PrimitiveType,
+        count: u32,
+        index_type: u32,
+        index_ref: Ref,
+    },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -1368,6 +1388,36 @@ impl Context {
             Command::VertexAttribConstant { index, x, y, z, w } => {
                 self.state.vertex_attrib_constant(index, [x, y, z, w])
             }
+
+            // -- CAP_PROGRAMMABLE: programmable draw -----------------
+            Command::DrawArraysProg { prim, first, count } => {
+                let Some(prim) = self.decode_gl(state::PrimitiveType::from_gl(prim)) else {
+                    return;
+                };
+                match self.state.require_current_program() {
+                    Ok(_) => out.push(RenderOp::DrawArraysProg { prim, first, count }),
+                    Err(code) => self.latch_protocol_error(code, start),
+                }
+            }
+            Command::DrawElementsProg {
+                prim,
+                count,
+                index_type,
+                index_ref,
+            } => {
+                let Some(prim) = self.decode_gl(state::PrimitiveType::from_gl(prim)) else {
+                    return;
+                };
+                match self.state.require_current_program() {
+                    Ok(_) => out.push(RenderOp::DrawElementsProg {
+                        prim,
+                        count,
+                        index_type,
+                        index_ref,
+                    }),
+                    Err(code) => self.latch_protocol_error(code, start),
+                }
+            }
         }
     }
 
@@ -1764,6 +1814,34 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
         assert!(ctx.state.vertex_attrib(0).unwrap().pointer.is_none());
+    }
+
+    #[test]
+    fn draw_arrays_prog_with_no_current_program_is_e_no_program() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_DRAW_ARRAYS_PROG, &[4, 0, 3])]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 16, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.error_code, ErrorCode::NoProgram as u32);
+    }
+
+    #[test]
+    fn draw_arrays_prog_with_a_current_program_pushes_a_render_op() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_PROGRAM_CREATE, &[1]),
+            cmd(OP_USE_PROGRAM, &[1]),
+            cmd(OP_DRAW_ARRAYS_PROG, &[4, 0, 3]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [RenderOp::DrawArraysProg { first: 0, count: 3, .. }]
+        ));
     }
 
     #[test]

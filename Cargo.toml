@@ -102,7 +102,7 @@ cd32-fmv = [
 # through `pixels`, so enabling this adds no new crate copies; the version
 # is pinned to the one `pixels` resolves to for that reason, and moves with
 # it (see the pixels/egui lockstep note below).
-c3d = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:glsl-lang"]
+c3d = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:glsl-lang", "dep:env_logger"]
 display-plan-trace = []
 # Detailed host-cost counters used by native diagnostics. The browser crate
 # builds the core with `default-features = false`, so its release hot paths do
@@ -210,7 +210,7 @@ pixels = { version = "0.17", optional = true }
 # already resolves, so the two share one wgpu in the graph rather than
 # linking a second copy; `pollster` blocks on adapter and device requests
 # from the trace runner, which has no async runtime and wants none.
-wgpu = { version = "29", optional = true }
+wgpu = { version = "29", optional = true, features = ["naga-ir"] }
 # The CAP_PROGRAMMABLE tier's GLSL ES shader compile step (src/c3d/render.rs):
 # naga's GLSL front end parses the GLSL-ES-rewritten-to-core-profile source
 # into a naga::Module, which also feeds wgpu::ShaderSource::Naga directly.

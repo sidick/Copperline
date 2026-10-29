@@ -315,6 +315,11 @@ pub const OP_VERTEX_ATTRIB_ENABLE: u16 = 0x0A04;
 pub const OP_VERTEX_ATTRIB_POINTER: u16 = 0x0A05;
 pub const OP_VERTEX_ATTRIB_CONSTANT: u16 = 0x0A06;
 
+// Programmable draw (0x0Cxx) -- `c3d-cmd-programmable-draw`,
+// `CAP_PROGRAMMABLE`.
+pub const OP_DRAW_ARRAYS_PROG: u16 = 0x0C00;
+pub const OP_DRAW_ELEMENTS_PROG: u16 = 0x0C01;
+
 // Programmable queries (0x0Dxx) -- `c3d-cmd-programmable-queries`,
 // `CAP_PROGRAMMABLE`. `PROGRAM_INTERFACE` (`0x0D02`) is not implemented yet.
 pub const OP_SHADER_STATUS: u16 = 0x0D00;
@@ -352,6 +357,9 @@ pub enum ErrorCode {
     UnsupportedFormat = 9,
     /// Beyond a reported limit (texture size, unit, light, plane).
     Limit = 10,
+    /// A programmable draw (`DRAW_ARRAYS_PROG`/`DRAW_ELEMENTS_PROG`) with
+    /// no current program bound, `CAP_PROGRAMMABLE`.
+    NoProgram = 11,
 }
 
 impl ErrorCode {
@@ -1180,6 +1188,21 @@ pub enum Command<'a> {
         y: f32,
         z: f32,
         w: f32,
+    },
+
+    // Programmable draw (0x0Cxx), `CAP_PROGRAMMABLE`. `prim`/`index_type`
+    // are raw GL enumerants, validated downstream like any other (see
+    // this module's doc comment).
+    DrawArraysProg {
+        prim: u32,
+        first: u32,
+        count: u32,
+    },
+    DrawElementsProg {
+        prim: u32,
+        count: u32,
+        index_type: u32,
+        index_ref: Ref,
     },
 
     // Programmable queries (0x0Dxx), `CAP_PROGRAMMABLE`.

@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let status = match run_cli(&args) {
         Ok(code) => code,

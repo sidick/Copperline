@@ -487,6 +487,8 @@ impl<'a> RingCursor<'a> {
                 | OP_VERTEX_ATTRIB_ENABLE
                 | OP_VERTEX_ATTRIB_POINTER
                 | OP_VERTEX_ATTRIB_CONSTANT
+                | OP_DRAW_ARRAYS_PROG
+                | OP_DRAW_ELEMENTS_PROG
         )
     }
 
@@ -1426,6 +1428,30 @@ impl<'a> RingCursor<'a> {
                     y: f32b(body, 2),
                     z: f32b(body, 3),
                     w: f32b(body, 4),
+                }
+            }
+
+            // Programmable draw (0x0Cxx), CAP_PROGRAMMABLE. `prim`/
+            // `index_type` are validated downstream (dispatch/render),
+            // not here -- see the fixed-function draw opcodes' identical
+            // treatment above.
+            OP_DRAW_ARRAYS_PROG => {
+                fixed!(3);
+                Command::DrawArraysProg {
+                    prim: w32(body, 0),
+                    first: w32(body, 1),
+                    count: w32(body, 2),
+                }
+            }
+            OP_DRAW_ELEMENTS_PROG => {
+                fixed!(5);
+                let index_ref = Ref::decode(w32(body, 3), w32(body, 4));
+                check!(self.validate_ref(index_ref, start));
+                Command::DrawElementsProg {
+                    prim: w32(body, 0),
+                    count: w32(body, 1),
+                    index_type: w32(body, 2),
+                    index_ref,
                 }
             }
 
@@ -3656,5 +3682,30 @@ mod tests {
                 data: Ref::decode(0, 0),
             })
         );
+    }
+
+    #[test]
+    fn draw_arrays_prog_decodes_its_three_fields() {
+        let c = config(true);
+        let words = [header(OP_DRAW_ARRAYS_PROG, 4), 4, 10, 3];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 16, c);
+        assert_eq!(
+            step,
+            Step::Command(Command::DrawArraysProg {
+                prim: 4,
+                first: 10,
+                count: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn draw_elements_prog_validates_its_index_ref() {
+        let c = config(true);
+        let words = [header(OP_DRAW_ELEMENTS_PROG, 6), 4, 3, 0x1403, 0x1001, 6]; // misaligned
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 24, c);
+        assert_eq!(step, err(ErrorCode::BadRef, 0, false));
     }
 }

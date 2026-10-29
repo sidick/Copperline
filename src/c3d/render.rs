@@ -135,6 +135,7 @@ use super::state::{
     self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
     PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
     SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
+    VertexAttribType,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -2604,12 +2605,21 @@ pub struct Renderer {
     /// `CAP_PROGRAMMABLE`'s link/validate results and bound attribute
     /// locations, by program id. See [`ProgramSlot`].
     programs: HashMap<u32, ProgramSlot>,
-    /// `CAP_PROGRAMMABLE`'s buffer objects, by id: a real `wgpu::Buffer`
-    /// holding exactly what `BUFFER_DATA`/`BUFFER_SUBDATA` last wrote.
-    /// `state.rs` tracks only a buffer's existence (see its module doc
-    /// comment); the bytes live only here, exactly as a texture's pixel
-    /// data does.
-    buffers: HashMap<u32, wgpu::Buffer>,
+    /// `CAP_PROGRAMMABLE`'s buffer objects, by id: the raw wire bytes
+    /// `BUFFER_DATA`/`BUFFER_SUBDATA` last wrote, exactly as received
+    /// (big-endian, per the wire format's own convention). `state.rs`
+    /// tracks only a buffer's existence (see its module doc comment);
+    /// the bytes live only here, exactly as a texture's pixel data does.
+    ///
+    /// Not a `wgpu::Buffer`: a buffer's bytes have no fixed type until a
+    /// `VERTEX_ATTRIB_POINTER` interprets a region of them, and that
+    /// interpretation determines the per-element byte-swap needed to
+    /// turn big-endian wire floats/shorts into something the (host-
+    /// native, little-endian on every real target) GPU can read
+    /// directly -- so the actual GPU-ready buffer is built fresh at
+    /// draw time from this CPU-side copy, per attribute, rather than
+    /// once at upload time when the type isn't known yet.
+    buffers: HashMap<u32, Vec<u8>>,
 }
 
 /// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
@@ -2633,12 +2643,99 @@ struct ProgramSlot {
     link_status: bool,
     validate_status: bool,
     info_log: String,
+    /// The shader ids a successful link was built from (`None` on
+    /// failure, or before the first link). A programmable draw looks
+    /// these up again in `Renderer::shaders` rather than caching their
+    /// compiled modules here, so a shader destroyed after a successful
+    /// link correctly makes the program undrawable rather than drawing
+    /// from a stale copy.
+    linked_vertex: Option<u32>,
+    linked_fragment: Option<u32>,
 }
 
 fn shader_stage(kind: ShaderKind) -> naga::ShaderStage {
     match kind {
         ShaderKind::Vertex => naga::ShaderStage::Vertex,
         ShaderKind::Fragment => naga::ShaderStage::Fragment,
+    }
+}
+
+/// A compiled vertex shader's location-bound inputs, `(name, location)`,
+/// in declaration order. Used to map `VERTEX_ATTRIB_POINTER`'s guest-
+/// chosen index onto the location the shader (or `PROGRAM_BIND_ATTRIB_
+/// LOCATION`) actually expects -- confirmed directly against naga's GLSL
+/// front end that an unbound `attribute` gets a location assigned by
+/// declaration order starting at 0, matching what a guest library that
+/// never calls `PROGRAM_BIND_ATTRIB_LOCATION` (and so cannot have
+/// requested a specific one) would have to assume.
+fn vertex_shader_inputs(module: &naga::Module) -> Vec<(String, u32)> {
+    let Some(ep) = module
+        .entry_points
+        .iter()
+        .find(|e| e.stage == naga::ShaderStage::Vertex)
+    else {
+        return Vec::new();
+    };
+    ep.function
+        .arguments
+        .iter()
+        .filter_map(|arg| {
+            let name = arg.name.clone()?;
+            match arg.binding {
+                Some(naga::Binding::Location { location, .. }) => Some((name, location)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// `VERTEX_ATTRIB_POINTER`'s `type`/`size`/`normalized` as a `wgpu`
+/// vertex format, plus that format's natural (tightly-packed) byte
+/// stride -- used when `stride_bytes` is `0`. `None` for a legal GLES2
+/// combination `wgpu` simply has no matching format for (there is no
+/// `Unorm8x1`/`x3`, for example): a real gap for a fully general
+/// implementation, acceptable for this first slice where only `size`
+/// `2`/`4` combinations and `FLOAT` at any size are exercised.
+/// Bytes per component of a `VERTEX_ATTRIB_POINTER` `type`, for computing
+/// a tightly-packed stride and for the byte-swap `draw_prog` does per
+/// element (a 1-byte type's "swap" is a no-op, which falls out of this
+/// naturally rather than needing a special case).
+fn component_byte_size(type_: VertexAttribType) -> usize {
+    match type_ {
+        VertexAttribType::Byte | VertexAttribType::UnsignedByte => 1,
+        VertexAttribType::Short | VertexAttribType::UnsignedShort => 2,
+        VertexAttribType::Float => 4,
+    }
+}
+
+fn vertex_attrib_wgpu_format(
+    type_: VertexAttribType,
+    size: u32,
+    normalized: bool,
+) -> Option<wgpu::VertexFormat> {
+    use wgpu::VertexFormat as F;
+    match (type_, size, normalized) {
+        (VertexAttribType::Float, 1, _) => Some(F::Float32),
+        (VertexAttribType::Float, 2, _) => Some(F::Float32x2),
+        (VertexAttribType::Float, 3, _) => Some(F::Float32x3),
+        (VertexAttribType::Float, 4, _) => Some(F::Float32x4),
+        (VertexAttribType::UnsignedByte, 2, true) => Some(F::Unorm8x2),
+        (VertexAttribType::UnsignedByte, 4, true) => Some(F::Unorm8x4),
+        (VertexAttribType::UnsignedByte, 2, false) => Some(F::Uint8x2),
+        (VertexAttribType::UnsignedByte, 4, false) => Some(F::Uint8x4),
+        (VertexAttribType::Byte, 2, true) => Some(F::Snorm8x2),
+        (VertexAttribType::Byte, 4, true) => Some(F::Snorm8x4),
+        (VertexAttribType::Byte, 2, false) => Some(F::Sint8x2),
+        (VertexAttribType::Byte, 4, false) => Some(F::Sint8x4),
+        (VertexAttribType::UnsignedShort, 2, true) => Some(F::Unorm16x2),
+        (VertexAttribType::UnsignedShort, 4, true) => Some(F::Unorm16x4),
+        (VertexAttribType::UnsignedShort, 2, false) => Some(F::Uint16x2),
+        (VertexAttribType::UnsignedShort, 4, false) => Some(F::Uint16x4),
+        (VertexAttribType::Short, 2, true) => Some(F::Snorm16x2),
+        (VertexAttribType::Short, 4, true) => Some(F::Snorm16x4),
+        (VertexAttribType::Short, 2, false) => Some(F::Sint16x2),
+        (VertexAttribType::Short, 4, false) => Some(F::Sint16x4),
+        _ => None,
     }
 }
 
@@ -3650,6 +3747,15 @@ impl Renderer {
                 size,
                 data,
             } => self.op_buffer_subdata(*id, *offset, *size, *data, mem),
+            RenderOp::DrawArraysProg { prim, first, count } => {
+                self.op_draw_arrays_prog(*prim, *first, *count, state)
+            }
+            RenderOp::DrawElementsProg {
+                prim,
+                count,
+                index_type,
+                index_ref,
+            } => self.op_draw_elements_prog(*prim, *count, *index_type, *index_ref, state, mem),
         }
     }
 
@@ -5249,6 +5355,8 @@ impl Renderer {
         slot.link_status = link_status;
         slot.validate_status = false; // a new link invalidates any previous validation
         slot.info_log = info_log;
+        slot.linked_vertex = if link_status { vertex } else { None };
+        slot.linked_fragment = if link_status { fragment } else { None };
         Ok(())
     }
 
@@ -5296,50 +5404,29 @@ impl Renderer {
 
     /// `BUFFER_DATA`: (re)allocates the buffer's storage. A null ref
     /// (address `0`, length `0`, per the spec's "allocates uninitialised
-    /// storage") creates zeroed storage without touching `mem` at all;
+    /// storage") stores `size` zero bytes without touching `mem` at all;
     /// otherwise `size` bytes are read from `data` and become the
-    /// buffer's initial contents, replacing whatever the id previously
-    /// held (re-inserting the `HashMap` entry, exactly as `TEX_CREATE`-
-    /// then-`TEX_IMAGE` replaces a texture's GPU resource wholesale).
-    ///
-    /// `wgpu::BufferUsages::VERTEX` is always included (the only consumer
-    /// so far is vertex-attribute sourcing); `COPY_DST` lets a later
-    /// `BUFFER_SUBDATA` update it in place without recreating it.
-    fn op_buffer_data(
-        &mut self,
-        id: u32,
-        size: u32,
-        data: Ref,
-        mem: &mut dyn Memory,
-    ) -> Result<(), RenderError> {
-        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
-        let buffer = if data.address == 0 && data.length == 0 {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("c3d buffer"),
-                size: size as u64,
-                usage,
-                mapped_at_creation: false,
-            })
+    /// buffer's contents verbatim (still big-endian wire bytes -- see
+    /// `Renderer::buffers`'s doc comment for why no conversion happens
+    /// here), replacing whatever the id previously held.
+    fn op_buffer_data(&mut self, id: u32, size: u32, data: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let bytes = if data.address == 0 && data.length == 0 {
+            vec![0u8; size as usize]
         } else {
             let loc = MemLoc::from_ref(data);
-            let bytes = mem
-                .read(loc, size as usize)
-                .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_DATA read from {loc:?}")))?;
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("c3d buffer"),
-                    contents: bytes,
-                    usage,
-                })
+            mem.read(loc, size as usize)
+                .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_DATA read from {loc:?}")))?
+                .to_vec()
         };
-        self.buffers.insert(id, buffer);
+        self.buffers.insert(id, bytes);
         Ok(())
     }
 
     /// `BUFFER_SUBDATA`: replaces `size` bytes at `offset` in an existing
     /// buffer. `GL_INVALID_OPERATION`-shaped (`UnknownObject`) if the
     /// buffer has never had `BUFFER_DATA` allocate it -- there is nothing
-    /// to write a sub-range of yet.
+    /// to write a sub-range of yet; `ShortPayload` if the range doesn't
+    /// fit the buffer's current size.
     fn op_buffer_subdata(
         &mut self,
         id: u32,
@@ -5349,15 +5436,347 @@ impl Renderer {
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(data);
-        let bytes = mem
+        let src = mem
             .read(loc, size as usize)
             .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_SUBDATA read from {loc:?}")))?
             .to_vec();
         let buffer = self
             .buffers
-            .get(&id)
+            .get_mut(&id)
             .ok_or(RenderError::UnknownObject("buffer", id))?;
-        self.queue.write_buffer(buffer, offset as u64, &bytes);
+        let (offset, size) = (offset as usize, size as usize);
+        let Some(dest) = buffer.get_mut(offset..offset + size) else {
+            return Err(RenderError::ShortPayload("BUFFER_SUBDATA range"));
+        };
+        dest.copy_from_slice(&src);
+        Ok(())
+    }
+
+    fn op_draw_arrays_prog(
+        &mut self,
+        prim: PrimitiveType,
+        first: u32,
+        count: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let base_indices: Vec<u32> = (first..first + count).collect();
+        self.draw_prog(prim, count, &base_indices, state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn op_draw_elements_prog(
+        &mut self,
+        prim: PrimitiveType,
+        count: u32,
+        index_type: u32,
+        index_ref: Ref,
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(index_ref);
+        let bytes_per_index = match index_type {
+            GL_UNSIGNED_BYTE => 1,
+            GL_UNSIGNED_SHORT => 2,
+            other => {
+                return Err(RenderError::Unimplemented(
+                    "DRAW_ELEMENTS_PROG index_type (only UNSIGNED_BYTE/UNSIGNED_SHORT are spec'd for this tier)",
+                ))
+                .inspect_err(|_| log::warn!("c3d: DRAW_ELEMENTS_PROG index_type {other:#x}"));
+            }
+        };
+        let needed = count as usize * bytes_per_index;
+        let bytes = mem
+            .read(loc, needed)
+            .ok_or_else(|| RenderError::BadMemory(format!("DRAW_ELEMENTS_PROG read from {loc:?}")))?;
+        let base_indices: Vec<u32> = (0..count as usize)
+            .map(|i| read_index(bytes, i * bytes_per_index, index_type).unwrap_or(0))
+            .collect();
+        self.draw_prog(prim, count, &base_indices, state)
+    }
+
+    /// The post-decode draw pipeline shared by `DRAW_ARRAYS_PROG` and
+    /// `DRAW_ELEMENTS_PROG`: `base_indices` is the per-draw vertex index
+    /// sequence before primitive expansion (`first..first+count` for the
+    /// arrays form, the guest's own decoded index array for the elements
+    /// form). [`primitive_index_order`] -- the same function the
+    /// fixed-function draw path uses to expand `TRIANGLE_FAN`/`QUADS`/etc.
+    /// into `wgpu`'s native topology set -- then composes with it to
+    /// produce the actual GPU index buffer, so the expansion logic is
+    /// shared rather than reimplemented here.
+    ///
+    /// Builds and submits a fresh `wgpu::RenderPipeline` on every call --
+    /// no cache, unlike the fixed-function path's `PipelineKey`. This is
+    /// a deliberate scope cut for the first working vertical slice, not
+    /// an oversight: caching would need a key covering the linked
+    /// program's identity, the full vertex-buffer layout (which can vary
+    /// per draw with the current attribute state) and the raster state
+    /// below, and getting that key wrong silently reuses a stale
+    /// pipeline -- a correctness bug, not just a missed optimisation.
+    /// Revisit once a real workload shows this costs something
+    /// measurable (the proposal's own staged plan defers exactly this
+    /// kind of optimisation to "Phase 6: optimize from measurements").
+    fn draw_prog(
+        &mut self,
+        prim: PrimitiveType,
+        count: u32,
+        base_indices: &[u32],
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let program_id = state.current_program();
+        let Some(prog) = self.programs.get(&program_id) else {
+            return Ok(()); // never linked; a draw with it current has no effect
+        };
+        if !prog.link_status {
+            return Ok(());
+        }
+        let (Some(vs_id), Some(fs_id)) = (prog.linked_vertex, prog.linked_fragment) else {
+            return Ok(());
+        };
+        let bound_attrib_locations = prog.bound_attrib_locations.clone();
+        let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
+            Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
+            _ => return Ok(()), // shader destroyed or re-sourced since link
+        };
+        let fs_module = match self.shaders.get(&fs_id).and_then(|s| s.compiled.as_ref()) {
+            Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
+            _ => return Ok(()),
+        };
+
+        let (topology, order) = primitive_index_order(prim, count as usize)?;
+        if order.is_empty() {
+            return Ok(());
+        }
+        let final_indices: Vec<u32> = order
+            .iter()
+            .map(|&i| {
+                base_indices
+                    .get(i)
+                    .copied()
+                    .ok_or(RenderError::ShortPayload("programmable draw vertex index"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let draw_id = state.draw_surface();
+        let def = *state
+            .surface(draw_id)
+            .ok_or(RenderError::UnknownObject("surface", draw_id))?;
+
+        // One `wgpu::VertexBufferLayout`/bound buffer per shader input,
+        // located by name (remapped through `PROGRAM_BIND_ATTRIB_LOCATION`
+        // if the guest called it, else naga's own declaration-order
+        // assignment -- confirmed directly: an unbound `attribute vec4
+        // position;` gets location 0).
+        // Every referenced vertex, 0..=the highest index the (expanded)
+        // draw touches: simplest correct bound for the fresh per-draw
+        // buffer built below, not necessarily the tightest one.
+        let vertex_count = final_indices.iter().copied().max().map_or(0, |m| m as usize + 1);
+
+        let inputs = vertex_shader_inputs(&vs_module);
+        let mut layouts = Vec::with_capacity(inputs.len());
+        let mut gpu_buffers = Vec::with_capacity(inputs.len());
+        for (shader_location, (name, naga_location)) in inputs.iter().enumerate() {
+            let attrib_index = bound_attrib_locations.get(name).copied().unwrap_or(*naga_location);
+            let attrib = state.vertex_attrib(attrib_index);
+            let Some(pointer) = attrib.filter(|a| a.enabled).and_then(|a| a.pointer.as_ref()) else {
+                return Err(RenderError::Unimplemented(
+                    "programmable draw with a disabled/constant vertex attribute (only buffer-backed, enabled attributes are supported so far)",
+                ));
+            };
+            let Some(format) = vertex_attrib_wgpu_format(pointer.type_, pointer.size, pointer.normalized)
+            else {
+                return Err(RenderError::Unimplemented(
+                    "VERTEX_ATTRIB_POINTER type/size/normalized combination with no direct wgpu vertex format",
+                ));
+            };
+            let raw = self
+                .buffers
+                .get(&pointer.buffer)
+                .ok_or(RenderError::UnknownObject("buffer", pointer.buffer))?;
+            let component_bytes = component_byte_size(pointer.type_);
+            let read_stride = if pointer.stride_bytes == 0 {
+                pointer.size as usize * component_bytes
+            } else {
+                pointer.stride_bytes as usize
+            };
+            // The wire is big-endian throughout, per the spec's own
+            // convention ("the 68k never byte-swaps") -- vertex array
+            // bytes are no exception, but `wgpu`'s vertex-fetch formats
+            // assume host-native (little-endian, on every real target)
+            // byte order, with no "big-endian" format variant to ask
+            // for. Converting per element here, at draw time, is the one
+            // point `VERTEX_ATTRIB_POINTER`'s type is actually known
+            // (`Renderer::buffers`'s doc comment explains why it can't
+            // happen earlier, at upload time).
+            let mut gpu_bytes = Vec::with_capacity(vertex_count * pointer.size as usize * component_bytes);
+            for v in 0..vertex_count {
+                let base = pointer.offset as usize + v * read_stride;
+                for c in 0..pointer.size as usize {
+                    let at = base + c * component_bytes;
+                    let Some(src) = raw.get(at..at + component_bytes) else {
+                        return Err(RenderError::ShortPayload("programmable draw vertex attribute data"));
+                    };
+                    gpu_bytes.extend(src.iter().rev());
+                }
+            }
+            let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("c3d programmable vertex attribute buffer"),
+                contents: &gpu_bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            gpu_buffers.push(gpu_buffer);
+            layouts.push(((pointer.size as usize * component_bytes) as u64, format, shader_location as u32));
+        }
+
+        let gpu = self.ensure_surface(draw_id, &def)?;
+        let (color_view, depth_view) = (gpu.color_view.clone(), gpu.depth_view.clone());
+
+        let vs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c3d programmable vertex shader"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(vs_module)),
+        });
+        let fs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c3d programmable fragment shader"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(fs_module)),
+        });
+
+        let vertex_attrs: Vec<[wgpu::VertexAttribute; 1]> = layouts
+            .iter()
+            .map(|&(_, format, shader_location)| {
+                [wgpu::VertexAttribute {
+                    format,
+                    offset: 0,
+                    shader_location,
+                }]
+            })
+            .collect();
+        let vertex_buffers: Vec<wgpu::VertexBufferLayout> = layouts
+            .iter()
+            .zip(&vertex_attrs)
+            .map(|(&(stride, _, _), attrs)| wgpu::VertexBufferLayout {
+                array_stride: stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: attrs,
+            })
+            .collect();
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("c3d programmable pipeline layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+
+        let blend = if state.enables.blend {
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: BlendFactorKey::from(state.raster.blend_src_rgb).to_wgpu(),
+                    dst_factor: BlendFactorKey::from(state.raster.blend_dst_rgb).to_wgpu(),
+                    operation: BlendEquationKey::from(state.raster.blend_equation).to_wgpu(),
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: BlendFactorKey::from(state.raster.blend_src_alpha).to_wgpu(),
+                    dst_factor: BlendFactorKey::from(state.raster.blend_dst_alpha).to_wgpu(),
+                    operation: BlendEquationKey::from(state.raster.blend_equation).to_wgpu(),
+                },
+            })
+        } else {
+            None
+        };
+
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("c3d programmable pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                buffers: &vertex_buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: topology.to_wgpu(),
+                strip_index_format: None,
+                front_face: front_face_to_wgpu(state.raster.front_face),
+                cull_mode: if state.enables.cull_face && topology == PrimTopologyKey::Triangles {
+                    cull_to_wgpu(Some(FaceKey::from(state.raster.cull_face_mode)))
+                } else {
+                    None
+                },
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: INTERNAL_DEPTH_FORMAT,
+                depth_write_enabled: Some(state.raster.depth_mask),
+                depth_compare: Some(if state.enables.depth_test {
+                    CompareFuncKey::from(state.raster.depth_func).to_wgpu()
+                } else {
+                    wgpu::CompareFunction::Always
+                }),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fs_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: INTERNAL_COLOR_FORMAT,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let index_bytes: Vec<u8> = final_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c3d programmable index buffer"),
+            contents: &index_bytes,
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d programmable draw"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("c3d programmable draw pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, def.width, def.height) {
+                pass.set_scissor_rect(x, y, sw, sh);
+            }
+            for (i, buffer) in gpu_buffers.iter().enumerate() {
+                pass.set_vertex_buffer(i as u32, buffer.slice(..));
+            }
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..final_indices.len() as u32, 0, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
@@ -9943,5 +10362,66 @@ mod tests {
              texcoord1 (u=0.25, red) -- not unit 0's texcoord0 (u=0.75, green), and not \
              plain untextured vertex colour: {px:?}"
         );
+    }
+
+    // -- CAP_PROGRAMMABLE: programmable draw's pure helpers --------------
+
+    #[test]
+    fn component_byte_size_matches_each_types_wire_width() {
+        assert_eq!(component_byte_size(VertexAttribType::Byte), 1);
+        assert_eq!(component_byte_size(VertexAttribType::UnsignedByte), 1);
+        assert_eq!(component_byte_size(VertexAttribType::Short), 2);
+        assert_eq!(component_byte_size(VertexAttribType::UnsignedShort), 2);
+        assert_eq!(component_byte_size(VertexAttribType::Float), 4);
+    }
+
+    #[test]
+    fn vertex_attrib_wgpu_format_covers_float_at_every_size() {
+        assert_eq!(
+            vertex_attrib_wgpu_format(VertexAttribType::Float, 1, false),
+            Some(wgpu::VertexFormat::Float32)
+        );
+        assert_eq!(
+            vertex_attrib_wgpu_format(VertexAttribType::Float, 4, false),
+            Some(wgpu::VertexFormat::Float32x4)
+        );
+    }
+
+    #[test]
+    fn vertex_attrib_wgpu_format_has_no_match_for_an_unrepresentable_combination() {
+        // wgpu has no Unorm8x1/x3 -- a legal GLES2 VERTEX_ATTRIB_POINTER
+        // combination this renderer can't map directly, by design (see
+        // vertex_attrib_wgpu_format's doc comment).
+        assert_eq!(
+            vertex_attrib_wgpu_format(VertexAttribType::UnsignedByte, 1, true),
+            None
+        );
+        assert_eq!(
+            vertex_attrib_wgpu_format(VertexAttribType::UnsignedByte, 3, true),
+            None
+        );
+    }
+
+    #[test]
+    fn vertex_shader_inputs_finds_the_vertex_stage_only() {
+        let glsl::CompileResult::Ok(vs) = glsl::compile(
+            "attribute vec4 position;\nattribute vec3 normal;\nvoid main() { gl_Position = position + vec4(normal, 0.0); }\n",
+            naga::ShaderStage::Vertex,
+        ) else {
+            panic!("vertex shader failed to compile");
+        };
+        let inputs = vertex_shader_inputs(&vs);
+        assert_eq!(
+            inputs,
+            vec![("position".to_string(), 0), ("normal".to_string(), 1)]
+        );
+
+        let glsl::CompileResult::Ok(fs) = glsl::compile(
+            "precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0); }\n",
+            naga::ShaderStage::Fragment,
+        ) else {
+            panic!("fragment shader failed to compile");
+        };
+        assert!(vertex_shader_inputs(&fs).is_empty());
     }
 }
