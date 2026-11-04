@@ -3626,13 +3626,16 @@ impl Renderer {
             .clone()
     }
 
-    /// Resolves a programmable draw's render target: the default
-    /// framebuffer (the current draw surface, exactly as the
-    /// fixed-function path already does) when no framebuffer object is
-    /// bound, or the bound draw framebuffer's attachments otherwise.
-    /// Returns `Ok(None)` for a bound-but-incomplete framebuffer -- per
-    /// the spec, that is not a protocol error and the draw simply has no
-    /// effect, which [`Self::draw_prog`] turns into an early `Ok(())`.
+    /// Resolves the current draw target -- shared by a programmable draw
+    /// and `CLEAR` alike, both of which the spec defines as acting on
+    /// the bound draw framebuffer: the default framebuffer (the current
+    /// draw surface, exactly as the fixed-function path already does)
+    /// when no framebuffer object is bound, or the bound draw
+    /// framebuffer's attachments otherwise. Returns `Ok(None)` for a
+    /// bound-but-incomplete framebuffer -- per the spec, that is not a
+    /// protocol error and the operation simply has no effect, which
+    /// [`Self::draw_prog`]/[`Self::op_clear`] each turn into an early
+    /// `Ok(())`.
     ///
     /// A framebuffer with no `DEPTH_STENCIL_ATTACHMENT` renderbuffer
     /// still gets a depth/stencil buffer to satisfy `wgpu`'s pipeline
@@ -4410,13 +4413,16 @@ impl Renderer {
     }
 
     fn op_clear(&mut self, mask: u32, state: &State) -> Result<(), RenderError> {
-        let id = state.draw_surface();
-        let def = *state
-            .surface(id)
-            .ok_or(RenderError::UnknownObject("surface", id))?;
-        let gpu = self.ensure_surface(id, &def)?;
-        let color_view = gpu.color_view.clone();
-        let depth_view = gpu.depth_view.clone();
+        let Some((width, height, color_view, depth_view, _persistent_depth)) =
+            self.resolve_draw_target(state)?
+        else {
+            // A CLEAR against an incomplete bound framebuffer is not a
+            // protocol error and has no effect -- the same rule
+            // DRAW_ARRAYS_PROG/DRAW_ELEMENTS_PROG already follow, and
+            // for the same reason (see FRAMEBUFFER_STATUS's doc comment
+            // in c3d.md).
+            return Ok(());
+        };
 
         let mask_full = state.raster.color_mask.r
             && state.raster.color_mask.g
@@ -4428,7 +4434,7 @@ impl Renderer {
         // that need no restriction (test off, or a rect that already
         // covers everything -- `set_draw_surface` resets scissor to the
         // whole surface, so an untouched scissor is "full" too).
-        let scissor_rect = Self::clamped_scissor_rect(state, def.width, def.height);
+        let scissor_rect = Self::clamped_scissor_rect(state, width, height);
 
         // `wgpu::LoadOp::Clear` covers the whole attachment and cannot be
         // masked per colour channel, so anything a scissor or a partial
@@ -7741,6 +7747,48 @@ mod tests {
         }
     }
 
+    /// Encodes one command's wire bytes: a header word (`opcode << 16 |
+    /// length`) followed by `payload_words`, big-endian. Shared by tests
+    /// that drive the real `dispatch::Context::submit` -> `Renderer::
+    /// execute` pipeline rather than constructing `RenderOp`s directly,
+    /// to exercise dispatch's own state-handling, not just the
+    /// renderer's.
+    fn cmd(opcode: u16, payload_words: &[u32]) -> Vec<u8> {
+        let length = 1 + payload_words.len() as u32;
+        let mut bytes = ((opcode as u32) << 16 | length).to_be_bytes().to_vec();
+        for w in payload_words {
+            bytes.extend_from_slice(&w.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// [`cmd`], for an opcode whose payload words are `f32`s (e.g.
+    /// `CLEAR_COLOR`) rather than `u32`s.
+    fn cmd_f32(opcode: u16, payload: &[f32]) -> Vec<u8> {
+        cmd(opcode, &payload.iter().map(|f| f.to_bits()).collect::<Vec<_>>())
+    }
+
+    /// Submits every byte of `commands` concatenated as one ring, in one
+    /// `Context::submit` call, and executes the resulting ops against a
+    /// fresh [`TestMemory`]. Panics on a protocol error, a pending GL
+    /// error, or a renderer error -- every test using this helper expects
+    /// its command stream to succeed outright, so any of those would
+    /// mean the test itself is wrong, not that it's exercising an error
+    /// path on purpose.
+    fn submit_commands(renderer: &mut Renderer, commands: &[Vec<u8>]) {
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0); // spare word: see RingCursor::new's own doc comment
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let mut mem = TestMemory::new(4096);
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
     struct TestMemory {
         aperture: Vec<u8>,
     }
@@ -7923,48 +7971,23 @@ mod tests {
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
 
-        fn cmd(opcode: u16, payload_words: &[u32]) -> Vec<u8> {
-            let length = 1 + payload_words.len() as u32;
-            let mut bytes = ((opcode as u32) << 16 | length).to_be_bytes().to_vec();
-            for w in payload_words {
-                bytes.extend_from_slice(&w.to_be_bytes());
-            }
-            bytes
-        }
-        fn cmd_f32(opcode: u16, payload: &[f32]) -> Vec<u8> {
-            cmd(opcode, &payload.iter().map(|f| f.to_bits()).collect::<Vec<_>>())
-        }
-
         const A8R8G8B8: u32 = 5;
-        let commands = [
-            cmd(
-                proto::OP_SURFACE_DEFINE,
-                &[1, 8, 8, 32, A8R8G8B8, 0, 0],
-            ),
-            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
-            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]), // black background
-            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
-            cmd(proto::OP_ENABLE, &[0x0C11]), // GL_SCISSOR_TEST
-            cmd(proto::OP_SCISSOR, &[0, 0, 4, 8]), // left half
-            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]), // red
-            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
-            cmd(proto::OP_SCISSOR, &[4, 0, 4, 8]), // right half
-            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 1.0, 0.0, 1.0]), // green
-            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
-        ];
-        let mut ring: Vec<u8> = commands.concat();
-        let total = ring.len() as u32;
-        ring.resize(ring.len() + 4, 0); // spare word: see RingCursor::new's own doc comment
-
-        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
-        let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
-        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
-
-        let mut mem = TestMemory::new(4096);
-        let errs = renderer.execute(&out, &mut mem);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        submit_commands(
+            &mut renderer,
+            &[
+                cmd(proto::OP_SURFACE_DEFINE, &[1, 8, 8, 32, A8R8G8B8, 0, 0]),
+                cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+                cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]), // black background
+                cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+                cmd(proto::OP_ENABLE, &[0x0C11]), // GL_SCISSOR_TEST
+                cmd(proto::OP_SCISSOR, &[0, 0, 4, 8]), // left half
+                cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]), // red
+                cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+                cmd(proto::OP_SCISSOR, &[4, 0, 4, 8]), // right half
+                cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 1.0, 0.0, 1.0]), // green
+                cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            ],
+        );
 
         let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
         for y in 0..8u32 {
@@ -7978,6 +8001,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `CLEAR` must act on the *bound draw framebuffer*, not
+    /// unconditionally on the draw surface -- extending `DRAW_ARRAYS_PROG`/
+    /// `DRAW_ELEMENTS_PROG`'s existing rule to `CLEAR` too (see
+    /// `c3d.md`'s `CLEAR` entry). One submission: clear the default
+    /// framebuffer (the draw surface) blue, bind an off-screen
+    /// framebuffer with a texture colour attachment, clear *that* red,
+    /// unbind back to the default framebuffer, then sample the texture
+    /// to colour a small on-screen triangle. If `CLEAR` incorrectly
+    /// targeted the draw surface the whole time, the "off-screen" red
+    /// clear would have painted the visible surface red instead of the
+    /// texture, and the final composite would sample the texture's
+    /// untouched initial contents instead.
+    #[test]
+    fn clear_targets_the_bound_draw_framebuffer_not_always_the_draw_surface() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const RGBA8: u32 = 0;
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"precision mediump float;\nuniform sampler2D tex;\nvoid main() { gl_FragColor = texture2D(tex, vec2(0.5, 0.5)); }\n";
+        // Solid green initially -- overwritten by the off-screen CLEAR if
+        // (and only if) the fix under test actually works.
+        let tex_init = [0u8, 255, 0, 255].repeat(4 * 4);
+        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_tex_init = 0x2000u32;
+        let a_verts = 0x2100u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_tex_init), &tex_init);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length] // space 0 (aperture)
+        }
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 64, 64, 256, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 1.0, 1.0]), // blue background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            {
+                let r = reference(a_tex_init, tex_init.len() as u32);
+                cmd(proto::OP_TEX_IMAGE, &[1, 0, RGBA8, 4, 4, 16, r[0], r[1]])
+            },
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 1]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_TEXTURE, &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 1, 0]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]), // red -- must land in the texture
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]), // back to the default framebuffer
+            cmd(proto::OP_TEX_BIND, &[0, 1]),
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_UNIFORM_SAMPLER, &[1, 0, 0]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let inside = &pixels[(32 * 64 + 32) * 4..][..4];
+        assert_eq!(
+            inside, [255, 0, 0, 255],
+            "triangle centre should sample the off-screen-cleared (red) texture: {inside:?}"
+        );
+        let outside = &pixels[(2 * 64 + 2) * 4..][..4];
+        assert_eq!(
+            outside, [0, 0, 255, 255],
+            "outside the triangle should still be the draw surface's own blue background: {outside:?}"
+        );
     }
 
     /// `STENCIL_TEST` must actually gate a *later*, unrelated draw's
