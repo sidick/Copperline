@@ -299,6 +299,31 @@ pub enum RenderOp<'a> {
         index_type: u32,
         index_ref: Ref,
     },
+
+    // -- CAP_PROGRAMMABLE: uniforms. Pushed unconditionally (no `state`
+    // gate, unlike most other programmable-tier ops): whether `program`
+    // exists, is linked, and whether `location` is one of its active
+    // uniforms is render.rs-resident knowledge (the linked interface,
+    // computed from the compiled naga modules at PROGRAM_LINK), which
+    // dispatch/state cannot see -- see ProgramSlot's doc comment. An
+    // unknown program/location is therefore a silent no-op in the
+    // renderer, not a GL_INVALID_OPERATION the spec would prefer: a
+    // known, documented gap (the same one PROGRAM_BIND_ATTRIB_LOCATION's
+    // doc comment already notes) rather than a retrofitted error path.
+    Uniform {
+        program: u32,
+        location: u32,
+        type_: u32,
+        count: u32,
+        values: &'a [u8],
+    },
+    UniformSampler {
+        program: u32,
+        location: u32,
+        unit: u32,
+    },
+    /// `PROGRAM_INTERFACE`.
+    ProgramInterface { program: u32, dest: Ref },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -1418,6 +1443,35 @@ impl Context {
                     Err(code) => self.latch_protocol_error(code, start),
                 }
             }
+
+            // -- CAP_PROGRAMMABLE: uniforms ---------------------------
+            Command::Uniform {
+                program,
+                location,
+                type_,
+                count,
+                values,
+            } => out.push(RenderOp::Uniform {
+                program,
+                location,
+                type_,
+                count,
+                values,
+            }),
+            Command::UniformSampler {
+                program,
+                location,
+                unit,
+            } => out.push(RenderOp::UniformSampler {
+                program,
+                location,
+                unit,
+            }),
+            Command::ProgramInterface { program, dest } => {
+                if self.state.program(program).is_some() {
+                    out.push(RenderOp::ProgramInterface { program, dest });
+                }
+            }
         }
     }
 
@@ -1842,6 +1896,46 @@ mod tests {
             out.as_slice(),
             [RenderOp::DrawArraysProg { first: 0, count: 3, .. }]
         ));
+    }
+
+    #[test]
+    fn uniform_and_uniform_sampler_push_render_ops_unconditionally() {
+        // No `state` gate at all -- see RenderOp::Uniform's doc comment
+        // on why validity is entirely render.rs's concern here.
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_UNIFORM, &[1, 0, 0x1406, 1, 0]), // FLOAT, value 0.0
+            cmd(OP_UNIFORM_SAMPLER, &[1, 0, 2]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(matches!(out[0], RenderOp::Uniform { program: 1, location: 0, .. }));
+        assert!(matches!(
+            out[1],
+            RenderOp::UniformSampler { program: 1, location: 0, unit: 2 }
+        ));
+    }
+
+    #[test]
+    fn program_interface_is_gated_on_the_program_existing_in_state() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_PROGRAM_INTERFACE, &[1, 0x0010_0000, 256])]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 16, &config(), &mut out);
+        assert!(out.is_empty(), "program 1 was never created");
+
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_PROGRAM_CREATE, &[1]),
+            cmd(OP_PROGRAM_INTERFACE, &[1, 0x0010_0000, 256]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(matches!(out.as_slice(), [RenderOp::ProgramInterface { program: 1, .. }]));
     }
 
     #[test]

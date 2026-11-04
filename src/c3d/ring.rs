@@ -478,8 +478,11 @@ impl<'a> RingCursor<'a> {
                 | OP_PROGRAM_LINK
                 | OP_PROGRAM_VALIDATE
                 | OP_USE_PROGRAM
+                | OP_UNIFORM
+                | OP_UNIFORM_SAMPLER
                 | OP_SHADER_STATUS
                 | OP_PROGRAM_STATUS
+                | OP_PROGRAM_INTERFACE
                 | OP_BUFFER_CREATE
                 | OP_BUFFER_DESTROY
                 | OP_BUFFER_DATA
@@ -1349,6 +1352,29 @@ impl<'a> RingCursor<'a> {
                 check!(self.check_id_or_none(program, self.config.max_programs, start));
                 Command::UseProgram { program }
             }
+            OP_UNIFORM => match self.decode_uniform(body, length_words, start) {
+                Ok((program, location, type_, count, values)) => {
+                    check!(self.check_id(program, self.config.max_programs, start));
+                    Command::Uniform {
+                        program,
+                        location,
+                        type_,
+                        count,
+                        values,
+                    }
+                }
+                Err(err) => return err,
+            },
+            OP_UNIFORM_SAMPLER => {
+                fixed!(3);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                Command::UniformSampler {
+                    program,
+                    location: w32(body, 1),
+                    unit: w32(body, 2),
+                }
+            }
 
             // Buffers and vertex attributes (0x0Axx), CAP_PROGRAMMABLE.
             OP_BUFFER_CREATE => {
@@ -1472,6 +1498,14 @@ impl<'a> RingCursor<'a> {
                 check!(self.validate_ref(dest, start));
                 Command::ProgramStatus { program, dest }
             }
+            OP_PROGRAM_INTERFACE => {
+                fixed!(3);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::ProgramInterface { program, dest }
+            }
 
             // Not in the opcode map at all, or LOGIC_OP (see this module's
             // doc comment): E_BAD_OPCODE, skipped by trusting `length`.
@@ -1514,6 +1548,37 @@ impl<'a> RingCursor<'a> {
         }
         let vertices = &body[12..];
         Ok((prim, format, count, vertices))
+    }
+
+    /// `program, location, type, count, values...` (`UNIFORM`). See
+    /// `decode_draw_inline`'s doc comment for why `length_words` is
+    /// bounds-checked before any `w32` call reads past a too-short body,
+    /// and why a `type` this function can't size (`uniform_type_
+    /// components` returning `None`) is `E_BAD_ARG` rather than a GL
+    /// error: `type` is load-bearing for framing here, exactly as
+    /// `DRAW_INLINE`'s `format` is.
+    fn decode_uniform(
+        &mut self,
+        body: &'a [u8],
+        length_words: u32,
+        start: u32,
+    ) -> Result<(u32, u32, u32, u32, &'a [u8]), Step<'a>> {
+        if length_words < 5 {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
+        let program = w32(body, 0);
+        let location = w32(body, 1);
+        let type_ = w32(body, 2);
+        let count = w32(body, 3);
+        let Some(components) = uniform_type_components(type_) else {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        };
+        let expected = 1 + 4 + u64::from(count) * u64::from(components);
+        if u64::from(length_words) != expected {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
+        let values = &body[16..];
+        Ok((program, location, type_, count, values))
     }
 
     /// `prim, format, count, arrays...` shared by `DRAW_ARRAYS`/
@@ -1861,6 +1926,34 @@ fn w32(body: &[u8], index: usize) -> u32 {
 /// c3d.md`'s "IEEE-754 single precision, big-endian" convention.
 fn f32b(body: &[u8], index: usize) -> f32 {
     f32::from_bits(w32(body, index))
+}
+
+/// `UNIFORM`'s `type` -> its component count (words per array element),
+/// for the set the spec documents: `FLOAT`/`FLOAT_VECn`, `INT`/
+/// `INT_VECn`, `FLOAT_MATn`. `None` for anything else, including sampler
+/// types (`UNIFORM_SAMPLER` is the opcode for those, not `UNIFORM`).
+fn uniform_type_components(type_: u32) -> Option<u32> {
+    const GL_FLOAT: u32 = 0x1406;
+    const GL_FLOAT_VEC2: u32 = 0x8B50;
+    const GL_FLOAT_VEC3: u32 = 0x8B51;
+    const GL_FLOAT_VEC4: u32 = 0x8B52;
+    const GL_INT: u32 = 0x1404;
+    const GL_INT_VEC2: u32 = 0x8B53;
+    const GL_INT_VEC3: u32 = 0x8B54;
+    const GL_INT_VEC4: u32 = 0x8B55;
+    const GL_FLOAT_MAT2: u32 = 0x8B5A;
+    const GL_FLOAT_MAT3: u32 = 0x8B5B;
+    const GL_FLOAT_MAT4: u32 = 0x8B5C;
+    match type_ {
+        GL_FLOAT | GL_INT => Some(1),
+        GL_FLOAT_VEC2 | GL_INT_VEC2 => Some(2),
+        GL_FLOAT_VEC3 | GL_INT_VEC3 => Some(3),
+        GL_FLOAT_VEC4 | GL_INT_VEC4 => Some(4),
+        GL_FLOAT_MAT2 => Some(4),
+        GL_FLOAT_MAT3 => Some(9),
+        GL_FLOAT_MAT4 => Some(16),
+        _ => None,
+    }
 }
 
 fn vec4(body: &[u8], index: usize) -> [f32; 4] {
@@ -3706,6 +3799,79 @@ mod tests {
         let words = [header(OP_DRAW_ELEMENTS_PROG, 6), 4, 3, 0x1403, 0x1001, 6]; // misaligned
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 24, c);
+        assert_eq!(step, err(ErrorCode::BadRef, 0, false));
+    }
+
+    #[test]
+    fn uniform_decodes_a_float_vec4_value() {
+        let c = config(true);
+        let f = |v: f32| v.to_bits();
+        let words = [
+            header(OP_UNIFORM, 9),
+            1,          // program
+            0,          // location
+            0x8B52,     // GL_FLOAT_VEC4
+            1,          // count
+            f(1.0),
+            f(2.0),
+            f(3.0),
+            f(4.0),
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 36, c);
+        let Step::Command(Command::Uniform { program, location, type_, count, values }) = step else {
+            panic!("expected Command::Uniform, got {step:?}");
+        };
+        assert_eq!((program, location, type_, count), (1, 0, 0x8B52, 1));
+        assert_eq!(values.len(), 16);
+    }
+
+    #[test]
+    fn uniform_with_an_unrecognised_type_is_e_bad_arg() {
+        // The type is load-bearing for framing (it determines how many
+        // value words to expect), so an unknown one can't even be
+        // parsed far enough to become a GL error -- see decode_uniform's
+        // doc comment.
+        let c = config(true);
+        let words = [header(OP_UNIFORM, 5), 1, 0, 0xDEAD, 1];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 20, c);
+        assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn uniform_with_a_length_inconsistent_with_count_is_e_bad_arg() {
+        let c = config(true);
+        // type is FLOAT (1 component), count is 2, so 2 value words are
+        // needed; only 1 is supplied.
+        let words = [header(OP_UNIFORM, 6), 1, 0, 0x1406, 2, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 24, c);
+        assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn uniform_sampler_decodes_its_three_fields() {
+        let c = config(true);
+        let words = [header(OP_UNIFORM_SAMPLER, 4), 1, 2, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 16, c);
+        assert_eq!(
+            step,
+            Step::Command(Command::UniformSampler {
+                program: 1,
+                location: 2,
+                unit: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn program_interface_validates_its_dest_ref() {
+        let c = config(true);
+        let words = [header(OP_PROGRAM_INTERFACE, 4), 1, 0x1001, 256]; // misaligned
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 16, c);
         assert_eq!(step, err(ErrorCode::BadRef, 0, false));
     }
 }

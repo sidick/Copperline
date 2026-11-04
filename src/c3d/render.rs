@@ -2651,7 +2651,60 @@ struct ProgramSlot {
     /// from a stale copy.
     linked_vertex: Option<u32>,
     linked_fragment: Option<u32>,
+    /// `PROGRAM_INTERFACE`'s report, computed once at a successful link:
+    /// active attributes first (`attrib_count` of them), then active
+    /// uniforms, in wire order. Empty when `!link_status`.
+    interface: Vec<InterfaceEntry>,
+    attrib_count: u32,
+    /// Parallel to `interface`'s uniform portion (index `i` here matches
+    /// `interface[attrib_count as usize + i]`): each active uniform's
+    /// naga-side binding(s). A uniform declared in both stages (the
+    /// common GLSL ES pattern -- the language has no shared interface
+    /// blocks) has both set, since each stage compiled independently
+    /// into its own naga module with its own binding number in that
+    /// stage's disjoint range (see `glsl.rs`'s `VERTEX_BINDING_BASE`/
+    /// `FRAGMENT_BINDING_BASE`).
+    uniform_bindings: Vec<UniformBinding>,
+    /// Uniform location -> its current value, already converted from
+    /// wire big-endian to native byte order (`UNIFORM`'s own concern,
+    /// not deferred to draw time the way vertex-attribute byte-swapping
+    /// is -- a uniform's value is a small, self-contained array with no
+    /// "unknown type until later" ambiguity the way a shared vertex
+    /// buffer region has). Cleared on every (re)link, per GLES2's "a
+    /// new link invalidates uniform values" semantics.
+    uniform_values: HashMap<u32, Vec<u8>>,
+    /// Uniform location -> bound texture unit (`UNIFORM_SAMPLER`).
+    /// Stored but **not yet applied** at draw time -- see `draw_prog`'s
+    /// doc comment on scope cuts; this tier does not build texture bind
+    /// groups yet. Kept so `PROGRAM_INTERFACE`/future work has it.
+    sampler_bindings: HashMap<u32, u32>,
 }
+
+/// One entry in `PROGRAM_INTERFACE`'s report (`c3d-cmd-programmable-
+/// queries`): either an active attribute or an active uniform depending
+/// on its position in `ProgramSlot::interface` (`attrib_count` says
+/// where the split is). `location` is the shader's own naga-assigned
+/// location for an attribute, or this renderer's own sequential
+/// numbering (this uniform's index among the program's uniforms) for a
+/// uniform -- there is no naga-exposed "location" concept for uniforms
+/// the way there is for vertex attributes, so the device invents one,
+/// exactly as a real GLES2 `glGetUniformLocation` implementation would.
+#[derive(Clone, Debug)]
+struct InterfaceEntry {
+    location: u32,
+    gl_type: u32,
+    array_size: u32,
+    name: String,
+}
+
+/// One active uniform's naga-side binding(s) within group `0` (see
+/// `ProgramSlot::uniform_bindings`'s doc comment).
+#[derive(Clone, Debug, Default)]
+struct UniformBinding {
+    vertex_binding: Option<u32>,
+    fragment_binding: Option<u32>,
+}
+
 
 fn shader_stage(kind: ShaderKind) -> naga::ShaderStage {
     match kind {
@@ -2687,6 +2740,176 @@ fn vertex_shader_inputs(module: &naga::Module) -> Vec<(String, u32)> {
             }
         })
         .collect()
+}
+
+// GL enumerants PROGRAM_INTERFACE/UNIFORM's `type` field can report, for
+// the set `naga_type_to_gl_enum` recognises. Mirrors ring.rs's
+// uniform_type_components (kept file-local there too, same reasoning).
+const GL_FLOAT_VEC2: u32 = 0x8B50;
+const GL_FLOAT_VEC3: u32 = 0x8B51;
+const GL_FLOAT_VEC4: u32 = 0x8B52;
+const GL_INT_VEC2: u32 = 0x8B53;
+const GL_INT_VEC3: u32 = 0x8B54;
+const GL_INT_VEC4: u32 = 0x8B55;
+const GL_FLOAT_MAT2: u32 = 0x8B5A;
+const GL_FLOAT_MAT3: u32 = 0x8B5B;
+const GL_FLOAT_MAT4: u32 = 0x8B5C;
+
+/// Bytes a `PROGRAM_INTERFACE`/`UNIFORM` GL type enumerant occupies
+/// (component count times 4, every component here being either an
+/// `f32` or an `i32`). `None` for anything `naga_type_to_gl_enum`
+/// wouldn't produce.
+fn gl_type_byte_size(gl_type: u32) -> Option<usize> {
+    match gl_type {
+        GL_FLOAT | GL_INT => Some(4),
+        GL_FLOAT_VEC2 | GL_INT_VEC2 => Some(8),
+        GL_FLOAT_VEC3 | GL_INT_VEC3 => Some(12),
+        GL_FLOAT_VEC4 | GL_INT_VEC4 => Some(16),
+        GL_FLOAT_MAT2 => Some(16),
+        GL_FLOAT_MAT3 => Some(36),
+        GL_FLOAT_MAT4 => Some(64),
+        _ => None,
+    }
+}
+
+/// A naga type's GL enumerant, for `PROGRAM_INTERFACE`'s `type` field.
+/// Covers exactly `UNIFORM`'s accepted set (`FLOAT`/`FLOAT_VECn`,
+/// `INT`/`INT_VECn`, square `FLOAT_MATn`) plus plain scalar/vector/
+/// matrix attribute types -- sampler/texture types are deliberately not
+/// handled here (see `ProgramSlot::sampler_bindings`'s doc comment on
+/// why this tier doesn't reflect them yet), and anything else (bool
+/// vectors, non-square matrices, arrays/structs) is `None`.
+fn naga_type_to_gl_enum(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Option<u32> {
+    use naga::{ScalarKind, VectorSize};
+    match &module.types[ty].inner {
+        naga::TypeInner::Scalar(s) if s.kind == ScalarKind::Float => Some(GL_FLOAT),
+        naga::TypeInner::Scalar(s) if s.kind == ScalarKind::Sint => Some(GL_INT),
+        naga::TypeInner::Vector { size, scalar } if scalar.kind == ScalarKind::Float => {
+            Some(match size {
+                VectorSize::Bi => GL_FLOAT_VEC2,
+                VectorSize::Tri => GL_FLOAT_VEC3,
+                VectorSize::Quad => GL_FLOAT_VEC4,
+            })
+        }
+        naga::TypeInner::Vector { size, scalar } if scalar.kind == ScalarKind::Sint => {
+            Some(match size {
+                VectorSize::Bi => GL_INT_VEC2,
+                VectorSize::Tri => GL_INT_VEC3,
+                VectorSize::Quad => GL_INT_VEC4,
+            })
+        }
+        naga::TypeInner::Matrix { columns, rows, scalar }
+            if scalar.kind == ScalarKind::Float && columns == rows =>
+        {
+            Some(match columns {
+                VectorSize::Bi => GL_FLOAT_MAT2,
+                VectorSize::Tri => GL_FLOAT_MAT3,
+                VectorSize::Quad => GL_FLOAT_MAT4,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`vertex_shader_inputs`] plus each input's GL type, for `PROGRAM_
+/// INTERFACE`'s attribute entries.
+fn vertex_shader_inputs_typed(module: &naga::Module) -> Vec<(String, u32, u32)> {
+    let Some(ep) = module
+        .entry_points
+        .iter()
+        .find(|e| e.stage == naga::ShaderStage::Vertex)
+    else {
+        return Vec::new();
+    };
+    ep.function
+        .arguments
+        .iter()
+        .filter_map(|arg| {
+            let name = arg.name.clone()?;
+            let naga::Binding::Location { location, .. } = arg.binding.clone()? else {
+                return None;
+            };
+            let gl_type = naga_type_to_gl_enum(module, arg.ty)?;
+            Some((name, location, gl_type))
+        })
+        .collect()
+}
+
+/// A compiled module's plain-value `uniform` globals (`AddressSpace::
+/// Uniform` -- excludes samplers/textures, a different address space;
+/// see `ProgramSlot::sampler_bindings`'s doc comment), as `(name, naga
+/// binding, GL type)`.
+fn module_uniforms(module: &naga::Module) -> Vec<(String, u32, u32)> {
+    module
+        .global_variables
+        .iter()
+        .filter(|(_, gv)| gv.space == naga::AddressSpace::Uniform)
+        .filter_map(|(_, gv)| {
+            let name = gv.name.clone()?;
+            let binding = gv.binding.as_ref()?.binding;
+            let gl_type = naga_type_to_gl_enum(module, gv.ty)?;
+            Some((name, binding, gl_type))
+        })
+        .collect()
+}
+
+/// Merges `vs`/`fs`'s uniform globals by name into one program-level
+/// uniform interface, assigning each a sequential location (this
+/// renderer's own numbering -- see [`InterfaceEntry`]'s doc comment).
+/// Returns the interface entries and, parallel to them, each uniform's
+/// naga binding(s) in whichever stage(s) declare it.
+fn compute_uniform_interface(
+    vs: &naga::Module,
+    fs: &naga::Module,
+) -> (Vec<InterfaceEntry>, Vec<UniformBinding>) {
+    struct Merged {
+        name: String,
+        gl_type: u32,
+        binding: UniformBinding,
+    }
+    let mut merged: Vec<Merged> = Vec::new();
+    for (name, binding, gl_type) in module_uniforms(vs) {
+        merged.push(Merged {
+            name,
+            gl_type,
+            binding: UniformBinding {
+                vertex_binding: Some(binding),
+                fragment_binding: None,
+            },
+        });
+    }
+    for (name, binding, gl_type) in module_uniforms(fs) {
+        if let Some(existing) = merged.iter_mut().find(|m| m.name == name) {
+            // A uniform declared in both stages: trust the GLSL source
+            // to agree on its type (not cross-validated) and just add
+            // this stage's own binding.
+            existing.binding.fragment_binding = Some(binding);
+        } else {
+            merged.push(Merged {
+                name,
+                gl_type,
+                binding: UniformBinding {
+                    vertex_binding: None,
+                    fragment_binding: Some(binding),
+                },
+            });
+        }
+    }
+    merged
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                InterfaceEntry {
+                    location: i as u32,
+                    gl_type: m.gl_type,
+                    array_size: 1,
+                    name: m.name,
+                },
+                m.binding,
+            )
+        })
+        .unzip()
 }
 
 /// `VERTEX_ATTRIB_POINTER`'s `type`/`size`/`normalized` as a `wgpu`
@@ -3756,6 +3979,17 @@ impl Renderer {
                 index_type,
                 index_ref,
             } => self.op_draw_elements_prog(*prim, *count, *index_type, *index_ref, state, mem),
+            RenderOp::Uniform {
+                program,
+                location,
+                type_,
+                count,
+                values,
+            } => self.op_uniform(*program, *location, *type_, *count, values),
+            RenderOp::UniformSampler { program, location, unit } => {
+                self.op_uniform_sampler(*program, *location, *unit)
+            }
+            RenderOp::ProgramInterface { program, dest } => self.op_program_interface(*program, *dest, mem),
         }
     }
 
@@ -5351,12 +5585,61 @@ impl Renderer {
             (_, _, _, Some(false)) => (false, "fragment shader did not compile successfully".to_string()),
             _ => (false, "attached shader has not been compiled".to_string()),
         };
+        // Computed defensively (no unwrap/panic on an internal invariant
+        // slipping): if a module genuinely can't be found despite
+        // link_status being true, the program just reports an empty
+        // interface rather than this op failing outright.
+        let mut interface = Vec::new();
+        let mut attrib_count = 0u32;
+        let mut uniform_bindings = Vec::new();
+        if link_status {
+            if let (Some(vid), Some(fid)) = (vertex, fragment) {
+                if let (Some(vs_slot), Some(fs_slot)) = (self.shaders.get(&vid), self.shaders.get(&fid)) {
+                    if let (Some(glsl::CompileResult::Ok(vs)), Some(glsl::CompileResult::Ok(fs))) =
+                        (&vs_slot.compiled, &fs_slot.compiled)
+                    {
+                        let attrib_entries = vertex_shader_inputs_typed(vs);
+                        attrib_count = attrib_entries.len() as u32;
+                        let (uniform_entries, bindings) = compute_uniform_interface(vs, fs);
+                        interface = attrib_entries
+                            .into_iter()
+                            .map(|(name, location, gl_type)| InterfaceEntry {
+                                location,
+                                gl_type,
+                                array_size: 1,
+                                name,
+                            })
+                            .collect::<Vec<_>>();
+                        interface.extend(uniform_entries);
+                        uniform_bindings = bindings;
+                    }
+                }
+            }
+        }
+
         let slot = self.programs.entry(program).or_default();
         slot.link_status = link_status;
         slot.validate_status = false; // a new link invalidates any previous validation
         slot.info_log = info_log;
         slot.linked_vertex = if link_status { vertex } else { None };
         slot.linked_fragment = if link_status { fragment } else { None };
+        slot.interface = interface;
+        slot.attrib_count = attrib_count;
+        slot.uniform_bindings = uniform_bindings;
+        // GLES2: a new link invalidates previous uniform values and
+        // sampler bindings, same reasoning as validate_status above.
+        // Every active uniform gets a zeroed default (real GL's own
+        // initial value for a just-linked uniform, before any UNIFORM
+        // call) rather than being left unset -- so draw_prog's bind
+        // group always has an entry for every binding the shader
+        // actually declares, with no "what if it was never set" case to
+        // handle separately at draw time.
+        slot.uniform_values.clear();
+        for (i, entry) in slot.interface.iter().skip(slot.attrib_count as usize).enumerate() {
+            let size = gl_type_byte_size(entry.gl_type).unwrap_or(0);
+            slot.uniform_values.insert(i as u32, vec![0u8; size]);
+        }
+        slot.sampler_bindings.clear();
         Ok(())
     }
 
@@ -5368,6 +5651,55 @@ impl Renderer {
     fn op_program_validate(&mut self, program: u32) -> Result<(), RenderError> {
         let slot = self.programs.entry(program).or_default();
         slot.validate_status = slot.link_status;
+        Ok(())
+    }
+
+    /// `UNIFORM`: records the value, converted from the wire's big-endian
+    /// words to native byte order (every word here is 4 bytes regardless
+    /// of `type_`'s float/int kind, so the conversion needs no type-
+    /// specific handling, unlike a vertex attribute's mixed component
+    /// widths). Silently does nothing if `program` doesn't exist yet --
+    /// see `RenderOp::Uniform`'s doc comment on why an invalid `program`/
+    /// `location` isn't a GL error here. `type_`/`count` themselves are
+    /// not stored or re-validated against the program's own interface in
+    /// this draft; a value at a location the interface doesn't actually
+    /// have just sits unused.
+    fn op_uniform(&mut self, program: u32, location: u32, _type_: u32, _count: u32, values: &[u8]) -> Result<(), RenderError> {
+        let Some(slot) = self.programs.get_mut(&program) else {
+            return Ok(());
+        };
+        let native: Vec<u8> = values.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect();
+        slot.uniform_values.insert(location, native);
+        Ok(())
+    }
+
+    /// `UNIFORM_SAMPLER`. See `ProgramSlot::sampler_bindings`'s doc
+    /// comment: recorded, not yet applied at draw time.
+    fn op_uniform_sampler(&mut self, program: u32, location: u32, unit: u32) -> Result<(), RenderError> {
+        if let Some(slot) = self.programs.get_mut(&program) {
+            slot.sampler_bindings.insert(location, unit);
+        }
+        Ok(())
+    }
+
+    /// `PROGRAM_INTERFACE`.
+    fn op_program_interface(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let slot = self.programs.entry(program).or_default();
+        let uniform_count = slot.interface.len() as u32 - slot.attrib_count;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&slot.attrib_count.to_be_bytes());
+        bytes.extend_from_slice(&uniform_count.to_be_bytes());
+        for entry in &slot.interface {
+            bytes.extend_from_slice(&(entry.location as i32).to_be_bytes());
+            bytes.extend_from_slice(&entry.gl_type.to_be_bytes());
+            bytes.extend_from_slice(&entry.array_size.to_be_bytes());
+            bytes.extend_from_slice(&(entry.name.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(entry.name.as_bytes());
+        }
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &bytes) {
+            return Err(RenderError::BadMemory(format!("PROGRAM_INTERFACE write to {loc:?}")));
+        }
         Ok(())
     }
 
@@ -5533,6 +5865,10 @@ impl Renderer {
             return Ok(());
         };
         let bound_attrib_locations = prog.bound_attrib_locations.clone();
+        let uniform_bindings = prog.uniform_bindings.clone();
+        let uniform_values: Vec<Vec<u8>> = (0..uniform_bindings.len() as u32)
+            .map(|i| prog.uniform_values.get(&i).cloned().unwrap_or_default())
+            .collect();
         let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
             Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
             _ => return Ok(()), // shader destroyed or re-sourced since link
@@ -5659,9 +5995,71 @@ impl Renderer {
             })
             .collect();
 
+        // One uniform buffer per active uniform (group 0), bound at each
+        // stage's own naga binding number -- a uniform used by both
+        // stages gets two bind-group entries pointing at the same
+        // buffer, exactly matching `glsl.rs`'s disjoint per-stage
+        // binding ranges. Every active uniform already has a value (a
+        // zeroed default from PROGRAM_LINK if never set -- see
+        // op_program_link's doc comment), so there is no "unset" case
+        // to special-case here.
+        let mut uniform_gpu_buffers = Vec::with_capacity(uniform_bindings.len());
+        let mut bind_group_layout_entries = Vec::new();
+        let mut bind_group_slot_buffers: Vec<(u32, usize)> = Vec::new();
+        for (binding, value) in uniform_bindings.iter().zip(&uniform_values) {
+            let buf_index = uniform_gpu_buffers.len();
+            uniform_gpu_buffers.push(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("c3d programmable uniform buffer"),
+                contents: value,
+                usage: wgpu::BufferUsages::UNIFORM,
+            }));
+            for (slot, visibility) in [
+                (binding.vertex_binding, wgpu::ShaderStages::VERTEX),
+                (binding.fragment_binding, wgpu::ShaderStages::FRAGMENT),
+            ] {
+                let Some(slot) = slot else { continue };
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: slot,
+                    visibility,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                });
+                bind_group_slot_buffers.push((slot, buf_index));
+            }
+        }
+        let uniform_bind_group = if bind_group_layout_entries.is_empty() {
+            None
+        } else {
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d programmable uniform bind group layout"),
+                entries: &bind_group_layout_entries,
+            });
+            let entries: Vec<wgpu::BindGroupEntry> = bind_group_slot_buffers
+                .iter()
+                .map(|&(binding, idx)| wgpu::BindGroupEntry {
+                    binding,
+                    resource: uniform_gpu_buffers[idx].as_entire_binding(),
+                })
+                .collect();
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("c3d programmable uniform bind group"),
+                layout: &layout,
+                entries: &entries,
+            });
+            Some((layout, bind_group))
+        };
+
+        let bind_group_layouts: &[Option<&wgpu::BindGroupLayout>] = match &uniform_bind_group {
+            Some((layout, _)) => &[Some(layout)],
+            None => &[],
+        };
         let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("c3d programmable pipeline layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts,
             immediate_size: 0,
         });
 
@@ -5767,6 +6165,9 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
+            if let Some((_, bind_group)) = &uniform_bind_group {
+                pass.set_bind_group(0, bind_group, &[]);
+            }
             if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, def.width, def.height) {
                 pass.set_scissor_rect(x, y, sw, sh);
             }
@@ -10423,5 +10824,57 @@ mod tests {
             panic!("fragment shader failed to compile");
         };
         assert!(vertex_shader_inputs(&fs).is_empty());
+    }
+
+    #[test]
+    fn gl_type_byte_size_matches_naga_type_to_gl_enum_for_every_recognised_type() {
+        // Every type naga_type_to_gl_enum can produce must have a byte
+        // size -- draw_prog relies on this to zero-initialise every
+        // active uniform at link time with no "unknown size" gap.
+        for gl_type in [
+            GL_FLOAT,
+            GL_INT,
+            GL_FLOAT_VEC2,
+            GL_FLOAT_VEC3,
+            GL_FLOAT_VEC4,
+            GL_INT_VEC2,
+            GL_INT_VEC3,
+            GL_INT_VEC4,
+            GL_FLOAT_MAT2,
+            GL_FLOAT_MAT3,
+            GL_FLOAT_MAT4,
+        ] {
+            assert!(gl_type_byte_size(gl_type).is_some(), "{gl_type:#x}");
+        }
+        assert_eq!(gl_type_byte_size(GL_FLOAT_VEC4), Some(16));
+        assert_eq!(gl_type_byte_size(GL_FLOAT_MAT4), Some(64));
+    }
+
+    #[test]
+    fn compute_uniform_interface_merges_a_shared_name_across_both_stages() {
+        let glsl::CompileResult::Ok(vs) = glsl::compile(
+            "uniform float scale;\nattribute vec4 position;\nvoid main() { gl_Position = position * scale; }\n",
+            naga::ShaderStage::Vertex,
+        ) else {
+            panic!("vertex shader failed to compile");
+        };
+        let glsl::CompileResult::Ok(fs) = glsl::compile(
+            "precision mediump float;\nuniform float scale;\nuniform vec4 tint;\nvoid main() { gl_FragColor = tint * scale; }\n",
+            naga::ShaderStage::Fragment,
+        ) else {
+            panic!("fragment shader failed to compile");
+        };
+        let (entries, bindings) = compute_uniform_interface(&vs, &fs);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(bindings.len(), 2);
+
+        let scale = entries.iter().position(|e| e.name == "scale").unwrap();
+        assert!(bindings[scale].vertex_binding.is_some());
+        assert!(bindings[scale].fragment_binding.is_some());
+
+        let tint = entries.iter().position(|e| e.name == "tint").unwrap();
+        assert!(bindings[tint].vertex_binding.is_none());
+        assert!(bindings[tint].fragment_binding.is_some());
+        assert_eq!(entries[tint].gl_type, GL_FLOAT_VEC4);
     }
 }

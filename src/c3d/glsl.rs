@@ -71,6 +71,21 @@ use naga::ShaderStage;
 ///   silently misbehaving.
 /// - `texture2D(`/`textureCube(` -> `texture(`, GLSL ES 1.00's sampling
 ///   functions onto core GLSL's single overloaded name.
+/// - `uniform` -> `layout(binding = N) uniform`, `N` counting each
+///   occurrence in source order, starting at [`VERTEX_BINDING_BASE`] or
+///   [`FRAGMENT_BINDING_BASE`] depending on stage. Unlike attributes,
+///   naga's GLSL front end does not accept a plain `uniform` declaration
+///   *at all* without one -- confirmed directly: "uniform/buffer blocks
+///   require layout(binding=X)" is naga's own parse error for the
+///   unrewritten form. The two stages' ranges are kept disjoint
+///   (deliberately far apart, not just adjacent) because a vertex and a
+///   fragment shader compile independently, with no knowledge of which
+///   program they'll eventually be linked into -- by the time `PROGRAM_
+///   LINK` pairs them, their binding numbers are already baked into
+///   each compiled `naga::Module` and can't be renumbered, so same-stage
+///   numbering starting at `0` on both sides would collide the moment
+///   two shaders using any uniforms were linked into one program sharing
+///   one bind group.
 ///
 /// Rewriting is done with whole-word substitution (never inside identifiers
 /// like `attribute_foo`), which is sufficient because every substituted
@@ -79,6 +94,7 @@ use naga::ShaderStage;
 pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
     let mut out = strip_precision_statements(source);
     out = inject_attribute_locations(&out);
+    out = inject_uniform_bindings(&out, stage);
     out = replace_word(
         &out,
         "varying",
@@ -167,6 +183,45 @@ fn inject_attribute_locations(source: &str) -> String {
         out.push_str(&format!("layout(location = {next_location}) in"));
         next_location += 1;
         rest = &rest[at + "attribute".len()..];
+    }
+    out
+}
+
+/// Binding numbers assigned to a vertex shader's `uniform` declarations
+/// start here. See [`rewrite_to_core_profile`]'s doc comment.
+const VERTEX_BINDING_BASE: u32 = 0;
+/// Binding numbers assigned to a fragment shader's `uniform` declarations
+/// start here -- far enough past any plausible vertex-stage count that
+/// the two stages' ranges never collide once linked into one program's
+/// shared bind group, while staying safely under `wgpu`'s own
+/// `max_bindings_per_bind_group` limit (confirmed directly: `wgpu`
+/// rejects a bind group layout entry at binding index `1000` outright,
+/// "greater than the maximum number 1000" -- so this is not just "a
+/// generous-looking round number", it is close to the actual ceiling).
+/// `256` stays comfortably below both that ceiling and any plausible
+/// GLES2 vertex-stage uniform-variable count.
+const FRAGMENT_BINDING_BASE: u32 = 256;
+
+/// Replaces each `uniform` with `layout(binding = N) uniform` (keeping
+/// the word itself, unlike [`inject_attribute_locations`]'s `attribute`
+/// -> `in` substitution), `N` counting occurrences in source order from
+/// the stage's base. See [`rewrite_to_core_profile`]'s doc comment.
+fn inject_uniform_bindings(source: &str, stage: ShaderStage) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut next_binding = match stage {
+        ShaderStage::Vertex => VERTEX_BINDING_BASE,
+        _ => FRAGMENT_BINDING_BASE,
+    };
+    loop {
+        let Some(at) = find_word(rest, "uniform") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("layout(binding = {next_binding}) uniform"));
+        next_binding += 1;
+        rest = &rest[at + "uniform".len()..];
     }
     out
 }
@@ -334,6 +389,46 @@ mod tests {
             "layout(location = 0) in vec4 position;\n\
              layout(location = 1) in vec3 normal;\n\
              layout(location = 2) in vec2 uv;\n"
+        );
+    }
+
+    #[test]
+    fn uniforms_get_sequential_bindings_in_group_zero() {
+        let src = "uniform float scale;\nuniform vec4 tint;\nattribute vec4 position;\nvoid main() { gl_Position = position * scale * tint; }\n";
+        let result = compile(src, ShaderStage::Vertex);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let uniforms: Vec<_> = module
+            .global_variables
+            .iter()
+            .filter(|(_, gv)| gv.space == naga::AddressSpace::Uniform)
+            .map(|(_, gv)| (gv.name.clone(), gv.binding))
+            .collect();
+        assert_eq!(
+            uniforms,
+            vec![
+                (
+                    Some("scale".to_string()),
+                    Some(naga::ResourceBinding { group: 0, binding: 0 })
+                ),
+                (
+                    Some("tint".to_string()),
+                    Some(naga::ResourceBinding { group: 0, binding: 1 })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fragment_stage_uniforms_use_the_disjoint_binding_range() {
+        let out = inject_uniform_bindings("uniform vec4 a; uniform vec4 b;", ShaderStage::Fragment);
+        assert_eq!(
+            out,
+            format!(
+                "layout(binding = {FRAGMENT_BINDING_BASE}) uniform vec4 a; layout(binding = {}) uniform vec4 b;",
+                FRAGMENT_BINDING_BASE + 1
+            )
         );
     }
 

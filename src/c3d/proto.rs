@@ -304,6 +304,8 @@ pub const OP_PROGRAM_BIND_ATTRIB_LOCATION: u16 = 0x0908;
 pub const OP_PROGRAM_LINK: u16 = 0x0909;
 pub const OP_PROGRAM_VALIDATE: u16 = 0x090A;
 pub const OP_USE_PROGRAM: u16 = 0x090B;
+pub const OP_UNIFORM: u16 = 0x090C;
+pub const OP_UNIFORM_SAMPLER: u16 = 0x090D;
 
 // Buffers and vertex attributes (0x0Axx) -- `c3d-cmd-buffers-and-vertex-
 // attributes`, `CAP_PROGRAMMABLE`.
@@ -321,9 +323,10 @@ pub const OP_DRAW_ARRAYS_PROG: u16 = 0x0C00;
 pub const OP_DRAW_ELEMENTS_PROG: u16 = 0x0C01;
 
 // Programmable queries (0x0Dxx) -- `c3d-cmd-programmable-queries`,
-// `CAP_PROGRAMMABLE`. `PROGRAM_INTERFACE` (`0x0D02`) is not implemented yet.
+// `CAP_PROGRAMMABLE`.
 pub const OP_SHADER_STATUS: u16 = 0x0D00;
 pub const OP_PROGRAM_STATUS: u16 = 0x0D01;
+pub const OP_PROGRAM_INTERFACE: u16 = 0x0D02;
 
 // ---------------------------------------------------------------------
 // Protocol errors (`c3d-errors`'s "Protocol errors" table).
@@ -1148,6 +1151,22 @@ pub enum Command<'a> {
     UseProgram {
         program: u32,
     },
+    /// `UNIFORM`. `values` is the raw wire bytes (big-endian words) for
+    /// `count` repetitions of `type_`'s component layout -- interpreted
+    /// per-component as `f32` or `i32` downstream, where `type_` (an
+    /// unvalidated raw enumerant here, like any other) says which.
+    Uniform {
+        program: u32,
+        location: u32,
+        type_: u32,
+        count: u32,
+        values: &'a [u8],
+    },
+    UniformSampler {
+        program: u32,
+        location: u32,
+        unit: u32,
+    },
 
     // Buffers and vertex attributes (0x0Axx), `CAP_PROGRAMMABLE`. `type_`,
     // like other raw GL enumerants, is validated by `state`, not here.
@@ -1211,6 +1230,10 @@ pub enum Command<'a> {
         dest: Ref,
     },
     ProgramStatus {
+        program: u32,
+        dest: Ref,
+    },
+    ProgramInterface {
         program: u32,
         dest: Ref,
     },
