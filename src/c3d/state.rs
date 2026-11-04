@@ -2236,11 +2236,26 @@ impl State {
     }
 
     /// `TEX_DESTROY`: releases the object and unbinds it from every unit.
+    /// `TEX_DESTROY`: unbinds it from every unit, and -- matching
+    /// `RENDERBUFFER_DESTROY`'s identical rule, and real GL's "deleting
+    /// an attached object detaches it" behaviour -- detaches it from any
+    /// framebuffer colour attachment point that held it (the only kind a
+    /// texture can ever be attached to; see `FRAMEBUFFER_ATTACH_TEXTURE`).
+    /// Without this, `FRAMEBUFFER_STATUS` on a framebuffer whose
+    /// attached texture was just destroyed would read
+    /// `FRAMEBUFFER_INCOMPLETE_ATTACHMENT` (a dangling reference) rather
+    /// than the correct `FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT` (no
+    /// attachment at all).
     pub fn tex_destroy(&mut self, id: u32) {
         self.textures.remove(&id);
         for unit in &mut self.texture_units {
             if unit.bound_texture == id {
                 unit.bound_texture = 0;
+            }
+        }
+        for fb in self.framebuffers.values_mut() {
+            if matches!(fb.color0, Some(FramebufferAttachment::Texture { id: tex, .. }) if tex == id) {
+                fb.color0 = None;
             }
         }
     }
@@ -4372,6 +4387,24 @@ mod tests {
             .unwrap();
         s.renderbuffer_destroy(1);
         assert_eq!(s.framebuffer(1).unwrap().color0, None);
+    }
+
+    #[test]
+    fn destroying_an_attached_texture_detaches_it_and_leaves_the_framebuffer_missing_attachment() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.tex_create(1);
+        s.framebuffer_attach_texture(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1, 0)
+            .unwrap();
+        s.tex_destroy(1);
+        assert_eq!(s.framebuffer(1).unwrap().color0, None);
+        // Not GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT (a dangling
+        // reference) -- the attachment is cleanly gone.
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+        );
     }
 
     #[test]
