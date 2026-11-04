@@ -401,7 +401,7 @@ fn replay(
                     ));
                 }
 
-                let render_errors = renderer.execute(&ops, &entry.ctx.state, &mut mem);
+                let render_errors = renderer.execute(&ops, &mut mem);
                 for e in render_errors {
                     errors.push(format!("context {}: {e}", r.context));
                 }

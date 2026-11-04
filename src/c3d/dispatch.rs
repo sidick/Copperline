@@ -88,6 +88,33 @@ use serde::{Deserialize, Serialize};
 /// draw's per-call primitive/format/vertex data, an upload's pixel
 /// reference, a query's already-resolved result, a fence's id.
 ///
+/// ## Why some variants also carry a `State` snapshot
+///
+/// "A renderer reads [state] straight out of the `Context`" above needs
+/// one correction: for any op whose GPU effect actually depends on
+/// time-varying state (`Clear`, every `Draw`/`DrawArraysProg`/
+/// `DrawElementsProg`, `SurfaceUpload`/`SurfaceReadback`, `TexCopyImage`/
+/// `TexCopySubImage`, `ReadPixels`), reading `Context::state` live at
+/// *execute* time is wrong, not just an optimisation left on the table.
+/// `Context::submit` decodes and applies an entire ring submission
+/// before any of the `RenderOp`s it produced are executed (`execute` is
+/// a separate pass over the whole batch, by every caller today -- see
+/// `board.rs`'s doorbell and `c3d-trace.rs`'s replay loop) -- so a bare
+/// `&State` handed to `execute` reflects whatever the state happens to
+/// be at the *end* of that submission, not what it was when each
+/// individual command actually ran. A guest doing "bind framebuffer A,
+/// draw, bind framebuffer B, draw" or "set scissor, draw, clear
+/// scissor, draw" in one doorbell write would get both draws seeing
+/// framebuffer B, or both seeing no scissor -- silently wrong, not an
+/// error. These variants instead carry their own `State`, cloned in
+/// [`Context::apply`] at the exact moment the command is applied (every
+/// earlier command in the batch has already mutated `self.state` by
+/// then, and no later one has yet), exactly extending the pattern
+/// `Query`'s `result` and `FramebufferStatus`'s `status` already use for
+/// a single resolved value rather than a whole state snapshot. `State`
+/// is a plain `Clone`, and a clone per draw/clear/readback is
+/// negligible next to the GPU work it accompanies.
+///
 /// ## Borrowed vs. owned bulk data
 ///
 /// [`RenderOp::Draw`]'s inline vertices and array descriptors are borrowed
@@ -120,12 +147,15 @@ use serde::{Deserialize, Serialize};
 /// native conformance-trace runner `docs/internals/c3d.md`'s "Conformance"
 /// section describes) can simply drain `out` synchronously after each
 /// `submit` and never pay a copy at all.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RenderOp<'a> {
-    /// `CLEAR`. `mask` is `CLEAR_MASK_COLOR`/`CLEAR_MASK_DEPTH` as decoded;
-    /// the colour/depth values, and whether scissor/colour-mask apply, are
-    /// state the renderer reads from [`state::State::raster`].
-    Clear { mask: u32 },
+    /// `CLEAR`. `mask` is `CLEAR_MASK_COLOR`/`CLEAR_MASK_DEPTH`/
+    /// `CLEAR_MASK_STENCIL` as decoded; the colour/depth/stencil values,
+    /// and whether scissor/colour-mask apply, come from `state.raster`
+    /// -- a full [`state::State`] snapshot taken *at the moment this
+    /// command was applied* (see this type's doc comment on why every
+    /// op below that depends on time-varying state carries one).
+    Clear { mask: u32, state: State },
     /// `DRAW_INLINE(_WIN)`/`DRAW_ARRAYS(_WIN)`/`DRAW_ELEMENTS(_WIN)`.
     /// `window_space` distinguishes the `_WIN` opcodes (already-transformed
     /// vertices) from the GL-space ones, which is the one piece of
@@ -137,14 +167,15 @@ pub enum RenderOp<'a> {
         format: proto::VertexFormat,
         count: u32,
         vertices: DrawVertices<'a>,
+        state: State,
     },
     /// `SURFACE_UPLOAD`. Rectangle in surface pixels, already validated
     /// against the draw surface's bounds.
-    SurfaceUpload { x: u32, y: u32, w: u32, h: u32 },
+    SurfaceUpload { x: u32, y: u32, w: u32, h: u32, state: State },
     /// `SURFACE_READBACK`. See the [readback contract](
     /// https://docs.internals/c3d.md#c3d-readback) for when its effects
     /// must be visible.
-    SurfaceReadback { x: u32, y: u32, w: u32, h: u32 },
+    SurfaceReadback { x: u32, y: u32, w: u32, h: u32, state: State },
     /// `TEX_IMAGE`. Emitted only once [`state::State::define_tex_level`]
     /// has recorded the level's shape against an existing texture object.
     TexImage {
@@ -180,6 +211,7 @@ pub enum RenderOp<'a> {
         y: u32,
         width: u32,
         height: u32,
+        state: State,
     },
     /// `TEX_COPY_SUBIMAGE` (`glCopyTexSubImage2D`). Emitted only once this
     /// module has confirmed `id` has a level `level` already defined (its
@@ -194,6 +226,7 @@ pub enum RenderOp<'a> {
         y: u32,
         width: u32,
         height: u32,
+        state: State,
     },
     /// `TEX_PALETTE`. Emitted only once
     /// [`state::State::set_tex_palette`] has bound it against an existing
@@ -210,6 +243,7 @@ pub enum RenderOp<'a> {
         row_bytes: u32,
         flags: u32,
         dest: Ref,
+        state: State,
     },
     /// `QUERY`. `result` is resolved from [`state::State`] *at the moment
     /// this command was applied* -- matching `glGet*`'s immediate-read
@@ -283,21 +317,23 @@ pub enum RenderOp<'a> {
     // -- CAP_PROGRAMMABLE: programmable draw (0x0Cxx). Unlike the
     // fixed-function `Draw` op, these carry no vertex data at all --
     // everything they draw from (the current program, the enabled
-    // vertex-attribute slots, the bound draw surface) is `state` the
-    // renderer already receives in `execute`, exactly as `Clear` reads
-    // `state.raster` rather than being handed it. `E_NO_PROGRAM` is
-    // caught at dispatch time (`Context::apply`), so by the time either
-    // op reaches the renderer a current program is guaranteed to exist.
+    // vertex-attribute slots, the bound draw framebuffer) comes from
+    // their own `state` snapshot (see this type's doc comment on why).
+    // `E_NO_PROGRAM` is caught at dispatch time (`Context::apply`), so
+    // by the time either op reaches the renderer a current program is
+    // guaranteed to exist.
     DrawArraysProg {
         prim: state::PrimitiveType,
         first: u32,
         count: u32,
+        state: State,
     },
     DrawElementsProg {
         prim: state::PrimitiveType,
         count: u32,
         index_type: u32,
         index_ref: Ref,
+        state: State,
     },
 
     // -- CAP_PROGRAMMABLE: uniforms. Pushed unconditionally (no `state`
@@ -329,10 +365,12 @@ pub enum RenderOp<'a> {
     // CREATE`/`_DESTROY`, `BIND_FRAMEBUFFER`, `RENDERBUFFER_CREATE`/
     // `_DESTROY`/`_STORAGE_*` and the two `FRAMEBUFFER_ATTACH_*` opcodes
     // carry no ref and are pure `state.rs` mutations with no `RenderOp`
-    // at all -- only `FRAMEBUFFER_STATUS` needs the renderer, exactly
-    // like `SHADER_STATUS`/`PROGRAM_STATUS`, because writing its result
-    // to `dest` needs `mem` access this module doesn't have.
-    FramebufferStatus { target: state::FramebufferTarget, dest: Ref },
+    // at all -- only `FRAMEBUFFER_STATUS` needs the renderer, to write
+    // its result to `dest` (needs `mem` access this module doesn't
+    // have). `status` is resolved from `state` immediately, exactly
+    // like `Query`'s `result` -- completeness is pure state, so there is
+    // nothing a renderer needs to re-derive later.
+    FramebufferStatus { dest: Ref, status: u32 },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -784,18 +822,33 @@ impl Context {
             Command::SetDrawSurface { id } => self.state.set_draw_surface(id),
             Command::SurfaceUpload { x, y, w, h } => {
                 match self.state.check_draw_surface_rect(x as i32, y as i32, w, h) {
-                    Ok(()) => out.push(RenderOp::SurfaceUpload { x, y, w, h }),
+                    Ok(()) => out.push(RenderOp::SurfaceUpload {
+                        x,
+                        y,
+                        w,
+                        h,
+                        state: self.state.clone(),
+                    }),
                     Err(code) => self.latch_protocol_error(code, start),
                 }
             }
             Command::SurfaceReadback { x, y, w, h } => {
                 match self.state.check_draw_surface_rect(x as i32, y as i32, w, h) {
-                    Ok(()) => out.push(RenderOp::SurfaceReadback { x, y, w, h }),
+                    Ok(()) => out.push(RenderOp::SurfaceReadback {
+                        x,
+                        y,
+                        w,
+                        h,
+                        state: self.state.clone(),
+                    }),
                     Err(code) => self.latch_protocol_error(code, start),
                 }
             }
             Command::Clear { mask } => match self.state.require_draw_surface() {
-                Ok(_) => out.push(RenderOp::Clear { mask }),
+                Ok(_) => out.push(RenderOp::Clear {
+                    mask,
+                    state: self.state.clone(),
+                }),
                 Err(code) => self.latch_protocol_error(code, start),
             },
 
@@ -1146,6 +1199,7 @@ impl Context {
                         y,
                         width,
                         height,
+                        state: self.state.clone(),
                     });
                 }
             }
@@ -1181,6 +1235,7 @@ impl Context {
                         y,
                         width,
                         height,
+                        state: self.state.clone(),
                     });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
@@ -1324,6 +1379,7 @@ impl Context {
                         row_bytes,
                         flags,
                         dest,
+                        state: self.state.clone(),
                     }),
                     Err(code) => self.latch_protocol_error(code, start),
                 }
@@ -1519,7 +1575,13 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                out.push(RenderOp::FramebufferStatus { target, dest });
+                // Resolved immediately, like `Query` -- completeness is
+                // pure state, so there is no reason to make the renderer
+                // re-derive it later (and, before this would have been
+                // just as exposed to the same stale-state hazard as
+                // every other op below).
+                let status = self.state.framebuffer_status(target);
+                out.push(RenderOp::FramebufferStatus { dest, status });
             }
 
             // -- CAP_PROGRAMMABLE: programmable draw -----------------
@@ -1528,7 +1590,12 @@ impl Context {
                     return;
                 };
                 match self.state.require_current_program() {
-                    Ok(_) => out.push(RenderOp::DrawArraysProg { prim, first, count }),
+                    Ok(_) => out.push(RenderOp::DrawArraysProg {
+                        prim,
+                        first,
+                        count,
+                        state: self.state.clone(),
+                    }),
                     Err(code) => self.latch_protocol_error(code, start),
                 }
             }
@@ -1547,6 +1614,7 @@ impl Context {
                         count,
                         index_type,
                         index_ref,
+                        state: self.state.clone(),
                     }),
                     Err(code) => self.latch_protocol_error(code, start),
                 }
@@ -1608,6 +1676,7 @@ impl Context {
                 format,
                 count,
                 vertices,
+                state: self.state.clone(),
             }),
             Err(code) => self.latch_protocol_error(code, start),
         }
@@ -2072,8 +2141,9 @@ mod tests {
         assert_eq!(
             out,
             vec![RenderOp::FramebufferStatus {
-                target: state::FramebufferTarget::Both,
                 dest: Ref::decode(0, 0),
+                // The newly created framebuffer has no attachments yet.
+                status: state::GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT,
             }]
         );
     }
@@ -2477,22 +2547,29 @@ mod tests {
             clear2.clone(),
         ]);
         let mut out = Vec::new();
-        let total = (define.len()
-            + set.len()
-            + clear.len()
-            + bad_enable.len()
-            + bad_readback.len()
-            + clear2.len()) as u32;
+        // Submitted in two steps, not one, so each `RenderOp::Clear`'s
+        // expected `state` snapshot can be captured at the point it was
+        // actually produced -- `bad_enable` raises a pending `GL_ERROR`
+        // between the two `CLEAR`s, so their snapshots must legitimately
+        // differ (first: no pending error; second: one), not just their
+        // `mask`.
+        let before_bad_enable = (define.len() + set.len() + clear.len()) as u32;
+        ctx.submit(&ring, before_bad_enable, &config(), &mut out);
+        let clear1_state = ctx.state.clone();
+        let total = before_bad_enable + (bad_enable.len() + bad_readback.len() + clear2.len()) as u32;
         ctx.submit(&ring, total, &config(), &mut out);
+        let clear2_state = ctx.state.clone();
 
         assert_eq!(
             out,
             vec![
                 RenderOp::Clear {
-                    mask: CLEAR_MASK_COLOR
+                    mask: CLEAR_MASK_COLOR,
+                    state: clear1_state,
                 },
                 RenderOp::Clear {
-                    mask: CLEAR_MASK_DEPTH
+                    mask: CLEAR_MASK_DEPTH,
+                    state: clear2_state,
                 },
             ]
         );

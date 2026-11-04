@@ -1013,7 +1013,6 @@ impl C3dBoard {
             if let Some(renderer) =
                 Self::ensure_renderer(&mut self.renderer, &mut self.renderer_failed)
             {
-                let state = &self.contexts[n].ctx.state;
                 let mut mem = ApertureMemory {
                     aperture: &mut self.aperture,
                     pending_dma: &mut self.pending_dma,
@@ -1021,7 +1020,7 @@ impl C3dBoard {
                     guest_scratch: Vec::new(),
                     capture: capturing.then_some(&mut captured_blobs),
                 };
-                let errors = renderer.execute(&ops, state, &mut mem);
+                let errors = renderer.execute(&ops, &mut mem);
                 for e in &errors {
                     log::warn!("c3d: context {n}: render error: {e}");
                 }

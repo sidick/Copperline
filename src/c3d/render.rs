@@ -4195,42 +4195,38 @@ impl Renderer {
 
     // -- Op execution -------------------------------------------------
 
-    /// Executes every op in `ops` in order against `state`, using `mem` to
-    /// resolve refs and surface backing memory. Returns the errors any
-    /// individual op raised (an unimplemented op, a bad ref, ...);
-    /// execution continues past an error exactly like the spec's "skip"
-    /// error actions, since a conformance run wants to see every failure
-    /// in one pass rather than stopping at the first.
-    pub fn execute(
-        &mut self,
-        ops: &[RenderOp<'_>],
-        state: &State,
-        mem: &mut dyn Memory,
-    ) -> Vec<RenderError> {
+    /// Executes every op in `ops` in order, using `mem` to resolve refs
+    /// and surface backing memory. Returns the errors any individual op
+    /// raised (an unimplemented op, a bad ref, ...); execution continues
+    /// past an error exactly like the spec's "skip" error actions, since
+    /// a conformance run wants to see every failure in one pass rather
+    /// than stopping at the first.
+    ///
+    /// Takes no `state: &State` of its own: every op that needs one
+    /// carries its own snapshot (see [`RenderOp`]'s doc comment on why a
+    /// single state shared across the whole batch would be wrong, not
+    /// just redundant).
+    pub fn execute(&mut self, ops: &[RenderOp<'_>], mem: &mut dyn Memory) -> Vec<RenderError> {
         let mut errors = Vec::new();
         for op in ops {
-            if let Err(e) = self.execute_op(op, state, mem) {
+            if let Err(e) = self.execute_op(op, mem) {
                 errors.push(e);
             }
         }
         errors
     }
 
-    fn execute_op(
-        &mut self,
-        op: &RenderOp<'_>,
-        state: &State,
-        mem: &mut dyn Memory,
-    ) -> Result<(), RenderError> {
+    fn execute_op(&mut self, op: &RenderOp<'_>, mem: &mut dyn Memory) -> Result<(), RenderError> {
         match op {
             RenderOp::Fence { .. } => Ok(()), // no GPU work; the caller tracks completion
-            RenderOp::Clear { mask } => self.op_clear(*mask, state),
+            RenderOp::Clear { mask, state } => self.op_clear(*mask, state),
             RenderOp::Draw {
                 window_space,
                 prim,
                 format,
                 count,
                 vertices,
+                state,
             } => match (window_space, vertices) {
                 (true, DrawVertices::Inline(bytes)) => {
                     self.op_draw_inline_win(*prim, *format, *count, bytes, state)
@@ -4307,10 +4303,10 @@ impl Renderer {
             } => self.op_tex_subimage(
                 *id, *level, *x, *y, *width, *height, *format, *row_bytes, *data, mem,
             ),
-            RenderOp::SurfaceReadback { x, y, w, h } => {
+            RenderOp::SurfaceReadback { x, y, w, h, state } => {
                 self.op_surface_readback(*x, *y, *w, *h, state, mem)
             }
-            RenderOp::SurfaceUpload { x, y, w, h } => {
+            RenderOp::SurfaceUpload { x, y, w, h, state } => {
                 self.op_surface_upload(*x, *y, *w, *h, state, mem)
             }
             RenderOp::TexCopyImage {
@@ -4321,6 +4317,7 @@ impl Renderer {
                 y,
                 width,
                 height,
+                state,
             } => self.op_tex_copy_image(*id, *level, *x, *y, *width, *height, state),
             RenderOp::TexCopySubImage {
                 id,
@@ -4331,6 +4328,7 @@ impl Renderer {
                 y,
                 width,
                 height,
+                state,
             } => {
                 self.op_tex_copy_subimage(*id, *level, *xoff, *yoff, *x, *y, *width, *height, state)
             }
@@ -4346,6 +4344,7 @@ impl Renderer {
                 row_bytes,
                 flags,
                 dest,
+                state,
             } => self.op_read_pixels(
                 *x, *y, *w, *h, *format, *row_bytes, *flags, *dest, state, mem,
             ),
@@ -4380,14 +4379,18 @@ impl Renderer {
                 size,
                 data,
             } => self.op_buffer_subdata(*id, *offset, *size, *data, mem),
-            RenderOp::DrawArraysProg { prim, first, count } => {
-                self.op_draw_arrays_prog(*prim, *first, *count, state)
-            }
+            RenderOp::DrawArraysProg {
+                prim,
+                first,
+                count,
+                state,
+            } => self.op_draw_arrays_prog(*prim, *first, *count, state),
             RenderOp::DrawElementsProg {
                 prim,
                 count,
                 index_type,
                 index_ref,
+                state,
             } => self.op_draw_elements_prog(*prim, *count, *index_type, *index_ref, state, mem),
             RenderOp::Uniform {
                 program,
@@ -4400,8 +4403,8 @@ impl Renderer {
                 self.op_uniform_sampler(*program, *location, *unit)
             }
             RenderOp::ProgramInterface { program, dest } => self.op_program_interface(*program, *dest, mem),
-            RenderOp::FramebufferStatus { target, dest } => {
-                self.op_framebuffer_status(*target, *dest, state, mem)
+            RenderOp::FramebufferStatus { dest, status } => {
+                self.op_framebuffer_status(*dest, *status, mem)
             }
         }
     }
@@ -6179,17 +6182,11 @@ impl Renderer {
         Ok(())
     }
 
-    /// `FRAMEBUFFER_STATUS`: writes [`state::State::framebuffer_status`]'s
-    /// result (already computed from pure state, no GPU resource
+    /// `FRAMEBUFFER_STATUS`: writes `status` (already resolved from pure
+    /// state at dispatch time by [`dispatch::Context::apply`] -- see
+    /// [`RenderOp::FramebufferStatus`]'s doc comment -- no GPU resource
     /// involved) to `dest` as one `u32`.
-    fn op_framebuffer_status(
-        &mut self,
-        target: state::FramebufferTarget,
-        dest: Ref,
-        state: &State,
-        mem: &mut dyn Memory,
-    ) -> Result<(), RenderError> {
-        let status = state.framebuffer_status(target);
+    fn op_framebuffer_status(&mut self, dest: Ref, status: u32, mem: &mut dyn Memory) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &status.to_be_bytes()) {
             return Err(RenderError::BadMemory(format!("FRAMEBUFFER_STATUS write to {loc:?}")));
@@ -7811,8 +7808,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -7860,8 +7857,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -7874,8 +7871,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -7897,6 +7894,87 @@ mod tests {
                         [0, 0, 255, 255],
                         "({x}, {y}) should still be blue (outside scissor)"
                     );
+                }
+            }
+        }
+    }
+
+    /// Regression test for the bug `RenderOp`'s state-snapshot doc
+    /// comment explains: a `CLEAR` scissored to one rectangle, followed
+    /// in the *same* `Context::submit` call by `SCISSOR` changing the
+    /// rectangle and a second `CLEAR`, must apply each clear against the
+    /// scissor rect that was actually current when *that* clear ran --
+    /// not both against whatever `SCISSOR` happens to be set to by the
+    /// time the whole submission's `RenderOp`s are finally executed.
+    /// Before the fix, both clears would have seen the *second* scissor
+    /// rect (state is mutated eagerly during decode, while the ops
+    /// themselves are executed only after the whole submission has
+    /// finished decoding), painting the right half green twice and
+    /// leaving the left half at its untouched initial-clear colour
+    /// instead of red.
+    #[test]
+    fn two_differently_scissored_clears_in_one_submission_each_see_their_own_scissor() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        fn cmd(opcode: u16, payload_words: &[u32]) -> Vec<u8> {
+            let length = 1 + payload_words.len() as u32;
+            let mut bytes = ((opcode as u32) << 16 | length).to_be_bytes().to_vec();
+            for w in payload_words {
+                bytes.extend_from_slice(&w.to_be_bytes());
+            }
+            bytes
+        }
+        fn cmd_f32(opcode: u16, payload: &[f32]) -> Vec<u8> {
+            cmd(opcode, &payload.iter().map(|f| f.to_bits()).collect::<Vec<_>>())
+        }
+
+        const A8R8G8B8: u32 = 5;
+        let commands = [
+            cmd(
+                proto::OP_SURFACE_DEFINE,
+                &[1, 8, 8, 32, A8R8G8B8, 0, 0],
+            ),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]), // black background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_ENABLE, &[0x0C11]), // GL_SCISSOR_TEST
+            cmd(proto::OP_SCISSOR, &[0, 0, 4, 8]), // left half
+            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]), // red
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_SCISSOR, &[4, 0, 4, 8]), // right half
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 1.0, 0.0, 1.0]), // green
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0); // spare word: see RingCursor::new's own doc comment
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+
+        let mut mem = TestMemory::new(4096);
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let at = ((y * 8 + x) * 4) as usize;
+                let px = &pixels[at..at + 4];
+                if x < 4 {
+                    assert_eq!(px, [255, 0, 0, 255], "({x}, {y}) should be red (left scissor)");
+                } else {
+                    assert_eq!(px, [0, 255, 0, 255], "({x}, {y}) should be green (right scissor)");
                 }
             }
         }
@@ -7963,8 +8041,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_STENCIL,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors (background clear): {errs:?}");
@@ -7983,8 +8061,8 @@ mod tests {
                 count: 3,
                 window_space: true,
                 vertices: DrawVertices::Inline(&verts),
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors (write pass): {errs:?}");
@@ -8002,8 +8080,8 @@ mod tests {
                 count: 3,
                 window_space: true,
                 vertices: DrawVertices::Inline(&verts),
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors (test pass): {errs:?}");
@@ -8066,8 +8144,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8078,8 +8156,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8149,15 +8227,16 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::SurfaceReadback {
                     x: 3,
                     y: 2,
                     w: 2,
                     h: 2,
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8242,15 +8321,16 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::SurfaceUpload {
                     x: 3,
                     y: 2,
                     w: 2,
                     h: 2,
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8314,8 +8394,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8324,8 +8404,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8345,8 +8425,8 @@ mod tests {
                 row_bytes: 8,
                 flags: proto::READ_PIXELS_FLAG_ROWS_BOTTOM_UP,
                 dest,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8401,8 +8481,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_DEPTH,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8422,8 +8502,8 @@ mod tests {
                 row_bytes: 8,
                 flags: 0,
                 dest,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8484,6 +8564,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -8491,9 +8572,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8513,8 +8594,8 @@ mod tests {
                 row_bytes: 4,
                 flags: 0,
                 dest,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8575,8 +8656,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
             }],
-            state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8586,8 +8667,8 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
             }],
-            state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8629,8 +8710,8 @@ mod tests {
                 y: 8,
                 width: 16,
                 height: 8,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8684,8 +8765,8 @@ mod tests {
                 y: 0,
                 width: 16,
                 height: 8,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8709,8 +8790,8 @@ mod tests {
                 y: 8,
                 width: 16,
                 height: 8,
+            state: state.clone(),
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8742,7 +8823,6 @@ mod tests {
             }
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(65536);
         let level0 = [255u8, 0, 0, 255].repeat(4 * 4);
         let level1 = [0u8, 255, 0, 255].repeat(2 * 2);
@@ -8778,7 +8858,6 @@ mod tests {
                     },
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8816,7 +8895,6 @@ mod tests {
                     length: 64,
                 },
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8855,7 +8933,6 @@ mod tests {
             }
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(65536);
         let level0_old = [255u8, 0, 0, 255].repeat(4 * 4); // 4x4 red
         let level1 = [0u8, 255, 0, 255].repeat(2 * 2); // 2x2 green
@@ -8909,7 +8986,6 @@ mod tests {
                     },
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8938,7 +9014,6 @@ mod tests {
             }
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(65536);
         let level0 = [0u8, 0, 0, 255].repeat(4 * 4);
         let level1 = [0u8, 0, 0, 255].repeat(2 * 2);
@@ -8973,7 +9048,6 @@ mod tests {
                     },
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -8997,7 +9071,6 @@ mod tests {
                     length: 16,
                 },
             }],
-            &state,
             &mut mem,
         );
         assert_eq!(errs.len(), 1);
@@ -9023,7 +9096,6 @@ mod tests {
                     length: 16,
                 },
             }],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9077,6 +9149,7 @@ mod tests {
                     y: 0,
                     width: 16,
                     height: 8,
+                state: state.clone(),
                 },
                 // Level 1 of a 16x8 base texture is 8x4 (`mip_extent`) --
                 // copy from the blue bottom half at that size, a
@@ -9090,9 +9163,9 @@ mod tests {
                     y: 8,
                     width: 8,
                     height: 4,
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9132,7 +9205,6 @@ mod tests {
             }
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(65536);
 
         // Palette: index 0 = red, index 1 = green.
@@ -9165,7 +9237,6 @@ mod tests {
                     },
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9201,7 +9272,6 @@ mod tests {
             }
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(65536);
         mem.write(MemLoc::Aperture(0), &[0u8, 255, 0, 255]); // palette index 0 = green
         mem.write(MemLoc::Aperture(1024), &[0u8]); // one I8 texel: index/intensity 0
@@ -9240,7 +9310,6 @@ mod tests {
                     },
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9307,6 +9376,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR,
+                    state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -9314,9 +9384,9 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
                     },
                 ],
-                &state,
                 &mut mem,
             );
             assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9393,6 +9463,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -9400,9 +9471,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9499,6 +9570,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -9506,9 +9578,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9562,6 +9634,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -9569,9 +9642,9 @@ mod tests {
                     count: 3,
                     window_space: false,
                     vertices: DrawVertices::Inline(verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9740,6 +9813,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_DEPTH,
+                    state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -9747,9 +9821,9 @@ mod tests {
                         count: 3,
                         window_space: false,
                         vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
                     },
                 ],
-                &state,
                 &mut mem,
             );
             assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -9769,8 +9843,8 @@ mod tests {
                     row_bytes: 4,
                     flags: 0,
                     dest,
+                state: state.clone(),
                 }],
-                &state,
                 &mut mem,
             );
             assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10038,6 +10112,7 @@ mod tests {
                 },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -10045,9 +10120,9 @@ mod tests {
                     count: 3,
                     window_space: false,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10263,7 +10338,6 @@ mod tests {
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
 
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(256);
 
         // A vec4-shaped result (as CURRENT_COLOR/VIEWPORT/etc. all are),
@@ -10281,7 +10355,7 @@ mod tests {
             length: 16,
         };
 
-        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &state, &mut mem);
+        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
         let written = mem.aperture[16..32].to_vec();
@@ -10311,7 +10385,6 @@ mod tests {
             Err(e) => panic!("unexpected renderer error: {e}"),
         };
 
-        let state = State::new(state::Limits::default());
         let mut mem = TestMemory::new(256);
 
         let result = QueryResult {
@@ -10323,7 +10396,7 @@ mod tests {
             space: RefSpace::Aperture,
             length: 8,
         };
-        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &state, &mut mem);
+        let errs = renderer.execute(&[RenderOp::Query { dest, result }], &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
         assert_eq!(mem.aperture[0..8].to_vec(), 9.0f32.to_be_bytes().repeat(2));
     }
@@ -10382,6 +10455,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                    state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -10389,9 +10463,9 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
                     },
                 ],
-                &state,
                 &mut mem,
             );
             assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10468,6 +10542,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                    state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -10475,9 +10550,9 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
                     },
                 ],
-                &state,
                 &mut mem,
             );
             assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10570,6 +10645,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Lines,
@@ -10577,9 +10653,9 @@ mod tests {
                     count: 2,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10643,6 +10719,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -10650,9 +10727,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10783,6 +10860,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: true,
@@ -10790,9 +10868,9 @@ mod tests {
                     format,
                     count: 3,
                     vertices: DrawVertices::Arrays(&descriptors),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10877,6 +10955,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: true,
@@ -10894,9 +10973,9 @@ mod tests {
                         index_ref,
                         descriptors: &descriptors,
                     },
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10978,6 +11057,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: false,
@@ -10985,9 +11065,9 @@ mod tests {
                     format,
                     count: 3,
                     vertices: DrawVertices::Arrays(&descriptors),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -11073,6 +11153,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: false,
@@ -11090,9 +11171,9 @@ mod tests {
                         index_ref,
                         descriptors: &descriptors,
                     },
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -11226,6 +11307,7 @@ mod tests {
                 },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -11233,9 +11315,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -11399,6 +11481,7 @@ mod tests {
                 },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -11406,9 +11489,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -11508,6 +11591,7 @@ mod tests {
                 },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
+                state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -11515,9 +11599,9 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
+                state: state.clone(),
                 },
             ],
-            &state,
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
