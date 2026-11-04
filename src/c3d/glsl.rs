@@ -69,8 +69,28 @@ use naga::ShaderStage;
 ///   scope for this draft's single-colour-attachment framebuffer model and
 ///   is left unrewritten, so a shader using it fails to parse rather than
 ///   silently misbehaving.
-/// - `texture2D(`/`textureCube(` -> `texture(`, GLSL ES 1.00's sampling
-///   functions onto core GLSL's single overloaded name.
+/// - `uniform sampler2D <name>;`/`uniform samplerCube <name>;` -> a pair of
+///   declarations, `uniform texture2D <name>_tex;` and `uniform sampler
+///   <name>_samp;` (each getting its own binding number), and every call
+///   `texture2D(<name>, ...)`/`textureCube(<name>, ...)` -> `texture(
+///   sampler2D(<name>_tex, <name>_samp), ...)` (likewise for `samplerCube`).
+///   Confirmed directly: naga's GLSL front end has no representation for
+///   GLSL ES's combined sampler type at all -- parsing a bare `uniform
+///   sampler2D tex;` fails with `NotImplemented("variable qualifier")`,
+///   because naga's GLSL front end only understands the Vulkan-GLSL-style
+///   split between a `textureND` (a `TypeInner::Image`, no attached
+///   sampler) and a separate `sampler`/`samplerShadow` object, recombined
+///   at the call site via a constructor call naga recognises by name
+///   (`sampler2D(someTexture, someSampler)`, dispatched to its own
+///   `MacroCall::Sampler`) -- not by declaring a combined type up front.
+///   This rewrite produces exactly that split/recombine shape. GLES2 has no
+///   bare (sampler-less) texture object, so every `textureND(` call site
+///   necessarily names one of these rewritten uniforms -- there is nothing
+///   else it could be naming. Known gap: an array of samplers (`uniform
+///   sampler2D tex[4];`) is not handled -- the `[4]` suffix lands only on
+///   the synthesised `sampler` declaration, not the paired `textureND`
+///   one, which would miscompile. No GLES2 workload exercising this has
+///   come up yet; revisit if one does.
 /// - `uniform` -> `layout(binding = N) uniform`, `N` counting each
 ///   occurrence in source order, starting at [`VERTEX_BINDING_BASE`] or
 ///   [`FRAGMENT_BINDING_BASE`] depending on stage. Unlike attributes,
@@ -94,6 +114,8 @@ use naga::ShaderStage;
 pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
     let mut out = strip_precision_statements(source);
     out = inject_attribute_locations(&out);
+    out = rewrite_sampler_calls(&out, "texture2D", "sampler2D");
+    out = rewrite_sampler_calls(&out, "textureCube", "samplerCube");
     out = inject_uniform_bindings(&out, stage);
     out = replace_word(
         &out,
@@ -108,8 +130,6 @@ pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
             _ => "in",
         },
     );
-    out = replace_word(&out, "texture2D", "texture");
-    out = replace_word(&out, "textureCube", "texture");
     if stage == ShaderStage::Fragment && contains_word(&out, "gl_FragColor") {
         out = replace_word(&out, "gl_FragColor", "c3d_frag_color");
         // An explicit location is required here: unlike vertex attribute
@@ -187,6 +207,54 @@ fn inject_attribute_locations(source: &str) -> String {
     out
 }
 
+/// Rewrites every call `<fn_name>(<ident>, ...)` to `texture(<sampler_ctor>(
+/// <ident>_tex, <ident>_samp), ...)`. See [`rewrite_to_core_profile`]'s doc
+/// comment for why: GLES2's combined sampler uniforms are split into a
+/// bare `textureND` and a `sampler` by [`inject_uniform_bindings`], and
+/// naga only recombines them at the call site via this constructor-call
+/// form. The first argument is assumed to be a bare identifier (the
+/// uniform's name) -- GLES2 has no way to produce a sampler value other
+/// than naming a `uniform sampler2D`/`samplerCube` variable directly, so
+/// this always holds for valid input.
+fn rewrite_sampler_calls(source: &str, fn_name: &str, sampler_ctor: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    loop {
+        let Some(at) = find_word(rest, fn_name) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        let after_name = &rest[at + fn_name.len()..];
+        let after_name_trimmed = after_name.trim_start();
+        if !after_name_trimmed.starts_with('(') {
+            // Not actually a call (shouldn't happen for a GLES2 reserved
+            // function name); copy the name through unchanged and keep
+            // scanning past it so the loop can't spin forever.
+            out.push_str(fn_name);
+            rest = after_name;
+            continue;
+        }
+        let after_paren = after_name_trimmed[1..].trim_start();
+        let ident_len = after_paren
+            .as_bytes()
+            .iter()
+            .take_while(|&&c| is_ident_char(c))
+            .count();
+        let ident = &after_paren[..ident_len];
+        let remainder = &after_paren[ident_len..];
+        out.push_str("texture(");
+        out.push_str(sampler_ctor);
+        out.push('(');
+        out.push_str(ident);
+        out.push_str("_tex, ");
+        out.push_str(ident);
+        out.push_str("_samp)");
+        rest = remainder;
+    }
+    out
+}
+
 /// Binding numbers assigned to a vertex shader's `uniform` declarations
 /// start here. See [`rewrite_to_core_profile`]'s doc comment.
 const VERTEX_BINDING_BASE: u32 = 0;
@@ -219,9 +287,40 @@ fn inject_uniform_bindings(source: &str, stage: ShaderStage) -> String {
             break;
         };
         out.push_str(&rest[..at]);
-        out.push_str(&format!("layout(binding = {next_binding}) uniform"));
-        next_binding += 1;
-        rest = &rest[at + "uniform".len()..];
+        let after_uniform = &rest[at + "uniform".len()..];
+        let after_ws = after_uniform.trim_start();
+        let type_len = after_ws
+            .as_bytes()
+            .iter()
+            .take_while(|&&c| is_ident_char(c))
+            .count();
+        let type_name = &after_ws[..type_len];
+
+        let texture_type = match type_name {
+            "sampler2D" => Some("texture2D"),
+            "samplerCube" => Some("textureCube"),
+            _ => None,
+        };
+        if let Some(texture_type) = texture_type {
+            let after_type_ws = after_ws[type_len..].trim_start();
+            let name_len = after_type_ws
+                .as_bytes()
+                .iter()
+                .take_while(|&&c| is_ident_char(c))
+                .count();
+            let name = &after_type_ws[..name_len];
+            out.push_str(&format!(
+                "layout(binding = {next_binding}) uniform {texture_type} {name}_tex;\n\
+                 layout(binding = {}) uniform sampler {name}_samp",
+                next_binding + 1
+            ));
+            next_binding += 2;
+            rest = &after_type_ws[name_len..];
+        } else {
+            out.push_str(&format!("layout(binding = {next_binding}) uniform"));
+            next_binding += 1;
+            rest = after_uniform;
+        }
     }
     out
 }
@@ -338,6 +437,57 @@ mod tests {
     const FRAGMENT_SRC_OK: &str = "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n}\n";
     const FRAGMENT_SRC_BAD: &str =
         "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0\n}\n";
+
+    #[test]
+    fn compiles_a_sampler2d_uniform_through_the_full_pipeline() {
+        let src = "precision mediump float;\n\
+                   uniform sampler2D tex;\n\
+                   varying vec2 uv;\n\
+                   void main() {\n    gl_FragColor = texture2D(tex, uv);\n}\n";
+        let result = compile(src, ShaderStage::Fragment);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let names: Vec<_> = module
+            .global_variables
+            .iter()
+            .map(|(_, gv)| gv.name.clone().unwrap_or_default())
+            .collect();
+        assert!(names.contains(&"tex_tex".to_string()));
+        assert!(names.contains(&"tex_samp".to_string()));
+    }
+
+    #[test]
+    fn compiles_a_sampler_cube_uniform_through_the_full_pipeline() {
+        let src = "precision mediump float;\n\
+                   uniform samplerCube cube;\n\
+                   varying vec3 dir;\n\
+                   void main() {\n    gl_FragColor = textureCube(cube, dir);\n}\n";
+        let result = compile(src, ShaderStage::Fragment);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_sampler_uniform_and_a_plain_uniform_get_disjoint_bindings() {
+        // The sampler splits into two bindings; a following plain uniform
+        // must not collide with either half.
+        let src = "precision mediump float;\n\
+                   uniform sampler2D tex;\n\
+                   uniform vec4 tint;\n\
+                   varying vec2 uv;\n\
+                   void main() {\n    gl_FragColor = texture2D(tex, uv) * tint;\n}\n";
+        let result = compile(src, ShaderStage::Fragment);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let bindings: Vec<_> = module
+            .global_variables
+            .iter()
+            .filter_map(|(_, gv)| gv.binding.map(|b| b.binding))
+            .collect();
+        let unique: std::collections::BTreeSet<_> = bindings.iter().copied().collect();
+        assert_eq!(bindings.len(), unique.len(), "binding collision: {bindings:?}");
+    }
 
     #[test]
     fn an_unbound_attribute_gets_a_declaration_order_location() {

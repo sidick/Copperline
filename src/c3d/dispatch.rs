@@ -324,6 +324,15 @@ pub enum RenderOp<'a> {
     },
     /// `PROGRAM_INTERFACE`.
     ProgramInterface { program: u32, dest: Ref },
+
+    // -- CAP_PROGRAMMABLE: framebuffers and renderbuffers. `FRAMEBUFFER_
+    // CREATE`/`_DESTROY`, `BIND_FRAMEBUFFER`, `RENDERBUFFER_CREATE`/
+    // `_DESTROY`/`_STORAGE_*` and the two `FRAMEBUFFER_ATTACH_*` opcodes
+    // carry no ref and are pure `state.rs` mutations with no `RenderOp`
+    // at all -- only `FRAMEBUFFER_STATUS` needs the renderer, exactly
+    // like `SHADER_STATUS`/`PROGRAM_STATUS`, because writing its result
+    // to `dest` needs `mem` access this module doesn't have.
+    FramebufferStatus { target: state::FramebufferTarget, dest: Ref },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -633,7 +642,7 @@ impl Context {
                         None => self.latch_protocol_error(ErrorCode::BadRef, start),
                     }
                 }
-                Some(ring::Step::Command(cmd)) => self.apply(cmd, start, out),
+                Some(ring::Step::Command(cmd)) => self.apply(cmd, start, config, out),
                 Some(ring::Step::Error(err)) => self.latch_protocol_error(err.code, err.offset),
                 None => break,
             }
@@ -668,7 +677,7 @@ impl Context {
                 // produced here -- it always arrives via the `Step::Error`
                 // arm below instead, which already latches `call_start` and
                 // (being skip-class) loops on to the next command.
-                Some(ring::Step::Command(cmd)) => self.apply(cmd, call_start, out),
+                Some(ring::Step::Command(cmd)) => self.apply(cmd, call_start, config, out),
                 Some(ring::Step::Error(err)) => {
                     self.latch_protocol_error(err.code, call_start);
                     if err.halt {
@@ -730,7 +739,7 @@ impl Context {
     /// none). `start` is the command's ring offset, needed only for a
     /// [`state::State`]-detected protocol error (`ring.rs`'s own errors
     /// already carry their offset in [`ring::ProtoError`]).
-    fn apply<'a>(&mut self, cmd: Command<'a>, start: u32, out: &mut Vec<RenderOp<'a>>) {
+    fn apply<'a>(&mut self, cmd: Command<'a>, start: u32, config: &DeviceConfig, out: &mut Vec<RenderOp<'a>>) {
         match cmd {
             Command::Nop | Command::Flush | Command::Finish => {}
             Command::Fence { id } => out.push(RenderOp::Fence { id }),
@@ -794,12 +803,20 @@ impl Context {
                 let Some(cap) = self.decode_gl(state::Capability::from_gl(cap)) else {
                     return;
                 };
+                if cap == state::Capability::StencilTest && !config.programmable {
+                    self.state.raise_gl_error(GlError::InvalidEnum);
+                    return;
+                }
                 self.state.enable(cap);
             }
             Command::Disable { cap } => {
                 let Some(cap) = self.decode_gl(state::Capability::from_gl(cap)) else {
                     return;
                 };
+                if cap == state::Capability::StencilTest && !config.programmable {
+                    self.state.raise_gl_error(GlError::InvalidEnum);
+                    return;
+                }
                 self.state.disable(cap);
             }
             Command::BlendFunc { sfactor, dfactor } => {
@@ -903,6 +920,27 @@ impl Context {
                 self.state
                     .set_blend_func_separate(src_rgb, dst_rgb, src_a, dst_a);
             }
+            Command::StencilFunc {
+                func,
+                reference,
+                mask,
+            } => {
+                let Some(func) = self.decode_gl(state::StencilCompareFunc::from_gl(func)) else {
+                    return;
+                };
+                self.state.set_stencil_func(func, reference, mask);
+            }
+            Command::StencilOp { fail, zfail, zpass } => {
+                let fail = self.decode_gl(state::StencilOp::from_gl(fail));
+                let zfail = self.decode_gl(state::StencilOp::from_gl(zfail));
+                let zpass = self.decode_gl(state::StencilOp::from_gl(zpass));
+                let (Some(fail), Some(zfail), Some(zpass)) = (fail, zfail, zpass) else {
+                    return;
+                };
+                self.state.set_stencil_op(fail, zfail, zpass);
+            }
+            Command::StencilMask { mask } => self.state.set_stencil_mask(mask),
+            Command::ClearStencil { value } => self.state.set_clear_stencil(value),
 
             Command::MatrixMode { mode } => {
                 let Some(m) = self.decode_gl(state::MatrixMode::from_gl(mode)) else {
@@ -1414,6 +1452,76 @@ impl Context {
                 self.state.vertex_attrib_constant(index, [x, y, z, w])
             }
 
+            // -- CAP_PROGRAMMABLE: framebuffers and renderbuffers ----
+            Command::FramebufferCreate { id } => self.state.framebuffer_create(id),
+            Command::FramebufferDestroy { id } => self.state.framebuffer_destroy(id),
+            Command::BindFramebuffer { target, id } => {
+                if let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) {
+                    self.state.bind_framebuffer(target, id);
+                }
+            }
+            Command::RenderbufferCreate { id } => self.state.renderbuffer_create(id),
+            Command::RenderbufferDestroy { id } => self.state.renderbuffer_destroy(id),
+            Command::RenderbufferStorageColor {
+                id,
+                width,
+                height,
+                format,
+            } => {
+                let Some(format) = self.decode_gl(state::SurfaceFormat::from_wire(format)) else {
+                    return;
+                };
+                self.state.renderbuffer_storage_color(id, width, height, format);
+            }
+            Command::RenderbufferStorageDepthStencil { id, width, height } => {
+                self.state.renderbuffer_storage_depth_stencil(id, width, height);
+            }
+            Command::FramebufferAttachRenderbuffer {
+                target,
+                attachment,
+                renderbuffer,
+            } => {
+                let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
+                    return;
+                };
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                else {
+                    return;
+                };
+                if let Err(code) = self
+                    .state
+                    .framebuffer_attach_renderbuffer(target, attachment, renderbuffer)
+                {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::FramebufferAttachTexture {
+                target,
+                attachment,
+                texture,
+                level,
+            } => {
+                let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
+                    return;
+                };
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                else {
+                    return;
+                };
+                if let Err(code) = self
+                    .state
+                    .framebuffer_attach_texture(target, attachment, texture, level)
+                {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::FramebufferStatus { target, dest } => {
+                let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
+                    return;
+                };
+                out.push(RenderOp::FramebufferStatus { target, dest });
+            }
+
             // -- CAP_PROGRAMMABLE: programmable draw -----------------
             Command::DrawArraysProg { prim, first, count } => {
                 let Some(prim) = self.decode_gl(state::PrimitiveType::from_gl(prim)) else {
@@ -1868,6 +1976,116 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
         assert!(ctx.state.vertex_attrib(0).unwrap().pointer.is_none());
+    }
+
+    #[test]
+    fn enable_stencil_test_without_programmable_raises_gl_invalid_enum() {
+        let mut ctx = context();
+        let mut cfg = config();
+        cfg.programmable = false;
+        let ring = ring_of(&[cmd(OP_ENABLE, &[0x0B90])]); // GL_STENCIL_TEST
+        let mut out = Vec::new();
+        ctx.submit(&ring, 8, &cfg, &mut out);
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
+        assert!(!ctx.state.is_enabled(state::Capability::StencilTest));
+    }
+
+    #[test]
+    fn enable_stencil_test_with_programmable_actually_enables_it() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_ENABLE, &[0x0B90])]); // GL_STENCIL_TEST
+        let mut out = Vec::new();
+        ctx.submit(&ring, 8, &config(), &mut out);
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR);
+        assert!(ctx.state.is_enabled(state::Capability::StencilTest));
+    }
+
+    #[test]
+    fn stencil_func_op_mask_and_clear_stencil_mutate_raster_state() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_STENCIL_FUNC, &[0x0207, 2, 0xAA]), // GL_ALWAYS
+            cmd(OP_STENCIL_OP, &[0x1E01, 0x1E01, 0x1E02]), // REPLACE, REPLACE, INCR
+            cmd(OP_STENCIL_MASK, &[0x0F]),
+            cmd(OP_CLEAR_STENCIL, &[7]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR);
+        assert_eq!(ctx.state.raster.stencil_func, state::StencilCompareFunc::Always);
+        assert_eq!(ctx.state.raster.stencil_ref, 2);
+        assert_eq!(ctx.state.raster.stencil_read_mask, 0xAA);
+        assert_eq!(ctx.state.raster.stencil_fail_op, state::StencilOp::Replace);
+        assert_eq!(ctx.state.raster.stencil_zfail_op, state::StencilOp::Replace);
+        assert_eq!(ctx.state.raster.stencil_zpass_op, state::StencilOp::Incr);
+        assert_eq!(ctx.state.raster.stencil_write_mask, 0x0F);
+        assert_eq!(ctx.state.raster.clear_stencil, 7);
+    }
+
+    #[test]
+    fn framebuffer_attach_renderbuffer_to_the_default_framebuffer_is_e_bad_id() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(OP_RENDERBUFFER_STORAGE_COLOR, &[1, 64, 64, 5]),
+            cmd(OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[0x8D40, 0x8CE0, 1]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, ErrorCode::BadId as u32);
+    }
+
+    #[test]
+    fn framebuffer_attach_renderbuffer_with_a_storage_kind_mismatch_is_e_bad_arg() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(OP_BIND_FRAMEBUFFER, &[0x8D40, 1]),
+            cmd(OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL, &[1, 64, 64]),
+            cmd(OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[0x8D40, 0x8CE0, 1]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, ErrorCode::BadArg as u32);
+    }
+
+    #[test]
+    fn framebuffer_status_pushes_a_render_op_once_target_decodes() {
+        let mut ctx = context();
+        let commands = [
+            cmd(OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(OP_BIND_FRAMEBUFFER, &[0x8D40, 1]),
+            cmd(OP_FRAMEBUFFER_STATUS, &[0x8D40, 0, 0]),
+        ];
+        let total: u32 = commands.iter().map(|c| c.len() as u32).sum();
+        let ring = ring_of(&commands);
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, 0);
+        assert_eq!(
+            out,
+            vec![RenderOp::FramebufferStatus {
+                target: state::FramebufferTarget::Both,
+                dest: Ref::decode(0, 0),
+            }]
+        );
+    }
+
+    #[test]
+    fn bind_framebuffer_with_an_unrecognised_target_raises_gl_invalid_enum() {
+        let mut ctx = context();
+        let ring = ring_of(&[cmd(OP_BIND_FRAMEBUFFER, &[0xDEAD, 0])]);
+        let mut out = Vec::new();
+        ctx.submit(&ring, 12, &config(), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
     }
 
     #[test]

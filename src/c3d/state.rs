@@ -211,6 +211,22 @@ gl_enum! {
 pub type DepthFunc = CompareFunc;
 /// `ALPHA_FUNC`'s argument type; see [`DepthFunc`].
 pub type AlphaFunc = CompareFunc;
+/// `STENCIL_FUNC`'s `func` argument; see [`DepthFunc`]. `CAP_PROGRAMMABLE`.
+pub type StencilCompareFunc = CompareFunc;
+
+gl_enum! {
+    /// `STENCIL_OP`'s `fail`/`zfail`/`zpass` arguments, `CAP_PROGRAMMABLE`.
+    StencilOp {
+        Zero = 0x0000,     // GL_ZERO
+        Keep = 0x1E00,     // GL_KEEP
+        Replace = 0x1E01,  // GL_REPLACE
+        Incr = 0x1E02,     // GL_INCR
+        Decr = 0x1E03,     // GL_DECR
+        Invert = 0x150A,   // GL_INVERT
+        IncrWrap = 0x8507, // GL_INCR_WRAP
+        DecrWrap = 0x8508, // GL_DECR_WRAP
+    }
+}
 
 gl_enum! {
     /// `CULL_FACE` mode, and the `face` argument of `MATERIAL`,
@@ -473,14 +489,19 @@ pub enum Capability {
     ClipPlane(ClipPlaneId),
     TextureGenS,
     TextureGenT,
+    /// `GL_STENCIL_TEST`. Decodes unconditionally here -- whether it is
+    /// actually legal (`CAP_PROGRAMMABLE`) is a capability check
+    /// `dispatch.rs`'s `Command::Enable`/`Disable` arms make with the
+    /// `DeviceConfig` this module has no access to, exactly like every
+    /// other capability-gated opcode group; this type only decodes the
+    /// wire enumerant.
+    StencilTest,
 }
 
 impl Capability {
-    /// Decode `cap` as a Khronos OpenGL registry enumerant. `None` covers
-    /// both a genuinely unknown enumerant and a legal-but-unsupported one
-    /// such as `GL_STENCIL_TEST` (there is no stencil buffer in this
-    /// protocol version) -- both are `GL_INVALID_ENUM` per the spec, so
-    /// the caller need not distinguish them.
+    /// Decode `cap` as a Khronos OpenGL registry enumerant. `None`
+    /// covers a genuinely unknown enumerant -- `GL_INVALID_ENUM` per the
+    /// spec.
     pub fn from_gl(cap: u32) -> Option<Self> {
         Some(match cap {
             0x0BC0 => Capability::AlphaTest,         // GL_ALPHA_TEST
@@ -498,6 +519,7 @@ impl Capability {
             0x803A => Capability::RescaleNormal,     // GL_RESCALE_NORMAL
             0x0C60 => Capability::TextureGenS,       // GL_TEXTURE_GEN_S
             0x0C61 => Capability::TextureGenT,       // GL_TEXTURE_GEN_T
+            0x0B90 => Capability::StencilTest,       // GL_STENCIL_TEST
             v @ 0x4000..=0x4007 => Capability::Light(LightId::from_gl(v)?),
             v @ 0x3000..=0x3005 => Capability::ClipPlane(ClipPlaneId::from_gl(v)?),
             _ => return None,
@@ -1002,6 +1024,8 @@ pub struct Enables {
     pub texture_gen_s: Vec<bool>,
     /// Per texture unit.
     pub texture_gen_t: Vec<bool>,
+    /// `STENCIL_TEST`, `CAP_PROGRAMMABLE`.
+    pub stencil_test: bool,
 }
 
 impl Enables {
@@ -1024,6 +1048,7 @@ impl Enables {
             texture_2d: vec![false; texture_units],
             texture_gen_s: vec![false; texture_units],
             texture_gen_t: vec![false; texture_units],
+            stencil_test: false,
         }
     }
 }
@@ -1093,6 +1118,22 @@ pub struct RasterState {
     pub point_size: f32,
     pub polygon_mode_front: PolygonMode,
     pub polygon_mode_back: PolygonMode,
+    /// `STENCIL_FUNC`'s `func`, `CAP_PROGRAMMABLE`. Applies to both
+    /// faces; there is no separate front/back stencil func in version 1.
+    pub stencil_func: StencilCompareFunc,
+    /// `STENCIL_FUNC`'s `ref`.
+    pub stencil_ref: u32,
+    /// `STENCIL_FUNC`'s `mask` (the comparison read mask).
+    pub stencil_read_mask: u32,
+    /// `STENCIL_OP`'s `fail`/`zfail`/`zpass`.
+    pub stencil_fail_op: StencilOp,
+    pub stencil_zfail_op: StencilOp,
+    pub stencil_zpass_op: StencilOp,
+    /// `STENCIL_MASK`: the write mask applied to every stencil-buffer
+    /// write, including `CLEAR`.
+    pub stencil_write_mask: u32,
+    /// `CLEAR_STENCIL`.
+    pub clear_stencil: u32,
 }
 
 impl Default for RasterState {
@@ -1138,6 +1179,17 @@ impl Default for RasterState {
             point_size: 1.0,
             polygon_mode_front: PolygonMode::Fill,
             polygon_mode_back: PolygonMode::Fill,
+            // GL's own stencil defaults: always pass, reference 0, every
+            // bit of both masks set, every op KEEP (a no-op test that
+            // never writes until a guest actually configures it).
+            stencil_func: StencilCompareFunc::Always,
+            stencil_ref: 0,
+            stencil_read_mask: 0xFFFF_FFFF,
+            stencil_fail_op: StencilOp::Keep,
+            stencil_zfail_op: StencilOp::Keep,
+            stencil_zpass_op: StencilOp::Keep,
+            stencil_write_mask: 0xFFFF_FFFF,
+            clear_stencil: 0,
         }
     }
 }
@@ -1497,6 +1549,93 @@ impl Default for VertexAttrib {
 }
 
 // ---------------------------------------------------------------------
+// Framebuffers and renderbuffers (CAP_PROGRAMMABLE, docs/internals/
+// c3d.md's "Framebuffers and renderbuffers"). Unlike a buffer object, a
+// renderbuffer's storage shape (colour width/height/format, or
+// depth/stencil width/height) is fully protocol-visible -- it is what
+// `FRAMEBUFFER_STATUS`'s completeness check validates against -- so it
+// lives here in full, not just as an existence marker. The actual GPU
+// storage (and a render-to-texture attachment's GPU texture) lives in
+// `render.rs`, exactly like a texture's pixel data never reaching this
+// module.
+// ---------------------------------------------------------------------
+
+gl_enum! {
+    /// `BIND_FRAMEBUFFER`/`FRAMEBUFFER_ATTACH_RENDERBUFFER`/
+    /// `FRAMEBUFFER_ATTACH_TEXTURE`/`FRAMEBUFFER_STATUS`'s `target`.
+    FramebufferTarget {
+        Both = 0x8D40, // GL_FRAMEBUFFER
+        Read = 0x8CA8, // GL_READ_FRAMEBUFFER
+        Draw = 0x8CA9, // GL_DRAW_FRAMEBUFFER
+    }
+}
+
+gl_enum! {
+    /// `FRAMEBUFFER_ATTACH_RENDERBUFFER`/`FRAMEBUFFER_ATTACH_TEXTURE`'s
+    /// `attachment`. Only `COLOR_ATTACHMENT0` exists: `MAX_COLOR_
+    /// ATTACHMENTS` is `1` (see `board.rs`'s register), so every higher
+    /// `COLOR_ATTACHMENTn` the spec's numbering reserves is simply never
+    /// a valid value yet -- `GL_INVALID_ENUM`, the same outcome a
+    /// genuinely unknown enumerant gets.
+    FramebufferAttachmentPoint {
+        Color0 = 0x8CE0,       // GL_COLOR_ATTACHMENT0
+        DepthStencil = 0x821A, // GL_DEPTH_STENCIL_ATTACHMENT
+    }
+}
+
+/// `FRAMEBUFFER_STATUS`'s result enumerants (`docs/internals/c3d.md`'s
+/// `0x0B09`).
+pub const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+pub const GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: u32 = 0x8CD6;
+pub const GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: u32 = 0x8CD7;
+pub const GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS: u32 = 0x8CD9;
+pub const GL_FRAMEBUFFER_UNSUPPORTED: u32 = 0x8CDD;
+
+/// One renderbuffer object's allocated storage (`RENDERBUFFER_STORAGE_
+/// COLOR`/`RENDERBUFFER_STORAGE_DEPTH_STENCIL`). `None` until either is
+/// called, per `RENDERBUFFER_CREATE`'s "creates an empty renderbuffer
+/// object".
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderbufferStorage {
+    /// Backed exactly like a [`Surface`]'s colour storage -- see this
+    /// section's module doc comment.
+    Color {
+        width: u32,
+        height: u32,
+        format: SurfaceFormat,
+    },
+    /// 24-bit depth, 8-bit stencil, implementation-packed; there is no
+    /// separate depth-only or stencil-only renderbuffer kind in version 1.
+    DepthStencil {
+        width: u32,
+        height: u32,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Renderbuffer {
+    pub storage: Option<RenderbufferStorage>,
+}
+
+/// What a framebuffer attachment point names: a renderbuffer, or (colour
+/// only, in version 1) a texture's mip level.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FramebufferAttachment {
+    Renderbuffer(u32),
+    Texture { id: u32, level: u32 },
+}
+
+/// One framebuffer object's attachment points (`docs/internals/c3d.md`'s
+/// "Framebuffers and renderbuffers"). `color0` is the only colour
+/// attachment point that exists while `MAX_COLOR_ATTACHMENTS` is `1` --
+/// see [`FramebufferAttachmentPoint`]'s doc comment.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Framebuffer {
+    pub color0: Option<FramebufferAttachment>,
+    pub depth_stencil: Option<FramebufferAttachment>,
+}
+
+// ---------------------------------------------------------------------
 // The context state machine
 // ---------------------------------------------------------------------
 
@@ -1543,6 +1682,11 @@ pub struct State {
     buffers: BTreeSet<u32>,
     vertex_attribs: Vec<VertexAttrib>,
 
+    framebuffers: BTreeMap<u32, Framebuffer>,
+    renderbuffers: BTreeMap<u32, Renderbuffer>,
+    draw_framebuffer: u32,
+    read_framebuffer: u32,
+
     pending_gl_error: Option<GlError>,
 }
 
@@ -1577,6 +1721,10 @@ impl State {
             current_program: 0,
             buffers: BTreeSet::new(),
             vertex_attribs: (0..limits.max_vertex_attribs).map(|_| VertexAttrib::default()).collect(),
+            framebuffers: BTreeMap::new(),
+            renderbuffers: BTreeMap::new(),
+            draw_framebuffer: 0,
+            read_framebuffer: 0,
             pending_gl_error: None,
         }
     }
@@ -1644,6 +1792,7 @@ impl State {
             Capability::Texture2D => self.per_unit_flag(&self.enables.texture_2d),
             Capability::TextureGenS => self.per_unit_flag(&self.enables.texture_gen_s),
             Capability::TextureGenT => self.per_unit_flag(&self.enables.texture_gen_t),
+            Capability::StencilTest => self.enables.stencil_test,
         }
     }
 
@@ -1679,6 +1828,7 @@ impl State {
                     *f = value;
                 }
             }
+            Capability::StencilTest => self.enables.stencil_test = value,
             Capability::Texture2D => {
                 if let Some(f) = self.enables.texture_2d.get_mut(unit) {
                     *f = value;
@@ -1736,6 +1886,30 @@ impl State {
     pub fn set_alpha_func(&mut self, func: AlphaFunc, reference: f32) {
         self.raster.alpha_func = func;
         self.raster.alpha_ref = reference;
+    }
+
+    /// `STENCIL_FUNC`, `CAP_PROGRAMMABLE`.
+    pub fn set_stencil_func(&mut self, func: StencilCompareFunc, reference: u32, mask: u32) {
+        self.raster.stencil_func = func;
+        self.raster.stencil_ref = reference;
+        self.raster.stencil_read_mask = mask;
+    }
+
+    /// `STENCIL_OP`, `CAP_PROGRAMMABLE`.
+    pub fn set_stencil_op(&mut self, fail: StencilOp, zfail: StencilOp, zpass: StencilOp) {
+        self.raster.stencil_fail_op = fail;
+        self.raster.stencil_zfail_op = zfail;
+        self.raster.stencil_zpass_op = zpass;
+    }
+
+    /// `STENCIL_MASK`, `CAP_PROGRAMMABLE`.
+    pub fn set_stencil_mask(&mut self, mask: u32) {
+        self.raster.stencil_write_mask = mask;
+    }
+
+    /// `CLEAR_STENCIL`, `CAP_PROGRAMMABLE`.
+    pub fn set_clear_stencil(&mut self, value: u32) {
+        self.raster.clear_stencil = value;
     }
 
     pub fn set_cull_face(&mut self, mode: Face) {
@@ -2405,6 +2579,205 @@ impl State {
         }
     }
 
+    // -- Framebuffers and renderbuffers (CAP_PROGRAMMABLE) ---------------
+
+    pub fn framebuffer(&self, id: u32) -> Option<&Framebuffer> {
+        self.framebuffers.get(&id)
+    }
+
+    pub fn renderbuffer(&self, id: u32) -> Option<&Renderbuffer> {
+        self.renderbuffers.get(&id)
+    }
+
+    /// The default framebuffer (`0`) is always complete -- a draw/clear
+    /// against it has always targeted the current draw surface directly,
+    /// outside this object model entirely.
+    pub fn draw_framebuffer(&self) -> u32 {
+        self.draw_framebuffer
+    }
+
+    pub fn read_framebuffer(&self) -> u32 {
+        self.read_framebuffer
+    }
+
+    fn framebuffer_binding(&self, target: FramebufferTarget) -> u32 {
+        match target {
+            FramebufferTarget::Both | FramebufferTarget::Draw => self.draw_framebuffer,
+            FramebufferTarget::Read => self.read_framebuffer,
+        }
+    }
+
+    /// `FRAMEBUFFER_CREATE`: creates an object with no attachments, or
+    /// resets an existing one to that state, mirroring `tex_create`'s
+    /// "creating an existing ID discards" behaviour.
+    pub fn framebuffer_create(&mut self, id: u32) {
+        self.framebuffers.insert(id, Framebuffer::default());
+    }
+
+    /// `FRAMEBUFFER_DESTROY`: if it is the bound draw/read framebuffer,
+    /// that binding becomes `0`, per the spec.
+    pub fn framebuffer_destroy(&mut self, id: u32) {
+        self.framebuffers.remove(&id);
+        if self.draw_framebuffer == id {
+            self.draw_framebuffer = 0;
+        }
+        if self.read_framebuffer == id {
+            self.read_framebuffer = 0;
+        }
+    }
+
+    /// `BIND_FRAMEBUFFER`. A no-op (leaving the previous binding in
+    /// place) if `id` is nonzero and unknown -- `ring.rs`'s `check_id_or_
+    /// none` against `MAX_FRAMEBUFFERS` already rejects anything above
+    /// the limit, but a mid-range id that was never created is not a
+    /// protocol error either, matching `tex_bind`'s identical fallback.
+    pub fn bind_framebuffer(&mut self, target: FramebufferTarget, id: u32) {
+        if id != 0 && !self.framebuffers.contains_key(&id) {
+            return;
+        }
+        match target {
+            FramebufferTarget::Both => {
+                self.draw_framebuffer = id;
+                self.read_framebuffer = id;
+            }
+            FramebufferTarget::Draw => self.draw_framebuffer = id,
+            FramebufferTarget::Read => self.read_framebuffer = id,
+        }
+    }
+
+    pub fn renderbuffer_create(&mut self, id: u32) {
+        self.renderbuffers.insert(id, Renderbuffer::default());
+    }
+
+    /// `RENDERBUFFER_DESTROY`: detaches it from every framebuffer
+    /// attachment point that held it, per the spec.
+    pub fn renderbuffer_destroy(&mut self, id: u32) {
+        self.renderbuffers.remove(&id);
+        let target = FramebufferAttachment::Renderbuffer(id);
+        for fb in self.framebuffers.values_mut() {
+            if fb.color0 == Some(target) {
+                fb.color0 = None;
+            }
+            if fb.depth_stencil == Some(target) {
+                fb.depth_stencil = None;
+            }
+        }
+    }
+
+    pub fn renderbuffer_storage_color(&mut self, id: u32, width: u32, height: u32, format: SurfaceFormat) {
+        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+            rb.storage = Some(RenderbufferStorage::Color { width, height, format });
+        }
+    }
+
+    pub fn renderbuffer_storage_depth_stencil(&mut self, id: u32, width: u32, height: u32) {
+        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height });
+        }
+    }
+
+    /// `FRAMEBUFFER_ATTACH_RENDERBUFFER`. `E_BAD_ID` against the default
+    /// framebuffer (its storage is the draw surface, not an attachment
+    /// list); `E_BAD_ARG` if `renderbuffer`'s allocated storage kind
+    /// doesn't match `attachment`'s (or it has none allocated yet).
+    pub fn framebuffer_attach_renderbuffer(
+        &mut self,
+        target: FramebufferTarget,
+        attachment: FramebufferAttachmentPoint,
+        renderbuffer: u32,
+    ) -> Result<(), ErrorCode> {
+        let fb_id = self.framebuffer_binding(target);
+        if fb_id == 0 {
+            return Err(ErrorCode::BadId);
+        }
+        if renderbuffer != 0 {
+            let storage = self.renderbuffers.get(&renderbuffer).and_then(|rb| rb.storage);
+            let matches = matches!(
+                (attachment, storage),
+                (FramebufferAttachmentPoint::Color0, Some(RenderbufferStorage::Color { .. }))
+                    | (FramebufferAttachmentPoint::DepthStencil, Some(RenderbufferStorage::DepthStencil { .. }))
+            );
+            if !matches {
+                return Err(ErrorCode::BadArg);
+            }
+        }
+        let Some(fb) = self.framebuffers.get_mut(&fb_id) else {
+            return Ok(());
+        };
+        let value = (renderbuffer != 0).then_some(FramebufferAttachment::Renderbuffer(renderbuffer));
+        match attachment {
+            FramebufferAttachmentPoint::Color0 => fb.color0 = value,
+            FramebufferAttachmentPoint::DepthStencil => fb.depth_stencil = value,
+        }
+        Ok(())
+    }
+
+    /// `FRAMEBUFFER_ATTACH_TEXTURE`. As above, but only a colour
+    /// attachment point accepts a texture in version 1 (`E_BAD_ARG`
+    /// otherwise).
+    pub fn framebuffer_attach_texture(
+        &mut self,
+        target: FramebufferTarget,
+        attachment: FramebufferAttachmentPoint,
+        texture: u32,
+        level: u32,
+    ) -> Result<(), ErrorCode> {
+        let fb_id = self.framebuffer_binding(target);
+        if fb_id == 0 {
+            return Err(ErrorCode::BadId);
+        }
+        if attachment != FramebufferAttachmentPoint::Color0 && texture != 0 {
+            return Err(ErrorCode::BadArg);
+        }
+        let Some(fb) = self.framebuffers.get_mut(&fb_id) else {
+            return Ok(());
+        };
+        fb.color0 = (texture != 0).then_some(FramebufferAttachment::Texture { id: texture, level });
+        Ok(())
+    }
+
+    /// `FRAMEBUFFER_STATUS`: the framebuffer's GLES2 completeness
+    /// enumerant, computed entirely from this module's own records (an
+    /// attachment's declared size, not any GPU resource) -- completeness
+    /// is protocol-visible state, not a rendering concern.
+    pub fn framebuffer_status(&self, target: FramebufferTarget) -> u32 {
+        let fb_id = self.framebuffer_binding(target);
+        let Some(fb) = self.framebuffers.get(&fb_id) else {
+            return GL_FRAMEBUFFER_COMPLETE;
+        };
+        let Some(color) = fb.color0 else {
+            return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+        };
+        let color_size = match color {
+            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+                Some(RenderbufferStorage::Color { width, height, .. }) => Some((width, height)),
+                _ => None,
+            },
+            FramebufferAttachment::Texture { id, level } => self
+                .textures
+                .get(&id)
+                .and_then(|t| t.levels.get(&level))
+                .map(|l| (l.width, l.height)),
+        };
+        let Some((width, height)) = color_size else {
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        };
+        if let Some(FramebufferAttachment::Renderbuffer(id)) = fb.depth_stencil {
+            match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+                Some(RenderbufferStorage::DepthStencil {
+                    width: dw,
+                    height: dh,
+                }) => {
+                    if dw != width || dh != height {
+                        return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS;
+                    }
+                }
+                _ => return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
+            }
+        }
+        GL_FRAMEBUFFER_COMPLETE
+    }
+
     // -- Protocol errors this module is in a position to detect ---------
     //
     // Everything else in `docs/internals/c3d.md`'s "Protocol errors"
@@ -2499,6 +2872,8 @@ impl State {
         self.vertex_attribs = (0..self.limits.max_vertex_attribs)
             .map(|_| VertexAttrib::default())
             .collect();
+        self.draw_framebuffer = 0;
+        self.read_framebuffer = 0;
     }
 
     /// `CTX_CONTROL.RESET` (the register bit, not the ring opcode): GL
@@ -2516,6 +2891,8 @@ impl State {
         self.shaders.clear();
         self.programs.clear();
         self.buffers.clear();
+        self.framebuffers.clear();
+        self.renderbuffers.clear();
         self.pending_gl_error = None;
     }
 }
@@ -3167,10 +3544,11 @@ mod tests {
     }
 
     #[test]
-    fn capability_from_gl_rejects_stencil_test_since_there_is_no_stencil_buffer() {
-        // GL_STENCIL_TEST = 0x0B90; the spec explicitly calls this out as
-        // GL_INVALID_ENUM, not merely "not yet supported".
-        assert_eq!(Capability::from_gl(0x0B90), None);
+    fn capability_from_gl_decodes_stencil_test() {
+        // GL_STENCIL_TEST = 0x0B90. Whether it is actually legal
+        // (`CAP_PROGRAMMABLE`) is `dispatch.rs`'s job, not this decode --
+        // see `Capability::StencilTest`'s doc comment.
+        assert_eq!(Capability::from_gl(0x0B90), Some(Capability::StencilTest));
     }
 
     #[test]
@@ -3877,5 +4255,155 @@ mod tests {
         assert_eq!(a.constant, [0.0, 0.0, 0.0, 1.0]);
         s.reset_all();
         assert!(!s.buffer_exists(1), "reset_all destroys objects too");
+    }
+
+    // -- Framebuffers and renderbuffers (CAP_PROGRAMMABLE) ---------------
+
+    #[test]
+    fn a_fresh_framebuffer_is_incomplete_missing_attachment() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+        );
+    }
+
+    #[test]
+    fn the_default_framebuffer_is_always_complete() {
+        let s = state();
+        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+    }
+
+    #[test]
+    fn attaching_a_colour_renderbuffer_with_storage_makes_the_framebuffer_complete() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1)
+            .unwrap();
+        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+    }
+
+    #[test]
+    fn attaching_a_renderbuffer_with_no_storage_allocated_is_incomplete_attachment() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        // No RENDERBUFFER_STORAGE_COLOR call: `storage` is still `None`,
+        // so attach-time validation (needing *some* colour storage to
+        // compare against) can't reject it, but completeness still
+        // must.
+        let fb = s.framebuffers.get_mut(&1).unwrap();
+        fb.color0 = Some(FramebufferAttachment::Renderbuffer(1));
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT
+        );
+    }
+
+    #[test]
+    fn mismatched_depth_stencil_and_colour_sizes_are_incomplete_dimensions() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
+        s.renderbuffer_create(2);
+        s.renderbuffer_storage_depth_stencil(2, 32, 32);
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1)
+            .unwrap();
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 2)
+            .unwrap();
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn attach_renderbuffer_rejects_the_default_framebuffer_with_bad_id() {
+        let mut s = state();
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
+        assert_eq!(
+            s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1),
+            Err(ErrorCode::BadId)
+        );
+    }
+
+    #[test]
+    fn attach_renderbuffer_rejects_a_storage_kind_mismatch_with_bad_arg() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_depth_stencil(1, 64, 64);
+        assert_eq!(
+            s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1),
+            Err(ErrorCode::BadArg)
+        );
+    }
+
+    #[test]
+    fn attach_texture_rejects_a_depth_stencil_attachment_point_with_bad_arg() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.tex_create(1);
+        assert_eq!(
+            s.framebuffer_attach_texture(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 1, 0),
+            Err(ErrorCode::BadArg)
+        );
+    }
+
+    #[test]
+    fn destroying_a_bound_renderbuffer_detaches_it_from_every_framebuffer() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color0, 1)
+            .unwrap();
+        s.renderbuffer_destroy(1);
+        assert_eq!(s.framebuffer(1).unwrap().color0, None);
+    }
+
+    #[test]
+    fn destroying_the_bound_draw_framebuffer_resets_the_binding_to_zero() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.framebuffer_destroy(1);
+        assert_eq!(s.draw_framebuffer(), 0);
+        assert_eq!(s.read_framebuffer(), 0);
+    }
+
+    #[test]
+    fn bind_framebuffer_distinguishes_draw_and_read_targets() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.framebuffer_create(2);
+        s.bind_framebuffer(FramebufferTarget::Draw, 1);
+        s.bind_framebuffer(FramebufferTarget::Read, 2);
+        assert_eq!(s.draw_framebuffer(), 1);
+        assert_eq!(s.read_framebuffer(), 2);
+    }
+
+    #[test]
+    fn reset_state_unbinds_framebuffers_but_reset_all_destroys_them() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.reset_state();
+        assert_eq!(s.draw_framebuffer(), 0, "reset_state unbinds");
+        assert!(s.framebuffer(1).is_some(), "reset_state keeps objects");
+        s.reset_all();
+        assert!(s.framebuffer(1).is_none(), "reset_all destroys objects too");
     }
 }

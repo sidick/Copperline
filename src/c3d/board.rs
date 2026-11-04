@@ -165,14 +165,21 @@ pub const RING_SIZE_LIMIT: u32 = 0x0004_0000; // 256 KiB
 /// the transform-tier MVP (GL-space draws in all three shapes,
 /// viewport/depth-range, two-unit multitexture, texgen); `CAP_GUESTMEM`
 /// is advertised now that `ApertureMemory` resolves space-1 refs (and
-/// a guest-memory ring) through `DeviceHost`, completing the spec's
-/// stated Copperline capability set (bits 0, 1, 2, 3, 4, 6).
+/// a guest-memory ring) through `DeviceHost`; `CAP_PROGRAMMABLE` is
+/// advertised now that the full object model `proto::CAP_PROGRAMMABLE`'s
+/// doc comment lists -- shaders/programs, buffers and vertex attributes,
+/// framebuffer/renderbuffer objects, programmable draw, and the stencil
+/// test -- is implemented, per the spec's porting guidance ("set
+/// `CAP_PROGRAMMABLE` only if it implements the full ... object model").
+/// This completes the spec's stated Copperline capability set (bits 0,
+/// 1, 2, 3, 4, 6, 7).
 pub const CAPS0: u32 = proto::CAP_IRQ
     | proto::CAP_REF_SYNC
     | proto::CAP_SURFACE_GUESTADDR
     | proto::CAP_TRANSFORM
     | proto::CAP_MULTITEXTURE
-    | proto::CAP_GUESTMEM;
+    | proto::CAP_GUESTMEM
+    | proto::CAP_PROGRAMMABLE;
 
 // ---------------------------------------------------------------------
 // Global register offsets (`docs/internals/c3d.md`, "Global registers")
@@ -208,7 +215,11 @@ mod greg {
     pub const MAX_SHADERS: u32 = 0x078;
     pub const MAX_PROGRAMS: u32 = 0x07C;
     pub const MAX_BUFFERS: u32 = 0x080;
+    pub const MAX_FRAMEBUFFERS: u32 = 0x084;
+    pub const MAX_RENDERBUFFERS: u32 = 0x088;
     pub const MAX_VERTEX_ATTRIBS: u32 = 0x08C;
+    pub const MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
+    pub const MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
 }
 
 // ---------------------------------------------------------------------
@@ -746,7 +757,14 @@ impl C3dBoard {
             MAX_SURFACE_HEIGHT => self.device_config().max_surface_height,
             // `0` without `CAP_PROGRAMMABLE`, per the spec's tier table --
             // same guarded-arm shape as the transform-tier limits above.
-            MAX_SHADERS | MAX_PROGRAMS | MAX_BUFFERS | MAX_VERTEX_ATTRIBS
+            MAX_SHADERS
+            | MAX_PROGRAMS
+            | MAX_BUFFERS
+            | MAX_FRAMEBUFFERS
+            | MAX_RENDERBUFFERS
+            | MAX_VERTEX_ATTRIBS
+            | MAX_COLOR_ATTACHMENTS
+            | MAX_RENDERBUFFER_SIZE
                 if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
             {
                 0
@@ -754,9 +772,16 @@ impl C3dBoard {
             MAX_SHADERS => self.device_config().max_shaders,
             MAX_PROGRAMS => self.device_config().max_programs,
             MAX_BUFFERS => self.device_config().max_buffers,
+            MAX_FRAMEBUFFERS => self.device_config().max_framebuffers,
+            MAX_RENDERBUFFERS => self.device_config().max_renderbuffers,
             // Like MAX_LIGHTS etc. above, reports the same value every
             // per-context `state::Limits::default()` enforces.
             MAX_VERTEX_ATTRIBS => state::Limits::default().max_vertex_attribs as u32,
+            // Fixed at 1: the renderer only ever resolves a framebuffer's
+            // `COLOR_ATTACHMENT0`, matching the programmable-tier
+            // implementation plan's scoped-down single-attachment pass.
+            MAX_COLOR_ATTACHMENTS => 1,
+            MAX_RENDERBUFFER_SIZE => self.device_config().max_renderbuffer_size,
             _ => 0,
         }
     }

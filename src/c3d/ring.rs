@@ -122,9 +122,8 @@ pub struct DeviceConfig {
     /// `CAP_SURFACE_GUESTADDR`: required for `SURFACE_DEFINE`'s
     /// guest-address `flags` bit.
     pub surface_guestaddr: bool,
-    /// `CAP_PROGRAMMABLE`: gates `0x09xx`/`0x0Dxx` (see this module's doc
-    /// comment and `proto::CAP_PROGRAMMABLE`'s note on why this is not yet
-    /// in the board's fitted `CAPS0`).
+    /// `CAP_PROGRAMMABLE`: gates `0x09xx`-`0x0Dxx` (see this module's doc
+    /// comment and `proto::CAP_PROGRAMMABLE`'s doc comment).
     pub programmable: bool,
 
     // Limits (`c3d-global-registers`).
@@ -137,13 +136,18 @@ pub struct DeviceConfig {
     pub max_texture_size: u32,
     pub max_surface_width: u32,
     pub max_surface_height: u32,
-    /// `MAX_SHADERS`/`MAX_PROGRAMS`/`MAX_BUFFERS`/`MAX_VERTEX_ATTRIBS`,
-    /// `CAP_PROGRAMMABLE`'s object/array limits for the opcode groups
-    /// implemented so far.
+    /// `MAX_SHADERS`/`MAX_PROGRAMS`/`MAX_BUFFERS`/`MAX_FRAMEBUFFERS`/
+    /// `MAX_RENDERBUFFERS`/`MAX_VERTEX_ATTRIBS`, `CAP_PROGRAMMABLE`'s
+    /// object/array limits for the opcode groups implemented so far.
     pub max_shaders: u32,
     pub max_programs: u32,
     pub max_buffers: u32,
+    pub max_framebuffers: u32,
+    pub max_renderbuffers: u32,
     pub max_vertex_attribs: u32,
+    /// `MAX_RENDERBUFFER_SIZE`: the largest edge `RENDERBUFFER_STORAGE_COLOR`/
+    /// `RENDERBUFFER_STORAGE_DEPTH_STENCIL` accepts, `E_LIMIT` beyond it.
+    pub max_renderbuffer_size: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -195,7 +199,10 @@ impl Default for DeviceConfig {
             max_shaders: 64,
             max_programs: 64,
             max_buffers: 1024,
+            max_framebuffers: 64,
+            max_renderbuffers: 64,
             max_vertex_attribs: 8,
+            max_renderbuffer_size: 1024,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9), // I8_INDEXED: TEX_PALETTE itself
@@ -460,7 +467,7 @@ impl<'a> RingCursor<'a> {
         )
     }
 
-    /// Whether `opcode` needs `CAP_PROGRAMMABLE`: every `0x09xx`/`0x0Dxx`
+    /// Whether `opcode` needs `CAP_PROGRAMMABLE`: every `0x09xx`-`0x0Dxx`
     /// opcode implemented so far (see this module's doc comment).
     fn opcode_needs_programmable(opcode: u16) -> bool {
         use proto::*;
@@ -492,6 +499,20 @@ impl<'a> RingCursor<'a> {
                 | OP_VERTEX_ATTRIB_CONSTANT
                 | OP_DRAW_ARRAYS_PROG
                 | OP_DRAW_ELEMENTS_PROG
+                | OP_FRAMEBUFFER_CREATE
+                | OP_FRAMEBUFFER_DESTROY
+                | OP_BIND_FRAMEBUFFER
+                | OP_RENDERBUFFER_CREATE
+                | OP_RENDERBUFFER_DESTROY
+                | OP_RENDERBUFFER_STORAGE_COLOR
+                | OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL
+                | OP_FRAMEBUFFER_ATTACH_RENDERBUFFER
+                | OP_FRAMEBUFFER_ATTACH_TEXTURE
+                | OP_FRAMEBUFFER_STATUS
+                | OP_STENCIL_FUNC
+                | OP_STENCIL_OP
+                | OP_STENCIL_MASK
+                | OP_CLEAR_STENCIL
         )
     }
 
@@ -663,7 +684,7 @@ impl<'a> RingCursor<'a> {
             OP_CLEAR => {
                 fixed!(1);
                 let mask = w32(body, 0);
-                if mask & !(CLEAR_MASK_COLOR | CLEAR_MASK_DEPTH) != 0 {
+                if mask & !(CLEAR_MASK_COLOR | CLEAR_MASK_DEPTH | CLEAR_MASK_STENCIL) != 0 {
                     return self.raise(ErrorCode::BadArg, start);
                 }
                 Command::Clear { mask }
@@ -826,6 +847,30 @@ impl<'a> RingCursor<'a> {
                     src_a: w32(body, 2),
                     dst_a: w32(body, 3),
                 }
+            }
+            OP_STENCIL_FUNC => {
+                fixed!(3);
+                Command::StencilFunc {
+                    func: w32(body, 0),
+                    reference: w32(body, 1),
+                    mask: w32(body, 2),
+                }
+            }
+            OP_STENCIL_OP => {
+                fixed!(3);
+                Command::StencilOp {
+                    fail: w32(body, 0),
+                    zfail: w32(body, 1),
+                    zpass: w32(body, 2),
+                }
+            }
+            OP_STENCIL_MASK => {
+                fixed!(1);
+                Command::StencilMask { mask: w32(body, 0) }
+            }
+            OP_CLEAR_STENCIL => {
+                fixed!(1);
+                Command::ClearStencil { value: w32(body, 0) }
             }
 
             OP_MATRIX_MODE => {
@@ -1507,6 +1552,101 @@ impl<'a> RingCursor<'a> {
                 Command::ProgramInterface { program, dest }
             }
 
+            // Framebuffers and renderbuffers (0x0Bxx), CAP_PROGRAMMABLE.
+            // `target`/`attachment` are raw GL enumerants, validated
+            // downstream (dispatch/state) like any other -- see this
+            // module's doc comment. `FRAMEBUFFER_ATTACH_RENDERBUFFER`/
+            // `_TEXTURE` name no explicit framebuffer id (they always
+            // address "the bound framebuffer of target"), so there is no
+            // `check_id` for a framebuffer here beyond the object-level
+            // ones below.
+            OP_FRAMEBUFFER_CREATE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_framebuffers, start));
+                Command::FramebufferCreate { id }
+            }
+            OP_FRAMEBUFFER_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_framebuffers, start));
+                Command::FramebufferDestroy { id }
+            }
+            OP_BIND_FRAMEBUFFER => {
+                fixed!(2);
+                let id = w32(body, 1);
+                check!(self.check_id_or_none(id, self.config.max_framebuffers, start));
+                Command::BindFramebuffer {
+                    target: w32(body, 0),
+                    id,
+                }
+            }
+            OP_RENDERBUFFER_CREATE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                Command::RenderbufferCreate { id }
+            }
+            OP_RENDERBUFFER_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                Command::RenderbufferDestroy { id }
+            }
+            OP_RENDERBUFFER_STORAGE_COLOR => {
+                fixed!(4);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                let width = w32(body, 1);
+                let height = w32(body, 2);
+                check!(self.check_renderbuffer_size(width, height, start));
+                Command::RenderbufferStorageColor {
+                    id,
+                    width,
+                    height,
+                    format: w32(body, 3),
+                }
+            }
+            OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL => {
+                fixed!(3);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                let width = w32(body, 1);
+                let height = w32(body, 2);
+                check!(self.check_renderbuffer_size(width, height, start));
+                Command::RenderbufferStorageDepthStencil { id, width, height }
+            }
+            OP_FRAMEBUFFER_ATTACH_RENDERBUFFER => {
+                fixed!(3);
+                let renderbuffer = w32(body, 2);
+                check!(self.check_id_or_none(renderbuffer, self.config.max_renderbuffers, start));
+                Command::FramebufferAttachRenderbuffer {
+                    target: w32(body, 0),
+                    attachment: w32(body, 1),
+                    renderbuffer,
+                }
+            }
+            OP_FRAMEBUFFER_ATTACH_TEXTURE => {
+                fixed!(4);
+                let texture = w32(body, 2);
+                check!(self.check_id_or_none(texture, self.config.max_textures, start));
+                Command::FramebufferAttachTexture {
+                    target: w32(body, 0),
+                    attachment: w32(body, 1),
+                    texture,
+                    level: w32(body, 3),
+                }
+            }
+            OP_FRAMEBUFFER_STATUS => {
+                fixed!(3);
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::FramebufferStatus {
+                    target: w32(body, 0),
+                    dest,
+                }
+            }
+
             // Not in the opcode map at all, or LOGIC_OP (see this module's
             // doc comment): E_BAD_OPCODE, skipped by trusting `length`.
             _ => return self.raise(ErrorCode::BadOpcode, start),
@@ -1755,6 +1895,15 @@ impl<'a> RingCursor<'a> {
 
     fn check_texture_size(&mut self, width: u32, height: u32, start: u32) -> Result<(), Step<'a>> {
         if width > self.config.max_texture_size || height > self.config.max_texture_size {
+            return Err(self.raise(ErrorCode::Limit, start));
+        }
+        Ok(())
+    }
+
+    /// `RENDERBUFFER_STORAGE_COLOR`/`RENDERBUFFER_STORAGE_DEPTH_STENCIL`'s
+    /// `width`/`height` against `MAX_RENDERBUFFER_SIZE`.
+    fn check_renderbuffer_size(&mut self, width: u32, height: u32, start: u32) -> Result<(), Step<'a>> {
+        if width > self.config.max_renderbuffer_size || height > self.config.max_renderbuffer_size {
             return Err(self.raise(ErrorCode::Limit, start));
         }
         Ok(())
@@ -2389,9 +2538,18 @@ mod tests {
 
     #[test]
     fn clear_rejects_a_non_zero_reserved_mask_bit() {
-        let ring = ring_with(4096, 0, &[header(OP_CLEAR, 2), 0b100]);
+        // Bit 3 and above remain reserved; bit 2 (CLEAR_MASK_STENCIL) is
+        // legal now -- see `clear_accepts_the_stencil_mask_bit` below.
+        let ring = ring_with(4096, 0, &[header(OP_CLEAR, 2), 0b1000]);
         let step = decode_one(&ring, 0, 8);
         assert_eq!(step, err(ErrorCode::BadArg, 0, false));
+    }
+
+    #[test]
+    fn clear_accepts_the_stencil_mask_bit() {
+        let ring = ring_with(4096, 0, &[header(OP_CLEAR, 2), 0b100]);
+        let step = decode_one(&ring, 0, 8);
+        assert_eq!(step, Step::Command(Command::Clear { mask: 0b100 }));
     }
 
     #[test]
@@ -3728,6 +3886,171 @@ mod tests {
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 8, c);
         assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn decodes_stencil_func() {
+        let words = [header(OP_STENCIL_FUNC, 4), 0x0207, 1, 0xFF];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 16);
+        assert_eq!(
+            step,
+            Step::Command(Command::StencilFunc {
+                func: 0x0207,
+                reference: 1,
+                mask: 0xFF,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_stencil_op() {
+        let words = [header(OP_STENCIL_OP, 4), 0x1E00, 0x1E00, 0x1E01];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 16);
+        assert_eq!(
+            step,
+            Step::Command(Command::StencilOp {
+                fail: 0x1E00,
+                zfail: 0x1E00,
+                zpass: 0x1E01,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_stencil_mask() {
+        let words = [header(OP_STENCIL_MASK, 2), 0xFF];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 8);
+        assert_eq!(step, Step::Command(Command::StencilMask { mask: 0xFF }));
+    }
+
+    #[test]
+    fn decodes_clear_stencil() {
+        let words = [header(OP_CLEAR_STENCIL, 2), 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 8);
+        assert_eq!(step, Step::Command(Command::ClearStencil { value: 0 }));
+    }
+
+    #[test]
+    fn stencil_opcodes_are_e_bad_opcode_without_programmable() {
+        let mut c = config(true);
+        c.programmable = false;
+        let cases: [(u16, u16); 4] = [
+            (OP_STENCIL_FUNC, 4),
+            (OP_STENCIL_OP, 4),
+            (OP_STENCIL_MASK, 2),
+            (OP_CLEAR_STENCIL, 2),
+        ];
+        for (opcode, length) in cases {
+            let words = vec![header(opcode, length)]
+                .into_iter()
+                .chain(std::iter::repeat_n(0, length as usize - 1))
+                .collect::<Vec<_>>();
+            let ring = ring_with(4096, 0, &words);
+            let step = decode_one_with(&ring, 0, length as u32 * 4, c);
+            assert_eq!(
+                step,
+                err(ErrorCode::BadOpcode, 0, false),
+                "opcode {opcode:#06x} should be E_BAD_OPCODE without CAP_PROGRAMMABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_framebuffer_create() {
+        let words = [header(OP_FRAMEBUFFER_CREATE, 2), 1];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 8);
+        assert_eq!(step, Step::Command(Command::FramebufferCreate { id: 1 }));
+    }
+
+    #[test]
+    fn framebuffer_create_rejects_an_id_above_max_framebuffers() {
+        let mut c = config(true);
+        c.max_framebuffers = 4;
+        let words = [header(OP_FRAMEBUFFER_CREATE, 2), 5];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 8, c);
+        assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn decodes_bind_framebuffer_with_id_zero_for_the_default_framebuffer() {
+        let words = [header(OP_BIND_FRAMEBUFFER, 3), 0x8D40, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 12);
+        assert_eq!(
+            step,
+            Step::Command(Command::BindFramebuffer { target: 0x8D40, id: 0 })
+        );
+    }
+
+    #[test]
+    fn bind_framebuffer_rejects_an_id_above_max_framebuffers() {
+        let mut c = config(true);
+        c.max_framebuffers = 4;
+        let words = [header(OP_BIND_FRAMEBUFFER, 3), 0x8D40, 5];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 12, c);
+        assert_eq!(step, err(ErrorCode::BadId, 0, false));
+    }
+
+    #[test]
+    fn decodes_renderbuffer_storage_color() {
+        let words = [header(OP_RENDERBUFFER_STORAGE_COLOR, 5), 1, 64, 32, 5];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 20);
+        assert_eq!(
+            step,
+            Step::Command(Command::RenderbufferStorageColor {
+                id: 1,
+                width: 64,
+                height: 32,
+                format: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn renderbuffer_storage_color_rejects_a_size_above_max_renderbuffer_size() {
+        let mut c = config(true);
+        c.max_renderbuffer_size = 128;
+        let words = [header(OP_RENDERBUFFER_STORAGE_COLOR, 5), 1, 256, 32, 5];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 20, c);
+        assert_eq!(step, err(ErrorCode::Limit, 0, false));
+    }
+
+    #[test]
+    fn decodes_framebuffer_attach_renderbuffer_with_renderbuffer_zero_to_detach() {
+        let words = [header(OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, 4), 0x8D40, 0x8CE0, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 16);
+        assert_eq!(
+            step,
+            Step::Command(Command::FramebufferAttachRenderbuffer {
+                target: 0x8D40,
+                attachment: 0x8CE0,
+                renderbuffer: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_framebuffer_status_with_a_null_ref() {
+        let words = [header(OP_FRAMEBUFFER_STATUS, 4), 0x8D40, 0, 0];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 16);
+        assert_eq!(
+            step,
+            Step::Command(Command::FramebufferStatus {
+                target: 0x8D40,
+                dest: Ref::decode(0, 0),
+            })
+        );
     }
 
     #[test]

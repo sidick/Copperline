@@ -505,7 +505,21 @@ pub fn tex_filter_mipmap_mode(filter: TexFilter) -> Option<wgpu::MipmapFilterMod
 /// readback/upload time ([`convert_from_rgba8`]/[`convert_to_rgba8`]),
 /// not by trying to render directly into a 16-bit target.
 pub const INTERNAL_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// The fallback depth-only format, used when this adapter doesn't
+/// support [`INTERNAL_DEPTH_STENCIL_FORMAT`] (see `Renderer::new`'s
+/// feature-detection, the same "request only what this adapter actually
+/// advertises" pattern `POLYGON_MODE_LINE`/`_POINT` already use) -- on
+/// such an adapter the stencil test (`CAP_PROGRAMMABLE`) silently has no
+/// effect, exactly like an unsupported polygon mode silently falls back
+/// to `Fill`.
 pub const INTERNAL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// The preferred depth/stencil format: combined storage for both, with a
+/// `DepthOnly`-aspect copy still yielding the same well-defined 32-bit
+/// float layout [`INTERNAL_DEPTH_FORMAT`] alone does (unlike
+/// `Depth24PlusStencil8`, whose depth aspect layout is backend-defined
+/// and not safely readable), so `READ_PIXELS(DEPTH)` needs no format-
+/// dependent decoding beyond picking the right copy aspect.
+pub const INTERNAL_DEPTH_STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
 
 /// Converts one RGBA8 (straight, `0..255` per channel) pixel to the bytes
 /// of `fmt`, for [`RenderOp::SurfaceReadback`]. `Depth` is not a colour
@@ -1800,6 +1814,13 @@ pub struct PipelineKey {
     pub alpha_test: Option<CompareFuncKey>,
     pub depth_test: Option<CompareFuncKey>,
     pub depth_write: bool,
+    /// `STENCIL_TEST`, `CAP_PROGRAMMABLE`. `None` when disabled -- an
+    /// always-pass, never-write `wgpu::StencilState::default()`, not
+    /// merely an unenforced test, since a disabled stencil test must not
+    /// write either (`glEnable(GL_STENCIL_TEST)` gates both halves at
+    /// once in GLES2, unlike depth where `DEPTH_TEST` and `DEPTH_MASK`
+    /// are independent).
+    pub stencil: Option<StencilKey>,
     pub blend: bool,
     pub blend_src: BlendFactorKey,
     pub blend_dst: BlendFactorKey,
@@ -1895,6 +1916,78 @@ impl CompareFuncKey {
             Self::Notequal => wgpu::CompareFunction::NotEqual,
             Self::Gequal => wgpu::CompareFunction::GreaterEqual,
             Self::Always => wgpu::CompareFunction::Always,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StencilOpKey {
+    Zero,
+    Keep,
+    Replace,
+    Incr,
+    Decr,
+    Invert,
+    IncrWrap,
+    DecrWrap,
+}
+impl From<state::StencilOp> for StencilOpKey {
+    fn from(op: state::StencilOp) -> Self {
+        match op {
+            state::StencilOp::Zero => Self::Zero,
+            state::StencilOp::Keep => Self::Keep,
+            state::StencilOp::Replace => Self::Replace,
+            state::StencilOp::Incr => Self::Incr,
+            state::StencilOp::Decr => Self::Decr,
+            state::StencilOp::Invert => Self::Invert,
+            state::StencilOp::IncrWrap => Self::IncrWrap,
+            state::StencilOp::DecrWrap => Self::DecrWrap,
+        }
+    }
+}
+impl StencilOpKey {
+    fn to_wgpu(self) -> wgpu::StencilOperation {
+        match self {
+            Self::Zero => wgpu::StencilOperation::Zero,
+            Self::Keep => wgpu::StencilOperation::Keep,
+            Self::Replace => wgpu::StencilOperation::Replace,
+            Self::Incr => wgpu::StencilOperation::IncrementClamp,
+            Self::Decr => wgpu::StencilOperation::DecrementClamp,
+            Self::Invert => wgpu::StencilOperation::Invert,
+            Self::IncrWrap => wgpu::StencilOperation::IncrementWrap,
+            Self::DecrWrap => wgpu::StencilOperation::DecrementWrap,
+        }
+    }
+}
+
+/// A pipeline's full stencil-test configuration (`STENCIL_FUNC`/
+/// `STENCIL_OP`/`STENCIL_MASK`'s *pipeline-fixed* half -- the reference
+/// value is draw-time state instead, set via `set_stencil_reference`,
+/// since `wgpu` allows that without rebuilding the pipeline). Applies to
+/// both faces alike, per the spec's "there is no separate front/back
+/// stencil func in version 1".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StencilKey {
+    func: CompareFuncKey,
+    fail: StencilOpKey,
+    zfail: StencilOpKey,
+    zpass: StencilOpKey,
+    read_mask: u8,
+    write_mask: u8,
+}
+impl StencilKey {
+    fn to_wgpu(self) -> wgpu::StencilState {
+        let face = wgpu::StencilFaceState {
+            compare: self.func.to_wgpu(),
+            fail_op: self.fail.to_wgpu(),
+            depth_fail_op: self.zfail.to_wgpu(),
+            pass_op: self.zpass.to_wgpu(),
+        };
+        wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: self.read_mask as u32,
+            write_mask: self.write_mask as u32,
         }
     }
 }
@@ -2597,6 +2690,12 @@ pub struct Renderer {
     /// doc comment for why, e.g. Metal has no native polygon-mode point).
     polygon_mode_line_supported: bool,
     polygon_mode_point_supported: bool,
+    /// [`INTERNAL_DEPTH_STENCIL_FORMAT`] if this adapter supports it,
+    /// else the depth-only [`INTERNAL_DEPTH_FORMAT`] fallback -- computed
+    /// once, the same way as `polygon_mode_line_supported` above. Every
+    /// internal depth/depth-stencil texture and every pipeline's
+    /// `DepthStencilState::format` must agree with this exact value.
+    depth_format: wgpu::TextureFormat,
     /// `CAP_PROGRAMMABLE`'s compiled shader state, by shader id -- the
     /// renderer-side counterpart to `state::ShaderObject`'s metadata-only
     /// record, exactly as `textures` holds pixel data `state::
@@ -2620,6 +2719,21 @@ pub struct Renderer {
     /// draw time from this CPU-side copy, per attribute, rather than
     /// once at upload time when the type isn't known yet.
     buffers: HashMap<u32, Vec<u8>>,
+    /// `CAP_PROGRAMMABLE`'s colour renderbuffers, by id: a persistent
+    /// GPU colour texture, resized on demand like [`GpuSurface`]'s own
+    /// colour texture -- unlike a texture object's pixels (sampled
+    /// through a shader), a renderbuffer is never read back by this
+    /// tier, so there is no separate "shape" struct the way
+    /// [`GpuTexture`] needs for its mip chain.
+    renderbuffers: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    /// `CAP_PROGRAMMABLE`'s depth/stencil renderbuffers, by id: the same
+    /// shape as `renderbuffers` above, but [`INTERNAL_DEPTH_FORMAT`]
+    /// instead of [`INTERNAL_COLOR_FORMAT`]. Only ever populated for a
+    /// framebuffer that actually has a `DEPTH_STENCIL_ATTACHMENT`
+    /// renderbuffer bound -- see [`Renderer::resolve_draw_target`] for
+    /// the transient scratch buffer a framebuffer without one gets
+    /// instead.
+    renderbuffer_depth: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32)>,
 }
 
 /// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
@@ -2674,9 +2788,9 @@ struct ProgramSlot {
     /// new link invalidates uniform values" semantics.
     uniform_values: HashMap<u32, Vec<u8>>,
     /// Uniform location -> bound texture unit (`UNIFORM_SAMPLER`).
-    /// Stored but **not yet applied** at draw time -- see `draw_prog`'s
-    /// doc comment on scope cuts; this tier does not build texture bind
-    /// groups yet. Kept so `PROGRAM_INTERFACE`/future work has it.
+    /// Applied at draw time by `draw_prog`: a location missing here
+    /// defaults to unit 0, matching GLES2's own "a sampler uniform's
+    /// initial value is 0" rule.
     sampler_bindings: HashMap<u32, u32>,
 }
 
@@ -2699,10 +2813,25 @@ struct InterfaceEntry {
 
 /// One active uniform's naga-side binding(s) within group `0` (see
 /// `ProgramSlot::uniform_bindings`'s doc comment).
+///
+/// For a plain value uniform, `vertex_binding`/`fragment_binding` are the
+/// naga binding of the uniform buffer itself and the `*_sampler_binding`
+/// fields are unused. For a sampler uniform (`is_sampler`), `glsl.rs`'s
+/// rewrite has already split the single GLES2 `uniform sampler2D`/
+/// `samplerCube` declaration into a `textureND` global (bound at
+/// `vertex_binding`/`fragment_binding`, reused rather than duplicated --
+/// it is still "the texture half's binding") and a paired `sampler`
+/// global (bound at `vertex_sampler_binding`/`fragment_sampler_binding`);
+/// `draw_prog` binds both halves to the same `GpuTexture`/cached
+/// `wgpu::Sampler` the fixed-function path already uses for the GLES2
+/// `UNIFORM_SAMPLER`-selected texture unit.
 #[derive(Clone, Debug, Default)]
 struct UniformBinding {
     vertex_binding: Option<u32>,
     fragment_binding: Option<u32>,
+    is_sampler: bool,
+    vertex_sampler_binding: Option<u32>,
+    fragment_sampler_binding: Option<u32>,
 }
 
 
@@ -2754,6 +2883,8 @@ const GL_INT_VEC4: u32 = 0x8B55;
 const GL_FLOAT_MAT2: u32 = 0x8B5A;
 const GL_FLOAT_MAT3: u32 = 0x8B5B;
 const GL_FLOAT_MAT4: u32 = 0x8B5C;
+const GL_SAMPLER_2D: u32 = 0x8B5E;
+const GL_SAMPLER_CUBE: u32 = 0x8B60;
 
 /// Bytes a `PROGRAM_INTERFACE`/`UNIFORM` GL type enumerant occupies
 /// (component count times 4, every component here being either an
@@ -2775,10 +2906,14 @@ fn gl_type_byte_size(gl_type: u32) -> Option<usize> {
 /// A naga type's GL enumerant, for `PROGRAM_INTERFACE`'s `type` field.
 /// Covers exactly `UNIFORM`'s accepted set (`FLOAT`/`FLOAT_VECn`,
 /// `INT`/`INT_VECn`, square `FLOAT_MATn`) plus plain scalar/vector/
-/// matrix attribute types -- sampler/texture types are deliberately not
-/// handled here (see `ProgramSlot::sampler_bindings`'s doc comment on
-/// why this tier doesn't reflect them yet), and anything else (bool
-/// vectors, non-square matrices, arrays/structs) is `None`.
+/// matrix attribute types. Sampler/texture types are *not* handled here
+/// -- `glsl.rs`'s rewrite splits a `sampler2D`/`samplerCube` uniform into
+/// a `textureND` + `sampler` global pair with no single naga type to
+/// match against this function's signature, so [`module_samplers`]
+/// recognises them separately and reports `GL_SAMPLER_2D`/
+/// `GL_SAMPLER_CUBE` directly from the split `Image`'s dimension.
+/// Anything else this function doesn't cover (bool vectors, non-square
+/// matrices, arrays/structs) is `None`.
 fn naga_type_to_gl_enum(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Option<u32> {
     use naga::{ScalarKind, VectorSize};
     match &module.types[ty].inner {
@@ -2836,9 +2971,9 @@ fn vertex_shader_inputs_typed(module: &naga::Module) -> Vec<(String, u32, u32)> 
 }
 
 /// A compiled module's plain-value `uniform` globals (`AddressSpace::
-/// Uniform` -- excludes samplers/textures, a different address space;
-/// see `ProgramSlot::sampler_bindings`'s doc comment), as `(name, naga
-/// binding, GL type)`.
+/// Uniform` -- excludes samplers/textures, which live in `AddressSpace::
+/// Handle` instead and are picked up separately by [`module_samplers`]),
+/// as `(name, naga binding, GL type)`.
 fn module_uniforms(module: &naga::Module) -> Vec<(String, u32, u32)> {
     module
         .global_variables
@@ -2849,6 +2984,39 @@ fn module_uniforms(module: &naga::Module) -> Vec<(String, u32, u32)> {
             let binding = gv.binding.as_ref()?.binding;
             let gl_type = naga_type_to_gl_enum(module, gv.ty)?;
             Some((name, binding, gl_type))
+        })
+        .collect()
+}
+
+/// A compiled module's sampler-uniform globals, paired back up from the
+/// `<name>_tex`/`<name>_samp` split `glsl.rs`'s rewrite produces (see
+/// [`rewrite_to_core_profile`]'s doc comment on `uniform sampler2D`), as
+/// `(name, texture naga binding, sampler naga binding, GL type)`. Only
+/// `GL_SAMPLER_2D`/`GL_SAMPLER_CUBE` dimensions are recognised, matching
+/// `glsl.rs`'s rewrite (which only splits `sampler2D`/`samplerCube`).
+fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32)> {
+    module
+        .global_variables
+        .iter()
+        .filter_map(|(_, gv)| {
+            let name = gv.name.as_ref()?;
+            let base = name.strip_suffix("_tex")?;
+            let tex_binding = gv.binding.as_ref()?.binding;
+            let gl_type = match module.types[gv.ty].inner {
+                naga::TypeInner::Image { dim: naga::ImageDimension::D2, .. } => GL_SAMPLER_2D,
+                naga::TypeInner::Image { dim: naga::ImageDimension::Cube, .. } => GL_SAMPLER_CUBE,
+                _ => return None,
+            };
+            let samp_name = format!("{base}_samp");
+            let samp_binding = module
+                .global_variables
+                .iter()
+                .find(|(_, g)| g.name.as_deref() == Some(samp_name.as_str()))?
+                .1
+                .binding
+                .as_ref()?
+                .binding;
+            Some((base.to_string(), tex_binding, samp_binding, gl_type))
         })
         .collect()
 }
@@ -2875,6 +3043,7 @@ fn compute_uniform_interface(
             binding: UniformBinding {
                 vertex_binding: Some(binding),
                 fragment_binding: None,
+                ..Default::default()
             },
         });
     }
@@ -2891,6 +3060,36 @@ fn compute_uniform_interface(
                 binding: UniformBinding {
                     vertex_binding: None,
                     fragment_binding: Some(binding),
+                    ..Default::default()
+                },
+            });
+        }
+    }
+    for (name, tex_binding, samp_binding, gl_type) in module_samplers(vs) {
+        merged.push(Merged {
+            name,
+            gl_type,
+            binding: UniformBinding {
+                vertex_binding: Some(tex_binding),
+                vertex_sampler_binding: Some(samp_binding),
+                is_sampler: true,
+                ..Default::default()
+            },
+        });
+    }
+    for (name, tex_binding, samp_binding, gl_type) in module_samplers(fs) {
+        if let Some(existing) = merged.iter_mut().find(|m| m.name == name) {
+            existing.binding.fragment_binding = Some(tex_binding);
+            existing.binding.fragment_sampler_binding = Some(samp_binding);
+        } else {
+            merged.push(Merged {
+                name,
+                gl_type,
+                binding: UniformBinding {
+                    fragment_binding: Some(tex_binding),
+                    fragment_sampler_binding: Some(samp_binding),
+                    is_sampler: true,
+                    ..Default::default()
                 },
             });
         }
@@ -2987,6 +3186,15 @@ fn adapter_rank(info: &wgpu::AdapterInfo) -> u8 {
 struct ClearRectPipelineKey {
     color_write: (bool, bool, bool, bool),
     depth_write: bool,
+    /// `0` when this clear doesn't touch stencil at all (the common
+    /// case, and functionally identical to a nonzero mask that happens
+    /// to write nothing -- no distinct "disabled" representation is
+    /// needed). Otherwise `STENCIL_MASK`'s low 8 bits: the test always
+    /// passes and every op is `REPLACE`, so this is the only thing that
+    /// varies the generated pipeline (the reference value -- the actual
+    /// clear value -- is draw-time state via `set_stencil_reference`,
+    /// like `PipelineKey`'s own stencil handling).
+    stencil_write_mask: u8,
     surface_format: TextureFormatKey,
 }
 
@@ -3075,11 +3283,12 @@ impl Renderer {
         // fallback this enables.
         let wanted_polygon_mode_features =
             wgpu::Features::POLYGON_MODE_LINE | wgpu::Features::POLYGON_MODE_POINT;
-        let polygon_mode_features = adapter.features() & wanted_polygon_mode_features;
+        let wanted_features = wanted_polygon_mode_features | wgpu::Features::DEPTH32FLOAT_STENCIL8;
+        let requested_features = adapter.features() & wanted_features;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("c3d headless device"),
-            required_features: polygon_mode_features,
+            required_features: requested_features,
             required_limits: wgpu::Limits::downlevel_defaults(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -3093,6 +3302,11 @@ impl Renderer {
         let polygon_mode_point_supported = device
             .features()
             .contains(wgpu::Features::POLYGON_MODE_POINT);
+        let depth_format = if device.features().contains(wgpu::Features::DEPTH32FLOAT_STENCIL8) {
+            INTERNAL_DEPTH_STENCIL_FORMAT
+        } else {
+            INTERNAL_DEPTH_FORMAT
+        };
 
         let bind_group_layout_textured =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3254,9 +3468,12 @@ impl Renderer {
             clear_rect_pipelines: HashMap::new(),
             polygon_mode_line_supported,
             polygon_mode_point_supported,
+            depth_format,
             shaders: HashMap::new(),
             programs: HashMap::new(),
             buffers: HashMap::new(),
+            renderbuffers: HashMap::new(),
+            renderbuffer_depth: HashMap::new(),
         })
     }
 
@@ -3312,7 +3529,7 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: INTERNAL_DEPTH_FORMAT,
+                format: self.depth_format,
                 // COPY_SRC: READ_PIXELS(DEPTH) reads this back via
                 // copy_texture_to_cpu, exactly like the colour texture's
                 // own COPY_SRC above.
@@ -3337,6 +3554,171 @@ impl Renderer {
             .surfaces
             .get_mut(&id)
             .expect("just inserted or present"))
+    }
+
+    /// A colour renderbuffer's GPU storage, created or resized to
+    /// `width` x `height` on demand -- the same pattern as
+    /// [`Self::ensure_surface`]'s colour half, without a paired depth
+    /// texture (a renderbuffer's own depth/stencil counterpart, if any,
+    /// is a separate renderbuffer object entirely, unlike a surface's
+    /// always-present internal depth buffer).
+    fn ensure_renderbuffer_color(&mut self, id: u32, width: u32, height: u32) -> wgpu::TextureView {
+        let needs_create = !matches!(self.renderbuffers.get(&id), Some((_, _, w, h)) if *w == width && *h == height);
+        if needs_create {
+            let size = wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("c3d renderbuffer color"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: INTERNAL_COLOR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.renderbuffers.insert(id, (texture, view, width, height));
+        }
+        self.renderbuffers.get(&id).expect("just inserted or present").1.clone()
+    }
+
+    /// A depth/stencil renderbuffer's GPU storage. See
+    /// [`Self::ensure_renderbuffer_color`]'s doc comment; `stencil_ops`
+    /// in the render pass stays `None` regardless (the stencil test
+    /// itself is not implemented yet -- see `proto::CAP_PROGRAMMABLE`'s
+    /// doc comment), so this exists only to give depth testing against
+    /// an attached depth/stencil renderbuffer somewhere persistent to
+    /// write to, unlike the transient scratch buffer
+    /// [`Self::resolve_draw_target`] uses when none is attached.
+    fn ensure_renderbuffer_depth(&mut self, id: u32, width: u32, height: u32) -> wgpu::TextureView {
+        let needs_create =
+            !matches!(self.renderbuffer_depth.get(&id), Some((_, _, w, h)) if *w == width && *h == height);
+        if needs_create {
+            let size = wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("c3d renderbuffer depth/stencil"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.depth_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.renderbuffer_depth.insert(id, (texture, view, width, height));
+        }
+        self.renderbuffer_depth
+            .get(&id)
+            .expect("just inserted or present")
+            .1
+            .clone()
+    }
+
+    /// Resolves a programmable draw's render target: the default
+    /// framebuffer (the current draw surface, exactly as the
+    /// fixed-function path already does) when no framebuffer object is
+    /// bound, or the bound draw framebuffer's attachments otherwise.
+    /// Returns `Ok(None)` for a bound-but-incomplete framebuffer -- per
+    /// the spec, that is not a protocol error and the draw simply has no
+    /// effect, which [`Self::draw_prog`] turns into an early `Ok(())`.
+    ///
+    /// A framebuffer with no `DEPTH_STENCIL_ATTACHMENT` renderbuffer
+    /// still gets a depth/stencil buffer to satisfy `wgpu`'s pipeline
+    /// requirements, but a *transient* one, cleared fresh every draw
+    /// rather than persisted across them: there is no renderbuffer
+    /// object backing it for a later draw to find again, so there is
+    /// nothing correct to load from. The returned `bool` reflects that
+    /// distinction -- `true` (load existing contents) wherever a
+    /// persistent depth/stencil buffer exists (the default framebuffer's
+    /// internal one, or a real attached renderbuffer), `false` (clear
+    /// fresh) for the transient scratch case; the caller turns it into
+    /// each aspect's own `wgpu::LoadOp`.
+    #[allow(clippy::type_complexity)]
+    fn resolve_draw_target(
+        &mut self,
+        state: &State,
+    ) -> Result<Option<(u32, u32, wgpu::TextureView, wgpu::TextureView, bool)>, RenderError> {
+        let fb_id = state.draw_framebuffer();
+        if fb_id == 0 {
+            let surf_id = state.draw_surface();
+            let def = *state
+                .surface(surf_id)
+                .ok_or(RenderError::UnknownObject("surface", surf_id))?;
+            let gpu = self.ensure_surface(surf_id, &def)?;
+            return Ok(Some((
+                def.width,
+                def.height,
+                gpu.color_view.clone(),
+                gpu.depth_view.clone(),
+                true,
+            )));
+        }
+        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
+            return Ok(None);
+        }
+        let fb = state
+            .framebuffer(fb_id)
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists");
+        let color = fb
+            .color0
+            .expect("FRAMEBUFFER_COMPLETE implies a colour attachment");
+        let (width, height, color_view) = match color {
+            state::FramebufferAttachment::Renderbuffer(rb_id) => {
+                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
+                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                else {
+                    unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
+                };
+                (width, height, self.ensure_renderbuffer_color(rb_id, width, height))
+            }
+            state::FramebufferAttachment::Texture { id, level } => {
+                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                (width, height, view)
+            }
+        };
+        let (depth_view, persistent_depth) = match fb.depth_stencil {
+            Some(state::FramebufferAttachment::Renderbuffer(rb_id)) => {
+                (self.ensure_renderbuffer_depth(rb_id, width, height), true)
+            }
+            _ => {
+                let size = wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                };
+                let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("c3d framebuffer scratch depth"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.depth_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                (depth.create_view(&wgpu::TextureViewDescriptor::default()), false)
+            }
+        };
+        Ok(Some((width, height, color_view, depth_view, persistent_depth)))
     }
 
     /// `mipmap` is the mip-selection half of `TEXTURE_MIN_FILTER`
@@ -3533,14 +3915,14 @@ impl Renderer {
                     conservative: false,
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: INTERNAL_DEPTH_FORMAT,
+                    format: self.depth_format,
                     depth_write_enabled: Some(key.depth_write),
                     depth_compare: Some(
                         key.depth_test
                             .map(CompareFuncKey::to_wgpu)
                             .unwrap_or(wgpu::CompareFunction::Always),
                     ),
-                    stencil: wgpu::StencilState::default(),
+                    stencil: key.stencil.map(StencilKey::to_wgpu).unwrap_or_default(),
                     bias: key
                         .polygon_offset
                         .map(PolygonOffsetKey::to_wgpu)
@@ -3625,13 +4007,28 @@ impl Renderer {
                     conservative: false,
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: INTERNAL_DEPTH_FORMAT,
+                    format: self.depth_format,
                     depth_write_enabled: Some(key.depth_write),
                     // Always: a clear unconditionally overwrites whatever
                     // depth is already there within the scissor rect,
                     // never depth-tested against it.
                     depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: wgpu::StencilState::default(),
+                    stencil: if key.stencil_write_mask != 0 {
+                        let face = wgpu::StencilFaceState {
+                            compare: wgpu::CompareFunction::Always,
+                            fail_op: wgpu::StencilOperation::Replace,
+                            depth_fail_op: wgpu::StencilOperation::Replace,
+                            pass_op: wgpu::StencilOperation::Replace,
+                        };
+                        wgpu::StencilState {
+                            front: face,
+                            back: face,
+                            read_mask: 0,
+                            write_mask: key.stencil_write_mask as u32,
+                        }
+                    } else {
+                        wgpu::StencilState::default()
+                    },
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
@@ -3695,6 +4092,18 @@ impl Renderer {
         } else {
             None
         };
+        let stencil = if state.is_enabled(state::Capability::StencilTest) {
+            Some(StencilKey {
+                func: raster.stencil_func.into(),
+                fail: raster.stencil_fail_op.into(),
+                zfail: raster.stencil_zfail_op.into(),
+                zpass: raster.stencil_zpass_op.into(),
+                read_mask: (raster.stencil_read_mask & 0xFF) as u8,
+                write_mask: (raster.stencil_write_mask & 0xFF) as u8,
+            })
+        } else {
+            None
+        };
         let env0 = state
             .texture_units
             .first()
@@ -3734,6 +4143,7 @@ impl Renderer {
             alpha_test,
             depth_test,
             depth_write: raster.depth_mask,
+            stencil,
             blend: state.is_enabled(state::Capability::Blend),
             blend_src: raster.blend_src_rgb.into(),
             blend_dst: raster.blend_dst_rgb.into(),
@@ -3990,6 +4400,9 @@ impl Renderer {
                 self.op_uniform_sampler(*program, *location, *unit)
             }
             RenderOp::ProgramInterface { program, dest } => self.op_program_interface(*program, *dest, mem),
+            RenderOp::FramebufferStatus { target, dest } => {
+                self.op_framebuffer_status(*target, *dest, state, mem)
+            }
         }
     }
 
@@ -4021,9 +4434,16 @@ impl Renderer {
         // colour and depth independently, since a scissor without a
         // colour mask still wants the cheap whole-attachment depth clear
         // whenever there is no scissor to restrict it by.
+        // `STENCIL_MASK` can restrict a stencil clear to a subset of bits
+        // the same way a partial `COLOR_MASK` restricts a colour clear --
+        // `wgpu::LoadOp::Clear` has no per-bit masking either, so that
+        // case also needs the draw path, not just a scissor.
+        let stencil_mask_full = state.raster.stencil_write_mask & 0xFF == 0xFF;
         let color_needs_draw =
             mask & proto::CLEAR_MASK_COLOR != 0 && (scissor_rect.is_some() || !mask_full);
         let depth_needs_draw = mask & proto::CLEAR_MASK_DEPTH != 0 && scissor_rect.is_some();
+        let stencil_needs_draw = mask & proto::CLEAR_MASK_STENCIL != 0
+            && (scissor_rect.is_some() || !stencil_mask_full);
 
         let [r, g, b, a] = state.raster.clear_color;
         let load_color = if mask & proto::CLEAR_MASK_COLOR != 0 && !color_needs_draw {
@@ -4038,6 +4458,11 @@ impl Renderer {
         };
         let load_depth = if mask & proto::CLEAR_MASK_DEPTH != 0 && !depth_needs_draw {
             wgpu::LoadOp::Clear(state.raster.clear_depth)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let load_stencil = if mask & proto::CLEAR_MASK_STENCIL != 0 && !stencil_needs_draw {
+            wgpu::LoadOp::Clear(state.raster.clear_stencil & state.raster.stencil_write_mask & 0xFF)
         } else {
             wgpu::LoadOp::Load
         };
@@ -4066,7 +4491,10 @@ impl Renderer {
                             load: load_depth,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: None,
+                        stencil_ops: Some(wgpu::Operations {
+                            load: load_stencil,
+                            store: wgpu::StoreOp::Store,
+                        }),
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
@@ -4076,7 +4504,7 @@ impl Renderer {
             self.queue.submit(Some(encoder.finish()));
         }
 
-        if color_needs_draw || depth_needs_draw {
+        if color_needs_draw || depth_needs_draw || stencil_needs_draw {
             let key = ClearRectPipelineKey {
                 color_write: if color_needs_draw {
                     (
@@ -4089,6 +4517,11 @@ impl Renderer {
                     (false, false, false, false)
                 },
                 depth_write: depth_needs_draw,
+                stencil_write_mask: if stencil_needs_draw {
+                    (state.raster.stencil_write_mask & 0xFF) as u8
+                } else {
+                    0
+                },
                 surface_format: wgpu::TextureFormat::Rgba8Unorm.into(),
             };
             self.clear_rect_pipeline_for(&key);
@@ -4141,13 +4574,19 @@ impl Renderer {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: None,
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
                 pass.set_pipeline(pipeline);
+                if stencil_needs_draw {
+                    pass.set_stencil_reference(state.raster.clear_stencil & 0xFF);
+                }
                 if let Some((x, y, sw, sh)) = scissor_rect {
                     pass.set_scissor_rect(x, y, sw, sh);
                 }
@@ -4824,13 +5263,17 @@ impl Renderer {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(pipeline);
+            pass.set_stencil_reference(state.raster.stencil_ref & 0xFF);
             if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, def.width, def.height) {
                 pass.set_scissor_rect(x, y, sw, sh);
             }
@@ -5049,10 +5492,14 @@ impl Renderer {
             // a *later* call to this function, to carry its other levels
             // forward across the next recreate (the loop above does
             // exactly that to `tex.texture` for whichever texture object
-            // already existed before this call).
+            // already existed before this call). RENDER_ATTACHMENT: any
+            // texture object may be named by `FRAMEBUFFER_ATTACH_TEXTURE`
+            // (render-to-texture), unconditionally -- the spec does not
+            // distinguish a "renderable" texture from any other.
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         for (lvl, w, h, data) in &carried {
@@ -5382,7 +5829,19 @@ impl Renderer {
             };
         let raw = if format == WireSurfaceFormat::Depth {
             let depth = gpu.depth.clone();
-            self.copy_texture_to_cpu(&depth, def.width, def.height)?
+            // `INTERNAL_DEPTH_STENCIL_FORMAT` has no single "all aspects"
+            // copy; `INTERNAL_DEPTH_FORMAT` has only the one aspect, for
+            // which `DepthOnly` and `All` are equivalent, so always
+            // asking for `DepthOnly` here is correct either way.
+            self.copy_texture_rect_to_cpu_aspect(
+                &depth,
+                0,
+                0,
+                0,
+                def.width,
+                def.height,
+                wgpu::TextureAspect::DepthOnly,
+            )?
         } else {
             let color = gpu.color.clone();
             self.copy_texture_to_cpu(&color, def.width, def.height)?
@@ -5674,7 +6133,7 @@ impl Renderer {
     }
 
     /// `UNIFORM_SAMPLER`. See `ProgramSlot::sampler_bindings`'s doc
-    /// comment: recorded, not yet applied at draw time.
+    /// comment: applied by `draw_prog` at the next programmable draw.
     fn op_uniform_sampler(&mut self, program: u32, location: u32, unit: u32) -> Result<(), RenderError> {
         if let Some(slot) = self.programs.get_mut(&program) {
             slot.sampler_bindings.insert(location, unit);
@@ -5716,6 +6175,24 @@ impl Renderer {
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
             return Err(RenderError::BadMemory(format!("SHADER_STATUS write to {loc:?}")));
+        }
+        Ok(())
+    }
+
+    /// `FRAMEBUFFER_STATUS`: writes [`state::State::framebuffer_status`]'s
+    /// result (already computed from pure state, no GPU resource
+    /// involved) to `dest` as one `u32`.
+    fn op_framebuffer_status(
+        &mut self,
+        target: state::FramebufferTarget,
+        dest: Ref,
+        state: &State,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let status = state.framebuffer_status(target);
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &status.to_be_bytes()) {
+            return Err(RenderError::BadMemory(format!("FRAMEBUFFER_STATUS write to {loc:?}")));
         }
         Ok(())
     }
@@ -5869,6 +6346,9 @@ impl Renderer {
         let uniform_values: Vec<Vec<u8>> = (0..uniform_bindings.len() as u32)
             .map(|i| prog.uniform_values.get(&i).cloned().unwrap_or_default())
             .collect();
+        let sampler_bindings = prog.sampler_bindings.clone();
+        let interface = prog.interface.clone();
+        let attrib_count = prog.attrib_count;
         let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
             Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
             _ => return Ok(()), // shader destroyed or re-sourced since link
@@ -5892,10 +6372,15 @@ impl Renderer {
             })
             .collect::<Result<_, _>>()?;
 
-        let draw_id = state.draw_surface();
-        let def = *state
-            .surface(draw_id)
-            .ok_or(RenderError::UnknownObject("surface", draw_id))?;
+        let Some((target_width, target_height, color_view, depth_view, persistent_depth)) =
+            self.resolve_draw_target(state)?
+        else {
+            // A programmable draw against an incomplete bound
+            // framebuffer is not a protocol error and has no effect,
+            // per the spec's `FRAMEBUFFER_STATUS`/`DRAW_ARRAYS_PROG`
+            // sections.
+            return Ok(());
+        };
 
         // One `wgpu::VertexBufferLayout`/bound buffer per shader input,
         // located by name (remapped through `PROGRAM_BIND_ATTRIB_LOCATION`
@@ -5963,9 +6448,6 @@ impl Renderer {
             layouts.push(((pointer.size as usize * component_bytes) as u64, format, shader_location as u32));
         }
 
-        let gpu = self.ensure_surface(draw_id, &def)?;
-        let (color_view, depth_view) = (gpu.color_view.clone(), gpu.depth_view.clone());
-
         let vs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("c3d programmable vertex shader"),
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(vs_module)),
@@ -5995,18 +6477,82 @@ impl Renderer {
             })
             .collect();
 
-        // One uniform buffer per active uniform (group 0), bound at each
-        // stage's own naga binding number -- a uniform used by both
-        // stages gets two bind-group entries pointing at the same
-        // buffer, exactly matching `glsl.rs`'s disjoint per-stage
-        // binding ranges. Every active uniform already has a value (a
-        // zeroed default from PROGRAM_LINK if never set -- see
-        // op_program_link's doc comment), so there is no "unset" case
-        // to special-case here.
+        // Every `sampler2D`/`samplerCube` uniform's bound texture unit
+        // (`UNIFORM_SAMPLER`, defaulting to unit 0 exactly like GLES2's
+        // own "a sampler uniform's initial value is 0" rule, since
+        // `sampler_bindings` has no zeroed-default entry the way
+        // `uniform_values` does). A sampler uniform whose unit has no
+        // bound texture object makes the draw a no-op, same reasoning as
+        // the "shader destroyed since link" early returns above -- there
+        // is nothing correct to bind.
+        let mut sampler_textures: Vec<(UniformBinding, u32)> = Vec::new();
+        for (i, binding) in uniform_bindings.iter().enumerate() {
+            if !binding.is_sampler {
+                continue;
+            }
+            let gl_type = interface
+                .get(attrib_count as usize + i)
+                .map(|e| e.gl_type)
+                .unwrap_or(GL_SAMPLER_2D);
+            if gl_type == GL_SAMPLER_CUBE {
+                // `GpuTexture` has no cube-map representation yet (no
+                // fixed-function path creates one either) -- a real gap,
+                // not a silently-wrong draw.
+                return Err(RenderError::Unimplemented(
+                    "programmable draw sampling a samplerCube uniform (no cube-map GPU texture support yet)",
+                ));
+            }
+            let unit = sampler_bindings.get(&(i as u32)).copied().unwrap_or(0);
+            let texture_id = state
+                .texture_units
+                .get(unit as usize)
+                .map(|u| u.bound_texture)
+                .unwrap_or(0);
+            if !self.textures.contains_key(&texture_id) {
+                return Ok(());
+            }
+            sampler_textures.push((binding.clone(), texture_id));
+        }
+        // Ensure each bound texture's sampler exists in the cache before
+        // building any bind group entries -- `Renderer::sampler` needs
+        // `&mut self`, so this has to happen before the entries below
+        // borrow `self.textures`/`self.sampler_cache` immutably (mirrors
+        // `submit_draw`'s identical ensure-then-look-up split).
+        let mut sampler_keys = Vec::with_capacity(sampler_textures.len());
+        for (_, texture_id) in &sampler_textures {
+            let obj = state.texture(*texture_id);
+            let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
+                TexWrap::Repeat,
+                TexWrap::Repeat,
+                TexFilter::Linear,
+            ));
+            let key: SamplerKey = (
+                tex_wrap_to_address_mode(ws),
+                tex_wrap_to_address_mode(wt),
+                tex_filter_to_wgpu(min),
+                tex_filter_mipmap_mode(min),
+            );
+            self.sampler(key.0, key.1, key.2, key.3);
+            sampler_keys.push(key);
+        }
+
+        // One uniform buffer per active plain-value uniform (group 0),
+        // bound at each stage's own naga binding number -- a uniform used
+        // by both stages gets two bind-group entries pointing at the same
+        // buffer, exactly matching `glsl.rs`'s disjoint per-stage binding
+        // ranges. Every active uniform already has a value (a zeroed
+        // default from PROGRAM_LINK if never set -- see op_program_link's
+        // doc comment), so there is no "unset" case to special-case here.
+        // Sampler uniforms (`is_sampler`) are excluded here -- their
+        // texture/sampler pair is bound below instead, from
+        // `sampler_textures`/`sampler_keys`.
         let mut uniform_gpu_buffers = Vec::with_capacity(uniform_bindings.len());
         let mut bind_group_layout_entries = Vec::new();
         let mut bind_group_slot_buffers: Vec<(u32, usize)> = Vec::new();
         for (binding, value) in uniform_bindings.iter().zip(&uniform_values) {
+            if binding.is_sampler {
+                continue;
+            }
             let buf_index = uniform_gpu_buffers.len();
             uniform_gpu_buffers.push(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("c3d programmable uniform buffer"),
@@ -6031,6 +6577,40 @@ impl Renderer {
                 bind_group_slot_buffers.push((slot, buf_index));
             }
         }
+        let mut bind_group_slot_textures: Vec<(u32, u32)> = Vec::new(); // (binding, texture_id)
+        let mut bind_group_slot_samplers: Vec<(u32, SamplerKey)> = Vec::new();
+        for ((binding, texture_id), key) in sampler_textures.iter().zip(&sampler_keys) {
+            for (slot, visibility) in [
+                (binding.vertex_binding, wgpu::ShaderStages::VERTEX),
+                (binding.fragment_binding, wgpu::ShaderStages::FRAGMENT),
+            ] {
+                let Some(slot) = slot else { continue };
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: slot,
+                    visibility,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                });
+                bind_group_slot_textures.push((slot, *texture_id));
+            }
+            for (slot, visibility) in [
+                (binding.vertex_sampler_binding, wgpu::ShaderStages::VERTEX),
+                (binding.fragment_sampler_binding, wgpu::ShaderStages::FRAGMENT),
+            ] {
+                let Some(slot) = slot else { continue };
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: slot,
+                    visibility,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                });
+                bind_group_slot_samplers.push((slot, *key));
+            }
+        }
         let uniform_bind_group = if bind_group_layout_entries.is_empty() {
             None
         } else {
@@ -6038,13 +6618,27 @@ impl Renderer {
                 label: Some("c3d programmable uniform bind group layout"),
                 entries: &bind_group_layout_entries,
             });
-            let entries: Vec<wgpu::BindGroupEntry> = bind_group_slot_buffers
+            let mut entries: Vec<wgpu::BindGroupEntry> = bind_group_slot_buffers
                 .iter()
                 .map(|&(binding, idx)| wgpu::BindGroupEntry {
                     binding,
                     resource: uniform_gpu_buffers[idx].as_entire_binding(),
                 })
                 .collect();
+            entries.extend(bind_group_slot_textures.iter().map(|&(binding, texture_id)| {
+                wgpu::BindGroupEntry {
+                    binding,
+                    resource: wgpu::BindingResource::TextureView(&self.textures[&texture_id].view),
+                }
+            }));
+            entries.extend(bind_group_slot_samplers.iter().map(|&(binding, key)| {
+                wgpu::BindGroupEntry {
+                    binding,
+                    resource: wgpu::BindingResource::Sampler(
+                        self.sampler_cache.get(&key).expect("just ensured"),
+                    ),
+                }
+            }));
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("c3d programmable uniform bind group"),
                 layout: &layout,
@@ -6103,14 +6697,26 @@ impl Renderer {
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: INTERNAL_DEPTH_FORMAT,
+                format: self.depth_format,
                 depth_write_enabled: Some(state.raster.depth_mask),
                 depth_compare: Some(if state.enables.depth_test {
                     CompareFuncKey::from(state.raster.depth_func).to_wgpu()
                 } else {
                     wgpu::CompareFunction::Always
                 }),
-                stencil: wgpu::StencilState::default(),
+                stencil: if state.enables.stencil_test {
+                    StencilKey {
+                        func: state.raster.stencil_func.into(),
+                        fail: state.raster.stencil_fail_op.into(),
+                        zfail: state.raster.stencil_zfail_op.into(),
+                        zpass: state.raster.stencil_zpass_op.into(),
+                        read_mask: (state.raster.stencil_read_mask & 0xFF) as u8,
+                        write_mask: (state.raster.stencil_write_mask & 0xFF) as u8,
+                    }
+                    .to_wgpu()
+                } else {
+                    wgpu::StencilState::default()
+                },
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
@@ -6155,20 +6761,32 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: if persistent_depth {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(1.0)
+                        },
                         store: wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: if persistent_depth {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(0)
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
+            pass.set_stencil_reference(state.raster.stencil_ref & 0xFF);
             if let Some((_, bind_group)) = &uniform_bind_group {
                 pass.set_bind_group(0, bind_group, &[]);
             }
-            if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, def.width, def.height) {
+            if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, target_width, target_height) {
                 pass.set_scissor_rect(x, y, sw, sh);
             }
             for (i, buffer) in gpu_buffers.iter().enumerate() {
@@ -6211,6 +6829,27 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
+        self.copy_texture_rect_to_cpu_aspect(texture, mip_level, x, y, width, height, wgpu::TextureAspect::All)
+    }
+
+    /// [`Self::copy_texture_rect_to_cpu`], plus an explicit copy aspect:
+    /// needed only for [`Self::op_read_pixels`]'s `DEPTH` format against
+    /// [`INTERNAL_DEPTH_STENCIL_FORMAT`] -- a combined depth/stencil
+    /// texture has no single "all aspects" copy (`wgpu` requires naming
+    /// one), unlike every other texture this module ever reads back
+    /// (always single-aspect colour), which is why every other caller
+    /// goes through the `All`-aspect wrapper above instead of this one
+    /// directly.
+    fn copy_texture_rect_to_cpu_aspect(
+        &self,
+        texture: &wgpu::Texture,
+        mip_level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        aspect: wgpu::TextureAspect,
+    ) -> Result<Vec<u8>, RenderError> {
         let bytes_per_row_unaligned = width * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = bytes_per_row_unaligned.div_ceil(align) * align;
@@ -6233,7 +6872,7 @@ impl Renderer {
                 texture,
                 mip_level,
                 origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
+                aspect,
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
@@ -7257,6 +7896,134 @@ mod tests {
                         px,
                         [0, 0, 255, 255],
                         "({x}, {y}) should still be blue (outside scissor)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `STENCIL_TEST` must actually gate a *later*, unrelated draw's
+    /// colour writes -- not just decode and store without effect. Two
+    /// passes on an 8x8 surface: the first (scissored to the left half,
+    /// `STENCIL_FUNC(ALWAYS, 1, 0xFF)`/`STENCIL_OP(KEEP, KEEP, REPLACE)`)
+    /// writes stencil `1` into columns `0..4` only; the second (no
+    /// scissor, a fresh fully-covering triangle, `STENCIL_FUNC(EQUAL, 1,
+    /// 0xFF)`) tries to paint the *whole* surface green but must only
+    /// succeed where stencil reads `1` -- i.e. exactly the left half the
+    /// first pass wrote. A renderer that decoded `STENCIL_FUNC`/
+    /// `STENCIL_OP`/`STENCIL_TEST` into `state` but never wired them into
+    /// the actual pipeline would paint the whole surface green instead.
+    #[test]
+    fn stencil_test_gates_a_later_draws_colour_writes() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 8,
+                height: 8,
+                stride_bytes: 32,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.enable(state::Capability::StencilTest);
+
+        // Fully covers an 8x8 surface from any window-space origin, same
+        // "triple the extent" construction the fog test above uses.
+        let covering_tri = [(-8.0f32, -8.0f32), (-8.0, 24.0), (24.0, -8.0)];
+        let verts = {
+            let mut v = Vec::new();
+            for (x, y) in covering_tri {
+                for w in [x, y, 0.5f32, 1.0f32] {
+                    v.extend_from_slice(&w.to_bits().to_be_bytes());
+                }
+            }
+            v
+        };
+
+        let mut mem = TestMemory::new(65536);
+
+        // A full-surface clear first, *before* the scissor restricting
+        // pass 1's write to the left half is even set -- otherwise this
+        // clear would itself be scissored to that same half, leaving the
+        // right half's colour and stencil at whatever uninitialised
+        // contents the GPU texture started with instead of a known
+        // background.
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_STENCIL,
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors (background clear): {errs:?}");
+
+        // Pass 1: scissored to the left half, writes stencil 1 there.
+        state.set_scissor(0, 0, 4, 8);
+        state.enable(state::Capability::ScissorTest);
+        state.set_stencil_func(state::StencilCompareFunc::Always, 1, 0xFF);
+        state.set_stencil_op(state::StencilOp::Keep, state::StencilOp::Keep, state::StencilOp::Replace);
+        state.set_stencil_mask(0xFF);
+        state.set_current_color(1.0, 0.0, 0.0, 1.0); // irrelevant -- overwritten (or not) by pass 2
+        let errs = renderer.execute(
+            &[RenderOp::Draw {
+                prim: PrimitiveType::Triangles,
+                format: VertexFormat(0),
+                count: 3,
+                window_space: true,
+                vertices: DrawVertices::Inline(&verts),
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors (write pass): {errs:?}");
+
+        // Pass 2: no scissor, full-covering green triangle, gated by the
+        // stencil test instead.
+        state.disable(state::Capability::ScissorTest);
+        state.set_stencil_func(state::StencilCompareFunc::Equal, 1, 0xFF);
+        state.set_stencil_op(state::StencilOp::Keep, state::StencilOp::Keep, state::StencilOp::Keep);
+        state.set_current_color(0.0, 1.0, 0.0, 1.0);
+        let errs = renderer.execute(
+            &[RenderOp::Draw {
+                prim: PrimitiveType::Triangles,
+                format: VertexFormat(0),
+                count: 3,
+                window_space: true,
+                vertices: DrawVertices::Inline(&verts),
+            }],
+            &state,
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors (test pass): {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let at = ((y * 8 + x) * 4) as usize;
+                let px = &pixels[at..at + 4];
+                if x < 4 {
+                    assert_eq!(
+                        px,
+                        [0, 255, 0, 255],
+                        "({x}, {y}) should be green: stencil 1 was written here"
+                    );
+                } else {
+                    assert_eq!(
+                        px,
+                        [0, 0, 0, 255],
+                        "({x}, {y}) should still be black: the stencil test must have rejected it"
                     );
                 }
             }

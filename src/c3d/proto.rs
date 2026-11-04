@@ -60,15 +60,21 @@ pub const GLOBAL_SURFFMT_SUPPORTED_LO: u32 = 0x068;
 pub const GLOBAL_SURFFMT_SUPPORTED_HI: u32 = 0x06C;
 pub const GLOBAL_MAX_SURFACE_WIDTH: u32 = 0x070;
 pub const GLOBAL_MAX_SURFACE_HEIGHT: u32 = 0x074;
-/// `CAP_PROGRAMMABLE` (`c3d-programmable-tier`). Only the shader/program
-/// object limits are implemented so far (see this tier's doc comment in
-/// `dispatch.rs`); the remaining `MAX_*` registers the spec defines for
-/// this tier (buffers, framebuffers, vertex attributes, ...) arrive with
-/// the opcode groups that need them.
+/// `CAP_PROGRAMMABLE` (`c3d-programmable-tier`). The shader/program,
+/// buffer, vertex-attribs and framebuffer/renderbuffer object limits are
+/// implemented (see this tier's doc comment in `dispatch.rs`); the
+/// uniform/varying vector-count registers the spec also defines for this
+/// tier (`MAX_VERTEX_UNIFORM_VECTORS`, `MAX_FRAGMENT_UNIFORM_VECTORS`,
+/// `MAX_VARYING_VECTORS`) remain unimplemented, since nothing enforces
+/// those limits yet either.
 pub const GLOBAL_MAX_SHADERS: u32 = 0x078;
 pub const GLOBAL_MAX_PROGRAMS: u32 = 0x07C;
 pub const GLOBAL_MAX_BUFFERS: u32 = 0x080;
+pub const GLOBAL_MAX_FRAMEBUFFERS: u32 = 0x084;
+pub const GLOBAL_MAX_RENDERBUFFERS: u32 = 0x088;
 pub const GLOBAL_MAX_VERTEX_ATTRIBS: u32 = 0x08C;
+pub const GLOBAL_MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
+pub const GLOBAL_MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
 
 /// `APERTURE_OFFSET`'s fixed reset value (`c3d-zorro-identity`'s window
 /// layout table): the data aperture always starts here.
@@ -100,14 +106,14 @@ pub const CAP_REF_SYNC: u32 = 1 << 6;
 /// and program objects, buffer-backed vertex attributes, framebuffer and
 /// renderbuffer objects, programmable draw, and the stencil test.
 ///
-/// **Not yet set in `board.rs`'s fitted `CAPS0`.** Only `0x09xx`'s
-/// shader/program lifecycle and `0x0D00`/`0x0D01`'s status queries are
-/// implemented; per the spec's porting guidance ("set `CAP_PROGRAMMABLE`
-/// only if it implements the full ... object model"), this bit stays off
-/// in the board's advertised capabilities until buffers, framebuffers and
-/// programmable draw land too. The constant and the opcode gating below
-/// exist now so each landing opcode group is additive from here rather
-/// than needing the gating logic added later.
+/// Set in `board.rs`'s fitted `CAPS0`: the full object model this doc
+/// comment names is implemented -- `0x09xx`'s shader/program lifecycle,
+/// `0x0Axx`'s buffers and vertex attributes, `0x0Bxx`'s framebuffer/
+/// renderbuffer objects, `0x0Cxx`'s programmable draw, `0x0Dxx`'s status
+/// queries, and `STENCIL_TEST`/`STENCIL_FUNC`/`STENCIL_OP`/`STENCIL_MASK`/
+/// `CLEAR_STENCIL` (shared raster state, `c3d-raster-state`) -- matching
+/// the spec's porting guidance ("set `CAP_PROGRAMMABLE` only if it
+/// implements the full ... object model").
 pub const CAP_PROGRAMMABLE: u32 = 1 << 7;
 
 /// The `IRQ_STATUS`/`IRQ_ENABLE` bit for context `n`'s fence interrupt.
@@ -166,6 +172,9 @@ pub const READ_PIXELS_FLAG_ROWS_BOTTOM_UP: u32 = 1 << 0;
 /// `CLEAR`'s `mask` bits.
 pub const CLEAR_MASK_COLOR: u32 = 1 << 0;
 pub const CLEAR_MASK_DEPTH: u32 = 1 << 1;
+/// `CAP_PROGRAMMABLE` only: ignored (no stencil buffer to clear) without
+/// it, per `CLEAR`'s own doc comment.
+pub const CLEAR_MASK_STENCIL: u32 = 1 << 2;
 
 // ---------------------------------------------------------------------
 // Opcodes (`c3d-command-stream`'s opcode map). Each constant is the full
@@ -228,6 +237,14 @@ pub const OP_LOGIC_OP: u16 = 0x0216;
 pub const OP_POLYGON_MODE: u16 = 0x0217;
 pub const OP_BLEND_EQUATION: u16 = 0x0218;
 pub const OP_BLEND_FUNC_SEPARATE: u16 = 0x0219;
+/// Shared raster state's stencil opcodes, `CAP_PROGRAMMABLE`: a stencil
+/// buffer only exists per surface once that capability is set (`c3d-
+/// raster-state`'s stencil prose), but the test and this state are
+/// shared machinery with the fixed-function tier once it does.
+pub const OP_STENCIL_FUNC: u16 = 0x021A;
+pub const OP_STENCIL_OP: u16 = 0x021B;
+pub const OP_STENCIL_MASK: u16 = 0x021C;
+pub const OP_CLEAR_STENCIL: u16 = 0x021D;
 
 // Matrix (0x03xx) -- `c3d-cmd-matrix`, `CAP_TRANSFORM`.
 pub const OP_MATRIX_MODE: u16 = 0x0300;
@@ -316,6 +333,19 @@ pub const OP_BUFFER_SUBDATA: u16 = 0x0A03;
 pub const OP_VERTEX_ATTRIB_ENABLE: u16 = 0x0A04;
 pub const OP_VERTEX_ATTRIB_POINTER: u16 = 0x0A05;
 pub const OP_VERTEX_ATTRIB_CONSTANT: u16 = 0x0A06;
+
+// Framebuffers and renderbuffers (0x0Bxx) -- `c3d-cmd-framebuffers-and-
+// renderbuffers`, `CAP_PROGRAMMABLE`.
+pub const OP_FRAMEBUFFER_CREATE: u16 = 0x0B00;
+pub const OP_FRAMEBUFFER_DESTROY: u16 = 0x0B01;
+pub const OP_BIND_FRAMEBUFFER: u16 = 0x0B02;
+pub const OP_RENDERBUFFER_CREATE: u16 = 0x0B03;
+pub const OP_RENDERBUFFER_DESTROY: u16 = 0x0B04;
+pub const OP_RENDERBUFFER_STORAGE_COLOR: u16 = 0x0B05;
+pub const OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL: u16 = 0x0B06;
+pub const OP_FRAMEBUFFER_ATTACH_RENDERBUFFER: u16 = 0x0B07;
+pub const OP_FRAMEBUFFER_ATTACH_TEXTURE: u16 = 0x0B08;
+pub const OP_FRAMEBUFFER_STATUS: u16 = 0x0B09;
 
 // Programmable draw (0x0Cxx) -- `c3d-cmd-programmable-draw`,
 // `CAP_PROGRAMMABLE`.
@@ -861,6 +891,26 @@ pub enum Command<'a> {
         src_a: u32,
         dst_a: u32,
     },
+    /// `STENCIL_FUNC`, `CAP_PROGRAMMABLE`.
+    StencilFunc {
+        func: u32,
+        reference: u32,
+        mask: u32,
+    },
+    /// `STENCIL_OP`, `CAP_PROGRAMMABLE`.
+    StencilOp {
+        fail: u32,
+        zfail: u32,
+        zpass: u32,
+    },
+    /// `STENCIL_MASK`, `CAP_PROGRAMMABLE`.
+    StencilMask {
+        mask: u32,
+    },
+    /// `CLEAR_STENCIL`, `CAP_PROGRAMMABLE`.
+    ClearStencil {
+        value: u32,
+    },
 
     // Matrix (0x03xx) -- CAP_TRANSFORM.
     MatrixMode {
@@ -1207,6 +1257,52 @@ pub enum Command<'a> {
         y: f32,
         z: f32,
         w: f32,
+    },
+
+    // Framebuffers and renderbuffers (0x0Bxx), `CAP_PROGRAMMABLE`. `target`/
+    // `attachment` are raw GL enumerants, validated downstream like any
+    // other (see this module's doc comment).
+    FramebufferCreate {
+        id: u32,
+    },
+    FramebufferDestroy {
+        id: u32,
+    },
+    BindFramebuffer {
+        target: u32,
+        id: u32,
+    },
+    RenderbufferCreate {
+        id: u32,
+    },
+    RenderbufferDestroy {
+        id: u32,
+    },
+    RenderbufferStorageColor {
+        id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    },
+    RenderbufferStorageDepthStencil {
+        id: u32,
+        width: u32,
+        height: u32,
+    },
+    FramebufferAttachRenderbuffer {
+        target: u32,
+        attachment: u32,
+        renderbuffer: u32,
+    },
+    FramebufferAttachTexture {
+        target: u32,
+        attachment: u32,
+        texture: u32,
+        level: u32,
+    },
+    FramebufferStatus {
+        target: u32,
+        dest: Ref,
     },
 
     // Programmable draw (0x0Cxx), `CAP_PROGRAMMABLE`. `prim`/`index_type`
