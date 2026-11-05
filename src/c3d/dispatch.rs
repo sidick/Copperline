@@ -57,13 +57,14 @@
 //! `E_NO_SURFACE`/`E_BAD_RECT` are applied at exactly the opcodes
 //! `docs/internals/c3d.md` and this milestone's brief name: `CLEAR` and
 //! every draw get [`state::State::require_draw_surface`] alone (neither
-//! carries a rectangle payload); `SURFACE_UPLOAD`, `SURFACE_READBACK` and
-//! `READ_PIXELS` get [`state::State::check_draw_surface_rect`] (surface
-//! *and* rectangle). `TEX_COPY_IMAGE`/`TEX_COPY_SUBIMAGE` also source
-//! pixels from the draw surface per the spec's prose, but neither the
-//! spec's error table nor this milestone's brief lists them under
-//! `E_NO_SURFACE`, so this module does not check them either -- flagged in
-//! this module's own limitations rather than silently invented.
+//! carries a rectangle payload); `SURFACE_UPLOAD`/`SURFACE_READBACK` get
+//! [`state::State::check_draw_surface_rect`] (surface *and* rectangle,
+//! always the draw surface -- neither is framebuffer-aware). `READ_
+//! PIXELS` and the copy-to-texture commands (`TEX_COPY_IMAGE`/`TEX_COPY_
+//! SUBIMAGE` and their `_FACE` siblings) get [`state::State::check_read_
+//! source_rect`] instead: the draw surface, or (`CAP_PROGRAMMABLE`, a
+//! non-default read framebuffer bound) that framebuffer's `READ_BUFFER`-
+//! selected attachment's actual size -- see that method's doc comment.
 //! `SCISSOR`/`VIEWPORT` are never rectangle-checked, per `state.rs`'s own
 //! note and its test that pins that behaviour.
 
@@ -1240,13 +1241,15 @@ impl Context {
                     self.latch_protocol_error(code, start);
                     return;
                 }
-                // The source rectangle comes off the draw surface, so this
-                // needs the same `E_NO_SURFACE`/`E_BAD_RECT` pair a readback
-                // does -- checked before the level is defined, so a rejected
-                // copy leaves the texture object untouched.
+                // The source rectangle comes off the draw surface, or
+                // (`CAP_PROGRAMMABLE`, a non-default read framebuffer
+                // bound) that framebuffer's `READ_BUFFER`-selected
+                // attachment instead -- see `check_read_source_rect`'s
+                // doc comment -- checked before the level is defined, so
+                // a rejected copy leaves the texture object untouched.
                 if let Err(code) = self
                     .state
-                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                    .check_read_source_rect(x as i32, y as i32, width, height)
                 {
                     self.latch_protocol_error(code, start);
                     return;
@@ -1282,10 +1285,11 @@ impl Context {
                     self.latch_protocol_error(code, start);
                     return;
                 }
-                // Source rectangle off the draw surface, as above.
+                // Source rectangle off the draw surface or the bound read
+                // framebuffer, as above.
                 if let Err(code) = self
                     .state
-                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                    .check_read_source_rect(x as i32, y as i32, width, height)
                 {
                     self.latch_protocol_error(code, start);
                     return;
@@ -1420,7 +1424,7 @@ impl Context {
                 }
                 if let Err(code) = self
                     .state
-                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                    .check_read_source_rect(x as i32, y as i32, width, height)
                 {
                     self.latch_protocol_error(code, start);
                     return;
@@ -1460,7 +1464,7 @@ impl Context {
                 }
                 if let Err(code) = self
                     .state
-                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                    .check_read_source_rect(x as i32, y as i32, width, height)
                 {
                     self.latch_protocol_error(code, start);
                     return;
@@ -1614,7 +1618,7 @@ impl Context {
                 let Some(fmt) = self.decode_gl(state::SurfaceFormat::from_wire(format)) else {
                     return;
                 };
-                match self.state.check_draw_surface_rect(x as i32, y as i32, w, h) {
+                match self.state.check_read_source_rect(x as i32, y as i32, w, h) {
                     Ok(()) => out.push(RenderOp::ReadPixels {
                         x,
                         y,
@@ -1785,7 +1789,7 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
                 else {
                     return;
                 };
@@ -1805,7 +1809,7 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
                 else {
                     return;
                 };
@@ -1838,7 +1842,7 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
                 else {
                     return;
                 };
@@ -1846,6 +1850,26 @@ impl Context {
                     .state
                     .framebuffer_attach_texture_face(target, attachment, texture, face, level)
                 {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::DrawBuffers { count, bufs } => {
+                let values: Vec<u32> = (0..count as usize)
+                    .map(|i| {
+                        u32::from_be_bytes([
+                            bufs[i * 4],
+                            bufs[i * 4 + 1],
+                            bufs[i * 4 + 2],
+                            bufs[i * 4 + 3],
+                        ])
+                    })
+                    .collect();
+                if let Err(code) = self.state.draw_buffers(&values) {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::ReadBuffer { buf } => {
+                if let Err(code) = self.state.read_buffer(buf) {
                     self.latch_protocol_error(code, start);
                 }
             }
@@ -2203,6 +2227,77 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(ctx.error_code, ErrorCode::BadRect as u32);
         assert!(!ctx.halted);
+    }
+
+    /// `TEX_COPY_IMAGE`'s source rectangle must be checked against the
+    /// bound *read* framebuffer's attachment, not always the draw
+    /// surface, once `CAP_PROGRAMMABLE` has a non-default one bound: a
+    /// rect that fits the (larger) draw surface but not the (smaller)
+    /// attachment must still be rejected.
+    #[test]
+    fn tex_copy_image_against_a_read_framebuffer_checks_the_attachments_own_size_not_the_draw_surfaces() {
+        let mut ctx = context();
+        const FRAMEBUFFER: u32 = 0x8D40; // GL_FRAMEBUFFER
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const RGBA8: u32 = 0;
+        let commands = vec![
+            define_surface(1, 8, 8),
+            cmd(OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 4, 4, 5]), // 4x4, A8R8G8B8
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            // (0,0,8,8) fits the 8x8 draw surface but not the 4x4
+            // attachment the bound read framebuffer actually sources
+            // from -- must be E_BAD_RECT.
+            cmd(proto::OP_TEX_COPY_IMAGE, &[1, 0, RGBA8, 0, 0, 8, 8]),
+        ];
+        let ring = ring_of(&commands);
+        let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert!(out.is_empty(), "expected no RenderOp, got {out:?}");
+        assert_eq!(ctx.error_code, ErrorCode::BadRect as u32);
+        assert!(!ctx.halted);
+    }
+
+    /// The reverse of the above: a rectangle too large for the (small)
+    /// draw surface but valid against the (larger) bound read
+    /// framebuffer attachment must succeed -- the old, always-draw-
+    /// surface check would have wrongly rejected this.
+    #[test]
+    fn tex_copy_image_against_a_read_framebuffer_accepts_a_rect_too_big_for_the_draw_surface() {
+        let mut ctx = context();
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const RGBA8: u32 = 0;
+        let commands = vec![
+            define_surface(1, 2, 2),
+            cmd(OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 8, 8, 5]), // 8x8, A8R8G8B8
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            // (0,0,8,8) overflows the 2x2 draw surface but fits the 8x8
+            // attachment the bound read framebuffer actually sources
+            // from -- must succeed.
+            cmd(proto::OP_TEX_COPY_IMAGE, &[1, 0, RGBA8, 0, 0, 8, 8]),
+        ];
+        let ring = ring_of(&commands);
+        let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(out.len(), 1, "expected exactly one RenderOp, got {out:?}");
+        match &out[0] {
+            RenderOp::TexCopyImage { x, y, width, height, .. } => {
+                assert_eq!((*x, *y, *width, *height), (0, 0, 8, 8));
+            }
+            other => panic!("expected a TexCopyImage op, got {other:?}"),
+        }
     }
 
     // -- GL errors ---------------------------------------------------

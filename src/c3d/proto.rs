@@ -372,6 +372,14 @@ pub const OP_FRAMEBUFFER_STATUS: u16 = 0x0B09;
 /// `CAP_PROGRAMMABLE`. Render-to-cube-face: as `FRAMEBUFFER_ATTACH_TEXTURE`,
 /// but names one face of a cube-map texture.
 pub const OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE: u16 = 0x0B0A;
+/// `CAP_PROGRAMMABLE`. `glDrawBuffers`/`glDrawBuffersEXT`'s wire
+/// equivalent: maps fragment-shader output slots to colour attachments of
+/// the bound draw framebuffer.
+pub const OP_DRAW_BUFFERS: u16 = 0x0B0B;
+/// `CAP_PROGRAMMABLE`. `glReadBuffer`'s wire equivalent: selects which
+/// colour attachment of the bound read framebuffer `READ_PIXELS`/the
+/// copy-to-texture commands source from.
+pub const OP_READ_BUFFER: u16 = 0x0B0C;
 
 // Programmable draw (0x0Cxx) -- `c3d-cmd-programmable-draw`,
 // `CAP_PROGRAMMABLE`.
@@ -1405,6 +1413,19 @@ pub enum Command<'a> {
         texture: u32,
         face: u32,
         level: u32,
+    },
+    /// `DRAW_BUFFERS`. `bufs` is the raw wire bytes (big-endian words) for
+    /// `count` colour-attachment selections, one per fragment-shader
+    /// output slot -- each `GL_NONE` or `GL_COLOR_ATTACHMENT0 + k`,
+    /// interpreted downstream (`state::State::draw_buffers`), like
+    /// `UNIFORM`'s `values`.
+    DrawBuffers {
+        count: u32,
+        bufs: &'a [u8],
+    },
+    /// `READ_BUFFER`.
+    ReadBuffer {
+        buf: u32,
     },
 
     // Programmable draw (0x0Cxx), `CAP_PROGRAMMABLE`. `prim`/`index_type`

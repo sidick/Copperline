@@ -3227,6 +3227,44 @@ fn vertex_shader_inputs_typed(module: &naga::Module) -> Vec<(String, u32, u32)> 
         .collect()
 }
 
+/// A compiled fragment module's output locations, in declaration order --
+/// `gl_FragData[n]`'s (or a single `gl_FragColor`'s) wire equivalent to
+/// `DRAW_BUFFERS`' slot numbering. Confirmed directly: naga's GLSL front
+/// end always represents a fragment result as a `Struct`, one member per
+/// `out` variable, each carrying its own `Binding::Location` -- even the
+/// single-`gl_FragColor` case -- so this one path handles both without
+/// special-casing (see `glsl.rs`'s `rewrite_to_core_profile` doc comment).
+/// Empty for a fragment shader with no result (shouldn't happen for valid
+/// GLSL ES, but this never panics on it).
+fn fragment_output_locations(module: &naga::Module) -> Vec<u32> {
+    let Some(ep) = module
+        .entry_points
+        .iter()
+        .find(|e| e.stage == naga::ShaderStage::Fragment)
+    else {
+        return Vec::new();
+    };
+    let Some(result) = &ep.function.result else {
+        return Vec::new();
+    };
+    let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+        // A single, directly-bound result (shouldn't occur in practice --
+        // naga's GLSL front end always produces a one-member struct, per
+        // this function's doc comment -- but handled rather than assumed).
+        return match &result.binding {
+            Some(naga::Binding::Location { location, .. }) => vec![*location],
+            _ => Vec::new(),
+        };
+    };
+    members
+        .iter()
+        .filter_map(|m| match &m.binding {
+            Some(naga::Binding::Location { location, .. }) => Some(*location),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A compiled module's plain-value `uniform` globals (`AddressSpace::
 /// Uniform` -- excludes samplers/textures, which live in `AddressSpace::
 /// Handle` instead and are picked up separately by [`module_samplers`]),
@@ -3983,7 +4021,7 @@ impl Renderer {
     fn resolve_draw_target(
         &mut self,
         state: &State,
-    ) -> Result<Option<(u32, u32, wgpu::TextureView, wgpu::TextureView, bool)>, RenderError> {
+    ) -> Result<Option<(u32, u32, Vec<Option<wgpu::TextureView>>, wgpu::TextureView, bool)>, RenderError> {
         let fb_id = state.draw_framebuffer();
         if fb_id == 0 {
             let surf_id = state.draw_surface();
@@ -3994,7 +4032,7 @@ impl Renderer {
             return Ok(Some((
                 def.width,
                 def.height,
-                gpu.color_view.clone(),
+                vec![Some(gpu.color_view.clone())],
                 gpu.depth_view.clone(),
                 true,
             )));
@@ -4004,48 +4042,40 @@ impl Renderer {
         }
         let fb = state
             .framebuffer(fb_id)
-            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists");
-        let color = fb
-            .color0
-            .expect("FRAMEBUFFER_COMPLETE implies a colour attachment");
-        let (width, height, color_view) = match color {
-            state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
-                    state.renderbuffer(rb_id).and_then(|r| r.storage)
-                else {
-                    unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
-                };
-                (width, height, self.ensure_renderbuffer_color(rb_id, width, height))
-            }
-            state::FramebufferAttachment::Texture { id, level } => {
-                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
-                let width = mip_extent(tex.width, level);
-                let height = mip_extent(tex.height, level);
-                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
-                    base_mip_level: level,
-                    mip_level_count: Some(1),
-                    ..Default::default()
-                });
-                (width, height, view)
-            }
-            state::FramebufferAttachment::TextureFace { id, face, level } => {
-                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
-                let width = mip_extent(tex.width, level);
-                let height = mip_extent(tex.height, level);
-                // One face, one level, as a plain `D2` slice -- a render
-                // attachment targets a single 2D surface regardless of
-                // the texture object's own `Cube` sampling view.
-                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: face,
-                    array_layer_count: Some(1),
-                    base_mip_level: level,
-                    mip_level_count: Some(1),
-                    ..Default::default()
-                });
-                (width, height, view)
-            }
-        };
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists")
+            .clone();
+
+        // Every attached colour resolved once, indexed by attachment
+        // slot -- not just the ones `DRAW_BUFFERS` currently names, so
+        // width/height come out right even when the active draw buffers
+        // and the attached colours don't fully overlap (e.g. a
+        // depth-only draw with every slot `NONE`). `FRAMEBUFFER_COMPLETE`
+        // already guarantees every attached colour (and depth/stencil,
+        // if attached) agrees in size.
+        let mut resolved: Vec<Option<(u32, u32, wgpu::TextureView)>> = Vec::with_capacity(fb.colors.len());
+        let mut width = 0;
+        let mut height = 0;
+        for color in &fb.colors {
+            resolved.push(match color {
+                Some(attachment) => {
+                    let (w, h, view) = self.resolve_color_attachment(state, *attachment)?;
+                    width = w;
+                    height = h;
+                    Some((w, h, view))
+                }
+                None => None,
+            });
+        }
+        let color_views: Vec<Option<wgpu::TextureView>> = fb
+            .draw_buffers
+            .iter()
+            .map(|slot| {
+                slot.and_then(|i| resolved.get(i))
+                    .and_then(|v| v.as_ref())
+                    .map(|(_, _, view)| view.clone())
+            })
+            .collect();
+
         let (depth_view, persistent_depth) = match fb.depth_stencil {
             Some(state::FramebufferAttachment::Renderbuffer(rb_id)) => {
                 (self.ensure_renderbuffer_depth(rb_id, width, height), true)
@@ -4069,7 +4099,145 @@ impl Renderer {
                 (depth.create_view(&wgpu::TextureViewDescriptor::default()), false)
             }
         };
-        Ok(Some((width, height, color_view, depth_view, persistent_depth)))
+        Ok(Some((width, height, color_views, depth_view, persistent_depth)))
+    }
+
+    /// One colour attachment's resolved GPU view and declared size,
+    /// shared across every attachment index by [`Self::resolve_draw_target`]
+    /// (previously inlined for `color0` alone).
+    /// A throwaway colour attachment, `INTERNAL_COLOR_FORMAT`, nothing
+    /// ever reads back -- stands in wherever a pipeline structurally
+    /// needs a colour target (one per fragment-shader output location)
+    /// but `DRAW_BUFFERS` doesn't currently route that location to any
+    /// real attachment. GL's own rule for this case is "the write is
+    /// simply discarded"; this is how that is represented on `wgpu`,
+    /// which has no "discard, no attachment at all" option for a target
+    /// slot the pipeline declares `Some` for.
+    fn scratch_color_view(&self, width: u32, height: u32) -> wgpu::TextureView {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("c3d scratch colour (discarded fragment output)"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: INTERNAL_COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    fn resolve_color_attachment(
+        &mut self,
+        state: &State,
+        attachment: state::FramebufferAttachment,
+    ) -> Result<(u32, u32, wgpu::TextureView), RenderError> {
+        match attachment {
+            state::FramebufferAttachment::Renderbuffer(rb_id) => {
+                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
+                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                else {
+                    unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
+                };
+                Ok((width, height, self.ensure_renderbuffer_color(rb_id, width, height)))
+            }
+            state::FramebufferAttachment::Texture { id, level } => {
+                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                Ok((width, height, view))
+            }
+            state::FramebufferAttachment::TextureFace { id, face, level } => {
+                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                // One face, one level, as a plain `D2` slice -- a render
+                // attachment targets a single 2D surface regardless of
+                // the texture object's own `Cube` sampling view.
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: face,
+                    array_layer_count: Some(1),
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                Ok((width, height, view))
+            }
+        }
+    }
+
+    /// Resolves `READ_PIXELS`/the copy-to-texture commands' colour
+    /// source: the draw surface (baseline, and with `CAP_PROGRAMMABLE`
+    /// whenever the default framebuffer is bound as read), or otherwise
+    /// the bound read framebuffer's `READ_BUFFER`-selected attachment.
+    /// `Ok(None)` for an incomplete read framebuffer or a `READ_BUFFER`
+    /// of `NONE` (or one naming an attachment point with nothing
+    /// attached) -- the caller turns that into a no-op, the same rule an
+    /// incomplete *draw* framebuffer already follows for a draw/`CLEAR`.
+    /// Returns the underlying `wgpu::Texture` (not a view): the
+    /// zero-copy GPU-to-GPU path in [`Self::op_tex_copy_image`] needs the
+    /// real texture object, not a view of it, to call
+    /// `copy_texture_to_texture`. `TextureFace` (a cube-map render
+    /// target) is not supported here yet -- no caller has exercised
+    /// reading back a cube-map face through `READ_PIXELS`/`TEX_COPY_*`
+    /// yet, and doing so correctly needs a `z`/array-layer origin this
+    /// function's `(width, height, texture, level)` shape doesn't carry.
+    fn resolve_read_source(
+        &mut self,
+        state: &State,
+    ) -> Result<Option<(u32, u32, wgpu::Texture, u32)>, RenderError> {
+        let fb_id = state.read_framebuffer();
+        if fb_id == 0 {
+            let surf_id = state.draw_surface();
+            let def = *state
+                .surface(surf_id)
+                .ok_or(RenderError::UnknownObject("surface", surf_id))?;
+            let color = self.ensure_surface(surf_id, &def)?.color.clone();
+            return Ok(Some((def.width, def.height, color, 0)));
+        }
+        if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
+            return Ok(None);
+        }
+        let fb = state
+            .framebuffer(fb_id)
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists");
+        let Some(color_idx) = fb.read_buffer else {
+            return Ok(None);
+        };
+        let Some(Some(attachment)) = fb.colors.get(color_idx) else {
+            return Ok(None);
+        };
+        match *attachment {
+            state::FramebufferAttachment::Renderbuffer(rb_id) => {
+                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
+                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                else {
+                    unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
+                };
+                self.ensure_renderbuffer_color(rb_id, width, height);
+                let texture = self.renderbuffers.get(&rb_id).expect("just ensured").0.clone();
+                Ok(Some((width, height, texture, 0)))
+            }
+            state::FramebufferAttachment::Texture { id, level } => {
+                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                Ok(Some((width, height, tex.texture.clone(), level)))
+            }
+            state::FramebufferAttachment::TextureFace { .. } => Err(RenderError::Unimplemented(
+                "READ_PIXELS/TEX_COPY_* sourcing from a cube-map-face framebuffer attachment",
+            )),
+        }
     }
 
     /// `mipmap` is the mip-selection half of `TEXTURE_MIN_FILTER`
@@ -4832,7 +5000,7 @@ impl Renderer {
     }
 
     fn op_clear(&mut self, mask: u32, state: &State) -> Result<(), RenderError> {
-        let Some((width, height, color_view, depth_view, _persistent_depth)) =
+        let Some((width, height, color_views, depth_view, _persistent_depth)) =
             self.resolve_draw_target(state)?
         else {
             // A CLEAR against an incomplete bound framebuffer is not a
@@ -4895,24 +5063,26 @@ impl Renderer {
             wgpu::LoadOp::Load
         };
 
+        // Bit 0 (`CLEAR_MASK_COLOR`) clears **every** colour attachment
+        // `DRAW_BUFFERS` currently names, all to the same `CLEAR_COLOR`,
+        // per the spec -- not just attachment 0. `wgpu` has no single
+        // multi-target "clear all of these" pass shape distinct from an
+        // ordinary draw's colour-attachment array sized to the pipeline,
+        // so this loops one pass per active attachment instead; depth/
+        // stencil (shared, not per-attachment) rides along on the first
+        // pass only; a depth/stencil-only clear (`active_colors` empty)
+        // still gets its own pass.
+        let active_colors: Vec<&wgpu::TextureView> = color_views.iter().flatten().collect();
         {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("c3d clear"),
                 });
-            {
+            if active_colors.is_empty() {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("c3d clear pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &color_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: load_color,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
+                    color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &depth_view,
                         depth_ops: Some(wgpu::Operations {
@@ -4928,6 +5098,39 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+            } else {
+                for (i, view) in active_colors.iter().enumerate() {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("c3d clear pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: load_color,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: if i == 0 {
+                            Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &depth_view,
+                                depth_ops: Some(wgpu::Operations {
+                                    load: load_depth,
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: Some(wgpu::Operations {
+                                    load: load_stencil,
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                            })
+                        } else {
+                            None
+                        },
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
             }
             self.queue.submit(Some(encoder.finish()));
         }
@@ -4979,16 +5182,33 @@ impl Renderer {
                 }],
             });
 
+            // As the plain clear pass above: one pass per active colour
+            // attachment (the pipeline's fragment stage always declares
+            // exactly one colour target, so each needs its own pass),
+            // depth/stencil riding along on every pass -- harmless to
+            // reapply identically more than once, and `wgpu` requires a
+            // depth/stencil attachment on every pass this pipeline runs
+            // in (its depth/stencil state is fixed by `ClearRectPipelineKey`,
+            // not optional per pass). With no active colour attachment at
+            // all (every `DRAW_BUFFERS` slot `NONE`, or none selected),
+            // a scratch colour view stands in just to satisfy the
+            // pipeline's structural shape; nothing reads it back.
+            let scratch_color = active_colors.is_empty().then(|| self.scratch_color_view(width, height));
+            let views_to_draw: Vec<&wgpu::TextureView> = match &scratch_color {
+                Some(view) => vec![view],
+                None => active_colors.clone(),
+            };
+
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("c3d clear-rect"),
                 });
-            {
+            for view in views_to_draw {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("c3d clear-rect pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &color_view,
+                        view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -6363,11 +6583,15 @@ impl Renderer {
         height: u32,
         state: &State,
     ) -> Result<(), RenderError> {
-        let surface_id = state.draw_surface();
-        let def = *state
-            .surface(surface_id)
-            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        // With `CAP_PROGRAMMABLE` and a non-default read framebuffer
+        // bound, sources from its `READ_BUFFER`-selected colour
+        // attachment instead of the draw surface -- see
+        // `Self::resolve_read_source`'s doc comment.
+        let Some((_, _, color, src_level)) = self.resolve_read_source(state)? else {
+            // Incomplete read framebuffer or `READ_BUFFER` == `NONE`:
+            // not a protocol error, no effect.
+            return Ok(());
+        };
 
         if level == 0 && !self.textures.contains_key(&id) {
             let size = wgpu::Extent3d {
@@ -6396,7 +6620,7 @@ impl Renderer {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &color,
-                    mip_level: 0,
+                    mip_level: src_level,
                     origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -6425,7 +6649,7 @@ impl Renderer {
             return Ok(());
         }
 
-        let rgba = self.copy_texture_rect_to_cpu(&color, 0, x, y, width, height)?;
+        let rgba = self.copy_texture_rect_to_cpu(&color, src_level, x, y, width, height)?;
         self.define_texture_level(id, level, width, height, &rgba)
     }
 
@@ -6465,11 +6689,12 @@ impl Renderer {
             return Err(RenderError::ShortPayload("TEX_COPY_SUBIMAGE rectangle"));
         }
 
-        let surface_id = state.draw_surface();
-        let def = *state
-            .surface(surface_id)
-            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        // As `op_tex_copy_image`: sources from the bound read
+        // framebuffer's `READ_BUFFER`-selected attachment with
+        // `CAP_PROGRAMMABLE`, the draw surface otherwise.
+        let Some((_, _, color, src_level)) = self.resolve_read_source(state)? else {
+            return Ok(());
+        };
         let dest = &self.textures[&id].texture;
 
         let mut encoder = self
@@ -6480,7 +6705,7 @@ impl Renderer {
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &color,
-                mip_level: 0,
+                mip_level: src_level,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -6606,10 +6831,6 @@ impl Renderer {
         let def = *state
             .surface(id)
             .ok_or(RenderError::UnknownObject("surface", id))?;
-        let gpu = self
-            .surfaces
-            .get(&id)
-            .ok_or(RenderError::UnknownObject("surface", id))?;
 
         // Three branches produce one value per source texel, straight
         // from `copy_texture_to_cpu`'s raw bytes (a raw GPU-to-CPU memory
@@ -6617,52 +6838,59 @@ impl Renderer {
         // little-endian convention every other GPU buffer in this module
         // uses, e.g. `gpu_vertices_to_bytes`): 4 channel bytes for an
         // ordinary colour format, one little-endian f32 for `Depth32Float`,
-        // or one raw byte for `Stencil8`.
+        // or one raw byte for `Stencil8`. Each produces its own source
+        // width too: `DEPTH`/`STENCIL` stay tied to the draw surface's
+        // own internal depth buffer (always `def.width`/`def.height`),
+        // but the colour case's source can now be a differently-sized
+        // read-framebuffer attachment.
         let bpp = surface_format_bytes_per_pixel(format);
         let raw_bpp = bpp; // the *source* copy's own per-texel size, below
         // Writes one encoded pixel into the front of `out` and reports its
         // length, rather than returning a fresh `Vec` per pixel -- see
-        // `encode_pixel_into`.
-        let encode_at =
-            |raw: &[u8], sx: u32, sy: u32, out: &mut [u8]| -> Result<usize, RenderError> {
-                match format {
-                    WireSurfaceFormat::Depth => {
-                        let at = ((sy * def.width + sx) * 4) as usize;
-                        let depth = f32::from_le_bytes(
-                            *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
-                        );
-                        let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
-                        out.get_mut(..4)
-                            .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
-                            .copy_from_slice(&scaled.to_be_bytes());
-                        Ok(4)
-                    }
-                    WireSurfaceFormat::Stencil => {
-                        // Raw, unscaled -- the spec's "8-bit stencil
-                        // value, one byte per pixel", unlike DEPTH's
-                        // normalised-to-u32 scaling.
-                        let at = (sy * def.width + sx) as usize;
-                        out.first_mut()
-                            .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))
-                            .map(|dst| *dst = raw[at])?;
-                        Ok(1)
-                    }
-                    _ => {
-                        let at = ((sy * def.width + sx) * 4) as usize;
-                        let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
-                        encode_pixel_into(format, pixel, out)
-                    }
+        // `encode_pixel_into`. `row_width` is the raw buffer's own row
+        // stride in texels (not `w`/the destination rectangle's width).
+        let encode_at = |raw: &[u8], row_width: u32, sx: u32, sy: u32, out: &mut [u8]| -> Result<usize, RenderError> {
+            match format {
+                WireSurfaceFormat::Depth => {
+                    let at = ((sy * row_width + sx) * 4) as usize;
+                    let depth =
+                        f32::from_le_bytes(*<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"));
+                    let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
+                    out.get_mut(..4)
+                        .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
+                        .copy_from_slice(&scaled.to_be_bytes());
+                    Ok(4)
                 }
-            };
-        let raw = match format {
+                WireSurfaceFormat::Stencil => {
+                    // Raw, unscaled -- the spec's "8-bit stencil
+                    // value, one byte per pixel", unlike DEPTH's
+                    // normalised-to-u32 scaling.
+                    let at = (sy * row_width + sx) as usize;
+                    out.first_mut()
+                        .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))
+                        .map(|dst| *dst = raw[at])?;
+                    Ok(1)
+                }
+                _ => {
+                    let at = ((sy * row_width + sx) * 4) as usize;
+                    let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
+                    encode_pixel_into(format, pixel, out)
+                }
+            }
+        };
+        let (raw, src_width, src_height) = match format {
             WireSurfaceFormat::Depth => {
+                let gpu = self
+                    .surfaces
+                    .get(&id)
+                    .ok_or(RenderError::UnknownObject("surface", id))?;
                 let depth = gpu.depth.clone();
                 // `INTERNAL_DEPTH_STENCIL_FORMAT` has no single "all
                 // aspects" copy; `INTERNAL_DEPTH_FORMAT` has only the one
                 // aspect, for which `DepthOnly` and `All` are equivalent,
                 // so always asking for `DepthOnly` here is correct either
                 // way.
-                self.copy_texture_rect_to_cpu_aspect(
+                let bytes = self.copy_texture_rect_to_cpu_aspect(
                     &depth,
                     0,
                     0,
@@ -6671,7 +6899,8 @@ impl Renderer {
                     def.height,
                     wgpu::TextureAspect::DepthOnly,
                     raw_bpp,
-                )?
+                )?;
+                (bytes, def.width, def.height)
             }
             WireSurfaceFormat::Stencil => {
                 // Unlike DEPTH, STENCIL has nothing to read at all on an
@@ -6684,8 +6913,12 @@ impl Renderer {
                         "READ_PIXELS(STENCIL) on an adapter without combined depth/stencil storage",
                     ));
                 }
+                let gpu = self
+                    .surfaces
+                    .get(&id)
+                    .ok_or(RenderError::UnknownObject("surface", id))?;
                 let depth = gpu.depth.clone();
-                self.copy_texture_rect_to_cpu_aspect(
+                let bytes = self.copy_texture_rect_to_cpu_aspect(
                     &depth,
                     0,
                     0,
@@ -6694,11 +6927,26 @@ impl Renderer {
                     def.height,
                     wgpu::TextureAspect::StencilOnly,
                     raw_bpp,
-                )?
+                )?;
+                (bytes, def.width, def.height)
             }
             _ => {
-                let color = gpu.color.clone();
-                self.copy_texture_to_cpu(&color, def.width, def.height)?
+                // With `CAP_PROGRAMMABLE` and a non-default read
+                // framebuffer bound, sources from its `READ_BUFFER`-
+                // selected colour attachment instead of the draw
+                // surface -- the same source `TEX_COPY_IMAGE` resolves
+                // to, by the same rule.
+                let Some((src_width, src_height, color, level)) = self.resolve_read_source(state)?
+                else {
+                    // Incomplete read framebuffer or `READ_BUFFER` ==
+                    // `NONE`: not a protocol error, no effect (`dest`
+                    // left unmodified), the same rule an incomplete
+                    // *draw* framebuffer already follows for a draw/
+                    // `CLEAR`.
+                    return Ok(());
+                };
+                let bytes = self.copy_texture_rect_to_cpu(&color, level, 0, 0, src_width, src_height)?;
+                (bytes, src_width, src_height)
             }
         };
 
@@ -6709,11 +6957,11 @@ impl Renderer {
             let mut row_out = vec![0u8; (w * bpp) as usize];
             for col in 0..w {
                 let sx = x + col;
-                if sx >= def.width || sy >= def.height {
+                if sx >= src_width || sy >= src_height {
                     continue;
                 }
                 let at = (col * bpp) as usize;
-                encode_at(&raw, sx, sy, &mut row_out[at..])?;
+                encode_at(&raw, src_width, sx, sy, &mut row_out[at..])?;
             }
             let loc = offset_ref(dest, out_row * row_bytes).ok_or_else(|| {
                 RenderError::BadMemory(format!(
@@ -7206,6 +7454,7 @@ impl Renderer {
             Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
             _ => return Ok(()),
         };
+        let frag_locations = fragment_output_locations(&fs_module);
 
         let (topology, order) = primitive_index_order(prim, count as usize)?;
         if order.is_empty() {
@@ -7221,7 +7470,7 @@ impl Renderer {
             })
             .collect::<Result<_, _>>()?;
 
-        let Some((target_width, target_height, color_view, depth_view, persistent_depth)) =
+        let Some((target_width, target_height, color_views, depth_view, persistent_depth)) =
             self.resolve_draw_target(state)?
         else {
             // A programmable draw against an incomplete bound
@@ -7614,6 +7863,55 @@ impl Renderer {
             None
         };
 
+        // One target per fragment-shader output location (`gl_FragData[n]`/
+        // a single `gl_FragColor`), indexed by location value, not
+        // declaration order -- `wgpu` requires the pipeline's `targets[i]`
+        // and the render pass's `color_attachments[i]` to agree on `Some`/
+        // `None` at every index, so a shader using locations `{0, 2}`
+        // (skipping `1`) needs a 3-long array with index `1` `None` in
+        // both. A used location with no real attachment bound there
+        // (`DRAW_BUFFERS` names `NONE`, or nothing attached) still needs
+        // `Some` on both sides -- GL's "write discarded, not an error" is
+        // represented by `Self::scratch_color_view`'s throwaway texture,
+        // not by `None`, since `None` here would mean "this location
+        // isn't a pipeline output at all".
+        let target_count = frag_locations.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![None; target_count];
+        for &loc in &frag_locations {
+            targets[loc as usize] = Some(wgpu::ColorTargetState {
+                format: INTERNAL_COLOR_FORMAT,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            });
+        }
+        // Owned views first (one per used location, a real attachment or
+        // a scratch stand-in), so the render pass descriptor below can
+        // borrow them -- `wgpu::TextureView` is a cheap handle clone, not
+        // a deep copy.
+        let pass_views: Vec<Option<wgpu::TextureView>> = (0..target_count)
+            .map(|loc| {
+                targets[loc].as_ref()?;
+                Some(match color_views.get(loc).and_then(|v| v.as_ref()) {
+                    Some(view) => view.clone(),
+                    None => self.scratch_color_view(target_width, target_height),
+                })
+            })
+            .collect();
+        let pass_color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = pass_views
+            .iter()
+            .map(|view| {
+                view.as_ref().map(|view| wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            })
+            .collect();
+
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("c3d programmable pipeline"),
             layout: Some(&pipeline_layout),
@@ -7664,11 +7962,7 @@ impl Renderer {
                 module: &fs_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: INTERNAL_COLOR_FORMAT,
-                    blend,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &targets,
             }),
             multiview_mask: None,
             cache: None,
@@ -7689,15 +7983,7 @@ impl Renderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("c3d programmable draw pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &pass_color_attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -14401,4 +14687,117 @@ mod tests {
         );
     }
 
+    /// End-to-end MRT: a fragment shader writing `gl_FragData[0]`/`[1]`,
+    /// `DRAW_BUFFERS` mapping both slots to two real (renderbuffer)
+    /// colour attachments, and `READ_BUFFER`/`READ_PIXELS` reading each
+    /// one back distinctly -- the full round trip `c3d.md`'s `DRAW_
+    /// BUFFERS`/`READ_BUFFER` rows describe, exercising the pipeline's
+    /// multi-target fragment state, the render pass's multi-attachment
+    /// array, and the `READ_PIXELS` read-framebuffer-awareness fix all
+    /// at once.
+    #[test]
+    fn draw_prog_writes_two_fragment_outputs_to_two_real_attachments_read_back_distinctly() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const BOTH_FRAMEBUFFER: u32 = 0x8D40;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const COLOR_ATTACHMENT1: u32 = 0x8CE1;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"void main() {\n    gl_FragData[0] = vec4(1.0, 0.0, 0.0, 1.0);\n    gl_FragData[1] = vec4(0.0, 0.0, 1.0, 1.0);\n}\n";
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            // CLEAR's E_NO_SURFACE check is independent of the bound
+            // framebuffer -- see `framebuffer_attach_texture_face_
+            // renders_into_only_that_face`'s identical note.
+            cmd(proto::OP_SURFACE_DEFINE, &[9, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[9]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[BOTH_FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[2, 2, 2, A8R8G8B8]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT1, 2],
+            ),
+            cmd(proto::OP_DRAW_BUFFERS, &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest0 = 0x4000u32;
+        let dest1 = 0x4100u32;
+        let readback = vec![
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 32]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT1]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 32]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let red = mem.read(MemLoc::Aperture(dest0), 4).unwrap().to_vec();
+        let blue = mem.read(MemLoc::Aperture(dest1), 4).unwrap().to_vec();
+        assert_eq!(
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+            red.as_slice(),
+            "COLOR_ATTACHMENT0 (gl_FragData[0]) should read back red: {red:?}"
+        );
+        assert_eq!(
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap(),
+            blue.as_slice(),
+            "COLOR_ATTACHMENT1 (gl_FragData[1]) should read back blue: {blue:?}"
+        );
+    }
 }

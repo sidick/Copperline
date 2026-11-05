@@ -791,10 +791,11 @@ impl C3dBoard {
             MAX_VERTEX_UNIFORM_VECTORS => 256,
             MAX_FRAGMENT_UNIFORM_VECTORS => 64,
             MAX_VARYING_VECTORS => 16,
-            // Fixed at 1: the renderer only ever resolves a framebuffer's
-            // `COLOR_ATTACHMENT0`, matching the programmable-tier
-            // implementation plan's scoped-down single-attachment pass.
-            MAX_COLOR_ATTACHMENTS => 1,
+            // Like MAX_VERTEX_ATTRIBS above, reports the same value every
+            // per-context `state::Limits::default()` enforces -- real
+            // multiple-render-target support (`DRAW_BUFFERS`/`READ_BUFFER`),
+            // not just the attachment-list shape.
+            MAX_COLOR_ATTACHMENTS => state::Limits::default().max_color_attachments as u32,
             MAX_RENDERBUFFER_SIZE => self.device_config().max_renderbuffer_size,
             _ => 0,
         }

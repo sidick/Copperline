@@ -145,6 +145,10 @@ pub struct DeviceConfig {
     pub max_framebuffers: u32,
     pub max_renderbuffers: u32,
     pub max_vertex_attribs: u32,
+    /// `MAX_COLOR_ATTACHMENTS`: `DRAW_BUFFERS`'s `count` limit and every
+    /// `COLOR_ATTACHMENTn`'s upper bound, mirrored from `state::Limits`'s
+    /// identically-named field (see its doc comment).
+    pub max_color_attachments: u32,
     /// `MAX_RENDERBUFFER_SIZE`: the largest edge `RENDERBUFFER_STORAGE_COLOR`/
     /// `RENDERBUFFER_STORAGE_DEPTH_STENCIL` accepts, `E_LIMIT` beyond it.
     pub max_renderbuffer_size: u32,
@@ -204,6 +208,7 @@ impl Default for DeviceConfig {
             max_framebuffers: 64,
             max_renderbuffers: 64,
             max_vertex_attribs: 8,
+            max_color_attachments: 4,
             max_renderbuffer_size: 1024,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
@@ -1787,6 +1792,14 @@ impl<'a> RingCursor<'a> {
                     level: w32(body, 4),
                 }
             }
+            OP_DRAW_BUFFERS => match self.decode_draw_buffers(body, length_words, start) {
+                Ok((count, bufs)) => Command::DrawBuffers { count, bufs },
+                Err(err) => return err,
+            },
+            OP_READ_BUFFER => {
+                fixed!(1);
+                Command::ReadBuffer { buf: w32(body, 0) }
+            }
 
             // Not in the opcode map at all, or LOGIC_OP (see this module's
             // doc comment): E_BAD_OPCODE, skipped by trusting `length`.
@@ -1860,6 +1873,33 @@ impl<'a> RingCursor<'a> {
         }
         let values = &body[16..];
         Ok((program, location, type_, count, values))
+    }
+
+    /// `count, buf0, .., buf{count-1}`, `DRAW_BUFFERS`. `count` is checked
+    /// against `max_color_attachments` here (not deferred to `state.rs`
+    /// like the `buf[i]` values themselves are): it decides how many
+    /// words this command occupies on the wire, which framing must know
+    /// regardless of where semantic validation of each value lives.
+    fn decode_draw_buffers(
+        &mut self,
+        body: &'a [u8],
+        length_words: u32,
+        start: u32,
+    ) -> Result<(u32, &'a [u8]), Step<'a>> {
+        if length_words < 2 {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
+        let count = w32(body, 0);
+        if count > self.config.max_color_attachments {
+            return Err(self.raise(ErrorCode::Limit, start));
+        }
+        // `1` (opcode header) + `1` (`count` itself) + `count` (`bufs`).
+        let expected = 1 + 1 + u64::from(count);
+        if u64::from(length_words) != expected {
+            return Err(self.raise(ErrorCode::BadArg, start));
+        }
+        let bufs = &body[4..];
+        Ok((count, bufs))
     }
 
     /// `prim, format, count, arrays...` shared by `DRAW_ARRAYS`/

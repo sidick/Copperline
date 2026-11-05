@@ -65,10 +65,21 @@ use naga::ShaderStage;
 /// - `varying` -> `out` in the vertex stage, `in` in the fragment stage.
 /// - `gl_FragColor` (fragment stage only) -> a synthesised `out vec4`
 ///   declaration, with every occurrence of `gl_FragColor` rewritten to
-///   reference it. `gl_FragData[n]` (multiple render targets) is out of
-///   scope for this draft's single-colour-attachment framebuffer model and
-///   is left unrewritten, so a shader using it fails to parse rather than
-///   silently misbehaving.
+///   reference it.
+/// - `gl_FragData[<literal>]` (fragment stage only, MRT) -> one synthesised
+///   `out vec4 c3d_frag_data_<n>` declaration per distinct literal index
+///   actually used, each at `layout(location = <n>)`, with every occurrence
+///   of `gl_FragData[<n>]` rewritten to reference its own variable. Only a
+///   literal integer index is recognised (the only form any real client
+///   emits, per `DRAW_BUFFERS`'s fixed slot numbering); a dynamic index is
+///   left unrewritten and fails to parse in naga, like any other
+///   unsupported construct. `render.rs`'s `fragment_output_locations`
+///   reads the resulting per-member `Binding::Location`s back off the
+///   compiled module to size the render pass/pipeline's colour-attachment
+///   arrays -- confirmed directly that naga represents a fragment result
+///   as a `Struct` with one member per `out` variable regardless of count,
+///   even the single-`gl_FragColor` case, so that one code path handles
+///   both.
 /// - `uniform sampler2D <name>;`/`uniform samplerCube <name>;` -> a pair of
 ///   declarations, `uniform texture2D <name>_tex;` and `uniform sampler
 ///   <name>_samp;` (each getting its own binding number), and every call
@@ -156,7 +167,66 @@ pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
         // silently produced no colour output until this was added.
         out = format!("layout(location = 0) out vec4 c3d_frag_color;\n{out}");
     }
+    if stage == ShaderStage::Fragment && contains_word(&out, "gl_FragData") {
+        let (rewritten, mut indices) = rewrite_frag_data(&out);
+        indices.sort_unstable();
+        let mut decls = String::new();
+        for n in indices {
+            decls.push_str(&format!("layout(location = {n}) out vec4 c3d_frag_data_{n};\n"));
+        }
+        out = format!("{decls}{rewritten}");
+    }
     out
+}
+
+/// Rewrites every `gl_FragData[<literal>]` occurrence to a distinct
+/// `c3d_frag_data_<n>` identifier, returning the rewritten source and the
+/// distinct indices used (unsorted, first-occurrence order, possibly with
+/// duplicates removed but not sorted -- the caller sorts). See
+/// [`rewrite_to_core_profile`]'s doc comment.
+fn rewrite_frag_data(source: &str) -> (String, Vec<u32>) {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    let mut indices = Vec::new();
+    loop {
+        let Some(at) = find_word(rest, "gl_FragData") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        let after_name = &rest[at + "gl_FragData".len()..];
+        let Some((n, bracket_len)) = parse_literal_index(after_name) else {
+            // Dynamic or malformed index: copy the name through
+            // unrewritten and keep scanning past it, so the loop can't
+            // spin forever. naga will reject the result with its own
+            // parse error, same as any other unsupported construct.
+            out.push_str("gl_FragData");
+            rest = after_name;
+            continue;
+        };
+        out.push_str(&format!("c3d_frag_data_{n}"));
+        if !indices.contains(&n) {
+            indices.push(n);
+        }
+        rest = &after_name[bracket_len..];
+    }
+    (out, indices)
+}
+
+/// If `source` starts with `[<digits>]`, returns the index and the total
+/// bracketed length (including both brackets); `None` for a dynamic or
+/// malformed index.
+fn parse_literal_index(source: &str) -> Option<(u32, usize)> {
+    let bytes = source.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let digits_len = bytes[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 || bytes.get(1 + digits_len) != Some(&b']') {
+        return None;
+    }
+    let n: u32 = source[1..1 + digits_len].parse().ok()?;
+    Some((n, 1 + digits_len + 1))
 }
 
 fn is_ident_char(c: u8) -> bool {
@@ -686,6 +756,59 @@ mod tests {
             arg.binding,
             Some(naga::Binding::Location {
                 location: 0,
+                interpolation: Some(naga::Interpolation::Perspective),
+                sampling: None,
+                blend_src: None,
+                per_primitive: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rewrites_frag_data_to_distinct_located_outputs() {
+        let f = rewrite_to_core_profile(
+            "void main() {\n    gl_FragData[0] = vec4(1.0);\n    gl_FragData[2] = vec4(0.5);\n}\n",
+            ShaderStage::Fragment,
+        );
+        assert_eq!(
+            f,
+            "layout(location = 0) out vec4 c3d_frag_data_0;\n\
+             layout(location = 2) out vec4 c3d_frag_data_2;\n\
+             void main() {\n    c3d_frag_data_0 = vec4(1.0);\n    c3d_frag_data_2 = vec4(0.5);\n}\n"
+        );
+    }
+
+    #[test]
+    fn compiles_and_links_a_two_output_frag_data_shader() {
+        let src = "void main() {\n    gl_FragData[0] = vec4(1.0, 0.0, 0.0, 1.0);\n    gl_FragData[1] = vec4(0.0, 1.0, 0.0, 1.0);\n}\n";
+        let result = compile(src, ShaderStage::Fragment);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let ep = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == naga::ShaderStage::Fragment)
+            .unwrap();
+        let result = ep.function.result.as_ref().unwrap();
+        let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+            panic!("expected a struct result");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members[0].binding,
+            Some(naga::Binding::Location {
+                location: 0,
+                interpolation: Some(naga::Interpolation::Perspective),
+                sampling: None,
+                blend_src: None,
+                per_primitive: false,
+            })
+        );
+        assert_eq!(
+            members[1].binding,
+            Some(naga::Binding::Location {
+                location: 1,
                 interpolation: Some(naga::Interpolation::Perspective),
                 sampling: None,
                 blend_src: None,
