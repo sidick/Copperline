@@ -113,12 +113,16 @@
 //! ## Structure
 //!
 //! One WGSL shader template ([`SHADER_TEMPLATE`]) specialised by
-//! [`PipelineKey`] (texturing, texenv mode, alpha test, shading), with
-//! pipelines cached by that key plus the blend/depth/cull state and the
-//! target surface format ([`Renderer::pipeline_for`]). The fixed-function
-//! content is thin in M1 (no lighting, no fog) but the specialisation
-//! mechanism is the M3-ready part: a later milestone adds WGSL fragments
-//! and key fields, not a new architecture.
+//! [`PipelineKey`] (texturing, texenv mode, alpha test, shading, fog),
+//! with pipelines cached by that key plus the blend/depth/cull state and
+//! the target surface format ([`Renderer::pipeline_for`]). Lighting
+//! ([`apply_lighting`]) is the one `CAP_TRANSFORM` feature that does
+//! *not* live in this shader: GL 1.1 fixed-function lighting is
+//! per-vertex, and every GL-space vertex is already fully transformed
+//! on the CPU before it ever reaches wgpu (see `GlVertex`'s `to_gpu`
+//! closure), so lighting is computed there too, producing a final lit
+//! colour the shader treats exactly like an ordinary vertex colour --
+//! no shader or `PipelineKey` changes needed for it at all.
 //!
 //! Vertex parsing, triangulation (including the spec's normative quad/
 //! polygon/strip/fan decomposition and provoking-vertex selection),
@@ -132,8 +136,8 @@ use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::glsl;
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
-    self, BlendEquation, BlendFactor, CompareFunc, Face, FogMode, FrontFace, Mat4, MatrixMode,
-    PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
+    self, BlendEquation, BlendFactor, ColorMaterialMode, CompareFunc, Face, FogMode, FrontFace, Mat4,
+    MatrixMode, PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
     SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
     VertexAttribType,
 };
@@ -319,6 +323,148 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
         return [0.0, 0.0, 1.0];
     }
     [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/// GL 1.1 fixed-function per-vertex lighting (`CAP_TRANSFORM`,
+/// `c3d.md`'s "Lighting, clipping and texgen"), section 2.13.1's
+/// equation exactly: Blinn-Phong (the halfway vector, not a mirror
+/// reflection), per-light ambient/diffuse/specular summed with the
+/// scene's global ambient and the material's emission, each light
+/// scaled by its own distance/spot attenuation. Returns `vertex_color`
+/// unchanged when `LIGHTING` is disabled -- the caller need not branch.
+///
+/// Everything here operates in **eye space**: `eye_pos`/`eye_normal` are
+/// the vertex's already-eye-space position/normal (`modelview`-
+/// transformed, the same ones [`apply_texgen`] uses), and
+/// `state::Light::position`/`spot_direction` are *already* eye-space
+/// too -- `State::set_light` transforms them at `LIGHT` dispatch time,
+/// per the spec's "transformed by the current modelview at the time of
+/// the command" rule, so there is no further transform to do here.
+///
+/// Two-sided lighting (`LIGHT_MODEL_TWO_SIDE`) is GL's own per-vertex
+/// rule (section 2.13.1), not a per-triangle facing test: if the
+/// (eye-space) normal points away from the eye vector, the back
+/// material is used with the normal negated. `COLOR_MATERIAL`
+/// substitutes `vertex_color` for the tracked component(s) of whichever
+/// material (front/back) that resolves to, before any of the above.
+fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex_color: [f32; 4]) -> [f32; 4] {
+    if !state.is_enabled(state::Capability::Lighting) {
+        return vertex_color;
+    }
+
+    // `LIGHT_MODEL_LOCAL_VIEWER`: `false` (GL's default) treats the eye
+    // as infinitely far down `+Z`, a fixed view direction for every
+    // vertex; `true` is the "correct" per-vertex direction to the actual
+    // (eye-space-origin) eye position.
+    let eye_dir = if state.light_model.local_viewer {
+        normalize3([-eye_pos[0], -eye_pos[1], -eye_pos[2]])
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+
+    let n = normalize3(eye_normal);
+    let facing_away = state.light_model.two_side
+        && (n[0] * eye_dir[0] + n[1] * eye_dir[1] + n[2] * eye_dir[2]) < 0.0;
+    let (face, n) = if facing_away {
+        (Face::Back, [-n[0], -n[1], -n[2]])
+    } else {
+        (Face::Front, n)
+    };
+    let material = match face {
+        Face::Back => &state.material_back,
+        _ => &state.material_front,
+    };
+    // `COLOR_MATERIAL` only overrides a material this draw actually
+    // resolved to, per its own `face` -- `FrontAndBack` always applies,
+    // `Front`/`Back` only when they match the face lighting just chose.
+    let color_material_applies = state.enables.color_material
+        && matches!(
+            (state.color_material.face, face),
+            (Face::FrontAndBack, _) | (Face::Front, Face::Front) | (Face::Back, Face::Back)
+        );
+    let (ambient, diffuse, specular, emission) = if color_material_applies {
+        let a = match state.color_material.mode {
+            ColorMaterialMode::Ambient | ColorMaterialMode::AmbientAndDiffuse => vertex_color,
+            _ => material.ambient,
+        };
+        let d = match state.color_material.mode {
+            ColorMaterialMode::Diffuse | ColorMaterialMode::AmbientAndDiffuse => vertex_color,
+            _ => material.diffuse,
+        };
+        let s = match state.color_material.mode {
+            ColorMaterialMode::Specular => vertex_color,
+            _ => material.specular,
+        };
+        let e = match state.color_material.mode {
+            ColorMaterialMode::Emission => vertex_color,
+            _ => material.emission,
+        };
+        (a, d, s, e)
+    } else {
+        (material.ambient, material.diffuse, material.specular, material.emission)
+    };
+
+    let mut rgb = [
+        emission[0] + ambient[0] * state.light_model.ambient[0],
+        emission[1] + ambient[1] * state.light_model.ambient[1],
+        emission[2] + ambient[2] * state.light_model.ambient[2],
+    ];
+
+    for (i, light) in state.lights.0.iter().enumerate() {
+        if !state.enables.light.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let directional = light.position[3] == 0.0;
+        let (l, attenuation) = if directional {
+            (normalize3([light.position[0], light.position[1], light.position[2]]), 1.0)
+        } else {
+            let d = [
+                light.position[0] - eye_pos[0],
+                light.position[1] - eye_pos[1],
+                light.position[2] - eye_pos[2],
+            ];
+            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let atten = 1.0
+                / (light.constant_attenuation + light.linear_attenuation * dist + light.quadratic_attenuation * dist * dist)
+                    .max(1e-8);
+            (normalize3(d), atten)
+        };
+
+        // `SPOT_CUTOFF`'s GL default, `180.0`, means "not a spotlight" --
+        // every other legal value is `0..=90`.
+        let spot = if light.spot_cutoff >= 180.0 {
+            1.0
+        } else {
+            let spot_dir = normalize3(light.spot_direction);
+            let cos_angle = -l[0] * spot_dir[0] - l[1] * spot_dir[1] - l[2] * spot_dir[2];
+            let cos_cutoff = light.spot_cutoff.to_radians().cos();
+            if cos_angle < cos_cutoff {
+                0.0
+            } else {
+                cos_angle.max(0.0).powf(light.spot_exponent)
+            }
+        };
+        let attenuation = attenuation * spot;
+        if attenuation <= 0.0 {
+            continue;
+        }
+
+        let n_dot_l = (n[0] * l[0] + n[1] * l[1] + n[2] * l[2]).max(0.0);
+        let half = normalize3([l[0] + eye_dir[0], l[1] + eye_dir[1], l[2] + eye_dir[2]]);
+        let n_dot_h = (n[0] * half[0] + n[1] * half[1] + n[2] * half[2]).max(0.0);
+        // `0.0.powf(0.0) == 1.0` in IEEE 754 (and GL's own convention),
+        // so a zero `SHININESS` still lights correctly at `n_dot_h == 0`.
+        let spec_factor = if n_dot_l > 0.0 { n_dot_h.powf(material.shininess) } else { 0.0 };
+
+        for c in 0..3 {
+            let ambient_term = ambient[c] * light.ambient[c];
+            let diffuse_term = n_dot_l * diffuse[c] * light.diffuse[c];
+            let specular_term = spec_factor * specular[c] * light.specular[c];
+            rgb[c] += attenuation * (ambient_term + diffuse_term + specular_term);
+        }
+    }
+
+    [rgb[0].clamp(0.0, 1.0), rgb[1].clamp(0.0, 1.0), rgb[2].clamp(0.0, 1.0), diffuse[3]]
 }
 
 /// `OBJECT_LINEAR`/`EYE_LINEAR` texgen (GL 1.1 section 2.10.4): the
@@ -1045,18 +1191,16 @@ pub struct GlVertex {
     pub fogcoord: f32,
     /// Object-space normal (`NORMAL`, or [`state::CurrentVertex::normal`]
     /// when the format omits it) -- used by `SPHERE_MAP`/`EYE_LINEAR`
-    /// texgen, which need it transformed into eye space
-    /// ([`Mat4::transform_normal3`]). Lighting (which also needs it)
-    /// remains unimplemented.
+    /// texgen and by [`apply_lighting`], both of which need it
+    /// transformed into eye space ([`Mat4::transform_normal3`]).
     pub normal: [f32; 3],
 }
 
 /// Parses `count` GL-space vertices out of `data`, `format`-interleaved,
 /// exactly as `DRAW_INLINE` lays them out -- see [`parse_vertices_raw`],
 /// which this wraps. `NORMAL` is legal in this format (unlike
-/// [`parse_window_vertices`]'s draw kind) and is used by texgen
-/// (`SPHERE_MAP`/`EYE_LINEAR`); lighting, which also needs it, remains
-/// unimplemented.
+/// [`parse_window_vertices`]'s draw kind) and feeds both texgen
+/// (`SPHERE_MAP`/`EYE_LINEAR`) and [`apply_lighting`].
 pub fn parse_gl_vertices(
     data: &[u8],
     format: VertexFormat,
@@ -1358,18 +1502,17 @@ fn fetch_array_vertex(
 /// from `descriptors`, the [`decode_array_descriptors`] output for a
 /// `DRAW_ARRAYS`/`DRAW_ELEMENTS` command. The GL-space counterpart of
 /// [`fetch_array_vertex`] -- same per-descriptor addressing, same
-/// `POS`/`COLOR`/`COLOR_PACKED`/`TEXCOORD0`/`TEXCOORD1`/`FOGCOORD`
-/// component set, same object-space position default (`w = 1.0` for a
-/// 2- or 3-component `POS`, matching `parse_vertices_raw`'s GL-space
-/// inline default). `NORMAL` is legal in this format (unlike the
-/// window-space fetch's, where `ring.rs` rejects it outright before this
-/// module ever sees it) but, per [`GlVertex`]'s own doc comment, this
-/// milestone applies no lighting and `GlVertex` carries no normal field
-/// -- so, exactly like `TEXCOORD2`-`3`, its descriptor is present (needed
-/// so later descriptors in the same command decode at the right index-
-/// independent slot) but never dereferenced. A follow-up milestone that
-/// adds lighting can extend this function (and `GlVertex`) to actually
-/// read it.
+/// `POS`/`COLOR`/`COLOR_PACKED`/`NORMAL`/`TEXCOORD0`/`TEXCOORD1`/
+/// `FOGCOORD` component set, same object-space position default (`w =
+/// 1.0` for a 2- or 3-component `POS`, matching `parse_vertices_raw`'s
+/// GL-space inline default). `NORMAL` is legal in this format (unlike
+/// the window-space fetch's, where `ring.rs` rejects it outright before
+/// this module ever sees it) and feeds both texgen
+/// (`SPHERE_MAP`/`EYE_LINEAR`) and lighting, exactly like
+/// [`parse_gl_vertices`]'s inline path. `TEXCOORD2`-`3`'s descriptor is
+/// present (needed so later descriptors in the same command decode at
+/// the right index-independent slot) but still never dereferenced --
+/// there is no third/fourth texture unit for them to feed.
 fn fetch_array_vertex_gl(
     descriptors: &[(Option<u32>, proto::ArrayDescriptor)],
     pos_words: u32,
@@ -1382,6 +1525,7 @@ fn fetch_array_vertex_gl(
     let mut texcoord0 = current.texcoord.first().copied().unwrap_or((0.0, 0.0));
     let mut texcoord1 = current.texcoord.get(1).copied().unwrap_or((0.0, 0.0));
     let mut fogcoord = current.fogcoord;
+    let mut normal = current.normal;
 
     for (bit, desc) in descriptors {
         match *bit {
@@ -1389,6 +1533,11 @@ fn fetch_array_vertex_gl(
                 let ncomp = pos_component_count(desc.array_type, pos_words)?;
                 let v = read_array_attribute(desc, ncomp, index, mem)?;
                 pos[..ncomp as usize].copy_from_slice(&v[..ncomp as usize]);
+            }
+            Some(b) if b == VertexFormat::NORMAL => {
+                let ncomp = descriptor_component_count(desc.array_type, 3)?;
+                let v = read_array_attribute(desc, ncomp, index, mem)?;
+                normal = [v[0], v[1], v[2]];
             }
             Some(b) if b == VertexFormat::COLOR => {
                 let ncomp = descriptor_component_count(desc.array_type, 4)?;
@@ -1413,7 +1562,7 @@ fn fetch_array_vertex_gl(
                 let v = read_array_attribute(desc, ncomp, index, mem)?;
                 fogcoord = v[0];
             }
-            _ => {} // NORMAL / TEXCOORD2-3: see this function's doc comment
+            _ => {} // TEXCOORD2-3: see this function's doc comment
         }
     }
 
@@ -1423,12 +1572,7 @@ fn fetch_array_vertex_gl(
         texcoord0: [texcoord0.0, texcoord0.1],
         texcoord1: [texcoord1.0, texcoord1.1],
         fogcoord,
-        // The NORMAL descriptor's data is decoded-but-not-read this
-        // milestone (see this function's doc comment), so even a format
-        // that carries the bit falls back to the current-state normal --
-        // texgen with array-supplied per-vertex normals is the documented
-        // follow-up alongside lighting.
-        normal: current.normal,
+        normal,
     })
 }
 
@@ -2290,10 +2434,9 @@ fn cull_to_wgpu(face: Option<FaceKey>) -> Option<wgpu::Face> {
 
 /// The shared shader source every [`PipelineKey`] specialises via string
 /// substitution of `__FLAT__` (either empty or `@interpolate(flat)`) and
-/// `__FRAGMENT_BODY__` (the texenv/alpha-test/fog combination). M1's
-/// fixed-function content is deliberately thin (no lighting -- see the
-/// module doc comment); the specialisation mechanism is what carries
-/// forward to M3, not the amount of WGSL below it. Fog's own parameters
+/// `__FRAGMENT_BODY__` (the texenv/alpha-test/fog combination). Lighting
+/// is computed CPU-side, not here -- see the module doc comment's
+/// "Structure" section. Fog's own parameters
 /// (mode, density, start, end, colour) are baked as WGSL literals per
 /// [`FogKey`] rather than passed through a uniform, the same way
 /// `alpha_test`'s comparison *operator* is baked while only its
@@ -4749,20 +4892,20 @@ impl Renderer {
     }
 
     /// The GL-space (object-space, `CAP_TRANSFORM`) counterpart of
-    /// [`Self::op_draw_inline_win`]: **position transform only** this
-    /// milestone -- no lighting, texgen or user clipping (see the module
-    /// doc comment's M3 scope). Each vertex's `(x, y, z, w)` object-space
-    /// position is transformed by `modelview` then `projection`
-    /// (`docs/internals/c3d.md`: "follow the OpenGL 1.1 specification's
-    /// fixed-function pipeline exactly, including the `[-1, 1]` clip-space
-    /// depth range mapped through `DEPTH_RANGE`"), then mapped through
-    /// `VIEWPORT` and `DEPTH_RANGE` -- both spec-mandated transform-tier
-    /// steps a window-space draw skips entirely (window-space vertices
-    /// already carry final surface pixels and `[0, 1]` depth, and
-    /// deliberately ignore `VIEWPORT`, per the module doc comment).
-    /// Colour and `TEXCOORD0` pass through exactly as parsed (or the
-    /// current-state fallback), same as the window-space path -- no
-    /// lighting or texgen is applied to them here.
+    /// [`Self::op_draw_inline_win`]. Each vertex's `(x, y, z, w)`
+    /// object-space position is transformed by `modelview` then
+    /// `projection` (`docs/internals/c3d.md`: "follow the OpenGL 1.1
+    /// specification's fixed-function pipeline exactly, including the
+    /// `[-1, 1]` clip-space depth range mapped through `DEPTH_RANGE`"),
+    /// then mapped through `VIEWPORT` and `DEPTH_RANGE` -- both
+    /// spec-mandated transform-tier steps a window-space draw skips
+    /// entirely (window-space vertices already carry final surface
+    /// pixels and `[0, 1]` depth, and deliberately ignore `VIEWPORT`,
+    /// per the module doc comment). Unlike the window-space path,
+    /// colour is not just passed through: texgen and lighting
+    /// (`apply_lighting`) both apply here, since both are meaningful
+    /// only for a vertex that is still in object/eye space when this
+    /// code runs.
     ///
     /// Parses `bytes` per `format` into a `Vec<GlVertex>` and hands it to
     /// [`Self::op_draw_gl`], the shared post-parse pipeline `DRAW_ARRAYS`/
@@ -4989,7 +5132,7 @@ impl Renderer {
                     depth_clip_z,
                     safe_w,
                 ],
-                color: v.color,
+                color: apply_lighting(state, [eye[0], eye[1], eye[2]], eye_normal, v.color),
                 texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { -eye[2] },
                 texcoord1,
@@ -9748,6 +9891,7 @@ mod tests {
     /// `TRIANGLES` primitive, and returns the rendered RGBA8 pixels (or
     /// `None` if no adapter is available, the usual skip-cleanly path).
     fn draw_gl_space_triangle(
+        format: VertexFormat,
         set_extra_state: impl FnOnce(&mut State),
         verts: &[u8],
     ) -> Option<Vec<u8>> {
@@ -9784,7 +9928,7 @@ mod tests {
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
-                    format: VertexFormat(VertexFormat::COLOR),
+                    format,
                     count: 3,
                     window_space: false,
                     vertices: DrawVertices::Inline(verts),
@@ -9804,6 +9948,18 @@ mod tests {
         }
         for c in color {
             out.extend_from_slice(&c.to_bits().to_be_bytes());
+        }
+    }
+
+    /// [`encode_gl_vertex`], plus a `NORMAL` -- wire order is bit order
+    /// (`COLOR` is bit 0, `NORMAL` is bit 1), so `color` still precedes
+    /// `normal` here. Caller must pass a `format` that sets both bits,
+    /// with `POS_COUNT` left `0` (4 words) to match `pos`'s unconditional
+    /// 4-word encoding, e.g. `VertexFormat::COLOR | VertexFormat::NORMAL`.
+    fn encode_gl_vertex_with_normal(pos: [f32; 4], color: [f32; 4], normal: [f32; 3], out: &mut Vec<u8>) {
+        encode_gl_vertex(pos, color, out);
+        for n in normal {
+            out.extend_from_slice(&n.to_bits().to_be_bytes());
         }
     }
 
@@ -9850,6 +10006,7 @@ mod tests {
         }
 
         let Some(pixels) = draw_gl_space_triangle(
+            VertexFormat(VertexFormat::COLOR),
             |s| {
                 s.set_matrix_mode(MatrixMode::Modelview);
                 s.rotate(90.0, 0.0, 0.0, 1.0);
@@ -9887,6 +10044,7 @@ mod tests {
         }
 
         let Some(pixels) = draw_gl_space_triangle(
+            VertexFormat(VertexFormat::COLOR),
             |s| {
                 s.set_viewport(4, 4, 8, 8);
             },
@@ -10055,7 +10213,7 @@ mod tests {
         // triangle's corner, but with an explicit w = 0.0.
         encode_gl_vertex([48.0, -16.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
 
-        let Some(pixels) = draw_gl_space_triangle(|_| {}, &verts) else {
+        let Some(pixels) = draw_gl_space_triangle(VertexFormat(VertexFormat::COLOR), |_| {}, &verts) else {
             return; // no adapter
         };
 
@@ -10065,6 +10223,145 @@ mod tests {
             &[255, 255, 255],
             "a vertex with clip w = 0.0 must not collapse the triangle to \
              nothing via a GPU-side NaN divide; centre pixel: {center:?}"
+        );
+    }
+
+    /// `LIGHTING` must actually reach the rendered pixel, with a
+    /// precisely predictable value: `LIGHT0`'s untouched defaults
+    /// (direction `(0, 0, 1)`, diffuse/specular white, ambient black --
+    /// `Lights::new`'s doc comment) against a `+Z`-facing covering
+    /// triangle under an identity modelview (so eye space == object
+    /// space, and the light's own default direction, never transformed
+    /// by any `LIGHT POSITION` call, is already exactly the direction
+    /// this test needs) gives `N . L == 1`, collapsing GL 1.1's lighting
+    /// equation to `emission + ambient*model_ambient + diffuse*1*1 +
+    /// specular*1*1`. With every other state at its default (material
+    /// ambient `0.2`, diffuse `0.8`, specular `0`, `LIGHT_MODEL_AMBIENT`
+    /// `0.2`), that's `0.0 + 0.2*0.2 + 0.8*1.0 + 0.0 = 0.84` per channel,
+    /// alpha `1.0` (the material's own diffuse alpha, per GL -- not
+    /// summed across lights). A renderer that decoded `LIGHT`/`MATERIAL`
+    /// into `state` but never wired them into rendering would instead
+    /// show the current colour (`CURRENT_COLOR`'s default white).
+    #[test]
+    fn lighting_produces_the_predicted_lit_colour() {
+        let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            encode_gl_vertex_with_normal(
+                [x, y, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0], // deliberately not white or black: COLOR_MATERIAL is off, so this must be ignored entirely
+                [0.0, 0.0, 1.0],
+                &mut verts,
+            );
+        }
+        // POS_COUNT field 0 (unset): 4 words -- matches
+        // `encode_gl_vertex_with_normal`'s unconditional 4-word `pos`.
+        let format = VertexFormat(VertexFormat::COLOR | VertexFormat::NORMAL);
+
+        let Some(pixels) = draw_gl_space_triangle(
+            format,
+            |s| {
+                s.enable(state::Capability::Lighting);
+                s.enable(state::Capability::Light(state::LightId::Light0));
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        let center = &pixels[(8 * 16 + 8) * 4..][..4];
+        let expected = (0.84f32 * 255.0).round() as i16;
+        for (i, &byte) in center.iter().take(3).enumerate() {
+            assert!(
+                (byte as i16 - expected).abs() <= 2,
+                "channel {i} should be close to the predicted lit value {expected}: {center:?}"
+            );
+        }
+        assert_eq!(center[3], 255, "alpha should be the material's own diffuse alpha: {center:?}");
+    }
+
+    /// `LIGHT_MODEL_TWO_SIDE` is GL 1.1's own *per-vertex* rule (section
+    /// 2.13.1), not a per-triangle facing test: a vertex whose (eye-space)
+    /// normal points away from the eye direction uses the *back*
+    /// material with the normal negated, not the front one. This
+    /// triangle's normal is `(0, 0, -1)` (facing away from the `+Z`
+    /// viewer) under an identity modelview, with the back material set
+    /// to solid green and the front material left at its default
+    /// (greyish) diffuse -- distinguishing which one actually got used,
+    /// not just whether lighting happened at all.
+    #[test]
+    fn two_sided_lighting_uses_the_back_material_for_an_away_facing_normal() {
+        let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            encode_gl_vertex_with_normal([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, -1.0], &mut verts);
+        }
+        let format = VertexFormat(VertexFormat::COLOR | VertexFormat::NORMAL);
+
+        let Some(pixels) = draw_gl_space_triangle(
+            format,
+            |s| {
+                s.enable(state::Capability::Lighting);
+                s.enable(state::Capability::Light(state::LightId::Light0));
+                s.light_model.two_side = true;
+                s.material_back.ambient = [0.0, 0.0, 0.0, 1.0];
+                s.material_back.diffuse = [0.0, 1.0, 0.0, 1.0];
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        let center = &pixels[(8 * 16 + 8) * 4..][..4];
+        assert_eq!(
+            center,
+            &[0, 255, 0, 255],
+            "an away-facing normal under LIGHT_MODEL_TWO_SIDE should be lit with the back \
+             material (solid green here), not the front one (its default greyish diffuse): {center:?}"
+        );
+    }
+
+    /// `COLOR_MATERIAL` substitutes the incoming vertex colour for the
+    /// tracked material component(s) -- `AMBIENT_AND_DIFFUSE` here, GL's
+    /// own default mode -- in place of the static `MATERIAL` value, for
+    /// every subsequent lit vertex, until disabled again.
+    #[test]
+    fn color_material_substitutes_the_vertex_colour_for_the_tracked_component() {
+        let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            // Not material_front's default grey ambient/diffuse, and not
+            // white/black either -- a value only COLOR_MATERIAL actually
+            // reaching the lit colour could produce.
+            encode_gl_vertex_with_normal([x, y, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0], &mut verts);
+        }
+        let format = VertexFormat(VertexFormat::COLOR | VertexFormat::NORMAL);
+
+        let Some(pixels) = draw_gl_space_triangle(
+            format,
+            |s| {
+                s.enable(state::Capability::Lighting);
+                s.enable(state::Capability::Light(state::LightId::Light0));
+                s.enable(state::Capability::ColorMaterial);
+                s.set_color_material(Face::FrontAndBack, ColorMaterialMode::AmbientAndDiffuse);
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        let center = &pixels[(8 * 16 + 8) * 4..][..4];
+        // Global ambient and per-light ambient both use the (now blue)
+        // material ambient, but are themselves black (LIGHT0's own
+        // ambient is black by default, and the vertex colour's R/G
+        // channels are 0) -- so only the diffuse term's blue channel
+        // ends up non-zero: 1.0 (N.L) * 1.0 (vertex blue) * 1.0 (LIGHT0
+        // diffuse) = 1.0, i.e. 255.
+        assert_eq!(
+            center,
+            &[0, 0, 255, 255],
+            "the lit colour's blue channel should come from the vertex colour via \
+             COLOR_MATERIAL's AMBIENT_AND_DIFFUSE tracking, not the material's own default: {center:?}"
         );
     }
 
