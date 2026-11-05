@@ -232,6 +232,10 @@ pub enum RenderOp<'a> {
     /// [`state::State::set_tex_palette`] has bound it against an existing
     /// texture object.
     TexPalette { id: u32, entries: u32, data: Ref },
+    /// `TEX_GENERATE_MIPS`. No `state` needed -- it operates purely on
+    /// an existing texture object's own GPU-side mip levels, independent
+    /// of any other context state.
+    TexGenerateMips { id: u32 },
     /// `READ_PIXELS`. Rectangle already validated against the draw
     /// surface's bounds.
     ReadPixels {
@@ -1237,6 +1241,21 @@ impl Context {
                         height,
                         state: self.state.clone(),
                     });
+                } else {
+                    self.state.raise_gl_error(GlError::InvalidOperation);
+                }
+            }
+            // `id` must name an existing texture object (`E_BAD_ID`
+            // already ruled out by `ring.rs`'s `check_id`; this is the
+            // GL-error-class "exists at all" check every other texture
+            // op above makes the same way). Level 0 itself being
+            // undefined is deliberately *not* checked here -- the spec's
+            // "generated levels are undefined but this is not an error"
+            // -- `render.rs`'s `op_tex_generate_mips` handles that case
+            // as a harmless no-op.
+            Command::TexGenerateMips { id } => {
+                if self.state.texture(id).is_some() {
+                    out.push(RenderOp::TexGenerateMips { id });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
                 }

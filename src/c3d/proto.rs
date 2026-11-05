@@ -289,6 +289,11 @@ pub const OP_ACTIVE_UNIT: u16 = 0x0508;
 pub const OP_TEX_PALETTE: u16 = 0x0509;
 pub const OP_TEX_COPY_IMAGE: u16 = 0x050A;
 pub const OP_TEX_COPY_SUBIMAGE: u16 = 0x050B;
+/// Spec-optional, gated by `TEXFMT_SUPPORTED` bit 10 (`MipgenSupported`)
+/// rather than by tier, exactly like `TEX_PALETTE`/`I8Indexed`'s bit 9 --
+/// see [`TextureFormat::MipgenSupported`] and this opcode's `ring.rs`
+/// gating.
+pub const OP_TEX_GENERATE_MIPS: u16 = 0x050C;
 
 /// `TEX_ENV`'s device-own `pname` for texcoord scaling (`c3d-cmd-textures`),
 /// not a GL enumerant: `TEXCOORD_SPACE`, value `0` normalised / `1` texel.
@@ -508,6 +513,9 @@ pub enum TextureFormat {
     /// Not an image format: `TEXFMT_SUPPORTED` bit 9 reports whether
     /// `TEX_PALETTE` is implemented.
     I8Indexed = 9,
+    /// Not an image format: `TEXFMT_SUPPORTED` bit 10 reports whether
+    /// `TEX_GENERATE_MIPS` is implemented.
+    MipgenSupported = 10,
 }
 
 impl TryFrom<u32> for TextureFormat {
@@ -1082,6 +1090,10 @@ pub enum Command<'a> {
         y: u32,
         width: u32,
         height: u32,
+    },
+    /// `TEX_GENERATE_MIPS`, `TEXFMT_SUPPORTED` bit 10.
+    TexGenerateMips {
+        id: u32,
     },
 
     // Current vertex state (0x06xx).

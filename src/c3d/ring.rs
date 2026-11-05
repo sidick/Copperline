@@ -167,10 +167,12 @@ impl Default for DeviceConfig {
     /// `max_texture_units` matches `state::Limits::default()`'s two units
     /// (the first client's two-unit multitexture target). `texfmt_supported`
     /// covers the spec's required minimum set (`RGBA8`..`A8`, bits 0-7)
-    /// plus the two optional `I8`/`I8_INDEXED` bits (8, 9): `render.rs`
-    /// expands a palette-indexed `I8` upload to RGBA8 at upload time
-    /// (`TEX_PALETTE`'s "nothing indexed ever stored" contract), so
-    /// advertising it costs nothing already implemented elsewhere.
+    /// plus the optional `I8`/`I8_INDEXED`/`MIPGEN_SUPPORTED` bits (8, 9,
+    /// 10): `render.rs` expands a palette-indexed `I8` upload to RGBA8 at
+    /// upload time (`TEX_PALETTE`'s "nothing indexed ever stored"
+    /// contract) and generates a texture's mip chain with `TEX_GENERATE_
+    /// MIPS`'s normative box filter, so advertising both costs nothing
+    /// already implemented elsewhere.
     /// `surffmt_supported` covers the required minimum (`R5G6B5`,
     /// `R5G6B5_LE` since spec draft 0.18, `A8R8G8B8`) plus the other
     /// chunky formats Copperline's surfaces also accept, including
@@ -205,7 +207,8 @@ impl Default for DeviceConfig {
             max_renderbuffer_size: 1024,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
-                | (1 << 9), // I8_INDEXED: TEX_PALETTE itself
+                | (1 << 9) // I8_INDEXED: TEX_PALETTE itself
+                | (1 << 10), // MIPGEN_SUPPORTED: TEX_GENERATE_MIPS itself
             surffmt_supported: (1 << 1) // R5G6B5
                 | (1 << 2) // R5G6B5_LE -- mandatory floor since spec draft 0.18
                 | (1 << 3) // R5G5B5
@@ -535,6 +538,13 @@ impl<'a> RingCursor<'a> {
         // format).
         if opcode == proto::OP_TEX_PALETTE
             && (self.config.texfmt_supported >> proto::TextureFormat::I8Indexed as u32) & 1 == 0
+        {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        // TEX_GENERATE_MIPS is spec-optional the same way, gated by
+        // TEXFMT_SUPPORTED bit 10 (MipgenSupported) rather than by tier.
+        if opcode == proto::OP_TEX_GENERATE_MIPS
+            && (self.config.texfmt_supported >> proto::TextureFormat::MipgenSupported as u32) & 1 == 0
         {
             return self.raise(ErrorCode::BadOpcode, start);
         }
@@ -1161,6 +1171,12 @@ impl<'a> RingCursor<'a> {
                     width,
                     height,
                 }
+            }
+            OP_TEX_GENERATE_MIPS => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_textures, start));
+                Command::TexGenerateMips { id }
             }
 
             OP_CURRENT_COLOR => {
@@ -2846,6 +2862,25 @@ mod tests {
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 20, config_with_tex_palette_supported());
         assert!(matches!(step, Step::Command(Command::TexPalette { .. })));
+    }
+
+    #[test]
+    fn tex_generate_mips_is_bad_opcode_without_texfmt_supported_bit_10() {
+        let mut c = DeviceConfig::default();
+        c.texfmt_supported &= !(1 << proto::TextureFormat::MipgenSupported as u32);
+        let words = [header(OP_TEX_GENERATE_MIPS, 2), 1];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 8, c);
+        assert_eq!(step, err(ErrorCode::BadOpcode, 0, false));
+    }
+
+    #[test]
+    fn tex_generate_mips_decodes_normally_when_texfmt_supported_bit_10_is_set() {
+        // Copperline's own default already advertises MIPGEN_SUPPORTED.
+        let words = [header(OP_TEX_GENERATE_MIPS, 2), 1];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 8);
+        assert_eq!(step, Step::Command(Command::TexGenerateMips { id: 1 }));
     }
 
     #[test]

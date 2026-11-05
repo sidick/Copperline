@@ -2770,6 +2770,32 @@ fn mip_extent(base: u32, level: u32) -> u32 {
     base.checked_shr(level).unwrap_or(0).max(1)
 }
 
+/// `TEX_GENERATE_MIPS`'s per-axis source taps (source index, weight) for
+/// output index `i` of `next_n` outputs downsampling an axis of length
+/// `n`, matching [`mip_extent`]'s floor-based `next_n`. Normally each
+/// output is the disjoint pair `(2i, 2i+1)` -- that always covers every
+/// source index exactly once when `n` is even, since `next_n == n / 2`.
+///
+/// When `n` is odd, `next_n` (floor) is one short of tiling all of `n`:
+/// the plain pair scheme would silently never read the last (edge)
+/// index. The spec's "edge texel repeated" rule is literally that --
+/// the last output's pair gains a third, distinct tap at the true edge
+/// `n - 1`, counted twice (weight 2) so every source index is used and
+/// the edge contributes double, while every other output keeps its
+/// normal disjoint pair. `n == 1` has no pairing at all; its lone index
+/// is simply weighted 2 so it combines with the other axis the same way
+/// a normal 2-weight pair would.
+fn axis_taps(n: u32, next_n: u32, i: u32) -> Vec<(u32, u32)> {
+    if n == 1 {
+        return vec![(0, 2)];
+    }
+    if i == next_n - 1 && n % 2 == 1 {
+        vec![(2 * i, 1), (2 * i + 1, 1), (n - 1, 2)]
+    } else {
+        vec![(2 * i, 1), (2 * i + 1, 1)]
+    }
+}
+
 /// Decodes a `TEX_IMAGE`/`TEX_SUBIMAGE` wire payload (`format`, packed at
 /// `row_bytes` per guest row) to a tightly-packed `width`x`height` RGBA8
 /// buffer. `op_name` tags the error on a short memory read or a short
@@ -4637,6 +4663,7 @@ impl Renderer {
             RenderOp::TexPalette { id, entries, data } => {
                 self.op_tex_palette(*id, *entries, *data, mem)
             }
+            RenderOp::TexGenerateMips { id } => self.op_tex_generate_mips(*id),
             RenderOp::ReadPixels {
                 x,
                 y,
@@ -5751,6 +5778,67 @@ impl Renderer {
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
         self.palettes.insert(id, palette);
+        Ok(())
+    }
+
+    /// `TEX_GENERATE_MIPS`: generates every level `1..` up to `1x1` from
+    /// `id`'s level 0, per `c3d.md`'s normative box filter -- one output
+    /// texel per `2x2` input block, averaged per channel at `u32`
+    /// precision and rounded to nearest, with the edge texel repeated
+    /// when a dimension is odd. Each generated level is handed to
+    /// [`Self::define_texture_level`], the same path `TEX_IMAGE` uses, so
+    /// the GPU texture's growing `mip_level_count` is handled identically
+    /// either way.
+    ///
+    /// "If level 0 is undefined, the generated levels are undefined but
+    /// this is not an error": a texture object with no level 0 uploaded
+    /// yet has no entry in `self.textures` at all (only `TEX_IMAGE`/
+    /// `TEX_COPY_IMAGE` ever insert one), so this is simply a silent
+    /// no-op rather than an error -- there is nothing to read from and
+    /// nothing useful to write. A palette-bound `id` is not special-cased
+    /// either: its stored level-0 pixels are already-expanded RGBA8 (per
+    /// `TEX_PALETTE`'s own "nothing indexed ever stored" contract), so
+    /// box-filtering them produces *some* deterministic result -- the
+    /// spec's "undefined" licenses this without requiring it.
+    fn op_tex_generate_mips(&mut self, id: u32) -> Result<(), RenderError> {
+        let Some(tex) = self.textures.get(&id) else {
+            return Ok(());
+        };
+        let (mut w, mut h) = (tex.width, tex.height);
+        let mut prev = self.copy_texture_to_cpu(&tex.texture, w, h)?;
+
+        let mut level = 1;
+        while w > 1 || h > 1 {
+            let next_w = mip_extent(w, 1);
+            let next_h = mip_extent(h, 1);
+            let x_taps: Vec<_> = (0..next_w).map(|ox| axis_taps(w, next_w, ox)).collect();
+            let y_taps: Vec<_> = (0..next_h).map(|oy| axis_taps(h, next_h, oy)).collect();
+            let mut next = vec![0u8; (next_w * next_h * 4) as usize];
+            for oy in 0..next_h {
+                for ox in 0..next_w {
+                    let out = ((oy * next_w + ox) * 4) as usize;
+                    for c in 0..4usize {
+                        let mut sum = 0u32;
+                        let mut total_weight = 0u32;
+                        for &(sx, xw) in &x_taps[ox as usize] {
+                            for &(sy, yw) in &y_taps[oy as usize] {
+                                let weight = xw * yw;
+                                sum += weight * prev[((sy * w + sx) * 4) as usize + c] as u32;
+                                total_weight += weight;
+                            }
+                        }
+                        // Round to nearest (round-half-up) at full u32
+                        // precision before truncating back to a byte.
+                        next[out + c] = ((sum + total_weight / 2) / total_weight) as u8;
+                    }
+                }
+            }
+            self.define_texture_level(id, level, next_w, next_h, &next)?;
+            prev = next;
+            w = next_w;
+            h = next_h;
+            level += 1;
+        }
         Ok(())
     }
 
@@ -9707,6 +9795,144 @@ mod tests {
                 "texel {i} should now be the bottom half's blue after TEX_COPY_SUBIMAGE"
             );
         }
+    }
+
+    /// `TEX_GENERATE_MIPS`'s box filter must produce *exact*, precisely
+    /// predictable values, not just "something plausible" -- a 4x4 level
+    /// 0 with four distinct, internally-uniform 2x2 colour quadrants
+    /// means every level-1 texel is the exact average of four identical
+    /// source texels (its own quadrant's colour, no rounding ambiguity
+    /// at all), and level 2 (1x1) is the one point in this test where
+    /// real averaging and the spec's "rounded to nearest" actually bite,
+    /// checked against a hand-computed exact byte value.
+    #[test]
+    fn tex_generate_mips_box_filters_down_to_1x1_with_exact_values() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut mem = TestMemory::new(65536);
+
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        const WHITE: [u8; 4] = [255, 255, 255, 255];
+        let mut level0 = Vec::with_capacity(4 * 4 * 4);
+        for row in 0..4u32 {
+            for col in 0..4u32 {
+                let px = match (col < 2, row < 2) {
+                    (true, true) => RED,
+                    (false, true) => GREEN,
+                    (true, false) => BLUE,
+                    (false, false) => WHITE,
+                };
+                level0.extend_from_slice(&px);
+            }
+        }
+        mem.write(MemLoc::Aperture(0), &level0);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 4,
+                    height: 4,
+                    row_bytes: 16,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 64,
+                    },
+                },
+                RenderOp::TexGenerateMips { id: 1 },
+            ],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        assert_eq!(tex.mip_level_count, 3, "4x4 -> 2x2 -> 1x1 is three levels");
+
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 2, 2)
+            .unwrap();
+        assert_eq!(&lvl1[0..4], &RED, "level 1 (0,0) should be the red quadrant's exact colour");
+        assert_eq!(&lvl1[4..8], &GREEN, "level 1 (1,0) should be the green quadrant's exact colour");
+        assert_eq!(&lvl1[8..12], &BLUE, "level 1 (0,1) should be the blue quadrant's exact colour");
+        assert_eq!(&lvl1[12..16], &WHITE, "level 1 (1,1) should be the white quadrant's exact colour");
+
+        // Level 2 (1x1): the average of (red, green, blue, white).
+        // R: (255+0+0+255)/4 = 127.5 -> 128; same for G, B; A is 255
+        // throughout.
+        let lvl2 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 2, 0, 0, 1, 1)
+            .unwrap();
+        assert_eq!(&lvl2[0..4], &[128, 128, 128, 255]);
+    }
+
+    /// The spec's "edge texel repeated when a dimension is odd" rule,
+    /// checked with hand-computed exact values. Mip level sizing is
+    /// floor-based ([`mip_extent`], matching wgpu's own mip-chain
+    /// extents), so a 3x1 texture's *only* further level is 1x1, not
+    /// 2x1 -- there is no room for a second output texel, so "the edge
+    /// texel repeated" must mean the single output's box includes all
+    /// three source texels, with the true edge (index 2, blue) counted
+    /// twice rather than silently dropped. For (red, green, blue) with
+    /// weights (1, 1, 2) over total weight 4: R=(255+0+0)/4=63.75->64,
+    /// G=(0+255+0)/4=63.75->64, B=(0+0+2*255)/4=127.5->128, A=255.
+    #[test]
+    fn tex_generate_mips_repeats_the_edge_texel_on_an_odd_dimension() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut mem = TestMemory::new(65536);
+
+        let level0: Vec<u8> = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]].concat();
+        mem.write(MemLoc::Aperture(0), &level0);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 3,
+                    height: 1,
+                    row_bytes: 12,
+                    data: Ref {
+                        address: 0,
+                        space: RefSpace::Aperture,
+                        length: 12,
+                    },
+                },
+                RenderOp::TexGenerateMips { id: 1 },
+            ],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let tex = renderer.textures.get(&1).unwrap();
+        assert_eq!(tex.mip_level_count, 2, "3x1 -> 1x1 is only two levels");
+
+        let lvl1 = renderer
+            .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 1, 1)
+            .unwrap();
+        assert_eq!(
+            &lvl1[0..4],
+            &[64, 64, 128, 255],
+            "edge (blue) weighted double against red and green, not dropped"
+        );
     }
 
     /// `TEX_IMAGE` for level 1 on top of an already-defined level 0 must
