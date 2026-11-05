@@ -90,8 +90,51 @@
 
 use crate::c3d::proto::ErrorCode;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::rc::Rc;
+
+/// Which namespace a context's five shareable object kinds (textures,
+/// shaders, programs, buffers, renderbuffers) and sync objects currently
+/// resolve `id`s against -- see c3d.md's "Cross-context sharing
+/// (CAP_SHARED_CONTEXTS)". `Private` names one context by its board-slot
+/// index (stable identity distinct from every other context, shared or
+/// not); `Shared` names a `CTX_SHARE_GROUP` value. Two `Private` contexts
+/// never alias each other even if constructed with the same `Limits`;
+/// two `Shared` members with the same group id always do.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum Namespace {
+    Private(u32),
+    Shared(u32),
+}
+
+/// `CAP_SHARED_CONTEXTS`'s shareable sync-object kind (`FENCE_SYNC_CREATE`/
+/// `WAIT_SYNC`/`SYNC_STATUS`'s wire equivalent of `glFenceSync`/
+/// `glWaitSync`/`glGetSynciv`). `signalled` becomes `true` the moment the
+/// creating context's `FENCE_SYNC_CREATE` is dispatched: this
+/// implementation's `Context::submit`/`Renderer::execute` are fully
+/// synchronous within one doorbell, so "every command this context
+/// submitted before this one has taken effect" is already satisfied by
+/// the time dispatch sees the opcode at all -- no deferred-fence
+/// bookkeeping is needed the way a real, pipelined GPU would need.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct SyncObject {
+    pub signalled: bool,
+}
+
+/// One of the five shareable object kinds' or sync objects' live storage:
+/// an `Rc<RefCell<_>>` so every context in a share group aliases the
+/// *same* map, while [`State::clone`] (used only to snapshot a
+/// `RenderOp`'s state at its exact dispatch moment -- see
+/// `dispatch.rs`'s and `render.rs`'s doc comments on why every
+/// state-dependent `RenderOp` carries its own snapshot) deliberately
+/// freezes a deep, independent copy of the map's *current contents*
+/// rather than cloning the `Rc` handle. Losing that distinction would
+/// silently reintroduce a cross-context variant of the exact staleness
+/// bug that snapshot discipline exists to prevent: a RenderOp dispatched
+/// before some *other* context's later mutation must never observe it.
+type Shared<T> = Rc<RefCell<T>>;
 
 // ---------------------------------------------------------------------
 // GL errors (docs/internals/c3d.md, "GL errors")
@@ -1760,11 +1803,29 @@ impl Framebuffer {
 
 /// One context's full GL 1.x state: one independent state machine per the
 /// spec's "one context = one command ring = one independent GL state
-/// machine".
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// machine" -- extended, with `CAP_SHARED_CONTEXTS`, to "one *or more*
+/// contexts sharing one namespace for five object kinds"; see
+/// [`Namespace`]. `Clone` is implemented manually, not derived -- see
+/// [`Shared`]'s doc comment for why.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(skip, default = "Limits::default")]
     limits: Limits,
+
+    /// This context's stable board-slot index, for [`Namespace::Private`]
+    /// identity. Set once, outside `reset_state`/`reset_all` entirely
+    /// (it is not GL state, the same category as `Context::ring_base`,
+    /// which also survives both kinds of reset) -- see
+    /// [`State::set_context_index`].
+    context_index: u32,
+    /// `CTX_SHARE_GROUP` (context register `0x34`): `0` = private
+    /// (`Namespace::Private(context_index)`), nonzero = shared
+    /// (`Namespace::Shared(share_group)`). Like `context_index`, this is
+    /// deliberately outside `reset_state`/`reset_all`'s reach -- a
+    /// context's group membership does not change across either kind of
+    /// reset, only across the one-time pre-first-command write board.rs
+    /// enforces. See [`State::namespace`].
+    share_group: u32,
 
     pub raster: RasterState,
     pub enables: Enables,
@@ -1785,28 +1846,95 @@ pub struct State {
     /// Per texture unit.
     pub texgen: Vec<TexGenUnit>,
 
-    textures: BTreeMap<u32, TextureObject>,
+    /// Shareable (`Namespace`-scoped) with `CAP_SHARED_CONTEXTS`; see
+    /// [`Shared`].
+    textures: Shared<BTreeMap<u32, TextureObject>>,
     pub texture_units: Vec<TextureUnit>,
     active_unit: u32,
 
     pub current: CurrentVertex,
 
+    /// Never shareable -- always this context's own, regardless of
+    /// `share_group`; see c3d.md's "Cross-context sharing" (a surface is
+    /// a render target tied to one context's presentation, matching
+    /// real GL's default framebuffer).
     surfaces: BTreeMap<u32, Surface>,
     draw_surface: u32,
 
-    shaders: BTreeMap<u32, ShaderObject>,
-    programs: BTreeMap<u32, ProgramObject>,
+    /// Shareable; see [`Shared`].
+    shaders: Shared<BTreeMap<u32, ShaderObject>>,
+    /// Shareable; see [`Shared`].
+    programs: Shared<BTreeMap<u32, ProgramObject>>,
     current_program: u32,
 
-    buffers: BTreeSet<u32>,
+    /// Shareable; see [`Shared`].
+    buffers: Shared<BTreeSet<u32>>,
     vertex_attribs: Vec<VertexAttrib>,
 
+    /// Never shareable -- always this context's own; a framebuffer is a
+    /// container of attachment *bindings*, not shareable storage,
+    /// matching real GL (see c3d.md's "Cross-context sharing").
     framebuffers: BTreeMap<u32, Framebuffer>,
-    renderbuffers: BTreeMap<u32, Renderbuffer>,
+    /// Shareable; see [`Shared`].
+    renderbuffers: Shared<BTreeMap<u32, Renderbuffer>>,
     draw_framebuffer: u32,
     read_framebuffer: u32,
 
+    /// `CAP_SHARED_CONTEXTS`'s shareable sync objects
+    /// (`FENCE_SYNC_CREATE`/`FENCE_SYNC_DESTROY`/`WAIT_SYNC`/
+    /// `SYNC_STATUS`), scoped to a share group exactly like the five
+    /// kinds above -- private, group-of-one, when `share_group` is `0`.
+    sync_objects: Shared<BTreeMap<u32, SyncObject>>,
+
     pending_gl_error: Option<GlError>,
+}
+
+/// Deliberately not `#[derive(Clone)]` -- see [`Shared`]'s doc comment.
+/// Every field clones the ordinary way *except* the six `Shared<_>`
+/// fields, which snapshot their current contents into a fresh,
+/// unaliased `Rc` rather than cloning the handle: the clone this
+/// produces must never see a later mutation by *any* context, including
+/// other members of the same share group, exactly as it must never see
+/// a later mutation by this same context (the original, single-context
+/// staleness bug this snapshot discipline exists to prevent).
+impl Clone for State {
+    fn clone(&self) -> Self {
+        State {
+            limits: self.limits,
+            context_index: self.context_index,
+            share_group: self.share_group,
+            raster: self.raster.clone(),
+            enables: self.enables.clone(),
+            matrix_mode: self.matrix_mode,
+            modelview: self.modelview.clone(),
+            projection: self.projection.clone(),
+            texture: self.texture.clone(),
+            lights: self.lights.clone(),
+            light_model: self.light_model.clone(),
+            material_front: self.material_front.clone(),
+            material_back: self.material_back.clone(),
+            color_material: self.color_material.clone(),
+            clip_planes: self.clip_planes.clone(),
+            texgen: self.texgen.clone(),
+            textures: Rc::new(RefCell::new(self.textures.borrow().clone())),
+            texture_units: self.texture_units.clone(),
+            active_unit: self.active_unit,
+            current: self.current.clone(),
+            surfaces: self.surfaces.clone(),
+            draw_surface: self.draw_surface,
+            shaders: Rc::new(RefCell::new(self.shaders.borrow().clone())),
+            programs: Rc::new(RefCell::new(self.programs.borrow().clone())),
+            current_program: self.current_program,
+            buffers: Rc::new(RefCell::new(self.buffers.borrow().clone())),
+            vertex_attribs: self.vertex_attribs.clone(),
+            framebuffers: self.framebuffers.clone(),
+            renderbuffers: Rc::new(RefCell::new(self.renderbuffers.borrow().clone())),
+            draw_framebuffer: self.draw_framebuffer,
+            read_framebuffer: self.read_framebuffer,
+            sync_objects: Rc::new(RefCell::new(self.sync_objects.borrow().clone())),
+            pending_gl_error: self.pending_gl_error,
+        }
+    }
 }
 
 impl State {
@@ -1814,6 +1942,8 @@ impl State {
         let texture_units = limits.texture_units.max(1);
         State {
             limits,
+            context_index: 0,
+            share_group: 0,
             raster: RasterState::default(),
             enables: Enables::new(texture_units, limits.max_lights, limits.max_clip_planes),
             matrix_mode: MatrixMode::Modelview,
@@ -1829,27 +1959,112 @@ impl State {
             color_material: ColorMaterial::default(),
             clip_planes: ClipPlanes::new(limits.max_clip_planes),
             texgen: (0..texture_units).map(|_| TexGenUnit::default()).collect(),
-            textures: BTreeMap::new(),
+            textures: Rc::new(RefCell::new(BTreeMap::new())),
             texture_units: (0..texture_units).map(|_| TextureUnit::default()).collect(),
             active_unit: 0,
             current: CurrentVertex::new(texture_units),
             surfaces: BTreeMap::new(),
             draw_surface: 0,
-            shaders: BTreeMap::new(),
-            programs: BTreeMap::new(),
+            shaders: Rc::new(RefCell::new(BTreeMap::new())),
+            programs: Rc::new(RefCell::new(BTreeMap::new())),
             current_program: 0,
-            buffers: BTreeSet::new(),
+            buffers: Rc::new(RefCell::new(BTreeSet::new())),
             vertex_attribs: (0..limits.max_vertex_attribs).map(|_| VertexAttrib::default()).collect(),
             framebuffers: BTreeMap::new(),
-            renderbuffers: BTreeMap::new(),
+            renderbuffers: Rc::new(RefCell::new(BTreeMap::new())),
             draw_framebuffer: 0,
             read_framebuffer: 0,
+            sync_objects: Rc::new(RefCell::new(BTreeMap::new())),
             pending_gl_error: None,
         }
     }
 
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// This context's `Namespace` right now: `Shared(share_group)` if
+    /// nonzero, else `Private(context_index)`. Every lookup/mutation of
+    /// the five shareable object kinds and sync objects, and every
+    /// `E_BAD_ID` cross-group visibility check, is ultimately "does this
+    /// id exist/resolve within `self.namespace()`'s map" -- but since the
+    /// map itself is the aliased `Rc`, in practice nothing needs to
+    /// branch on this directly except board.rs's share-group registry
+    /// (which uses it only as a lookup *key*, to find or create the
+    /// `Rc`s a newly-joining context should alias).
+    pub fn namespace(&self) -> Namespace {
+        if self.share_group != 0 {
+            Namespace::Shared(self.share_group)
+        } else {
+            Namespace::Private(self.context_index)
+        }
+    }
+
+    /// Board-assigned identity, set once right after construction and
+    /// never touched again (not GL state; see the field's doc comment).
+    /// `pub(crate)`: only `board.rs` -- the only layer that knows "which
+    /// slot is this" -- ever calls this.
+    pub(crate) fn set_context_index(&mut self, index: u32) {
+        self.context_index = index;
+    }
+
+    /// `CTX_SHARE_GROUP`'s current value, for the register read path.
+    pub fn share_group(&self) -> u32 {
+        self.share_group
+    }
+
+    /// This context's board-slot index -- `render.rs` uses this to key
+    /// its own GPU-resource maps for the never-shareable kinds
+    /// (surfaces), which always resolve by context identity regardless
+    /// of `namespace()`/`share_group`.
+    pub fn context_index(&self) -> u32 {
+        self.context_index
+    }
+
+    /// Reverts to a fresh, private (group-of-one) namespace -- `CTX_
+    /// SHARE_GROUP` written back to `0` within the same pre-first-
+    /// command window [`State::set_share_group`] requires. Safe for the
+    /// same reason that method is: nothing could have been created yet.
+    pub(crate) fn set_private(&mut self) {
+        self.share_group = 0;
+        self.textures = Rc::new(RefCell::new(BTreeMap::new()));
+        self.shaders = Rc::new(RefCell::new(BTreeMap::new()));
+        self.programs = Rc::new(RefCell::new(BTreeMap::new()));
+        self.buffers = Rc::new(RefCell::new(BTreeSet::new()));
+        self.renderbuffers = Rc::new(RefCell::new(BTreeMap::new()));
+        self.sync_objects = Rc::new(RefCell::new(BTreeMap::new()));
+    }
+
+    /// `CTX_SHARE_GROUP`'s write path (context register `0x34`).
+    /// `board.rs` enforces the "only before this context's first decoded
+    /// command" immutability window (mirroring `RING_SIZE`'s own
+    /// "written only while `ENABLE` is clear" rule) *before* calling
+    /// this -- by the time this runs, the five shareable maps are
+    /// guaranteed still empty (nothing could have been created yet), so
+    /// swapping them for a different group's `Rc`s (or back to a fresh
+    /// private set) never loses data. `textures`..`sync_objects` are the
+    /// *target* `Rc`s to alias -- already resolved by board.rs's
+    /// share-group registry (an existing group's live `Rc`s, or freshly
+    /// created ones for a new group) -- not constructed here, since only
+    /// board.rs has the cross-context visibility to resolve them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_share_group(
+        &mut self,
+        group: u32,
+        textures: Shared<BTreeMap<u32, TextureObject>>,
+        shaders: Shared<BTreeMap<u32, ShaderObject>>,
+        programs: Shared<BTreeMap<u32, ProgramObject>>,
+        buffers: Shared<BTreeSet<u32>>,
+        renderbuffers: Shared<BTreeMap<u32, Renderbuffer>>,
+        sync_objects: Shared<BTreeMap<u32, SyncObject>>,
+    ) {
+        self.share_group = group;
+        self.textures = textures;
+        self.shaders = shaders;
+        self.programs = programs;
+        self.buffers = buffers;
+        self.renderbuffers = renderbuffers;
+        self.sync_objects = sync_objects;
     }
 
     // -- GL errors --------------------------------------------------
@@ -2351,7 +2566,7 @@ impl State {
     /// resets an existing one to defaults (per the spec, "Creating an
     /// existing ID resets it") without touching who has it bound.
     pub fn tex_create(&mut self, id: u32) {
-        self.textures.insert(id, TextureObject::default());
+        self.textures.borrow_mut().insert(id, TextureObject::default());
     }
 
     /// `TEX_CREATE_CUBE`: as `TEX_CREATE`, but `id` becomes a cube-map
@@ -2361,7 +2576,7 @@ impl State {
     /// "resets its parameters and discards its images" rule, just with a
     /// different resulting kind.
     pub fn tex_create_cube(&mut self, id: u32) {
-        self.textures.insert(
+        self.textures.borrow_mut().insert(
             id,
             TextureObject {
                 kind: TextureKind::Cube,
@@ -2379,7 +2594,7 @@ impl State {
     /// own early return) handles that separately, exactly like every
     /// other texture op's layering.
     pub fn check_texture_kind(&self, id: u32, want: TextureKind) -> Result<(), ErrorCode> {
-        match self.textures.get(&id) {
+        match self.textures.borrow().get(&id) {
             Some(tex) if tex.kind != want => Err(ErrorCode::BadArg),
             _ => Ok(()),
         }
@@ -2397,7 +2612,7 @@ impl State {
     /// than the correct `FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT` (no
     /// attachment at all).
     pub fn tex_destroy(&mut self, id: u32) {
-        self.textures.remove(&id);
+        self.textures.borrow_mut().remove(&id);
         for unit in &mut self.texture_units {
             if unit.bound_texture == id {
                 unit.bound_texture = 0;
@@ -2414,8 +2629,14 @@ impl State {
         }
     }
 
-    pub fn texture(&self, id: u32) -> Option<&TextureObject> {
-        self.textures.get(&id)
+    /// Returns a clone, not a reference: `textures` is shareable
+    /// (`Rc<RefCell<_>>`, see [`Shared`]) with `CAP_SHARED_CONTEXTS`, so
+    /// a borrowed reference could not outlive the temporary `Ref` guard
+    /// `RefCell::borrow` returns. `TextureObject` is already `Clone`
+    /// (the map it lives in always has been); every caller already only
+    /// reads a field or two and drops the result immediately.
+    pub fn texture(&self, id: u32) -> Option<TextureObject> {
+        self.textures.borrow().get(&id).cloned()
     }
 
     /// `TEX_BIND`. A no-op if `unit` is out of range or `id` is not a
@@ -2423,7 +2644,7 @@ impl State {
     /// concerns the ring decoder is expected to have already rejected;
     /// this is a defensive fallback, not a second error path.
     pub fn tex_bind(&mut self, unit: u32, id: u32) {
-        if id != 0 && !self.textures.contains_key(&id) {
+        if id != 0 && !self.textures.borrow().contains_key(&id) {
             return;
         }
         if let Some(u) = self.texture_units.get_mut(unit as usize) {
@@ -2434,10 +2655,17 @@ impl State {
     /// `TEX_PARAM`. `Err(GL_INVALID_OPERATION)` if `id` was never
     /// created (or has been destroyed).
     pub fn set_tex_param(&mut self, id: u32, param: TexParam) -> Result<(), GlError> {
-        let Some(tex) = self.textures.get_mut(&id) else {
+        // Checked (and any error raised) before taking the mutable
+        // borrow below: `raise_gl_error` takes `&mut self` as a whole,
+        // which a live `RefMut` derived from `self.textures` (one field)
+        // would conflict with -- `Rc<RefCell<_>>`'s price for being
+        // shareable across contexts, see `Shared`'s doc comment.
+        if !self.textures.borrow().contains_key(&id) {
             self.raise_gl_error(GlError::InvalidOperation);
             return Err(GlError::InvalidOperation);
-        };
+        }
+        let mut textures = self.textures.borrow_mut();
+        let tex = textures.get_mut(&id).expect("just checked contains_key above");
         match param {
             TexParam::MinFilter(f) => tex.min_filter = f,
             TexParam::MagFilter(f) => tex.mag_filter = f,
@@ -2476,10 +2704,12 @@ impl State {
         width: u32,
         height: u32,
     ) -> Result<(), GlError> {
-        let Some(tex) = self.textures.get_mut(&id) else {
+        if !self.textures.borrow().contains_key(&id) {
             self.raise_gl_error(GlError::InvalidOperation);
             return Err(GlError::InvalidOperation);
-        };
+        }
+        let mut textures = self.textures.borrow_mut();
+        let tex = textures.get_mut(&id).expect("just checked contains_key above");
         tex.levels.insert(
             (face, level),
             TexLevel {
@@ -2493,10 +2723,12 @@ impl State {
 
     /// `TEX_PALETTE`. `entries == 0` unbinds, per the spec.
     pub fn set_tex_palette(&mut self, id: u32, entries: u32) -> Result<(), GlError> {
-        let Some(tex) = self.textures.get_mut(&id) else {
+        if !self.textures.borrow().contains_key(&id) {
             self.raise_gl_error(GlError::InvalidOperation);
             return Err(GlError::InvalidOperation);
-        };
+        }
+        let mut textures = self.textures.borrow_mut();
+        let tex = textures.get_mut(&id).expect("just checked contains_key above");
         tex.palette_entries = if entries == 0 { None } else { Some(entries) };
         Ok(())
     }
@@ -2594,14 +2826,14 @@ impl State {
     /// `render.rs`, which the caller is responsible for re-initialising
     /// alongside this -- see `dispatch.rs`'s `Command::ShaderCreate` arm).
     pub fn shader_create(&mut self, id: u32, kind: ShaderKind) {
-        self.shaders.insert(id, ShaderObject { kind });
+        self.shaders.borrow_mut().insert(id, ShaderObject { kind });
     }
 
     /// `SHADER_DESTROY`: releases the object and detaches it from every
     /// program that had it attached.
     pub fn shader_destroy(&mut self, id: u32) {
-        self.shaders.remove(&id);
-        for program in self.programs.values_mut() {
+        self.shaders.borrow_mut().remove(&id);
+        for program in self.programs.borrow_mut().values_mut() {
             if program.attached_vertex == Some(id) {
                 program.attached_vertex = None;
             }
@@ -2611,29 +2843,33 @@ impl State {
         }
     }
 
-    pub fn shader(&self, id: u32) -> Option<&ShaderObject> {
-        self.shaders.get(&id)
+    /// Returns a clone, not a reference -- see [`State::texture`]'s
+    /// identical reasoning.
+    pub fn shader(&self, id: u32) -> Option<ShaderObject> {
+        self.shaders.borrow().get(&id).cloned()
     }
 
     /// `PROGRAM_CREATE`. Re-creating an existing id discards its previous
     /// attachments (and, in `render.rs`, its previous link result),
     /// exactly as `SHADER_CREATE` does for a shader.
     pub fn program_create(&mut self, id: u32) {
-        self.programs.insert(id, ProgramObject::default());
+        self.programs.borrow_mut().insert(id, ProgramObject::default());
     }
 
     /// `PROGRAM_DESTROY`: releases the object. If it was the current
     /// program, the current program becomes `0`, per `PROGRAM_DESTROY`'s
     /// spec (mirroring `SURFACE_DESTROY`'s effect on the draw surface).
     pub fn program_destroy(&mut self, id: u32) {
-        self.programs.remove(&id);
+        self.programs.borrow_mut().remove(&id);
         if self.current_program == id {
             self.current_program = 0;
         }
     }
 
-    pub fn program(&self, id: u32) -> Option<&ProgramObject> {
-        self.programs.get(&id)
+    /// Returns a clone, not a reference -- see [`State::texture`]'s
+    /// identical reasoning.
+    pub fn program(&self, id: u32) -> Option<ProgramObject> {
+        self.programs.borrow().get(&id).cloned()
     }
 
     /// `PROGRAM_ATTACH`. `Ok(())` and a no-op if `program` or `shader` was
@@ -2642,20 +2878,34 @@ impl State {
     /// OPERATION)` if a shader of the same kind is already attached, per
     /// the spec.
     pub fn program_attach(&mut self, program: u32, shader: u32) -> Result<(), GlError> {
-        let Some(kind) = self.shaders.get(&shader).map(|s| s.kind) else {
+        let Some(kind) = self.shaders.borrow().get(&shader).map(|s| s.kind) else {
             return Ok(());
         };
-        let Some(prog) = self.programs.get_mut(&program) else {
-            return Ok(());
+        // Read-only pass first, and any error raised here, before taking
+        // the mutable borrow below -- `raise_gl_error` needs `&mut self`
+        // as a whole, which a live `RefMut` from `self.programs` (one
+        // field) would conflict with. See `set_tex_param`'s identical
+        // reasoning.
+        let already_attached = {
+            let programs = self.programs.borrow();
+            let Some(prog) = programs.get(&program) else {
+                return Ok(());
+            };
+            match kind {
+                ShaderKind::Vertex => prog.attached_vertex.is_some(),
+                ShaderKind::Fragment => prog.attached_fragment.is_some(),
+            }
         };
+        if already_attached {
+            self.raise_gl_error(GlError::InvalidOperation);
+            return Err(GlError::InvalidOperation);
+        }
+        let mut programs = self.programs.borrow_mut();
+        let prog = programs.get_mut(&program).expect("checked above");
         let slot = match kind {
             ShaderKind::Vertex => &mut prog.attached_vertex,
             ShaderKind::Fragment => &mut prog.attached_fragment,
         };
-        if slot.is_some() {
-            self.raise_gl_error(GlError::InvalidOperation);
-            return Err(GlError::InvalidOperation);
-        }
         *slot = Some(shader);
         Ok(())
     }
@@ -2663,7 +2913,8 @@ impl State {
     /// `PROGRAM_DETACH`. A no-op if `shader` was not attached to
     /// `program` (including if either was never created).
     pub fn program_detach(&mut self, program: u32, shader: u32) {
-        if let Some(prog) = self.programs.get_mut(&program) {
+        let mut programs = self.programs.borrow_mut();
+        if let Some(prog) = programs.get_mut(&program) {
             if prog.attached_vertex == Some(shader) {
                 prog.attached_vertex = None;
             }
@@ -2677,7 +2928,7 @@ impl State {
     /// created (defensive fallback, as above); `0` always succeeds
     /// (clears the current program).
     pub fn use_program(&mut self, program: u32) {
-        if program != 0 && !self.programs.contains_key(&program) {
+        if program != 0 && !self.programs.borrow().contains_key(&program) {
             return;
         }
         self.current_program = program;
@@ -2698,6 +2949,39 @@ impl State {
         }
     }
 
+    // -- Cross-context sync objects (CAP_SHARED_CONTEXTS) ----------------
+
+    /// `FENCE_SYNC_CREATE`: creates (or replaces) sync object `id` in
+    /// the unsignalled state, then immediately marks it signalled --
+    /// see [`SyncObject`]'s doc comment for why this implementation's
+    /// synchronous execution model makes that correct, not a shortcut.
+    /// Scoped to `self.namespace()`, exactly like the five shareable
+    /// object kinds.
+    pub fn fence_sync_create(&mut self, id: u32) {
+        self.sync_objects.borrow_mut().insert(id, SyncObject { signalled: true });
+    }
+
+    /// `FENCE_SYNC_DESTROY`: releases the guest's claim on `id`. Real
+    /// `glDeleteSync`'s "stays alive for anyone still referencing it"
+    /// half has no counterpart to implement here: nothing in this
+    /// synchronous model can be "still referencing" a sync object across
+    /// a `FENCE_SYNC_DESTROY` call the way a pipelined real GPU's
+    /// already-submitted `glWaitSync` can.
+    pub fn fence_sync_destroy(&mut self, id: u32) {
+        self.sync_objects.borrow_mut().remove(&id);
+    }
+
+    /// Whether sync object `id` exists *in this context's current
+    /// namespace* and, if so, whether it is signalled -- `None` for
+    /// `WAIT_SYNC`'s/`FENCE_SYNC_CREATE`'s `E_BAD_ID` case (unknown, or
+    /// belongs to a different share group -- indistinguishable, and
+    /// correctly so: a different group's sync object simply isn't in
+    /// `self.sync_objects` at all, the same way a different group's
+    /// texture id isn't in `self.textures`).
+    pub fn sync_signalled(&self, id: u32) -> Option<bool> {
+        self.sync_objects.borrow().get(&id).map(|s| s.signalled)
+    }
+
     // -- Buffers and vertex attributes (CAP_PROGRAMMABLE) ----------------
 
     /// `BUFFER_CREATE`. Re-creating an existing id is a no-op here: unlike
@@ -2705,14 +2989,14 @@ impl State {
     /// this module tracks to reset -- its storage (which `BUFFER_DATA`
     /// replaces wholesale, per the spec) lives only in `render.rs`.
     pub fn buffer_create(&mut self, id: u32) {
-        self.buffers.insert(id);
+        self.buffers.borrow_mut().insert(id);
     }
 
     /// `BUFFER_DESTROY`: releases the object and disables (reverting to
     /// its constant value) any vertex attribute slot still pointing at
     /// it, per the spec.
     pub fn buffer_destroy(&mut self, id: u32) {
-        self.buffers.remove(&id);
+        self.buffers.borrow_mut().remove(&id);
         for attrib in &mut self.vertex_attribs {
             if attrib.pointer.as_ref().is_some_and(|p| p.buffer == id) {
                 attrib.pointer = None;
@@ -2721,14 +3005,14 @@ impl State {
     }
 
     pub fn buffer_exists(&self, id: u32) -> bool {
-        self.buffers.contains(&id)
+        self.buffers.borrow().contains(&id)
     }
 
     /// `BUFFER_DATA`/`BUFFER_SUBDATA` on a buffer that was never created
     /// (or has been destroyed) is `GL_INVALID_OPERATION`, exactly as
     /// `TEX_IMAGE` on an unknown texture is (`State::define_tex_level`).
     pub fn check_buffer_exists(&mut self, id: u32) -> Result<(), GlError> {
-        if self.buffers.contains(&id) {
+        if self.buffers.borrow().contains(&id) {
             Ok(())
         } else {
             self.raise_gl_error(GlError::InvalidOperation);
@@ -2773,8 +3057,10 @@ impl State {
         self.framebuffers.get(&id)
     }
 
-    pub fn renderbuffer(&self, id: u32) -> Option<&Renderbuffer> {
-        self.renderbuffers.get(&id)
+    /// Returns a clone, not a reference -- see [`State::texture`]'s
+    /// identical reasoning.
+    pub fn renderbuffer(&self, id: u32) -> Option<Renderbuffer> {
+        self.renderbuffers.borrow().get(&id).cloned()
     }
 
     /// The default framebuffer (`0`) is always complete -- a draw/clear
@@ -2834,13 +3120,13 @@ impl State {
     }
 
     pub fn renderbuffer_create(&mut self, id: u32) {
-        self.renderbuffers.insert(id, Renderbuffer::default());
+        self.renderbuffers.borrow_mut().insert(id, Renderbuffer::default());
     }
 
     /// `RENDERBUFFER_DESTROY`: detaches it from every framebuffer
     /// attachment point that held it, per the spec.
     pub fn renderbuffer_destroy(&mut self, id: u32) {
-        self.renderbuffers.remove(&id);
+        self.renderbuffers.borrow_mut().remove(&id);
         let target = FramebufferAttachment::Renderbuffer(id);
         for fb in self.framebuffers.values_mut() {
             for color in &mut fb.colors {
@@ -2855,13 +3141,13 @@ impl State {
     }
 
     pub fn renderbuffer_storage_color(&mut self, id: u32, width: u32, height: u32, format: SurfaceFormat) {
-        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+        if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
             rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples: 0 });
         }
     }
 
     pub fn renderbuffer_storage_depth_stencil(&mut self, id: u32, width: u32, height: u32) {
-        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+        if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
             rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples: 0 });
         }
     }
@@ -2884,7 +3170,7 @@ impl State {
         if !(2..=self.limits.max_samples as u32).contains(&samples) {
             return Err(ErrorCode::Limit);
         }
-        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+        if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
             rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples });
         }
         Ok(())
@@ -2902,7 +3188,7 @@ impl State {
         if !(2..=self.limits.max_samples as u32).contains(&samples) {
             return Err(ErrorCode::Limit);
         }
-        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+        if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
             rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples });
         }
         Ok(())
@@ -2923,7 +3209,7 @@ impl State {
             return Err(ErrorCode::BadId);
         }
         if renderbuffer != 0 {
-            let storage = self.renderbuffers.get(&renderbuffer).and_then(|rb| rb.storage);
+            let storage = self.renderbuffers.borrow().get(&renderbuffer).and_then(|rb| rb.storage);
             let matches = matches!(
                 (attachment, storage),
                 (FramebufferAttachmentPoint::Color(_), Some(RenderbufferStorage::Color { .. }))
@@ -3088,18 +3374,20 @@ impl State {
     /// to be its only callers before `BLIT_FRAMEBUFFER`).
     fn attachment_size(&self, attachment: FramebufferAttachment) -> Option<(u32, u32)> {
         match attachment {
-            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
                 Some(RenderbufferStorage::Color { width, height, .. }) => Some((width, height)),
                 Some(RenderbufferStorage::DepthStencil { width, height, .. }) => Some((width, height)),
                 None => None,
             },
             FramebufferAttachment::Texture { id, level } => self
                 .textures
+                .borrow()
                 .get(&id)
                 .and_then(|t| t.levels.get(&(0, level)))
                 .map(|l| (l.width, l.height)),
             FramebufferAttachment::TextureFace { id, face, level } => self
                 .textures
+                .borrow()
                 .get(&id)
                 .and_then(|t| t.levels.get(&(face, level)))
                 .map(|l| (l.width, l.height)),
@@ -3113,7 +3401,7 @@ impl State {
     /// INCOMPLETE_MULTISAMPLE` check.
     fn attachment_samples(&self, attachment: FramebufferAttachment) -> u32 {
         match attachment {
-            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
                 Some(RenderbufferStorage::Color { samples, .. }) => samples,
                 Some(RenderbufferStorage::DepthStencil { samples, .. }) => samples,
                 None => 0,
@@ -3155,7 +3443,7 @@ impl State {
             return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
         };
         if let Some(FramebufferAttachment::Renderbuffer(id)) = fb.depth_stencil {
-            match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+            match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
                 Some(RenderbufferStorage::DepthStencil {
                     width: dw,
                     height: dh,
@@ -3418,15 +3706,31 @@ impl State {
     /// it would outlive the state that produced it. The protocol-error
     /// latch is cleared alongside it by the caller, which owns that
     /// latch.
+    ///
+    /// `surfaces`/`framebuffers` are never shareable and always cleared
+    /// unconditionally. The five shareable kinds (`textures`..
+    /// `renderbuffers`) and `sync_objects` are cleared only while this
+    /// context is actually `Private` right now: with `CAP_SHARED_
+    /// CONTEXTS`, c3d.md's "a shared object outlives this one context's
+    /// release as long as another member exists" means a RESET on one
+    /// member of a live share group must not destroy objects the other
+    /// members still use. `CTX_SHARE_GROUP` itself does not change here
+    /// (not GL state -- see its field doc comment), so a context stays
+    /// exactly as shared after RESET as it was before; a guest wanting
+    /// to actually delete a specific shared object still has the
+    /// ordinary `*_DESTROY` opcodes for that, same as it always did.
     pub fn reset_all(&mut self) {
         self.reset_state();
-        self.textures.clear();
+        if matches!(self.namespace(), Namespace::Private(_)) {
+            self.textures.borrow_mut().clear();
+            self.shaders.borrow_mut().clear();
+            self.programs.borrow_mut().clear();
+            self.buffers.borrow_mut().clear();
+            self.renderbuffers.borrow_mut().clear();
+            self.sync_objects.borrow_mut().clear();
+        }
         self.surfaces.clear();
-        self.shaders.clear();
-        self.programs.clear();
-        self.buffers.clear();
         self.framebuffers.clear();
-        self.renderbuffers.clear();
         self.pending_gl_error = None;
     }
 }
@@ -5002,7 +5306,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            s.renderbuffers.get(&1).unwrap().storage,
+            s.renderbuffers.borrow().get(&1).unwrap().storage,
             Some(RenderbufferStorage::Color {
                 width: 64,
                 height: 64,

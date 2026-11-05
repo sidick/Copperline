@@ -137,12 +137,33 @@ use super::glsl;
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
     self, BlendEquation, BlendFactor, ColorMaterialMode, CompareFunc, Face, FogMode, FrontFace, Mat4,
-    MatrixMode, PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
+    MatrixMode, Namespace, PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
     SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
     VertexAttribType,
 };
 use std::collections::HashMap;
 use std::fmt;
+
+/// `Renderer`'s GPU-resource maps are keyed by this, not a bare object
+/// id: investigating `CAP_SHARED_CONTEXTS` surfaced that they previously
+/// were not partitioned by context *at all* -- a single `Renderer`
+/// instance already serves every context on the board (`board.rs`'s
+/// `C3dBoard` owns one `Renderer` alongside `Vec<ContextSlot>`, each
+/// with its own independent `state::State`), yet every one of these
+/// maps was keyed purely by id. Two concurrently-live *private*
+/// contexts that happened to reuse the same texture/buffer/shader/
+/// program/renderbuffer/surface id already silently aliased each
+/// other's GPU resources -- a latent cross-context isolation bug this
+/// capability's own namespacing fix also happens to correct, since it
+/// requires real partitioning to exist before "two partitions collapse
+/// into one shared group" is a coherent idea at all. `surfaces` is keyed
+/// by `Namespace::Private(state.context_index())` unconditionally
+/// (never `state.namespace()`) since surfaces are never shareable, per
+/// the spec, regardless of a context's `CTX_SHARE_GROUP`; every other
+/// map here uses `state.namespace()` directly, so two contexts in the
+/// same share group transparently land on the same key -- no extra
+/// lookup/translation needed anywhere else in this file.
+type PartKey = (Namespace, u32);
 
 // ---------------------------------------------------------------------
 // Errors
@@ -624,7 +645,7 @@ fn texcoord_texel_scale(state: &State, unit: usize) -> [f32; 2] {
     if tu.coord_space != state::TexCoordSpace::Texel {
         return [1.0, 1.0];
     }
-    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&(0, 0))) {
+    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&(0, 0)).copied()) {
         Some(level) if level.width > 0 && level.height > 0 => {
             [1.0 / level.width as f32, 1.0 / level.height as f32]
         }
@@ -2978,8 +2999,8 @@ pub struct Renderer {
     /// [`Renderer::resolve_multisample_depth`].
     bind_group_layout_depth_resolve: wgpu::BindGroupLayout,
     depth_resolve_pipeline: wgpu::RenderPipeline,
-    surfaces: HashMap<u32, GpuSurface>,
-    textures: HashMap<u32, GpuTexture>,
+    surfaces: HashMap<PartKey, GpuSurface>,
+    textures: HashMap<PartKey, GpuTexture>,
     /// `TEX_PALETTE`'s bound RGBA8 colour tables, by texture id --
     /// independent of `textures` (a palette can be bound before the
     /// texture object itself exists on the GPU side, i.e. before its
@@ -2987,7 +3008,7 @@ pub struct Renderer {
     /// Consulted only when expanding an `I8` upload
     /// ([`decode_wire_rgba8`]); a missing or empty entry means I8 keeps
     /// its plain intensity meaning.
-    palettes: HashMap<u32, Vec<[u8; 4]>>,
+    palettes: HashMap<PartKey, Vec<[u8; 4]>>,
     clear_rect_pipelines: HashMap<ClearRectPipelineKey, wgpu::RenderPipeline>,
     /// Whether this device's adapter advertised `POLYGON_MODE_LINE`/
     /// `POLYGON_MODE_POINT` -- computed once from the adapter's own
@@ -3009,10 +3030,10 @@ pub struct Renderer {
     /// renderer-side counterpart to `state::ShaderObject`'s metadata-only
     /// record, exactly as `textures` holds pixel data `state::
     /// TextureObject` never does. See [`ShaderSlot`].
-    shaders: HashMap<u32, ShaderSlot>,
+    shaders: HashMap<PartKey, ShaderSlot>,
     /// `CAP_PROGRAMMABLE`'s link/validate results and bound attribute
     /// locations, by program id. See [`ProgramSlot`].
-    programs: HashMap<u32, ProgramSlot>,
+    programs: HashMap<PartKey, ProgramSlot>,
     /// `CAP_PROGRAMMABLE`'s buffer objects, by id: the raw wire bytes
     /// `BUFFER_DATA`/`BUFFER_SUBDATA` last wrote, exactly as received
     /// (big-endian, per the wire format's own convention). `state.rs`
@@ -3027,14 +3048,14 @@ pub struct Renderer {
     /// directly -- so the actual GPU-ready buffer is built fresh at
     /// draw time from this CPU-side copy, per attribute, rather than
     /// once at upload time when the type isn't known yet.
-    buffers: HashMap<u32, Vec<u8>>,
+    buffers: HashMap<PartKey, Vec<u8>>,
     /// `CAP_PROGRAMMABLE`'s colour renderbuffers, by id: a persistent
     /// GPU colour texture, resized on demand like [`GpuSurface`]'s own
     /// colour texture -- unlike a texture object's pixels (sampled
     /// through a shader), a renderbuffer is never read back by this
     /// tier, so there is no separate "shape" struct the way
     /// [`GpuTexture`] needs for its mip chain.
-    renderbuffers: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
+    renderbuffers: HashMap<PartKey, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
     /// `CAP_PROGRAMMABLE`'s depth/stencil renderbuffers, by id: the same
     /// shape as `renderbuffers` above, but [`INTERNAL_DEPTH_FORMAT`]
     /// instead of [`INTERNAL_COLOR_FORMAT`]. Only ever populated for a
@@ -3042,7 +3063,7 @@ pub struct Renderer {
     /// renderbuffer bound -- see [`Renderer::resolve_draw_target`] for
     /// the transient scratch buffer a framebuffer without one gets
     /// instead.
-    renderbuffer_depth: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
+    renderbuffer_depth: HashMap<PartKey, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
 }
 
 /// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
@@ -4020,8 +4041,15 @@ impl Renderer {
         self.adapter_info.device_type == wgpu::DeviceType::Cpu
     }
 
-    fn ensure_surface(&mut self, id: u32, def: &Surface) -> Result<&mut GpuSurface, RenderError> {
-        let needs_create = match self.surfaces.get(&id) {
+    /// `part` is always `Namespace::Private(state.context_index())` at
+    /// every call site -- surfaces are never shareable (see
+    /// [`PartKey`]'s doc comment) -- but taking it explicitly rather
+    /// than a `&State` keeps this (and the two `ensure_renderbuffer_*`
+    /// functions below, which *are* genuinely shareable) to one
+    /// consistent shape.
+    fn ensure_surface(&mut self, part: Namespace, id: u32, def: &Surface) -> Result<&mut GpuSurface, RenderError> {
+        let key = (part, id);
+        let needs_create = match self.surfaces.get(&key) {
             Some(existing) => existing.def.width != def.width || existing.def.height != def.height,
             None => true,
         };
@@ -4060,7 +4088,7 @@ impl Renderer {
             });
             let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
             self.surfaces.insert(
-                id,
+                key,
                 GpuSurface {
                     def: *def,
                     color,
@@ -4069,12 +4097,12 @@ impl Renderer {
                     depth_view,
                 },
             );
-        } else if let Some(existing) = self.surfaces.get_mut(&id) {
+        } else if let Some(existing) = self.surfaces.get_mut(&key) {
             existing.def = *def;
         }
         Ok(self
             .surfaces
-            .get_mut(&id)
+            .get_mut(&key)
             .expect("just inserted or present"))
     }
 
@@ -4084,9 +4112,17 @@ impl Renderer {
     /// texture (a renderbuffer's own depth/stencil counterpart, if any,
     /// is a separate renderbuffer object entirely, unlike a surface's
     /// always-present internal depth buffer).
-    fn ensure_renderbuffer_color(&mut self, id: u32, width: u32, height: u32, samples: u32) -> wgpu::TextureView {
+    fn ensure_renderbuffer_color(
+        &mut self,
+        part: Namespace,
+        id: u32,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> wgpu::TextureView {
+        let key = (part, id);
         let needs_create =
-            !matches!(self.renderbuffers.get(&id), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
+            !matches!(self.renderbuffers.get(&key), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
         if needs_create {
             let size = wgpu::Extent3d {
                 width: width.max(1),
@@ -4114,9 +4150,9 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffers.insert(id, (texture, view, width, height, samples));
+            self.renderbuffers.insert(key, (texture, view, width, height, samples));
         }
-        self.renderbuffers.get(&id).expect("just inserted or present").1.clone()
+        self.renderbuffers.get(&key).expect("just inserted or present").1.clone()
     }
 
     /// A depth/stencil renderbuffer's GPU storage. See
@@ -4127,8 +4163,16 @@ impl Renderer {
     /// an attached depth/stencil renderbuffer somewhere persistent to
     /// write to, unlike the transient scratch buffer
     /// [`Self::resolve_draw_target`] uses when none is attached.
-    fn ensure_renderbuffer_depth(&mut self, id: u32, width: u32, height: u32, samples: u32) -> wgpu::TextureView {
-        let needs_create = !matches!(self.renderbuffer_depth.get(&id), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
+    fn ensure_renderbuffer_depth(
+        &mut self,
+        part: Namespace,
+        id: u32,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> wgpu::TextureView {
+        let key = (part, id);
+        let needs_create = !matches!(self.renderbuffer_depth.get(&key), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
         if needs_create {
             let size = wgpu::Extent3d {
                 width: width.max(1),
@@ -4146,10 +4190,10 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffer_depth.insert(id, (texture, view, width, height, samples));
+            self.renderbuffer_depth.insert(key, (texture, view, width, height, samples));
         }
         self.renderbuffer_depth
-            .get(&id)
+            .get(&key)
             .expect("just inserted or present")
             .1
             .clone()
@@ -4188,7 +4232,7 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(surf_id, &def)?;
+            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((
                 def.width,
                 def.height,
@@ -4245,7 +4289,7 @@ impl Renderer {
                     Some(state::RenderbufferStorage::DepthStencil { samples, .. }) => samples,
                     _ => 0,
                 };
-                (self.ensure_renderbuffer_depth(rb_id, width, height, samples), true)
+                (self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples), true)
             }
             _ => {
                 // Must match every colour attachment's sample count --
@@ -4316,10 +4360,13 @@ impl Renderer {
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                Ok((width, height, self.ensure_renderbuffer_color(rb_id, width, height, samples), samples))
+                Ok((width, height, self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples), samples))
             }
             state::FramebufferAttachment::Texture { id, level } => {
-                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let tex = self
+                    .textures
+                    .get(&(state.namespace(), id))
+                    .ok_or(RenderError::UnknownObject("texture", id))?;
                 let width = mip_extent(tex.width, level);
                 let height = mip_extent(tex.height, level);
                 let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -4330,7 +4377,10 @@ impl Renderer {
                 Ok((width, height, view, 0))
             }
             state::FramebufferAttachment::TextureFace { id, face, level } => {
-                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let tex = self
+                    .textures
+                    .get(&(state.namespace(), id))
+                    .ok_or(RenderError::UnknownObject("texture", id))?;
                 let width = mip_extent(tex.width, level);
                 let height = mip_extent(tex.height, level);
                 // One face, one level, as a plain `D2` slice -- a render
@@ -4375,7 +4425,7 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let color = self.ensure_surface(surf_id, &def)?.color.clone();
+            let color = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?.color.clone();
             return Ok(Some((def.width, def.height, color, 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
@@ -4397,12 +4447,12 @@ impl Renderer {
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                self.ensure_renderbuffer_color(rb_id, width, height, samples);
-                let texture = self.renderbuffers.get(&rb_id).expect("just ensured").0.clone();
+                self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples);
+                let texture = self.renderbuffers.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
                 Ok(Some((width, height, texture, 0)))
             }
             state::FramebufferAttachment::Texture { id, level } => {
-                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let tex = self.textures.get(&(state.namespace(), id)).ok_or(RenderError::UnknownObject("texture", id))?;
                 let width = mip_extent(tex.width, level);
                 let height = mip_extent(tex.height, level);
                 Ok(Some((width, height, tex.texture.clone(), level)))
@@ -4998,8 +5048,9 @@ impl Renderer {
                 height,
                 row_bytes,
                 data,
+                namespace,
             } => self.op_tex_image(
-                *id, *level, *format, *width, *height, *row_bytes, *data, mem,
+                *id, *level, *format, *width, *height, *row_bytes, *data, *namespace, mem,
             ),
             RenderOp::TexSubImage {
                 id,
@@ -5011,8 +5062,9 @@ impl Renderer {
                 format,
                 row_bytes,
                 data,
+                namespace,
             } => self.op_tex_subimage(
-                *id, *level, *x, *y, *width, *height, *format, *row_bytes, *data, mem,
+                *id, *level, *x, *y, *width, *height, *format, *row_bytes, *data, *namespace, mem,
             ),
             RenderOp::SurfaceReadback { x, y, w, h, state } => {
                 self.op_surface_readback(*x, *y, *w, *h, state, mem)
@@ -5043,10 +5095,15 @@ impl Renderer {
             } => {
                 self.op_tex_copy_subimage(*id, *level, *xoff, *yoff, *x, *y, *width, *height, state)
             }
-            RenderOp::TexPalette { id, entries, data } => {
-                self.op_tex_palette(*id, *entries, *data, mem)
+            RenderOp::TexPalette {
+                id,
+                entries,
+                data,
+                namespace,
+            } => self.op_tex_palette(*id, *entries, *data, *namespace, mem),
+            RenderOp::TexGenerateMips { id, namespace } => {
+                self.op_tex_generate_mips(*id, *namespace)
             }
-            RenderOp::TexGenerateMips { id } => self.op_tex_generate_mips(*id),
             RenderOp::TexImageFace {
                 id,
                 face,
@@ -5056,8 +5113,9 @@ impl Renderer {
                 height,
                 row_bytes,
                 data,
+                namespace,
             } => self.op_tex_image_face(
-                *id, *face, *level, *format, *width, *height, *row_bytes, *data, mem,
+                *id, *face, *level, *format, *width, *height, *row_bytes, *data, *namespace, mem,
             ),
             RenderOp::TexSubImageFace {
                 id,
@@ -5070,8 +5128,9 @@ impl Renderer {
                 format,
                 row_bytes,
                 data,
+                namespace,
             } => self.op_tex_subimage_face(
-                *id, *face, *level, *x, *y, *width, *height, *format, *row_bytes, *data, mem,
+                *id, *face, *level, *x, *y, *width, *height, *format, *row_bytes, *data, *namespace, mem,
             ),
             RenderOp::TexCopyImageFace {
                 id,
@@ -5113,43 +5172,56 @@ impl Renderer {
             ),
             RenderOp::Query { dest, result } => self.op_query(*dest, *result, mem),
 
-            RenderOp::ShaderSource { id, source } => self.op_shader_source(*id, *source, mem),
-            RenderOp::ShaderCompile { id, kind } => self.op_shader_compile(*id, *kind),
+            RenderOp::ShaderSource { id, source, namespace } => {
+                self.op_shader_source(*id, *source, *namespace, mem)
+            }
+            RenderOp::ShaderCompile { id, kind, namespace } => {
+                self.op_shader_compile(*id, *kind, *namespace)
+            }
             RenderOp::ProgramBindAttribLocation {
                 program,
                 index,
                 name,
-            } => self.op_program_bind_attrib_location(*program, *index, *name, mem),
+                namespace,
+            } => self.op_program_bind_attrib_location(*program, *index, *name, *namespace, mem),
             RenderOp::ProgramLink {
                 program,
                 vertex,
                 fragment,
-            } => self.op_program_link(*program, *vertex, *fragment),
-            RenderOp::ProgramValidate { program } => self.op_program_validate(*program),
-            RenderOp::ShaderStatus { shader, dest } => self.op_shader_status(*shader, *dest, mem),
-            RenderOp::ProgramStatus { program, dest } => {
-                self.op_program_status(*program, *dest, mem)
+                namespace,
+            } => self.op_program_link(*program, *vertex, *fragment, *namespace),
+            RenderOp::ProgramValidate { program, namespace } => {
+                self.op_program_validate(*program, *namespace)
+            }
+            RenderOp::ShaderStatus { shader, dest, namespace } => {
+                self.op_shader_status(*shader, *dest, *namespace, mem)
+            }
+            RenderOp::ProgramStatus { program, dest, namespace } => {
+                self.op_program_status(*program, *dest, *namespace, mem)
             }
             RenderOp::ProgramBinary {
                 program,
                 format,
                 data,
-            } => self.op_program_binary(*program, *format, *data, mem),
-            RenderOp::ProgramGetBinary { program, dest } => {
-                self.op_program_get_binary(*program, *dest, mem)
+                namespace,
+            } => self.op_program_binary(*program, *format, *data, *namespace, mem),
+            RenderOp::ProgramGetBinary { program, dest, namespace } => {
+                self.op_program_get_binary(*program, *dest, *namespace, mem)
             }
             RenderOp::BufferData {
                 id,
                 size,
                 usage: _,
                 data,
-            } => self.op_buffer_data(*id, *size, *data, mem),
+                namespace,
+            } => self.op_buffer_data(*id, *size, *data, *namespace, mem),
             RenderOp::BufferSubData {
                 id,
                 offset,
                 size,
                 data,
-            } => self.op_buffer_subdata(*id, *offset, *size, *data, mem),
+                namespace,
+            } => self.op_buffer_subdata(*id, *offset, *size, *data, *namespace, mem),
             RenderOp::DrawArraysProg {
                 prim,
                 first,
@@ -5169,14 +5241,18 @@ impl Renderer {
                 type_,
                 count,
                 values,
-            } => self.op_uniform(*program, *location, *type_, *count, values),
-            RenderOp::UniformSampler { program, location, unit } => {
-                self.op_uniform_sampler(*program, *location, *unit)
+                namespace,
+            } => self.op_uniform(*program, *location, *type_, *count, values, *namespace),
+            RenderOp::UniformSampler { program, location, unit, namespace } => {
+                self.op_uniform_sampler(*program, *location, *unit, *namespace)
             }
-            RenderOp::ProgramInterface { program, dest } => self.op_program_interface(*program, *dest, mem),
+            RenderOp::ProgramInterface { program, dest, namespace } => {
+                self.op_program_interface(*program, *dest, *namespace, mem)
+            }
             RenderOp::FramebufferStatus { dest, status } => {
                 self.op_framebuffer_status(*dest, *status, mem)
             }
+            RenderOp::SyncStatus { id: _, dest, status } => self.op_sync_status(*dest, *status, mem),
             RenderOp::BlitFramebuffer {
                 src_x0,
                 src_y0,
@@ -5577,7 +5653,7 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(surf_id, &def)?;
+            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((
                 def.width,
                 def.height,
@@ -5633,8 +5709,8 @@ impl Renderer {
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                let view = self.ensure_renderbuffer_color(rb_id, width, height, samples);
-                let tex = self.renderbuffers.get(&rb_id).expect("just ensured").0.clone();
+                let view = self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples);
+                let tex = self.renderbuffers.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
                 Ok((width, height, tex, view))
             }
             state::FramebufferAttachment::Texture { .. } | state::FramebufferAttachment::TextureFace { .. } => {
@@ -5971,7 +6047,7 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(surf_id, &def)?;
+            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
@@ -5988,8 +6064,8 @@ impl Renderer {
         else {
             return Ok(None);
         };
-        self.ensure_renderbuffer_depth(rb_id, width, height, samples);
-        let tex = self.renderbuffer_depth.get(&rb_id).expect("just ensured").0.clone();
+        self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples);
+        let tex = self.renderbuffer_depth.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
         Ok(Some((width, height, tex, samples)))
     }
 
@@ -6005,7 +6081,7 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(surf_id, &def)?;
+            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
@@ -6022,8 +6098,8 @@ impl Renderer {
         else {
             return Ok(None);
         };
-        self.ensure_renderbuffer_depth(rb_id, width, height, samples);
-        let tex = self.renderbuffer_depth.get(&rb_id).expect("just ensured").0.clone();
+        self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples);
+        let tex = self.renderbuffer_depth.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
         Ok(Some((width, height, tex, samples)))
     }
 
@@ -6485,12 +6561,12 @@ impl Renderer {
         // pipeline-key/bind-group purposes.
         let unit0 = state.texture_units.first();
         let bound_tex0 = unit0.map(|u| u.bound_texture).unwrap_or(0);
-        let unit0_bound = bound_tex0 != 0 && self.is_flat_texture(bound_tex0);
+        let unit0_bound = bound_tex0 != 0 && self.is_flat_texture(state, bound_tex0);
         let unit0_active =
             unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false);
         let unit1 = state.texture_units.get(1);
         let bound_tex1 = unit1.map(|u| u.bound_texture).unwrap_or(0);
-        let unit1_bound = bound_tex1 != 0 && self.is_flat_texture(bound_tex1);
+        let unit1_bound = bound_tex1 != 0 && self.is_flat_texture(state, bound_tex1);
         let unit1_active = unit1_bound && state.enables.texture_2d.get(1).copied().unwrap_or(false);
         // The primary texturing stage: unit 0 when active, else unit 1
         // standing in alone -- see `pipeline_key_from_state`'s doc
@@ -6513,7 +6589,7 @@ impl Renderer {
         }
 
         let (color_view, depth_view) = {
-            let gpu = self.ensure_surface(id, &def)?;
+            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), id, &def)?;
             (gpu.color_view.clone(), gpu.depth_view.clone())
         };
 
@@ -6581,12 +6657,12 @@ impl Renderer {
             // primary stage in that combination -- see
             // `pipeline_key_from_state`'s doc comment), so `bound_tex0` is
             // exactly `primary_bound_tex` here.
-            let tex = &self.textures[&bound_tex0];
+            let tex = &self.textures[&(state.namespace(), bound_tex0)];
             let sampler = self
                 .sampler_cache
                 .get(&sampler_key.expect("textured implies a sampler key"))
                 .expect("just ensured");
-            let tex1 = &self.textures[&bound_tex1];
+            let tex1 = &self.textures[&(state.namespace(), bound_tex1)];
             let sampler1 = self
                 .sampler_cache
                 .get(&sampler_key1.expect("textured1 implies a sampler key"))
@@ -6637,7 +6713,7 @@ impl Renderer {
             // `primary_bound_tex` resolved to; the layout/shader shape
             // (and this bind group) is identical either way, only
             // `tex0_source` in the key differs.
-            let tex = &self.textures[&primary_bound_tex];
+            let tex = &self.textures[&(state.namespace(), primary_bound_tex)];
             let sampler = self
                 .sampler_cache
                 .get(&sampler_key.expect("textured implies a sampler key"))
@@ -6763,8 +6839,8 @@ impl Renderer {
     /// cube-map object, and (matching the existing "a texture with no
     /// data uploaded is simply not bound, for pipeline purposes" rule)
     /// for an id with no GPU texture at all.
-    fn is_flat_texture(&self, id: u32) -> bool {
-        self.textures.get(&id).is_some_and(|t| t.kind == TexKind::Flat)
+    fn is_flat_texture(&self, state: &State, id: u32) -> bool {
+        self.textures.get(&(state.namespace(), id)).is_some_and(|t| t.kind == TexKind::Flat)
     }
 
     fn op_tex_image(
@@ -6776,9 +6852,10 @@ impl Renderer {
         height: u32,
         row_bytes: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let palette = self.palettes.get(&(namespace, id)).map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -6789,7 +6866,7 @@ impl Renderer {
             "TEX_IMAGE",
             palette,
         )?;
-        self.define_texture_level(id, level, width, height, &rgba)
+        self.define_texture_level(namespace, id, level, width, height, &rgba)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6804,9 +6881,11 @@ impl Renderer {
         format: TexFormat,
         row_bytes: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let Some(existing) = self.textures.get(&id) else {
+        let key = (namespace, id);
+        let Some(existing) = self.textures.get(&key) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
         if level >= existing.mip_level_count {
@@ -6818,7 +6897,7 @@ impl Renderer {
             return Err(RenderError::ShortPayload("TEX_SUBIMAGE rectangle"));
         }
 
-        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let palette = self.palettes.get(&key).map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -6830,7 +6909,7 @@ impl Renderer {
             palette,
         )?;
 
-        let texture = &self.textures[&id].texture;
+        let texture = &self.textures[&key].texture;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -6864,9 +6943,10 @@ impl Renderer {
         height: u32,
         row_bytes: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let palette = self.palettes.get(&(namespace, id)).map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -6877,7 +6957,7 @@ impl Renderer {
             "TEX_IMAGE_FACE",
             palette,
         )?;
-        self.define_texture_level_face(id, face, level, width, height, &rgba)
+        self.define_texture_level_face(namespace, id, face, level, width, height, &rgba)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6893,9 +6973,11 @@ impl Renderer {
         format: TexFormat,
         row_bytes: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let Some(existing) = self.textures.get(&id) else {
+        let key = (namespace, id);
+        let Some(existing) = self.textures.get(&key) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
         if level >= existing.mip_level_count {
@@ -6907,7 +6989,7 @@ impl Renderer {
             return Err(RenderError::ShortPayload("TEX_SUBIMAGE_FACE rectangle"));
         }
 
-        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let palette = self.palettes.get(&key).map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -6919,7 +7001,7 @@ impl Renderer {
             palette,
         )?;
 
-        let texture = &self.textures[&id].texture;
+        let texture = &self.textures[&key].texture;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -6964,9 +7046,9 @@ impl Renderer {
         let def = *state
             .surface(surface_id)
             .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        let color = self.ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?.color.clone();
         let rgba = self.copy_texture_rect_to_cpu(&color, 0, x, y, width, height)?;
-        self.define_texture_level_face(id, face, level, width, height, &rgba)
+        self.define_texture_level_face(state.namespace(), id, face, level, width, height, &rgba)
     }
 
     /// `TEX_COPY_SUBIMAGE_FACE`: as [`Self::op_tex_copy_subimage`], for
@@ -6985,7 +7067,7 @@ impl Renderer {
         height: u32,
         state: &State,
     ) -> Result<(), RenderError> {
-        let Some(existing) = self.textures.get(&id) else {
+        let Some(existing) = self.textures.get(&(state.namespace(), id)) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
         if level >= existing.mip_level_count {
@@ -7001,8 +7083,8 @@ impl Renderer {
         let def = *state
             .surface(surface_id)
             .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(surface_id, &def)?.color.clone();
-        let dest = &self.textures[&id].texture;
+        let color = self.ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?.color.clone();
+        let dest = &self.textures[&(state.namespace(), id)].texture;
 
         let mut encoder = self
             .device
@@ -7051,10 +7133,11 @@ impl Renderer {
         id: u32,
         entries: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
         if entries == 0 {
-            self.palettes.remove(&id);
+            self.palettes.remove(&(namespace, id));
             return Ok(());
         }
         let loc = MemLoc::from_ref(data);
@@ -7066,7 +7149,7 @@ impl Renderer {
             .chunks_exact(4)
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect();
-        self.palettes.insert(id, palette);
+        self.palettes.insert((namespace, id), palette);
         Ok(())
     }
 
@@ -7095,13 +7178,13 @@ impl Renderer {
     /// `glGenerateMipmap` (`c3d-cmd-textures`'s "Cube-map completeness").
     /// A `Flat` object's single "face" `0` is exactly the pre-cube-map
     /// behaviour.
-    fn op_tex_generate_mips(&mut self, id: u32) -> Result<(), RenderError> {
-        let Some(tex) = self.textures.get(&id) else {
+    fn op_tex_generate_mips(&mut self, id: u32, namespace: Namespace) -> Result<(), RenderError> {
+        let Some(tex) = self.textures.get(&(namespace, id)) else {
             return Ok(());
         };
         let (base_w, base_h, kind) = (tex.width, tex.height, tex.kind);
         for face in 0..kind.face_count() {
-            self.generate_mips_for_face(id, kind, face, base_w, base_h)?;
+            self.generate_mips_for_face(namespace, id, kind, face, base_w, base_h)?;
         }
         Ok(())
     }
@@ -7118,6 +7201,7 @@ impl Renderer {
     /// either way.
     fn generate_mips_for_face(
         &mut self,
+        namespace: Namespace,
         id: u32,
         kind: TexKind,
         face: u32,
@@ -7125,7 +7209,7 @@ impl Renderer {
         base_h: u32,
     ) -> Result<(), RenderError> {
         let (mut w, mut h) = (base_w, base_h);
-        let tex = &self.textures[&id].texture;
+        let tex = &self.textures[&(namespace, id)].texture;
         let mut prev = self.copy_texture_rect_to_cpu_face(tex, face, 0, 0, 0, w, h)?;
 
         let mut level = 1;
@@ -7154,7 +7238,7 @@ impl Renderer {
                     }
                 }
             }
-            self.define_texture_level_generic(id, kind, face, level, next_w, next_h, &next)?;
+            self.define_texture_level_generic(namespace, id, kind, face, level, next_w, next_h, &next)?;
             prev = next;
             w = next_w;
             h = next_h;
@@ -7178,13 +7262,14 @@ impl Renderer {
     /// since `existing.mip_level_count` is always 1 in that case.
     fn define_texture_level(
         &mut self,
+        namespace: Namespace,
         id: u32,
         level: u32,
         width: u32,
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
-        self.define_texture_level_generic(id, TexKind::Flat, 0, level, width, height, rgba)
+        self.define_texture_level_generic(namespace, id, TexKind::Flat, 0, level, width, height, rgba)
     }
 
     /// `TEX_IMAGE_FACE`/`TEX_COPY_IMAGE_FACE`: as [`Self::define_texture_level`],
@@ -7194,6 +7279,7 @@ impl Renderer {
     /// shape).
     fn define_texture_level_face(
         &mut self,
+        namespace: Namespace,
         id: u32,
         face: u32,
         level: u32,
@@ -7201,7 +7287,7 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
-        self.define_texture_level_generic(id, TexKind::Cube, face, level, width, height, rgba)
+        self.define_texture_level_generic(namespace, id, TexKind::Cube, face, level, width, height, rgba)
     }
 
     /// Common tail of [`Self::define_texture_level`] and
@@ -7226,6 +7312,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn define_texture_level_generic(
         &mut self,
+        namespace: Namespace,
         id: u32,
         kind: TexKind,
         face: u32,
@@ -7234,7 +7321,8 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
-        let existing = self.textures.get(&id).filter(|tex| tex.kind == kind);
+        let key = (namespace, id);
+        let existing = self.textures.get(&key).filter(|tex| tex.kind == kind);
         let face_count = kind.face_count();
         // Level 0's shape is the texture's base size; a guest defining a
         // higher level before level 0 (not something any real driver
@@ -7323,7 +7411,7 @@ impl Renderer {
             ..Default::default()
         });
         self.textures.insert(
-            id,
+            key,
             GpuTexture {
                 texture,
                 view,
@@ -7373,7 +7461,7 @@ impl Renderer {
             return Ok(());
         };
 
-        if level == 0 && !self.textures.contains_key(&id) {
+        if level == 0 && !self.textures.contains_key(&(state.namespace(), id)) {
             let size = wgpu::Extent3d {
                 width: width.max(1),
                 height: height.max(1),
@@ -7416,7 +7504,7 @@ impl Renderer {
 
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.textures.insert(
-                id,
+                (state.namespace(), id),
                 GpuTexture {
                     texture,
                     view,
@@ -7430,7 +7518,7 @@ impl Renderer {
         }
 
         let rgba = self.copy_texture_rect_to_cpu(&color, src_level, x, y, width, height)?;
-        self.define_texture_level(id, level, width, height, &rgba)
+        self.define_texture_level(state.namespace(), id, level, width, height, &rgba)
     }
 
     /// `TEX_COPY_SUBIMAGE` (`glCopyTexSubImage2D`): the in-place mirror of
@@ -7457,7 +7545,7 @@ impl Renderer {
         height: u32,
         state: &State,
     ) -> Result<(), RenderError> {
-        let Some(existing) = self.textures.get(&id) else {
+        let Some(existing) = self.textures.get(&(state.namespace(), id)) else {
             return Err(RenderError::UnknownObject("texture", id));
         };
         if level >= existing.mip_level_count {
@@ -7475,7 +7563,7 @@ impl Renderer {
         let Some((_, _, color, src_level)) = self.resolve_read_source(state)? else {
             return Ok(());
         };
-        let dest = &self.textures[&id].texture;
+        let dest = &self.textures[&(state.namespace(), id)].texture;
 
         let mut encoder = self
             .device
@@ -7529,7 +7617,7 @@ impl Renderer {
         let def = *state
             .surface(id)
             .ok_or(RenderError::UnknownObject("surface", id))?;
-        let color = self.ensure_surface(id, &def)?.color.clone();
+        let color = self.ensure_surface(Namespace::Private(state.context_index()), id, &def)?.color.clone();
 
         let bpp = surface_format_bytes_per_pixel(def.format);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -7662,7 +7750,7 @@ impl Renderer {
             WireSurfaceFormat::Depth => {
                 let gpu = self
                     .surfaces
-                    .get(&id)
+                    .get(&(Namespace::Private(state.context_index()), id))
                     .ok_or(RenderError::UnknownObject("surface", id))?;
                 let depth = gpu.depth.clone();
                 // `INTERNAL_DEPTH_STENCIL_FORMAT` has no single "all
@@ -7695,7 +7783,7 @@ impl Renderer {
                 }
                 let gpu = self
                     .surfaces
-                    .get(&id)
+                    .get(&(Namespace::Private(state.context_index()), id))
                     .ok_or(RenderError::UnknownObject("surface", id))?;
                 let depth = gpu.depth.clone();
                 let bytes = self.copy_texture_rect_to_cpu_aspect(
@@ -7772,7 +7860,7 @@ impl Renderer {
             .ok_or(RenderError::UnknownObject("surface", id))?;
         let gpu = self
             .surfaces
-            .get(&id)
+            .get(&(Namespace::Private(state.context_index()), id))
             .ok_or(RenderError::UnknownObject("surface", id))?;
 
         let rgba = self.copy_texture_to_cpu(&gpu.color, def.width, def.height)?;
@@ -7848,13 +7936,19 @@ impl Renderer {
     /// that is a better guest-visible error than a protocol-level one for
     /// what is fundamentally malformed *content*, not a malformed
     /// *command*.
-    fn op_shader_source(&mut self, id: u32, source: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+    fn op_shader_source(
+        &mut self,
+        id: u32,
+        source: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(source);
         let bytes = mem
             .read(loc, source.length as usize)
             .ok_or_else(|| RenderError::BadMemory(format!("SHADER_SOURCE read from {loc:?}")))?;
         let text = String::from_utf8_lossy(bytes).into_owned();
-        let slot = self.shaders.entry(id).or_default();
+        let slot = self.shaders.entry((namespace, id)).or_default();
         slot.source = Some(text);
         slot.compiled = None;
         Ok(())
@@ -7864,14 +7958,15 @@ impl Renderer {
     /// none was ever set via `SHADER_SOURCE`, which naga reports as a
     /// real parse failure -- "no main function" -- rather than this
     /// module inventing a special case for it).
-    fn op_shader_compile(&mut self, id: u32, kind: ShaderKind) -> Result<(), RenderError> {
+    fn op_shader_compile(&mut self, id: u32, kind: ShaderKind, namespace: Namespace) -> Result<(), RenderError> {
+        let key = (namespace, id);
         let source = self
             .shaders
-            .get(&id)
+            .get(&key)
             .and_then(|s| s.source.clone())
             .unwrap_or_default();
         let result = glsl::compile(&source, shader_stage(kind));
-        self.shaders.entry(id).or_default().compiled = Some(result);
+        self.shaders.entry(key).or_default().compiled = Some(result);
         Ok(())
     }
 
@@ -7884,6 +7979,7 @@ impl Renderer {
         program: u32,
         index: u32,
         name: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(name);
@@ -7892,7 +7988,7 @@ impl Renderer {
         })?;
         let text = String::from_utf8_lossy(bytes).into_owned();
         self.programs
-            .entry(program)
+            .entry((namespace, program))
             .or_default()
             .bound_attrib_locations
             .insert(text, index);
@@ -7911,10 +8007,11 @@ impl Renderer {
         program: u32,
         vertex: Option<u32>,
         fragment: Option<u32>,
+        namespace: Namespace,
     ) -> Result<(), RenderError> {
         let compiled = |id: Option<u32>| -> Option<bool> {
             let id = id?;
-            match self.shaders.get(&id)?.compiled.as_ref()? {
+            match self.shaders.get(&(namespace, id))?.compiled.as_ref()? {
                 glsl::CompileResult::Ok(_) => Some(true),
                 glsl::CompileResult::Err(_) => Some(false),
             }
@@ -7937,7 +8034,9 @@ impl Renderer {
         let mut linked_modules: Option<(naga::Module, naga::Module)> = None;
         if link_status {
             if let (Some(vid), Some(fid)) = (vertex, fragment) {
-                if let (Some(vs_slot), Some(fs_slot)) = (self.shaders.get(&vid), self.shaders.get(&fid)) {
+                if let (Some(vs_slot), Some(fs_slot)) =
+                    (self.shaders.get(&(namespace, vid)), self.shaders.get(&(namespace, fid)))
+                {
                     if let (Some(glsl::CompileResult::Ok(vs)), Some(glsl::CompileResult::Ok(fs))) =
                         (&vs_slot.compiled, &fs_slot.compiled)
                     {
@@ -7983,7 +8082,7 @@ impl Renderer {
             _ => None,
         };
 
-        let slot = self.programs.entry(program).or_default();
+        let slot = self.programs.entry((namespace, program)).or_default();
         slot.link_status = link_status;
         slot.validate_status = false; // a new link invalidates any previous validation
         slot.info_log = info_log;
@@ -8028,6 +8127,7 @@ impl Renderer {
         program: u32,
         format: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(data);
@@ -8050,7 +8150,7 @@ impl Renderer {
             slot.sampler_bindings.clear();
         };
 
-        let slot = self.programs.entry(program).or_default();
+        let slot = self.programs.entry((namespace, program)).or_default();
         if format != PROGRAM_BINARY_FORMAT {
             fail(
                 slot,
@@ -8089,8 +8189,14 @@ impl Renderer {
     /// `PROGRAM_GET_BINARY`: writes `format (u32), length (u32), binary
     /// bytes...`. `format`/`length` are both `0` (no bytes) if `program`
     /// is not currently successfully linked -- not an error.
-    fn op_program_get_binary(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
-        let slot = self.programs.entry(program).or_default();
+    fn op_program_get_binary(
+        &mut self,
+        program: u32,
+        dest: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let slot = self.programs.entry((namespace, program)).or_default();
         let mut bytes = Vec::new();
         match &slot.cached_binary {
             Some(blob) => {
@@ -8115,8 +8221,8 @@ impl Renderer {
     /// so validation succeeds exactly when the program is linked --
     /// matching GLES2's own "undefined... if not successfully linked"
     /// language, made concrete as "false".
-    fn op_program_validate(&mut self, program: u32) -> Result<(), RenderError> {
-        let slot = self.programs.entry(program).or_default();
+    fn op_program_validate(&mut self, program: u32, namespace: Namespace) -> Result<(), RenderError> {
+        let slot = self.programs.entry((namespace, program)).or_default();
         slot.validate_status = slot.link_status;
         Ok(())
     }
@@ -8131,8 +8237,16 @@ impl Renderer {
     /// not stored or re-validated against the program's own interface in
     /// this draft; a value at a location the interface doesn't actually
     /// have just sits unused.
-    fn op_uniform(&mut self, program: u32, location: u32, _type_: u32, _count: u32, values: &[u8]) -> Result<(), RenderError> {
-        let Some(slot) = self.programs.get_mut(&program) else {
+    fn op_uniform(
+        &mut self,
+        program: u32,
+        location: u32,
+        _type_: u32,
+        _count: u32,
+        values: &[u8],
+        namespace: Namespace,
+    ) -> Result<(), RenderError> {
+        let Some(slot) = self.programs.get_mut(&(namespace, program)) else {
             return Ok(());
         };
         let native: Vec<u8> = values.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect();
@@ -8142,16 +8256,28 @@ impl Renderer {
 
     /// `UNIFORM_SAMPLER`. See `ProgramSlot::sampler_bindings`'s doc
     /// comment: applied by `draw_prog` at the next programmable draw.
-    fn op_uniform_sampler(&mut self, program: u32, location: u32, unit: u32) -> Result<(), RenderError> {
-        if let Some(slot) = self.programs.get_mut(&program) {
+    fn op_uniform_sampler(
+        &mut self,
+        program: u32,
+        location: u32,
+        unit: u32,
+        namespace: Namespace,
+    ) -> Result<(), RenderError> {
+        if let Some(slot) = self.programs.get_mut(&(namespace, program)) {
             slot.sampler_bindings.insert(location, unit);
         }
         Ok(())
     }
 
     /// `PROGRAM_INTERFACE`.
-    fn op_program_interface(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
-        let slot = self.programs.entry(program).or_default();
+    fn op_program_interface(
+        &mut self,
+        program: u32,
+        dest: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let slot = self.programs.entry((namespace, program)).or_default();
         let uniform_count = slot.interface.len() as u32 - slot.attrib_count;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&slot.attrib_count.to_be_bytes());
@@ -8170,8 +8296,14 @@ impl Renderer {
         Ok(())
     }
 
-    fn op_shader_status(&mut self, shader: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
-        let (compile_status, log) = match self.shaders.get(&shader).and_then(|s| s.compiled.as_ref()) {
+    fn op_shader_status(
+        &mut self,
+        shader: u32,
+        dest: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let (compile_status, log) = match self.shaders.get(&(namespace, shader)).and_then(|s| s.compiled.as_ref()) {
             Some(glsl::CompileResult::Ok(_)) => (1u32, String::new()),
             Some(glsl::CompileResult::Err(log)) => (0u32, log.clone()),
             None => (0u32, "not compiled".to_string()),
@@ -8199,8 +8331,25 @@ impl Renderer {
         Ok(())
     }
 
-    fn op_program_status(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
-        let slot = self.programs.entry(program).or_default();
+    /// `SYNC_STATUS`: `status` was already resolved at dispatch time
+    /// (`RenderOp::SyncStatus`'s doc comment) -- this just writes it, the
+    /// same shape as [`Self::op_framebuffer_status`].
+    fn op_sync_status(&mut self, dest: Ref, status: u32, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &status.to_be_bytes()) {
+            return Err(RenderError::BadMemory(format!("SYNC_STATUS write to {loc:?}")));
+        }
+        Ok(())
+    }
+
+    fn op_program_status(
+        &mut self,
+        program: u32,
+        dest: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let slot = self.programs.entry((namespace, program)).or_default();
         let binary_length = slot.cached_binary.as_ref().map_or(0, |b| b.len() as u32);
         let mut bytes = Vec::with_capacity(16 + slot.info_log.len());
         bytes.extend_from_slice(&(slot.link_status as u32).to_be_bytes());
@@ -8222,7 +8371,14 @@ impl Renderer {
     /// buffer's contents verbatim (still big-endian wire bytes -- see
     /// `Renderer::buffers`'s doc comment for why no conversion happens
     /// here), replacing whatever the id previously held.
-    fn op_buffer_data(&mut self, id: u32, size: u32, data: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+    fn op_buffer_data(
+        &mut self,
+        id: u32,
+        size: u32,
+        data: Ref,
+        namespace: Namespace,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
         let bytes = if data.address == 0 && data.length == 0 {
             vec![0u8; size as usize]
         } else {
@@ -8231,7 +8387,7 @@ impl Renderer {
                 .ok_or_else(|| RenderError::BadMemory(format!("BUFFER_DATA read from {loc:?}")))?
                 .to_vec()
         };
-        self.buffers.insert(id, bytes);
+        self.buffers.insert((namespace, id), bytes);
         Ok(())
     }
 
@@ -8246,6 +8402,7 @@ impl Renderer {
         offset: u32,
         size: u32,
         data: Ref,
+        namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(data);
@@ -8255,7 +8412,7 @@ impl Renderer {
             .to_vec();
         let buffer = self
             .buffers
-            .get_mut(&id)
+            .get_mut(&(namespace, id))
             .ok_or(RenderError::UnknownObject("buffer", id))?;
         let (offset, size) = (offset as usize, size as usize);
         let Some(dest) = buffer.get_mut(offset..offset + size) else {
@@ -8336,7 +8493,7 @@ impl Renderer {
         state: &State,
     ) -> Result<(), RenderError> {
         let program_id = state.current_program();
-        let Some(prog) = self.programs.get(&program_id) else {
+        let Some(prog) = self.programs.get(&(state.namespace(), program_id)) else {
             return Ok(()); // never linked; a draw with it current has no effect
         };
         if !prog.link_status {
@@ -8353,11 +8510,11 @@ impl Renderer {
             let (Some(vs_id), Some(fs_id)) = (prog.linked_vertex, prog.linked_fragment) else {
                 return Ok(());
             };
-            let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
+            let vs_module = match self.shaders.get(&(state.namespace(), vs_id)).and_then(|s| s.compiled.as_ref()) {
                 Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
                 _ => return Ok(()), // shader destroyed or re-sourced since link
             };
-            let fs_module = match self.shaders.get(&fs_id).and_then(|s| s.compiled.as_ref()) {
+            let fs_module = match self.shaders.get(&(state.namespace(), fs_id)).and_then(|s| s.compiled.as_ref()) {
                 Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
                 _ => return Ok(()),
             };
@@ -8423,7 +8580,7 @@ impl Renderer {
                 };
                 let raw = self
                     .buffers
-                    .get(&pointer.buffer)
+                    .get(&(state.namespace(), pointer.buffer))
                     .ok_or(RenderError::UnknownObject("buffer", pointer.buffer))?;
                 let component_bytes = component_byte_size(pointer.type_);
                 let read_stride = if pointer.stride_bytes == 0 {
@@ -8572,7 +8729,7 @@ impl Renderer {
                 // an incomplete-framebuffer draw's `GL_INVALID_
                 // FRAMEBUFFER_OPERATION`, which `resolve_draw_target`
                 // also doesn't set).
-                match self.textures.get(&texture_id) {
+                match self.textures.get(&(state.namespace(), texture_id)) {
                     Some(tex) if tex.kind == want_kind => {}
                     _ => return Ok(()),
                 }
@@ -8715,7 +8872,7 @@ impl Renderer {
             // that references them.
             let texture_views: Vec<Vec<&wgpu::TextureView>> = bind_group_slot_textures
                 .iter()
-                .map(|(_, ids)| ids.iter().map(|id| &self.textures[id].view).collect())
+                .map(|(_, ids)| ids.iter().map(|id| &self.textures[&(state.namespace(), *id)].view).collect())
                 .collect();
             entries.extend(bind_group_slot_textures.iter().zip(&texture_views).map(
                 |(&(binding, _), views)| wgpu::BindGroupEntry {
@@ -9158,10 +9315,17 @@ impl Renderer {
     /// `SurfaceReadback` writes through `Memory` in the surface's own wire
     /// format instead -- this is the convenience path a runner uses
     /// directly against the renderer.
+    /// Always resolves against `Namespace::Private(0)` -- every caller
+    /// (every test in this module, and `c3d-trace`'s runner) only ever
+    /// drives a single context, context index `0`, so this is exactly
+    /// the surface that context's own `SET_DRAW_SURFACE`/`SURFACE_DEFINE`
+    /// calls populated. A multi-context test or tool reading a surface
+    /// back would need its own context-aware accessor; none exists yet
+    /// because nothing has needed one.
     pub fn read_surface_rgba8(&self, id: u32) -> Result<(u32, u32, Vec<u8>), RenderError> {
         let gpu = self
             .surfaces
-            .get(&id)
+            .get(&(Namespace::Private(0), id))
             .ok_or(RenderError::UnknownObject("surface", id))?;
         let pixels = self.copy_texture_to_cpu(&gpu.color, gpu.def.width, gpu.def.height)?;
         Ok((gpu.def.width, gpu.def.height, pixels))
@@ -11421,7 +11585,7 @@ mod tests {
 
         let tex = renderer
             .textures
-            .get(&1)
+            .get(&(Namespace::Private(0), 1))
             .expect("TEX_COPY_IMAGE created it");
         assert_eq!((tex.width, tex.height), (16, 8));
         let pixels = renderer
@@ -11473,7 +11637,7 @@ mod tests {
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let before = renderer
             .copy_texture_to_cpu(&tex.texture, tex.width, tex.height)
             .unwrap();
@@ -11498,7 +11662,7 @@ mod tests {
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let after = renderer
             .copy_texture_to_cpu(&tex.texture, tex.width, tex.height)
             .unwrap();
@@ -11563,14 +11727,15 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                },
-                RenderOp::TexGenerateMips { id: 1 },
+                namespace: Namespace::Private(0),
+            },
+                RenderOp::TexGenerateMips { id: 1, namespace: Namespace::Private(0) },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         assert_eq!(tex.mip_level_count, 3, "4x4 -> 2x2 -> 1x1 is three levels");
 
         let lvl1 = renderer
@@ -11629,14 +11794,15 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 12,
                     },
-                },
-                RenderOp::TexGenerateMips { id: 1 },
+                namespace: Namespace::Private(0),
+            },
+                RenderOp::TexGenerateMips { id: 1, namespace: Namespace::Private(0) },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         assert_eq!(tex.mip_level_count, 2, "3x1 -> 1x1 is only two levels");
 
         let lvl1 = renderer
@@ -11684,7 +11850,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -11697,13 +11864,14 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         assert_eq!(tex.mip_level_count, 2);
         let lvl0 = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 4, 4)
@@ -11735,11 +11903,12 @@ mod tests {
                     space: RefSpace::Aperture,
                     length: 64,
                 },
+                namespace: Namespace::Private(0),
             }],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         assert_eq!(
             tex.mip_level_count, 2,
             "redefining level 0 must not shrink the object and drop level 1"
@@ -11796,7 +11965,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -11809,7 +11979,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 // Redefine level 0 bigger than before -- old level 1
                 // (sized from the old 4x4 base) must be read back
                 // against its own real size, not the new 8x8 base's.
@@ -11825,12 +11996,13 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 256,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let lvl0 = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 8, 8)
             .unwrap();
@@ -11874,7 +12046,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -11887,7 +12060,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
             ],
             &mut mem,
         );
@@ -11911,6 +12085,7 @@ mod tests {
                     space: RefSpace::Aperture,
                     length: 16,
                 },
+                namespace: Namespace::Private(0),
             }],
             &mut mem,
         );
@@ -11936,11 +12111,12 @@ mod tests {
                     space: RefSpace::Aperture,
                     length: 16,
                 },
+                namespace: Namespace::Private(0),
             }],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let lvl0 = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 4, 4)
             .unwrap();
@@ -12011,7 +12187,7 @@ mod tests {
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         assert_eq!(tex.mip_level_count, 2);
         let lvl0 = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 16, 8)
@@ -12063,6 +12239,7 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 8,
                     },
+                    namespace: Namespace::Private(0),
                 },
                 RenderOp::TexImage {
                     id: 1,
@@ -12076,13 +12253,14 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 2,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let rgba = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 2, 1)
             .unwrap();
@@ -12127,6 +12305,7 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
+                    namespace: Namespace::Private(0),
                 },
                 RenderOp::TexPalette {
                     id: 1,
@@ -12136,6 +12315,7 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 0,
                     },
+                    namespace: Namespace::Private(0),
                 },
                 RenderOp::TexImage {
                     id: 1,
@@ -12149,13 +12329,14 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 1,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
             ],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let tex = renderer.textures.get(&1).unwrap();
+        let tex = renderer.textures.get(&(Namespace::Private(0), 1)).unwrap();
         let rgba = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 0, 0, 0, 1, 1)
             .unwrap();
@@ -13230,7 +13411,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                 state: state.clone(),
@@ -13504,7 +13686,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                     state: state.clone(),
@@ -14584,7 +14767,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::TexImage {
                     id: 2,
                     level: 0,
@@ -14597,7 +14781,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: tw * th * 4,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                 state: state.clone(),
@@ -14758,7 +14943,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::TexImage {
                     id: 2,
                     level: 0,
@@ -14771,7 +14957,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                 state: state.clone(),
@@ -14881,7 +15068,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 8,
                     },
-                },
+                namespace: Namespace::Private(0),
+            },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                 state: state.clone(),
@@ -15433,7 +15621,7 @@ mod tests {
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
-        let tex = &renderer.textures[&1];
+        let tex = &renderer.textures[&(Namespace::Private(0), 1)];
         assert_eq!(tex.mip_level_count, 2, "a 2x2 base should generate exactly one more level (1x1)");
         for (face, &expected) in colors.iter().enumerate() {
             let pixel = renderer
@@ -15493,7 +15681,7 @@ mod tests {
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
-        let tex = &renderer.textures[&1];
+        let tex = &renderer.textures[&(Namespace::Private(0), 1)];
         let face2 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 2, 0, 0, 0, 2, 2).unwrap();
         assert_eq!(&face2[0..4], &[0, 0, 0, 255], "face 2 should now be cleared to black: {face2:?}");
         let face0 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 0, 0, 0, 0, 2, 2).unwrap();

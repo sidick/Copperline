@@ -123,6 +123,14 @@ pub const CAP_REF_SYNC: u32 = 1 << 6;
 /// implements the full ... object model").
 pub const CAP_PROGRAMMABLE: u32 = 1 << 7;
 
+/// Cross-context object sharing (`c3d-cross-context-sharing`): a
+/// context may join a share group (`CTX_SHARE_GROUP`, context register
+/// `0x34`), giving every member one namespace for textures, buffers,
+/// shaders, programs and renderbuffers, plus a shareable sync-object
+/// kind and opcode group `0x0Exx` for explicit cross-context ordering.
+/// Independent of every other bit, including `CAP_PROGRAMMABLE`.
+pub const CAP_SHARED_CONTEXTS: u32 = 1 << 8;
+
 /// The `IRQ_STATUS`/`IRQ_ENABLE` bit for context `n`'s fence interrupt.
 pub const fn irq_fence_bit(context: u32) -> u32 {
     1 << context
@@ -414,6 +422,19 @@ pub const OP_PROGRAM_INTERFACE: u16 = 0x0D02;
 /// `CAP_PROGRAMMABLE`, optional (`PROGRAM_BINARY_FORMAT` nonzero;
 /// `E_BAD_OPCODE` otherwise). `glGetProgramBinary`'s wire equivalent.
 pub const OP_PROGRAM_GET_BINARY: u16 = 0x0D03;
+
+// Cross-context sharing (0x0Exx) -- `c3d-cross-context-sharing`,
+// `CAP_SHARED_CONTEXTS`. Scoped to the calling context's current share
+// group (`CTX_SHARE_GROUP`, a context-page register, not a ring opcode).
+/// `glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)`'s wire equivalent.
+pub const OP_FENCE_SYNC_CREATE: u16 = 0x0E00;
+/// `glDeleteSync`'s wire equivalent.
+pub const OP_FENCE_SYNC_DESTROY: u16 = 0x0E01;
+/// `glWaitSync`'s wire equivalent -- a device-side wait; see
+/// `c3d-cross-context-sharing`.
+pub const OP_WAIT_SYNC: u16 = 0x0E02;
+/// `glGetSynciv(..., GL_SYNC_STATUS, ...)`'s wire equivalent.
+pub const OP_SYNC_STATUS: u16 = 0x0E03;
 
 // ---------------------------------------------------------------------
 // Protocol errors (`c3d-errors`'s "Protocol errors" table).
@@ -1521,6 +1542,26 @@ pub enum Command<'a> {
     /// `PROGRAM_GET_BINARY`.
     ProgramGetBinary {
         program: u32,
+        dest: Ref,
+    },
+    /// `FENCE_SYNC_CREATE`. `CAP_SHARED_CONTEXTS`.
+    FenceSyncCreate {
+        id: u32,
+    },
+    /// `FENCE_SYNC_DESTROY`. `CAP_SHARED_CONTEXTS`.
+    FenceSyncDestroy {
+        id: u32,
+    },
+    /// `WAIT_SYNC`. `CAP_SHARED_CONTEXTS`. A device-side wait -- see
+    /// `c3d-cross-context-sharing`; `id`'s validity (exists, in the
+    /// calling context's current share group) is resolved at dispatch
+    /// time, not here.
+    WaitSync {
+        id: u32,
+    },
+    /// `SYNC_STATUS`. `CAP_SHARED_CONTEXTS`.
+    SyncStatus {
+        id: u32,
         dest: Ref,
     },
 }

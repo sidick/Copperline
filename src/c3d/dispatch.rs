@@ -187,6 +187,7 @@ pub enum RenderOp<'a> {
         height: u32,
         row_bytes: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `TEX_SUBIMAGE`. Emitted only once this module has confirmed `id`
     /// has a level `level` already defined with a matching `format`, per
@@ -201,6 +202,7 @@ pub enum RenderOp<'a> {
         format: state::TexFormat,
         row_bytes: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `TEX_COPY_IMAGE` (`glCopyTexImage2D`): defines a level from the
     /// draw surface's rectangle.
@@ -239,6 +241,7 @@ pub enum RenderOp<'a> {
         height: u32,
         row_bytes: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `TEX_SUBIMAGE_FACE`. As `TexSubImage`, for one face.
     TexSubImageFace {
@@ -252,6 +255,7 @@ pub enum RenderOp<'a> {
         format: state::TexFormat,
         row_bytes: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `TEX_COPY_IMAGE_FACE`. As `TexCopyImage`, for one face.
     TexCopyImageFace {
@@ -281,11 +285,18 @@ pub enum RenderOp<'a> {
     /// `TEX_PALETTE`. Emitted only once
     /// [`state::State::set_tex_palette`] has bound it against an existing
     /// texture object.
-    TexPalette { id: u32, entries: u32, data: Ref },
-    /// `TEX_GENERATE_MIPS`. No `state` needed -- it operates purely on
-    /// an existing texture object's own GPU-side mip levels, independent
-    /// of any other context state.
-    TexGenerateMips { id: u32 },
+    TexPalette {
+        id: u32,
+        entries: u32,
+        data: Ref,
+        namespace: state::Namespace,
+    },
+    /// `TEX_GENERATE_MIPS`. Carries `namespace` (not a full `state`
+    /// snapshot): which texture object `id` resolves to -- and hence
+    /// which GPU-side mip levels get regenerated -- depends on the
+    /// dispatching context's `CAP_SHARED_CONTEXTS` namespace, even
+    /// though nothing else about this op depends on broader GL state.
+    TexGenerateMips { id: u32, namespace: state::Namespace },
     /// `READ_PIXELS`. Rectangle already validated against the draw
     /// surface's bounds.
     ReadPixels {
@@ -321,15 +332,24 @@ pub enum RenderOp<'a> {
     /// `SHADER_SOURCE`. Replaces the shader's source text; the renderer
     /// also clears any previous compile result, matching the spec's
     /// "replacing any previous source".
-    ShaderSource { id: u32, source: Ref },
+    ShaderSource { id: u32, source: Ref, namespace: state::Namespace },
     /// `SHADER_COMPILE`. `kind` is read from `state` at dispatch time (see
     /// [`Context::apply`]) so the renderer doesn't need a `state`
     /// parameter for this op.
-    ShaderCompile { id: u32, kind: state::ShaderKind },
+    ShaderCompile {
+        id: u32,
+        kind: state::ShaderKind,
+        namespace: state::Namespace,
+    },
     /// `PROGRAM_BIND_ATTRIB_LOCATION`. `name` is resolved by the renderer
     /// and kept in its own program table -- it only ever feeds
     /// `ProgramLink`, never read back by `state.rs`.
-    ProgramBindAttribLocation { program: u32, index: u32, name: Ref },
+    ProgramBindAttribLocation {
+        program: u32,
+        index: u32,
+        name: Ref,
+        namespace: state::Namespace,
+    },
     /// `PROGRAM_LINK`. `vertex`/`fragment` are the program's attached
     /// shader ids, read from `state` at dispatch time (`None` if nothing
     /// of that kind is attached, which the renderer treats as a link
@@ -338,16 +358,25 @@ pub enum RenderOp<'a> {
         program: u32,
         vertex: Option<u32>,
         fragment: Option<u32>,
+        namespace: state::Namespace,
     },
     /// `PROGRAM_VALIDATE`.
-    ProgramValidate { program: u32 },
+    ProgramValidate { program: u32, namespace: state::Namespace },
     /// `SHADER_STATUS`/`PROGRAM_STATUS` (`0x0D00`/`0x0D01`). Both write a
     /// fixed-shape status record (and the two leave their own variant
     /// rather than sharing `Query`'s `QueryResult`, which is a fixed `f32`
     /// vector -- these records are `u32` status words plus a
     /// variable-length UTF-8 log, a different shape entirely).
-    ShaderStatus { shader: u32, dest: Ref },
-    ProgramStatus { program: u32, dest: Ref },
+    ShaderStatus {
+        shader: u32,
+        dest: Ref,
+        namespace: state::Namespace,
+    },
+    ProgramStatus {
+        program: u32,
+        dest: Ref,
+        namespace: state::Namespace,
+    },
     /// `PROGRAM_BINARY`. `format` is forwarded unvalidated, like
     /// `ProgramBinary`'s own doc comment -- render.rs compares it against
     /// the device's own format and treats a mismatch as a link failure.
@@ -355,9 +384,20 @@ pub enum RenderOp<'a> {
         program: u32,
         format: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `PROGRAM_GET_BINARY`.
-    ProgramGetBinary { program: u32, dest: Ref },
+    ProgramGetBinary {
+        program: u32,
+        dest: Ref,
+        namespace: state::Namespace,
+    },
+
+    // -- CAP_SHARED_CONTEXTS: cross-context sync objects -----------
+    /// `SYNC_STATUS`. Resolved eagerly at dispatch time, like
+    /// `FramebufferStatus`/`Query` -- `status` is a snapshot of
+    /// "signalled right now", not re-read at execute time.
+    SyncStatus { id: u32, dest: Ref, status: u32 },
 
     // -- CAP_PROGRAMMABLE: buffers. `BUFFER_CREATE`/`_DESTROY` and every
     // `VERTEX_ATTRIB_*` opcode carry no ref and are pure `state.rs`
@@ -369,6 +409,7 @@ pub enum RenderOp<'a> {
         size: u32,
         usage: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
     /// `BUFFER_SUBDATA`: replaces `size` bytes at `offset` from `data`.
     BufferSubData {
@@ -376,6 +417,7 @@ pub enum RenderOp<'a> {
         offset: u32,
         size: u32,
         data: Ref,
+        namespace: state::Namespace,
     },
 
     // -- CAP_PROGRAMMABLE: programmable draw (0x0Cxx). Unlike the
@@ -416,14 +458,20 @@ pub enum RenderOp<'a> {
         type_: u32,
         count: u32,
         values: &'a [u8],
+        namespace: state::Namespace,
     },
     UniformSampler {
         program: u32,
         location: u32,
         unit: u32,
+        namespace: state::Namespace,
     },
     /// `PROGRAM_INTERFACE`.
-    ProgramInterface { program: u32, dest: Ref },
+    ProgramInterface {
+        program: u32,
+        dest: Ref,
+        namespace: state::Namespace,
+    },
 
     // -- CAP_PROGRAMMABLE: framebuffers and renderbuffers. `FRAMEBUFFER_
     // CREATE`/`_DESTROY`, `BIND_FRAMEBUFFER`, `RENDERBUFFER_CREATE`/
@@ -650,6 +698,15 @@ pub struct Context {
     pub error_offset: u32,
     /// `CTX_STATUS.HALTED`.
     pub halted: bool,
+    /// `CTX_STATUS.AWAITING_SYNC` (`CAP_SHARED_CONTEXTS`): decoding is
+    /// paused at a `WAIT_SYNC` for a sync object another context has not
+    /// yet signalled -- see [`Context::submit_with`]'s `WAIT_SYNC`
+    /// handling. Unlike `halted`, this is not an error latch: it clears
+    /// itself (no `ERROR_ACK` needed) the moment a later `submit`/
+    /// `submit_with` call -- for *any* context, not necessarily this one
+    /// -- re-decodes from the same `ring_head` and finds the dependency
+    /// satisfied.
+    pub awaiting_sync: bool,
 }
 
 impl Context {
@@ -664,6 +721,7 @@ impl Context {
             error_code: 0,
             error_offset: 0,
             halted: false,
+            awaiting_sync: false,
         }
     }
 
@@ -736,11 +794,40 @@ impl Context {
         if self.halted {
             return;
         }
+        // Cleared unconditionally at the start of every decode attempt:
+        // this bool reflects "stalled right now", re-derived fresh each
+        // call, not "stalled at some point in the past". If this attempt
+        // re-stalls at the same WAIT_SYNC, the branch below sets it true
+        // again before returning.
+        self.awaiting_sync = false;
 
         let mut cursor = RingCursor::new(ring, self.ring_head, new_tail, *config);
         loop {
             let start = cursor.head();
             match cursor.step() {
+                // `WAIT_SYNC` (`CAP_SHARED_CONTEXTS`) is intercepted here,
+                // not handled generically in `apply`, because stalling
+                // needs direct access to `start`/`cursor`/the loop itself
+                // to leave `ring_head` sitting *before* this command
+                // rather than past it -- the device-side wait the spec
+                // asks for: no guest CPU polling or interrupt round-trip,
+                // just "try again later", where "later" is the next call
+                // to `submit`/`submit_with` for *any* context (board.rs's
+                // doorbell re-attempts every stalled context after each
+                // one's own processing -- see its doc comment). Only
+                // intercepted at this top level; `WAIT_SYNC` decoded from
+                // inside a `CALL`'d buffer falls through to `apply`'s
+                // generic (non-stalling) arm instead -- see that arm's
+                // doc comment for why.
+                Some(ring::Step::Command(Command::WaitSync { id })) => match self.state.sync_signalled(id) {
+                    None => self.latch_protocol_error(ErrorCode::BadId, start),
+                    Some(true) => {}
+                    Some(false) => {
+                        self.awaiting_sync = true;
+                        self.ring_head = start;
+                        return;
+                    }
+                },
                 Some(ring::Step::Command(Command::Call { data })) => {
                     match fetch_call_buffer(data) {
                         Some(bytes) => {
@@ -1191,6 +1278,7 @@ impl Context {
                         height,
                         row_bytes,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
@@ -1215,7 +1303,7 @@ impl Context {
                 let matches_existing_level = self
                     .state
                     .texture(id)
-                    .and_then(|t| t.levels.get(&(0, level)))
+                    .and_then(|t| t.levels.get(&(0, level)).copied())
                     .is_some_and(|existing| existing.format == fmt);
                 if matches_existing_level {
                     out.push(RenderOp::TexSubImage {
@@ -1228,6 +1316,7 @@ impl Context {
                         format: fmt,
                         row_bytes,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
@@ -1251,7 +1340,12 @@ impl Context {
             Command::ActiveUnit { unit } => self.state.set_active_unit(unit),
             Command::TexPalette { id, entries, data } => {
                 if self.state.set_tex_palette(id, entries).is_ok() {
-                    out.push(RenderOp::TexPalette { id, entries, data });
+                    out.push(RenderOp::TexPalette {
+                        id,
+                        entries,
+                        data,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
             Command::TexCopyImage {
@@ -1353,7 +1447,10 @@ impl Context {
             // as a harmless no-op.
             Command::TexGenerateMips { id } => {
                 if self.state.texture(id).is_some() {
-                    out.push(RenderOp::TexGenerateMips { id });
+                    out.push(RenderOp::TexGenerateMips {
+                        id,
+                        namespace: self.state.namespace(),
+                    });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
                 }
@@ -1390,6 +1487,7 @@ impl Context {
                         height,
                         row_bytes,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
@@ -1415,7 +1513,7 @@ impl Context {
                 let matches_existing_level = self
                     .state
                     .texture(id)
-                    .and_then(|t| t.levels.get(&(face, level)))
+                    .and_then(|t| t.levels.get(&(face, level)).copied())
                     .is_some_and(|existing| existing.format == fmt);
                 if matches_existing_level {
                     out.push(RenderOp::TexSubImageFace {
@@ -1429,6 +1527,7 @@ impl Context {
                         format: fmt,
                         row_bytes,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
@@ -1671,11 +1770,19 @@ impl Context {
             }
             Command::ShaderDestroy { id } => self.state.shader_destroy(id),
             Command::ShaderSource { id, source } => {
-                out.push(RenderOp::ShaderSource { id, source });
+                out.push(RenderOp::ShaderSource {
+                    id,
+                    source,
+                    namespace: self.state.namespace(),
+                });
             }
             Command::ShaderCompile { id } => {
                 if let Some(kind) = self.state.shader(id).map(|s| s.kind) {
-                    out.push(RenderOp::ShaderCompile { id, kind });
+                    out.push(RenderOp::ShaderCompile {
+                        id,
+                        kind,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
             Command::ProgramCreate { id } => self.state.program_create(id),
@@ -1694,6 +1801,7 @@ impl Context {
                 program,
                 index,
                 name,
+                namespace: self.state.namespace(),
             }),
             Command::ProgramLink { program } => {
                 if let Some(prog) = self.state.program(program) {
@@ -1701,12 +1809,16 @@ impl Context {
                         program,
                         vertex: prog.attached_vertex,
                         fragment: prog.attached_fragment,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
             Command::ProgramValidate { program } => {
                 if self.state.program(program).is_some() {
-                    out.push(RenderOp::ProgramValidate { program });
+                    out.push(RenderOp::ProgramValidate {
+                        program,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
             Command::UseProgram { program } => self.state.use_program(program),
@@ -1714,12 +1826,20 @@ impl Context {
             // -- CAP_PROGRAMMABLE: programmable queries (0x0Dxx) -----
             Command::ShaderStatus { shader, dest } => {
                 if self.state.shader(shader).is_some() {
-                    out.push(RenderOp::ShaderStatus { shader, dest });
+                    out.push(RenderOp::ShaderStatus {
+                        shader,
+                        dest,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
             Command::ProgramStatus { program, dest } => {
                 if self.state.program(program).is_some() {
-                    out.push(RenderOp::ProgramStatus { program, dest });
+                    out.push(RenderOp::ProgramStatus {
+                        program,
+                        dest,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
             Command::ProgramBinary {
@@ -1732,14 +1852,44 @@ impl Context {
                         program,
                         format,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
             Command::ProgramGetBinary { program, dest } => {
                 if self.state.program(program).is_some() {
-                    out.push(RenderOp::ProgramGetBinary { program, dest });
+                    out.push(RenderOp::ProgramGetBinary {
+                        program,
+                        dest,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
+
+            // -- CAP_SHARED_CONTEXTS: cross-context sync objects -----
+            Command::FenceSyncCreate { id } => self.state.fence_sync_create(id),
+            Command::FenceSyncDestroy { id } => self.state.fence_sync_destroy(id),
+            // Unreachable in practice: the top-level `submit_with` loop
+            // intercepts `Command::WaitSync` itself, before this generic
+            // dispatch, to actually stall (it alone has the outer
+            // cursor/`ring_head` access that needs); `ring.rs` separately
+            // rejects `WAIT_SYNC` outright (`E_BAD_OPCODE`) when decoded
+            // from inside a `CALL`'d buffer, since that stall has nowhere
+            // to persist a resumable position across the doorbells it can
+            // span, unlike the outer ring's `ring_head` -- see `OP_WAIT_
+            // SYNC`'s decode-time `self.linear` check. So no live caller
+            // of `apply`/`apply_call_buffer` can ever actually construct
+            // a `Command::WaitSync` that reaches here; this arm exists
+            // only because `Command`'s match must stay exhaustive.
+            Command::WaitSync { .. } => {}
+            Command::SyncStatus { id, dest } => match self.state.sync_signalled(id) {
+                Some(signalled) => out.push(RenderOp::SyncStatus {
+                    id,
+                    dest,
+                    status: signalled as u32,
+                }),
+                None => self.latch_protocol_error(ErrorCode::BadId, start),
+            },
 
             // -- CAP_PROGRAMMABLE: buffers and vertex attributes -----
             Command::BufferCreate { id } => self.state.buffer_create(id),
@@ -1756,6 +1906,7 @@ impl Context {
                         size,
                         usage,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
@@ -1771,6 +1922,7 @@ impl Context {
                         offset,
                         size,
                         data,
+                        namespace: self.state.namespace(),
                     });
                 }
             }
@@ -2105,6 +2257,7 @@ impl Context {
                 type_,
                 count,
                 values,
+                namespace: self.state.namespace(),
             }),
             Command::UniformSampler {
                 program,
@@ -2114,10 +2267,15 @@ impl Context {
                 program,
                 location,
                 unit,
+                namespace: self.state.namespace(),
             }),
             Command::ProgramInterface { program, dest } => {
                 if self.state.program(program).is_some() {
-                    out.push(RenderOp::ProgramInterface { program, dest });
+                    out.push(RenderOp::ProgramInterface {
+                        program,
+                        dest,
+                        namespace: self.state.namespace(),
+                    });
                 }
             }
         }
@@ -2683,7 +2841,8 @@ mod tests {
             out[1],
             RenderOp::ShaderCompile {
                 id: 1,
-                kind: state::ShaderKind::Vertex
+                kind: state::ShaderKind::Vertex,
+                ..
             }
         ));
     }
@@ -2884,7 +3043,7 @@ mod tests {
         assert!(matches!(out[0], RenderOp::Uniform { program: 1, location: 0, .. }));
         assert!(matches!(
             out[1],
-            RenderOp::UniformSampler { program: 1, location: 0, unit: 2 }
+            RenderOp::UniformSampler { program: 1, location: 0, unit: 2, .. }
         ));
     }
 

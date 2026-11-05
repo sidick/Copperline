@@ -171,15 +171,25 @@ pub const RING_SIZE_LIMIT: u32 = 0x0004_0000; // 256 KiB
 /// framebuffer/renderbuffer objects, programmable draw, and the stencil
 /// test -- is implemented, per the spec's porting guidance ("set
 /// `CAP_PROGRAMMABLE` only if it implements the full ... object model").
+/// Also advertises `CAP_SHARED_CONTEXTS` (bit 8) now that `Renderer`'s
+/// GPU-resource maps are properly partitioned by [`SharePartition`]
+/// (textures, shaders, programs, buffers, renderbuffers, palettes) --
+/// investigating this feature surfaced that they previously were not
+/// partitioned by context *at all* (every context's objects landed in
+/// one accidentally-global id-keyed map), a latent cross-context
+/// aliasing bug independent of this capability; see `SharePartition`'s
+/// doc comment.
+///
 /// This completes the spec's stated Copperline capability set (bits 0,
-/// 1, 2, 3, 4, 6, 7).
+/// 1, 2, 3, 4, 6, 7, 8).
 pub const CAPS0: u32 = proto::CAP_IRQ
     | proto::CAP_REF_SYNC
     | proto::CAP_SURFACE_GUESTADDR
     | proto::CAP_TRANSFORM
     | proto::CAP_MULTITEXTURE
     | proto::CAP_GUESTMEM
-    | proto::CAP_PROGRAMMABLE;
+    | proto::CAP_PROGRAMMABLE
+    | proto::CAP_SHARED_CONTEXTS;
 
 // ---------------------------------------------------------------------
 // Global register offsets (`docs/internals/c3d.md`, "Global registers")
@@ -227,6 +237,7 @@ mod greg {
     pub const PROGRAM_BINARY_FORMAT: u32 = 0x0A8;
     pub const ALIASED_POINT_SIZE_MIN: u32 = 0x0AC;
     pub const ALIASED_POINT_SIZE_MAX: u32 = 0x0B0;
+    pub const MAX_SYNC_OBJECTS: u32 = 0x0B4;
 }
 
 // ---------------------------------------------------------------------
@@ -247,6 +258,7 @@ mod creg {
     pub const GL_ERROR: u32 = 0x28;
     pub const GL_ERROR_ACK: u32 = 0x2C;
     pub const FENCE_IRQ_TARGET: u32 = 0x30;
+    pub const SHARE_GROUP: u32 = 0x34;
 }
 
 const CTX_CONTROL_ALLOC: u32 = 1 << 0;
@@ -255,6 +267,7 @@ const CTX_CONTROL_RESET: u32 = 1 << 2;
 
 const CTX_STATUS_HALTED: u32 = 1 << 1;
 const CTX_STATUS_IDLE_RING: u32 = 1 << 2;
+const CTX_STATUS_AWAITING_SYNC: u32 = 1 << 3;
 
 const CONTROL_ENABLE: u32 = 1 << 0;
 const CONTROL_RESET: u32 = 1 << 1;
@@ -289,10 +302,88 @@ struct ContextSlot {
     deferred_fence_ready: Option<u32>,
 }
 
-impl Default for ContextSlot {
-    fn default() -> Self {
+/// One share group's live storage, as `board.rs` sees it: `Weak` handles
+/// into the same six `Rc<RefCell<_>>`s a group's member contexts'
+/// `State`s hold strong references to -- see `C3dBoard::share_groups`'s
+/// doc comment for why `Weak`, not `Rc`, is essential here. `Default`
+/// gives every field a `Weak::new()` (upgrades to `None`), used as the
+/// "no live member yet" starting point in [`Self::resolve`].
+#[derive(Default)]
+struct ShareGroupStores {
+    textures: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::TextureObject>>>,
+    shaders: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ShaderObject>>>,
+    programs: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ProgramObject>>>,
+    buffers: std::rc::Weak<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
+    renderbuffers: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::Renderbuffer>>>,
+    sync_objects: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::SyncObject>>>,
+}
+
+type SharedMap<T> = std::rc::Rc<std::cell::RefCell<T>>;
+
+impl ShareGroupStores {
+    /// Returns this group's six live `Rc`s, upgrading the stored `Weak`s
+    /// if another member is still alive, or creating (and remembering)
+    /// a fresh set if this is the group's first member (or its previous
+    /// members have all since dropped out -- `Weak::upgrade` correctly
+    /// returns `None` either way, and either way the right thing is "make
+    /// a new one").
+    #[allow(clippy::type_complexity)]
+    fn resolve(
+        &mut self,
+    ) -> (
+        SharedMap<std::collections::BTreeMap<u32, state::TextureObject>>,
+        SharedMap<std::collections::BTreeMap<u32, state::ShaderObject>>,
+        SharedMap<std::collections::BTreeMap<u32, state::ProgramObject>>,
+        SharedMap<std::collections::BTreeSet<u32>>,
+        SharedMap<std::collections::BTreeMap<u32, state::Renderbuffer>>,
+        SharedMap<std::collections::BTreeMap<u32, state::SyncObject>>,
+    ) {
+        let textures = self.textures.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            self.textures = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        let shaders = self.shaders.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            self.shaders = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        let programs = self.programs.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            self.programs = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        let buffers = self.buffers.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            self.buffers = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        let renderbuffers = self.renderbuffers.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            self.renderbuffers = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        let sync_objects = self.sync_objects.upgrade().unwrap_or_else(|| {
+            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            self.sync_objects = std::rc::Rc::downgrade(&fresh);
+            fresh
+        });
+        (textures, shaders, programs, buffers, renderbuffers, sync_objects)
+    }
+}
+
+impl ContextSlot {
+    /// `index` is this slot's fixed position in `C3dBoard::contexts`,
+    /// threaded down into [`state::State::set_context_index`] so
+    /// [`state::Namespace::Private`] identity is stable and distinct
+    /// per slot -- see that method's doc comment for why it cannot be
+    /// derived any other way (`State`/`Context` have no board-level
+    /// view of "which slot is this").
+    fn new(index: u32) -> Self {
+        let mut ctx = Context::new(state::Limits::default());
+        ctx.state.set_context_index(index);
         ContextSlot {
-            ctx: Context::new(state::Limits::default()),
+            ctx,
             alloc: false,
             enable: false,
             fence_irq_target: 0,
@@ -323,6 +414,29 @@ pub struct C3dBoard {
     irq_enable: u32,
     contexts: Vec<ContextSlot>,
     activity: bool,
+
+    /// `CAP_SHARED_CONTEXTS`'s share groups: `CTX_SHARE_GROUP`'s write
+    /// path (`write_context`) looks a group up here to find the `Rc`s an
+    /// already-live member holds, or creates a fresh set and registers
+    /// them if this is the group's first member. Deliberately `Weak`,
+    /// not `Rc`: a strong reference here would keep a group's storage
+    /// alive forever, even after every member context has gone, which
+    /// would silently break the spec's "a shared object outlives this
+    /// one context's release as long as another member exists" -- the
+    /// *last* member's own drop (see `write_context`'s `CONTROL` arm)
+    /// must be what frees it. `#[serde(skip)]`: a save state round-trips
+    /// each context's `State` independently via `serde`'s `rc` feature,
+    /// which does not preserve `Rc` identity across separately
+    /// (de)serialized values -- restoring from a save state therefore
+    /// does not currently preserve a share group's aliasing across its
+    /// members, a known, narrow limitation (ordinary single-context
+    /// save/restore is completely unaffected). This registry is rebuilt
+    /// from empty on restore and repopulated the next time any context
+    /// writes a nonzero `CTX_SHARE_GROUP` -- which, since that write is
+    /// only honoured before a context's first command, cannot happen to
+    /// an already-populated restored context anyway.
+    #[serde(skip)]
+    share_groups: std::collections::HashMap<u32, ShareGroupStores>,
 
     /// Bytes queued this tick for the bus's cross-board DMA pass; see
     /// `take_pending_dma_writes`. Transient -- drained every tick, so a
@@ -641,8 +755,7 @@ impl C3dBoard {
     pub fn with_masked_caps(window_bytes: u32, mask_caps: u32) -> Self {
         let aperture_offset = proto::APERTURE_OFFSET_DEFAULT;
         let aperture_len = window_bytes.saturating_sub(aperture_offset) as usize;
-        let mut contexts = Vec::with_capacity(CONTEXT_COUNT);
-        contexts.resize_with(CONTEXT_COUNT, ContextSlot::default);
+        let contexts: Vec<ContextSlot> = (0..CONTEXT_COUNT as u32).map(ContextSlot::new).collect();
         C3dBoard {
             window_bytes,
             aperture_offset,
@@ -653,6 +766,7 @@ impl C3dBoard {
             irq_enable: 0,
             contexts,
             activity: false,
+            share_groups: std::collections::HashMap::new(),
             pending_dma: Vec::new(),
             renderer: None,
             renderer_failed: false,
@@ -676,6 +790,7 @@ impl C3dBoard {
             multitexture: self.caps0 & proto::CAP_MULTITEXTURE != 0,
             surface_guestaddr: self.caps0 & proto::CAP_SURFACE_GUESTADDR != 0,
             programmable: self.caps0 & proto::CAP_PROGRAMMABLE != 0,
+            shared_contexts: self.caps0 & proto::CAP_SHARED_CONTEXTS != 0,
             aperture_size: self.aperture_size(),
             ..DeviceConfig::default()
         }
@@ -819,6 +934,12 @@ impl C3dBoard {
             // doc comment for why `0x4350_3031` is independently
             // hardcoded here rather than referencing `render.rs`.
             PROGRAM_BINARY_FORMAT => state::Limits::default().program_binary_format,
+            // `0` without `CAP_SHARED_CONTEXTS` -- its own independent
+            // guard, not folded into the `CAP_PROGRAMMABLE` block above:
+            // cross-context sharing is independent of the programmable
+            // tier, per the spec.
+            MAX_SYNC_OBJECTS if self.caps0 & proto::CAP_SHARED_CONTEXTS == 0 => 0,
+            MAX_SYNC_OBJECTS => self.device_config().max_sync_objects,
             // Deliberately NOT gated by `CAP_PROGRAMMABLE`, unlike every
             // other register in this guarded block above: this device
             // draws every point at one pixel regardless of `POINT_SIZE`
@@ -851,9 +972,10 @@ impl C3dBoard {
     }
 
     fn do_full_reset(&mut self) {
-        for slot in &mut self.contexts {
-            *slot = ContextSlot::default();
+        for (i, slot) in self.contexts.iter_mut().enumerate() {
+            *slot = ContextSlot::new(i as u32);
         }
+        self.share_groups.clear();
         self.irq_status = 0;
         self.irq_enable = 0;
         self.control = CONTROL_ENABLE;
@@ -880,6 +1002,9 @@ impl C3dBoard {
                 if slot.ctx.ring_head == slot.ctx.ring_tail {
                     v |= CTX_STATUS_IDLE_RING;
                 }
+                if slot.ctx.awaiting_sync {
+                    v |= CTX_STATUS_AWAITING_SYNC;
+                }
                 v
             }
             RING_BASE => slot.ctx.ring_base,
@@ -891,6 +1016,7 @@ impl C3dBoard {
             ERROR_OFFSET => slot.ctx.error_offset,
             GL_ERROR => slot.ctx.state.gl_error(),
             FENCE_IRQ_TARGET => slot.fence_irq_target,
+            SHARE_GROUP => slot.ctx.state.share_group(),
             _ => 0, // ERROR_ACK/GL_ERROR_ACK are WO; reserved offsets are 0
         }
     }
@@ -907,11 +1033,17 @@ impl C3dBoard {
                 slot.alloc = value & CTX_CONTROL_ALLOC != 0;
                 slot.enable = value & CTX_CONTROL_ENABLE != 0;
                 if was_alloc && !slot.alloc {
-                    // Freed: every object this context held is gone.
-                    self.contexts[n] = ContextSlot {
-                        alloc: false,
-                        ..ContextSlot::default()
-                    };
+                    // Freed: every PRIVATE object this context held is
+                    // gone (wholesale-replacing its `State` drops its
+                    // `Rc` handles to the five shareable kinds and to
+                    // sync objects). A SHARED object survives exactly as
+                    // long as `Rc::strong_count` stays above zero across
+                    // this drop, i.e. as long as another live member of
+                    // the same group still holds its own clone of the
+                    // same `Rc` -- correct for free, no explicit "am I
+                    // the last member" bookkeeping needed. See
+                    // `state::State::set_share_group`'s doc comment.
+                    self.contexts[n] = ContextSlot::new(n as u32);
                 } else if value & CTX_CONTROL_RESET != 0 {
                     self.contexts[n].ctx.reset_all();
                     self.contexts[n].ctx.error_code = 0;
@@ -929,7 +1061,10 @@ impl C3dBoard {
                     self.contexts[n].ctx.ring_tail = 0;
                 }
             }
-            RING_TAIL => self.doorbell(n, value, host),
+            RING_TAIL => {
+                self.doorbell(n, value, host);
+                self.retry_awaiting_sync_contexts(host);
+            }
             ERROR_ACK => {
                 self.contexts[n].ctx.error_ack();
             }
@@ -937,6 +1072,31 @@ impl C3dBoard {
                 self.contexts[n].ctx.state.ack_gl_error();
             }
             FENCE_IRQ_TARGET => self.contexts[n].fence_irq_target = value,
+            // `CAP_SHARED_CONTEXTS`-gated (ignored, stays private, without
+            // it -- per the spec's CAPS0 bit-8 row) and "written only
+            // while this context has decoded no command since its last
+            // ALLOC transition" -- the same immutability shape `RING_SIZE`
+            // already enforces above, just against `ring_head == 0`
+            // (nothing consumed yet) rather than `!enable`. Falling through
+            // to the `_` arm's no-op when the guard fails is exactly a
+            // discarded write, the same as every other gated case here.
+            SHARE_GROUP if self.caps0 & proto::CAP_SHARED_CONTEXTS != 0 && self.contexts[n].ctx.ring_head == 0 => {
+                if value == 0 {
+                    self.contexts[n].ctx.state.set_private();
+                } else {
+                    let stores = self.share_groups.entry(value).or_default();
+                    let (textures, shaders, programs, buffers, renderbuffers, sync_objects) = stores.resolve();
+                    self.contexts[n].ctx.state.set_share_group(
+                        value,
+                        textures,
+                        shaders,
+                        programs,
+                        buffers,
+                        renderbuffers,
+                        sync_objects,
+                    );
+                }
+            }
             _ => {} // RO offsets (STATUS, RING_HEAD, FENCE_COMPLETED, ERROR_CODE/OFFSET, GL_ERROR) discard writes
         }
         self.update_irq_status(n);
@@ -1104,6 +1264,42 @@ impl C3dBoard {
             self.record_doorbell(n, old_head, new_tail, &ring_bytes, captured_blobs);
         }
         self.update_irq_status(n);
+    }
+
+    /// `WAIT_SYNC`'s device-side wait (`CAP_SHARED_CONTEXTS`): a context
+    /// stalled there needs no guest CPU polling or interrupt round-trip
+    /// to resume -- the device itself retries it, here, after every
+    /// top-level doorbell (called from `write_context`'s `RING_TAIL`
+    /// arm, *not* from [`Self::doorbell`] itself, so a retry's own calls
+    /// back into `doorbell` cannot recursively re-trigger another retry
+    /// pass). Re-attempts every other currently-`alloc`+`enable`+
+    /// `awaiting_sync` context by replaying its last-known `RING_TAIL`
+    /// against its own (unchanged) `ring_head` -- exactly the ordinary
+    /// doorbell path, which naturally either advances past the `WAIT_
+    /// SYNC` now (if its dependency has since been signalled) or stalls
+    /// again at the identical position (if not). Looped until a pass
+    /// makes no further progress, bounded by `contexts.len() + 1`
+    /// passes: a `WAIT_SYNC` cycle (context A waiting on a sync only B
+    /// can signal, B waiting on one only A can signal) can never
+    /// resolve regardless of how many passes run, so a bound is exactly
+    /// as correct as an unbounded loop for every satisfiable case and
+    /// strictly safer for an unsatisfiable one.
+    fn retry_awaiting_sync_contexts(&mut self, host: &DeviceHost) {
+        for _ in 0..=self.contexts.len() {
+            let mut made_progress = false;
+            for m in 0..self.contexts.len() {
+                if self.contexts[m].alloc && self.contexts[m].enable && self.contexts[m].ctx.awaiting_sync {
+                    let retry_tail = self.contexts[m].ctx.ring_tail;
+                    self.doorbell(m, retry_tail, host);
+                    if !self.contexts[m].ctx.awaiting_sync {
+                        made_progress = true;
+                    }
+                }
+            }
+            if !made_progress {
+                break;
+            }
+        }
     }
 
     /// `[c3d] trace`'s resolved default path, if the config set one --
@@ -3196,5 +3392,511 @@ mod tests {
         assert_eq!(status.path, path);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- CAP_SHARED_CONTEXTS: cross-context sharing ----------------------
+
+    const SHARE_GROUP_REG: u32 = CONTEXT_PAGE_BASE + creg::SHARE_GROUP;
+
+    fn context_page(n: u32) -> u32 {
+        CONTEXT_PAGE_BASE + n * CONTEXT_PAGE_SIZE
+    }
+
+    /// As `setup_ring_context`, parameterised over which context slot and
+    /// which ring-base offset within the aperture to use -- the plain
+    /// single-context helper above always uses context `0` and ring base
+    /// `0`, which two *simultaneously live* contexts in these tests can't
+    /// both do without their rings overlapping in the shared aperture.
+    fn setup_ring_context_n(b: &mut C3dBoard, h: &mut DeviceHost, n: u32, ring_base: u32) {
+        b.write(context_page(n) + creg::RING_BASE, 4, ring_base, h);
+        b.write(context_page(n) + creg::RING_SIZE, 4, 0x1000, h);
+        b.write(
+            context_page(n) + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            h,
+        );
+    }
+
+    /// As `submit_doorbell`, for context `n` at aperture offset
+    /// `ring_base` (matching whatever `setup_ring_context_n` used).
+    fn submit_doorbell_n(
+        b: &mut C3dBoard,
+        h: &mut DeviceHost,
+        n: u32,
+        ring_base: u32,
+        tail: &mut u32,
+        cmds: &[u32],
+    ) {
+        let bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let window_off = b.aperture_offset + ring_base;
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(window_off + *tail + i as u32, 1, *byte as u32, h);
+        }
+        *tail += bytes.len() as u32;
+        b.write(context_page(n) + creg::RING_TAIL, 4, *tail, h);
+    }
+
+    fn fence_sync_create_cmd(id: u32) -> Vec<u32> {
+        vec![((proto::OP_FENCE_SYNC_CREATE as u32) << 16) | 2, id]
+    }
+
+    fn fence_sync_destroy_cmd(id: u32) -> Vec<u32> {
+        vec![((proto::OP_FENCE_SYNC_DESTROY as u32) << 16) | 2, id]
+    }
+
+    fn wait_sync_cmd(id: u32) -> Vec<u32> {
+        vec![((proto::OP_WAIT_SYNC as u32) << 16) | 2, id]
+    }
+
+    fn error_code(b: &mut C3dBoard, h: &mut DeviceHost, n: u32) -> u32 {
+        b.read(context_page(n) + creg::ERROR_CODE, 4, h)
+    }
+
+    fn ctx_status(b: &mut C3dBoard, h: &mut DeviceHost, n: u32) -> u32 {
+        b.read(context_page(n) + creg::STATUS, 4, h)
+    }
+
+    fn ring_head(b: &mut C3dBoard, h: &mut DeviceHost, n: u32) -> u32 {
+        b.read(context_page(n) + creg::RING_HEAD, 4, h)
+    }
+
+    fn ring_tail_reg(b: &mut C3dBoard, h: &mut DeviceHost, n: u32) -> u32 {
+        b.read(context_page(n) + creg::RING_TAIL, 4, h)
+    }
+
+    /// Without `CAP_SHARED_CONTEXTS`, every `0x0Exx` opcode is
+    /// `E_BAD_OPCODE` and `CTX_SHARE_GROUP` always reads/stays `0` --
+    /// the spec's `CAPS0` bit-8 row, the "each bit cleared singly" case.
+    #[test]
+    fn cap_shared_contexts_gating_rejects_the_sync_opcodes_and_share_group_write() {
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_SHARED_CONTEXTS);
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        let mut tail = 0u32;
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &fence_sync_create_cmd(1));
+        assert_eq!(
+            error_code(&mut b, &mut h, 0),
+            proto::ErrorCode::BadOpcode as u32
+        );
+
+        b.write(SHARE_GROUP_REG, 4, 5, &mut h);
+        assert_eq!(
+            b.read(SHARE_GROUP_REG, 4, &mut h),
+            0,
+            "CTX_SHARE_GROUP must stay 0 without the capability"
+        );
+    }
+
+    /// The core feature: two contexts that write the same nonzero
+    /// `CTX_SHARE_GROUP` *before their first command* share one sync-
+    /// object namespace -- `FENCE_SYNC_CREATE` in context 0 is visible
+    /// to `WAIT_SYNC` in context 1, immediately (synchronous signalling;
+    /// see `SyncObject`'s doc comment), with no `E_BAD_ID`.
+    #[test]
+    fn two_contexts_in_the_same_share_group_see_each_others_sync_objects() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        b.write(context_page(0) + creg::SHARE_GROUP, 4, 5, &mut h);
+        b.write(context_page(1) + creg::SHARE_GROUP, 4, 5, &mut h);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        setup_ring_context_n(&mut b, &mut h, 1, 0x1000);
+        let mut tail0 = 0u32;
+        let mut tail1 = 0u32;
+
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail0, &fence_sync_create_cmd(9));
+        assert_eq!(error_code(&mut b, &mut h, 0), 0);
+
+        submit_doorbell_n(&mut b, &mut h, 1, 0x1000, &mut tail1, &wait_sync_cmd(9));
+        assert_eq!(
+            error_code(&mut b, &mut h, 1),
+            0,
+            "context 1 must see context 0's sync object -- same share group"
+        );
+        assert_eq!(
+            ring_head(&mut b, &mut h, 1),
+            ring_tail_reg(&mut b, &mut h, 1),
+            "already-signalled WAIT_SYNC must not stall"
+        );
+    }
+
+    /// Two contexts in *different* share groups (or one left private)
+    /// must not see each other's sync objects at all -- the id simply
+    /// doesn't exist in the waiting context's own namespace, `E_BAD_ID`,
+    /// indistinguishable from an id that was never created.
+    #[test]
+    fn contexts_in_different_share_groups_cannot_see_each_others_sync_objects() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        b.write(context_page(0) + creg::SHARE_GROUP, 4, 5, &mut h);
+        b.write(context_page(1) + creg::SHARE_GROUP, 4, 6, &mut h);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        setup_ring_context_n(&mut b, &mut h, 1, 0x1000);
+        let mut tail0 = 0u32;
+        let mut tail1 = 0u32;
+
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail0, &fence_sync_create_cmd(9));
+        assert_eq!(error_code(&mut b, &mut h, 0), 0);
+
+        submit_doorbell_n(&mut b, &mut h, 1, 0x1000, &mut tail1, &wait_sync_cmd(9));
+        assert_eq!(
+            error_code(&mut b, &mut h, 1),
+            proto::ErrorCode::BadId as u32,
+            "different share groups must not alias each other's sync objects"
+        );
+    }
+
+    /// `CTX_SHARE_GROUP` is "written only while this context has decoded
+    /// no command since its last `ALLOC` transition" -- a write *after*
+    /// the first command must be silently ignored, leaving the context
+    /// exactly as private (or as shared) as it already was.
+    #[test]
+    fn ctx_share_group_written_after_the_first_command_has_no_effect() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        setup_ring_context_n(&mut b, &mut h, 1, 0x1000);
+        let mut tail0 = 0u32;
+        let mut tail1 = 0u32;
+
+        // Context 0 decodes one command (still private) before trying to
+        // join a group -- the write below must be ignored.
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail0, &fence_sync_create_cmd(1));
+        b.write(context_page(0) + creg::SHARE_GROUP, 4, 5, &mut h);
+        assert_eq!(
+            b.read(context_page(0) + creg::SHARE_GROUP, 4, &mut h),
+            0,
+            "late write must not take effect"
+        );
+
+        // Context 1 genuinely joins group 5 before its first command.
+        b.write(context_page(1) + creg::SHARE_GROUP, 4, 5, &mut h);
+
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail0, &fence_sync_create_cmd(9));
+        submit_doorbell_n(&mut b, &mut h, 1, 0x1000, &mut tail1, &wait_sync_cmd(9));
+        assert_eq!(
+            error_code(&mut b, &mut h, 1),
+            proto::ErrorCode::BadId as u32,
+            "context 0 stayed private (its late join was ignored), so context \
+             1's real group-5 membership still cannot see context 0's sync id"
+        );
+    }
+
+    /// `WAIT_SYNC`'s device-side wait, the real substance of this
+    /// capability, in the one shape this board's fully-synchronous-per-
+    /// doorbell execution model (dispatch *and* `Renderer::execute` both
+    /// complete before a doorbell call returns) can ever actually
+    /// reach: a genuinely cross-context stall -- context B waiting on a
+    /// sync object context A has not created *yet* -- is `E_BAD_ID`
+    /// immediately, per the spec's "never created" rule, not a wait;
+    /// `FENCE_SYNC_CREATE` signals synchronously at dispatch time (see
+    /// `state::SyncObject`'s doc comment), so by the time any *other*
+    /// context's separate doorbell could ever observe a sync object
+    /// that exists at all, it is already signalled. The `Some(false)`
+    /// branch in `Context::submit_with`'s `WAIT_SYNC` interception is
+    /// therefore real, spec-required infrastructure for a device that
+    /// *can* have a created-but-unsignalled window (a pipelined one, or
+    /// a future revision of this one) -- but is unreachable through
+    /// Copperline's own wire sequence today. This test exercises it
+    /// directly instead, at the `dispatch`/`state` level this module
+    /// cannot reach: two `State`s sharing one `sync_objects` `Rc`
+    /// (mirroring what `board.rs`'s `ShareGroupStores::resolve` does for
+    /// two real contexts), with `id` `9` manually inserted *unsignalled*
+    /// -- a case no wire opcode can actually produce, exactly why this
+    /// needs a lower-level test to reach at all.
+    #[test]
+    fn wait_sync_interception_actually_stalls_on_a_genuinely_unsignalled_sync_object() {
+        use crate::c3d::dispatch::Context;
+        use crate::c3d::state::{self as c3d_state, SyncObject};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let sync_objects = Rc::new(RefCell::new(std::collections::BTreeMap::from([(
+            9,
+            SyncObject { signalled: false },
+        )])));
+        let mut waiter = Context::new(c3d_state::Limits::default());
+        waiter.state.set_context_index(1);
+        waiter.state.set_share_group(
+            5,
+            Rc::new(RefCell::new(Default::default())),
+            Rc::new(RefCell::new(Default::default())),
+            Rc::new(RefCell::new(Default::default())),
+            Rc::new(RefCell::new(Default::default())),
+            Rc::new(RefCell::new(Default::default())),
+            sync_objects.clone(),
+        );
+
+        let cmds = {
+            let mut v = wait_sync_cmd(9);
+            v.extend(fence_sync_create_cmd(10)); // the "follow-up" command
+            v
+        };
+        let tail = (cmds.len() * 4) as u32;
+        let mut bytes: Vec<u8> = cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        bytes.resize(bytes.len() + 4, 0); // RingCursor reserves one spare word
+        let config = crate::c3d::ring::DeviceConfig::default();
+        let mut out = Vec::new();
+        waiter.submit_with(&bytes, tail, &config, &mut out, &mut Vec::new(), &mut |_| None);
+
+        assert_eq!(waiter.error_code, 0, "not an error, a stall");
+        assert!(waiter.awaiting_sync, "AWAITING_SYNC must be set while stalled");
+        assert_eq!(
+            waiter.ring_head, 0,
+            "ring_head must sit at WAIT_SYNC itself, not past it"
+        );
+        assert!(
+            waiter.state.sync_signalled(10).is_none(),
+            "the follow-up FENCE_SYNC_CREATE must not have run yet"
+        );
+
+        // Something else (a real implementation's equivalent of another
+        // context's GPU work actually completing) signals sync 9.
+        sync_objects.borrow_mut().get_mut(&9).unwrap().signalled = true;
+
+        // Retrying is exactly `board.rs`'s `retry_awaiting_sync_contexts`:
+        // call `submit_with` again from the same `ring_tail`.
+        out.clear();
+        waiter.submit_with(&bytes, tail, &config, &mut out, &mut Vec::new(), &mut |_| None);
+
+        assert!(!waiter.awaiting_sync, "AWAITING_SYNC must clear once signalled");
+        assert_eq!(
+            waiter.ring_head, tail,
+            "the follow-up command must now have been decoded too"
+        );
+        assert_eq!(
+            waiter.state.sync_signalled(10),
+            Some(true),
+            "the follow-up FENCE_SYNC_CREATE actually ran, not just ring_head moving"
+        );
+    }
+
+    /// `WAIT_SYNC` on a sync object that is already signalled -- real
+    /// GL's own "wait on a fence already passed" case -- is a no-op, not
+    /// a stall: covered incidentally by the same-share-group test above,
+    /// this isolates it with an explicit same-context round trip too.
+    #[test]
+    fn wait_sync_on_an_already_signalled_sync_object_does_not_stall() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        let mut tail = 0u32;
+        let mut cmds = fence_sync_create_cmd(1);
+        cmds.extend(wait_sync_cmd(1));
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &cmds);
+        assert_eq!(error_code(&mut b, &mut h, 0), 0);
+        assert_eq!(ring_head(&mut b, &mut h, 0), ring_tail_reg(&mut b, &mut h, 0));
+        assert_eq!(ctx_status(&mut b, &mut h, 0) & CTX_STATUS_AWAITING_SYNC, 0);
+    }
+
+    /// `FENCE_SYNC_DESTROY` frees `id` for reuse in the group's
+    /// namespace -- a later `WAIT_SYNC` against the now-destroyed id is
+    /// `E_BAD_ID`, indistinguishable from one that was never created.
+    #[test]
+    fn wait_sync_after_fence_sync_destroy_is_bad_id() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        setup_ring_context_n(&mut b, &mut h, 0, 0);
+        let mut tail = 0u32;
+        let mut cmds = fence_sync_create_cmd(1);
+        cmds.extend(fence_sync_destroy_cmd(1));
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &cmds);
+        assert_eq!(error_code(&mut b, &mut h, 0), 0);
+
+        submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &wait_sync_cmd(1));
+        assert_eq!(error_code(&mut b, &mut h, 0), proto::ErrorCode::BadId as u32);
+    }
+
+    /// `WAIT_SYNC` decoded from inside a `CALL`'d buffer is `E_BAD_OPCODE`
+    /// -- a real device-side stall there has nowhere to persist a
+    /// resumable position across the doorbells it can span (the outer
+    /// ring's `ring_head` names the `CALL` command itself, not anywhere
+    /// inside the buffer it names), so this must be rejected outright
+    /// rather than silently falling through to a non-stalling no-op --
+    /// mirroring `CALL`-inside-`CALL`'s own identical nesting rejection.
+    #[test]
+    fn wait_sync_inside_a_call_buffer_is_bad_opcode() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+
+        const RING_BASE_REL: u32 = 0;
+        const BUFFER_REL: u32 = 0x1000;
+
+        // A sync object that genuinely exists (and is signalled) in this
+        // context's own namespace -- so if the `CALL`-nesting rejection
+        // were missing, this would wrongly succeed as a no-op rather
+        // than correctly failing closed.
+        let buf_cmds = wait_sync_cmd(1);
+        let buf_bytes: Vec<u8> = buf_cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let buf_off = b.aperture_offset + BUFFER_REL;
+        for (i, byte) in buf_bytes.iter().enumerate() {
+            b.write(buf_off + i as u32, 1, *byte as u32, &mut h);
+        }
+
+        let mut ring_cmds = fence_sync_create_cmd(1);
+        ring_cmds.extend([
+            ((proto::OP_CALL as u32) << 16) | 3,
+            BUFFER_REL,
+            buf_bytes.len() as u32,
+        ]);
+        let ring_bytes: Vec<u8> = ring_cmds.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let ring_off = b.aperture_offset + RING_BASE_REL;
+        for (i, byte) in ring_bytes.iter().enumerate() {
+            b.write(ring_off + i as u32, 1, *byte as u32, &mut h);
+        }
+
+        b.write(context_page(0) + creg::RING_BASE, 4, RING_BASE_REL, &mut h);
+        b.write(context_page(0) + creg::RING_SIZE, 4, 0x4000, &mut h);
+        b.write(
+            context_page(0) + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            context_page(0) + creg::RING_TAIL,
+            4,
+            ring_bytes.len() as u32,
+            &mut h,
+        );
+
+        assert_eq!(
+            error_code(&mut b, &mut h, 0),
+            proto::ErrorCode::BadOpcode as u32,
+            "WAIT_SYNC inside a CALL must fail closed, even against a real, \
+             signalled, same-namespace sync object"
+        );
+    }
+
+    /// The headline claim, proven end to end through a real GPU round
+    /// trip, not a `state.rs`-level assertion that an `Rc` is shared:
+    /// context 0 creates and uploads a texture; context 1, in the same
+    /// `CTX_SHARE_GROUP`, binds the *same id* with zero re-upload and
+    /// actually renders with it -- a window-space textured triangle
+    /// sampling it, read back from the aperture-backed draw surface --
+    /// producing exactly the colour context 0 uploaded. If the sharing
+    /// plumbing (the `Rc<RefCell<_>>` namespace machinery and the
+    /// `Renderer`-side `PartKey` partitioning fix it depends on) were
+    /// wrong in either direction -- not actually shared, or aliased
+    /// across the wrong namespace -- this would either fail to bind at
+    /// all (`E_BAD_ID`) or render the wrong/undefined colour.
+    #[test]
+    fn a_texture_uploaded_in_one_context_is_sampled_by_a_real_draw_in_another_sharing_it() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        b.write(context_page(0) + creg::SHARE_GROUP, 4, 5, &mut h);
+        b.write(context_page(1) + creg::SHARE_GROUP, 4, 5, &mut h);
+
+        const RING0_REL: u32 = 0;
+        const RING1_REL: u32 = 0x2000;
+        const TEX_SRC_REL: u32 = 0x4000;
+        const SURFACE_REL: u32 = 0x5000;
+        const SURFACE_W: u32 = 4;
+        const SURFACE_H: u32 = 4;
+        const SURFACE_STRIDE: u32 = SURFACE_W * 4;
+        const TEXTURE_ID: u32 = 7;
+
+        let opcode_len = |op: u16, words: u32| ((op as u32) << 16) | words;
+
+        // Opaque red, RGBA8 byte order (TEX_IMAGE's wire format 0).
+        let tex_src = [0xFFu8, 0x00, 0x00, 0xFF];
+        let tex_src_off = b.aperture_offset + TEX_SRC_REL;
+        for (i, byte) in tex_src.iter().enumerate() {
+            b.write(tex_src_off + i as u32, 1, *byte as u32, &mut h);
+        }
+
+        setup_ring_context_n(&mut b, &mut h, 0, RING0_REL);
+        setup_ring_context_n(&mut b, &mut h, 1, RING1_REL);
+        let mut tail0 = 0u32;
+        let mut tail1 = 0u32;
+
+        // Context 0: creates the texture object and uploads its only
+        // content. Context 1 never does either of these.
+        let ctx0_cmds = [
+            opcode_len(proto::OP_TEX_CREATE, 2),
+            TEXTURE_ID,
+            opcode_len(proto::OP_TEX_IMAGE, 9),
+            TEXTURE_ID,
+            0, // level
+            0, // format: RGBA8
+            1, // width
+            1, // height
+            4, // row_bytes
+            TEX_SRC_REL,
+            4, // ref length
+        ];
+        submit_doorbell_n(&mut b, &mut h, 0, RING0_REL, &mut tail0, &ctx0_cmds);
+        assert_eq!(error_code(&mut b, &mut h, 0), 0, "context 0's own upload");
+
+        // Context 1: binds the SAME id with no TEX_CREATE/TEX_IMAGE of
+        // its own, defines a draw surface, enables texturing, and draws
+        // one window-space triangle (position + texcoord0 only --
+        // GLES2's default white CURRENT_COLOR and MODULATE TEX_ENV mean
+        // the fragment colour is exactly the sampled texel) covering the
+        // whole surface, then reads it back into the aperture.
+        let tri_vertex = |x: f32, y: f32| -> [u32; 6] {
+            [x.to_bits(), y.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 0, 0]
+        };
+        let mut ctx1_cmds = vec![
+            opcode_len(proto::OP_TEX_BIND, 3),
+            0, // unit
+            TEXTURE_ID,
+            opcode_len(proto::OP_SURFACE_DEFINE, 8),
+            1,
+            SURFACE_W,
+            SURFACE_H,
+            SURFACE_STRIDE,
+            5,
+            0,
+            SURFACE_REL,
+            opcode_len(proto::OP_SET_DRAW_SURFACE, 2),
+            1,
+            opcode_len(proto::OP_ENABLE, 2),
+            0x0DE1, // GL_TEXTURE_2D
+            opcode_len(proto::OP_DRAW_INLINE_WIN, 1 + 3 + 3 * 6),
+            4, // prim: TRIANGLES
+            proto::VertexFormat::TEXCOORD0,
+            3, // count
+        ];
+        ctx1_cmds.extend(tri_vertex(-2.0, -2.0));
+        ctx1_cmds.extend(tri_vertex(16.0, -2.0));
+        ctx1_cmds.extend(tri_vertex(-2.0, 16.0));
+        ctx1_cmds.push(opcode_len(proto::OP_SURFACE_READBACK, 5));
+        ctx1_cmds.extend([0, 0, SURFACE_W, SURFACE_H]);
+        submit_doorbell_n(&mut b, &mut h, 1, RING1_REL, &mut tail1, &ctx1_cmds);
+        assert_eq!(
+            error_code(&mut b, &mut h, 1),
+            0,
+            "context 1 binding and drawing with context 0's texture"
+        );
+
+        if b.renderer.is_none() {
+            eprintln!(
+                "skipping pixel check: no wgpu adapter available (renderer_failed={})",
+                b.renderer_failed
+            );
+            return;
+        }
+        let start = (b.aperture_offset + SURFACE_REL) as usize;
+        for row in 0..SURFACE_H {
+            for col in 0..SURFACE_W {
+                let px = start + (row * SURFACE_STRIDE) as usize + (col * 4) as usize
+                    - b.aperture_offset as usize;
+                assert_eq!(
+                    &b.aperture[px..px + 4],
+                    &[0xFFu8, 0xFF, 0x00, 0x00],
+                    "pixel ({col}, {row}) must be context 0's uploaded red, \
+                     sampled by context 1's draw with zero re-upload"
+                );
+            }
+        }
     }
 }

@@ -125,6 +125,11 @@ pub struct DeviceConfig {
     /// `CAP_PROGRAMMABLE`: gates `0x09xx`-`0x0Dxx` (see this module's doc
     /// comment and `proto::CAP_PROGRAMMABLE`'s doc comment).
     pub programmable: bool,
+    /// `CAP_SHARED_CONTEXTS`: gates `0x0Exx` and `CTX_SHARE_GROUP`
+    /// (`board.rs`'s context-register concern, not this decoder's --
+    /// `CTX_SHARE_GROUP` is a register write, never a ring opcode).
+    /// Independent of `programmable`.
+    pub shared_contexts: bool,
 
     // Limits (`c3d-global-registers`).
     pub aperture_size: u32,
@@ -175,6 +180,10 @@ pub struct DeviceConfig {
     /// `ProgramBinaryBlob` shape or its pinned `naga` version ever
     /// changes.
     pub program_binary_format: u32,
+    /// `MAX_SYNC_OBJECTS`: highest sync object id, per share group. `0`
+    /// without `CAP_SHARED_CONTEXTS`, `>= 1` with it -- the two are not
+    /// independently toggleable, per the spec.
+    pub max_sync_objects: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -216,6 +225,7 @@ impl Default for DeviceConfig {
             multitexture: true,
             surface_guestaddr: true,
             programmable: true,
+            shared_contexts: true,
             aperture_size: proto::APERTURE_SIZE_DEFAULT,
             max_texture_units: 2,
             max_textures: 2048,
@@ -235,6 +245,7 @@ impl Default for DeviceConfig {
             max_renderbuffer_size: 1024,
             max_samples: 2,
             program_binary_format: 0x4350_3031, // "CP01" -- see this field's doc comment
+            max_sync_objects: 64,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9) // I8_INDEXED: TEX_PALETTE itself
@@ -562,6 +573,16 @@ impl<'a> RingCursor<'a> {
         )
     }
 
+    /// Whether `opcode` needs `CAP_SHARED_CONTEXTS`: the whole `0x0Exx`
+    /// group.
+    fn opcode_needs_shared_contexts(opcode: u16) -> bool {
+        use proto::*;
+        matches!(
+            opcode,
+            OP_FENCE_SYNC_CREATE | OP_FENCE_SYNC_DESTROY | OP_WAIT_SYNC | OP_SYNC_STATUS
+        )
+    }
+
     /// Decodes the payload of a structurally-framed command (length
     /// already validated against the ring/tail bounds). `body` is the
     /// command's payload words, i.e. `ring[start+4 .. start+length*4]`.
@@ -570,6 +591,9 @@ impl<'a> RingCursor<'a> {
             return self.raise(ErrorCode::BadOpcode, start);
         }
         if !self.config.programmable && Self::opcode_needs_programmable(opcode) {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        if !self.config.shared_contexts && Self::opcode_needs_shared_contexts(opcode) {
             return self.raise(ErrorCode::BadOpcode, start);
         }
         // TEX_PALETTE is spec-optional, gated by its own TEXFMT_SUPPORTED
@@ -1745,6 +1769,56 @@ impl<'a> RingCursor<'a> {
                 let dest = Ref::decode(w32(body, 1), w32(body, 2));
                 check!(self.validate_ref(dest, start));
                 Command::ProgramGetBinary { program, dest }
+            }
+
+            // Cross-context sharing (0x0Exx), CAP_SHARED_CONTEXTS. `id`'s
+            // *membership* in the calling context's current share group
+            // is a dispatch-time concern (only `dispatch.rs`/`state.rs`
+            // know which group this context is in); here it is only
+            // bounds-checked against the device's own `MAX_SYNC_OBJECTS`,
+            // exactly like every other object id at this layer.
+            OP_FENCE_SYNC_CREATE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_sync_objects, start));
+                Command::FenceSyncCreate { id }
+            }
+            OP_FENCE_SYNC_DESTROY => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_sync_objects, start));
+                Command::FenceSyncDestroy { id }
+            }
+            OP_WAIT_SYNC => {
+                fixed!(1);
+                // `WAIT_SYNC` decoded from inside a `CALL`'d buffer is
+                // `E_BAD_OPCODE`, the same restriction `OP_CALL` above
+                // places on nesting a `CALL`: the device-side stall this
+                // opcode needs (`Context::submit_with`'s top-level
+                // interception, which rewinds the *outer* ring's
+                // `ring_head` to resume exactly here) has no counterpart
+                // for a position inside an ephemeral, re-fetched call
+                // buffer -- there is nowhere to persist "resume the call
+                // at this nested offset" across the doorbells a stall can
+                // span, unlike the outer ring's `ring_head`. Checked here,
+                // at decode time, rather than left for dispatch.rs to
+                // reject after the fact, mirroring `OP_CALL`'s own
+                // "checked ahead of validate_ref" reasoning -- this must
+                // never silently fall through to a non-stalling no-op.
+                if self.linear {
+                    return self.raise(ErrorCode::BadOpcode, start);
+                }
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_sync_objects, start));
+                Command::WaitSync { id }
+            }
+            OP_SYNC_STATUS => {
+                fixed!(3);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_sync_objects, start));
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::SyncStatus { id, dest }
             }
 
             // Framebuffers and renderbuffers (0x0Bxx), CAP_PROGRAMMABLE.
