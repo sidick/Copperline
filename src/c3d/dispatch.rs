@@ -417,14 +417,33 @@ pub enum RenderOp<'a> {
 
     // -- CAP_PROGRAMMABLE: framebuffers and renderbuffers. `FRAMEBUFFER_
     // CREATE`/`_DESTROY`, `BIND_FRAMEBUFFER`, `RENDERBUFFER_CREATE`/
-    // `_DESTROY`/`_STORAGE_*` and the two `FRAMEBUFFER_ATTACH_*` opcodes
-    // carry no ref and are pure `state.rs` mutations with no `RenderOp`
-    // at all -- only `FRAMEBUFFER_STATUS` needs the renderer, to write
-    // its result to `dest` (needs `mem` access this module doesn't
-    // have). `status` is resolved from `state` immediately, exactly
-    // like `Query`'s `result` -- completeness is pure state, so there is
-    // nothing a renderer needs to re-derive later.
+    // `_DESTROY`/`_STORAGE_*` (including the `_MULTISAMPLE` variants) and
+    // the three `FRAMEBUFFER_ATTACH_*` opcodes carry no ref and are pure
+    // `state.rs` mutations with no `RenderOp` at all -- only
+    // `FRAMEBUFFER_STATUS` needs the renderer, to write its result to
+    // `dest` (needs `mem` access this module doesn't have). `status` is
+    // resolved from `state` immediately, exactly like `Query`'s `result`
+    // -- completeness is pure state, so there is nothing a renderer needs
+    // to re-derive later.
     FramebufferStatus { dest: Ref, status: u32 },
+    /// `BLIT_FRAMEBUFFER`. Corner coordinates, not `x, y, w, h`, so a
+    /// reversed pair (`x0 > x1`/`y0 > y1`) can flip that axis, exactly as
+    /// `glBlitFramebuffer` allows -- cast to `i32` at dispatch time since
+    /// negative/reversed coordinates are meaningful here, unlike most
+    /// other rect-shaped commands.
+    BlitFramebuffer {
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        mask: u32,
+        filter: u32,
+        state: State,
+    },
 }
 
 /// A draw command's vertex/index source, exactly as `docs/internals/
@@ -1873,6 +1892,141 @@ impl Context {
                     self.latch_protocol_error(code, start);
                 }
             }
+            Command::RenderbufferStorageColorMultisample {
+                id,
+                width,
+                height,
+                format,
+                samples,
+            } => {
+                let Some(format) = self.decode_gl(state::SurfaceFormat::from_wire(format)) else {
+                    return;
+                };
+                if let Err(code) = self
+                    .state
+                    .renderbuffer_storage_color_multisample(id, width, height, format, samples)
+                {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::RenderbufferStorageDepthStencilMultisample {
+                id,
+                width,
+                height,
+                samples,
+            } => {
+                if let Err(code) = self
+                    .state
+                    .renderbuffer_storage_depth_stencil_multisample(id, width, height, samples)
+                {
+                    self.latch_protocol_error(code, start);
+                }
+            }
+            Command::BlitFramebuffer {
+                src_x0,
+                src_y0,
+                src_x1,
+                src_y1,
+                dst_x0,
+                dst_y0,
+                dst_x1,
+                dst_y1,
+                mask,
+                filter,
+            } => {
+                let (src_x0, src_y0, src_x1, src_y1) =
+                    (src_x0 as i32, src_y0 as i32, src_x1 as i32, src_y1 as i32);
+                let (dst_x0, dst_y0, dst_x1, dst_y1) =
+                    (dst_x0 as i32, dst_y0 as i32, dst_x1 as i32, dst_y1 as i32);
+
+                // `LINEAR` only means something for a scaled *colour*
+                // copy; GL requires `NEAREST` for depth/stencil, since
+                // those have no sensible notion of interpolation.
+                if filter == proto::BLIT_FILTER_LINEAR
+                    && mask & (proto::CLEAR_MASK_DEPTH | proto::CLEAR_MASK_STENCIL) != 0
+                {
+                    self.state.raise_gl_error(GlError::InvalidOperation);
+                    return;
+                }
+
+                // The multisample scale/flip/mismatch rule applies to the
+                // colour plane; both sides' size+samples are pure
+                // protocol state, resolvable here without the renderer --
+                // see `State::blit_color_source_info`/`_dest_info`'s doc
+                // comments. `src_samples > 0, dst_samples == 0` is the
+                // *valid* resolve case (same-size/unflipped only, hence
+                // the separate orientation check) -- it must not be
+                // treated as a plain "samples differ" mismatch, which
+                // would also incorrectly reject every ordinary MSAA
+                // resolve. Only checked when `mask` includes colour: this
+                // is specifically the colour plane's own rule.
+                if mask & proto::CLEAR_MASK_COLOR != 0 {
+                    if let (Some((_, _, src_samples)), Some(dests)) =
+                        (self.state.blit_color_source_info(), self.state.blit_color_dest_info())
+                    {
+                        let same_size_and_orientation =
+                            (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+                        let mismatched = dests.iter().any(|&(_, _, dst_samples)| {
+                            if dst_samples > 0 && src_samples == 0 {
+                                // "Un-resolving" into a multisample
+                                // destination from a non-multisample
+                                // source is never valid.
+                                true
+                            } else if dst_samples > 0 && src_samples > 0 && src_samples != dst_samples {
+                                true
+                            } else {
+                                (src_samples > 0 || dst_samples > 0) && !same_size_and_orientation
+                            }
+                        });
+                        if mismatched {
+                            self.state.raise_gl_error(GlError::InvalidOperation);
+                            return;
+                        }
+                    }
+                }
+
+                // The depth/stencil plane's own multisample rule, same
+                // shape as colour's above -- plus one case colour has no
+                // equivalent of: `STENCIL_BUFFER_BIT` against a
+                // multisample source is unconditionally rejected, since
+                // no WGSL fragment-shader builtin can forward a stencil
+                // value the way `@builtin(frag_depth)` forwards depth
+                // (see `render.rs`'s `Renderer::resolve_multisample_depth`
+                // doc comment) -- a real correctness gap otherwise,
+                // not something to silently no-op.
+                if mask & (proto::CLEAR_MASK_DEPTH | proto::CLEAR_MASK_STENCIL) != 0 {
+                    if let (Some((_, _, src_samples)), Some((_, _, dst_samples))) =
+                        (self.state.blit_depth_stencil_source_info(), self.state.blit_depth_stencil_dest_info())
+                    {
+                        if mask & proto::CLEAR_MASK_STENCIL != 0 && src_samples > 0 {
+                            self.state.raise_gl_error(GlError::InvalidOperation);
+                            return;
+                        }
+                        let same_size_and_orientation =
+                            (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+                        let mismatched = (dst_samples > 0 && src_samples != dst_samples)
+                            || ((src_samples > 0 || dst_samples > 0) && !same_size_and_orientation);
+                        if mismatched {
+                            self.state.raise_gl_error(GlError::InvalidOperation);
+                            return;
+                        }
+                    }
+                }
+
+                out.push(RenderOp::BlitFramebuffer {
+                    src_x0,
+                    src_y0,
+                    src_x1,
+                    src_y1,
+                    dst_x0,
+                    dst_y0,
+                    dst_x1,
+                    dst_y1,
+                    mask,
+                    filter,
+                    state: self.state.clone(),
+                });
+            }
 
             // -- CAP_PROGRAMMABLE: programmable draw -----------------
             Command::DrawArraysProg { prim, first, count } => {
@@ -2312,6 +2466,145 @@ mod tests {
         assert_eq!(ctx.state.gl_error(), GlError::InvalidEnum.to_gl());
         // The protocol latch is untouched by a GL error.
         assert_eq!(ctx.error_code, 0);
+    }
+
+    #[test]
+    fn blit_framebuffer_with_linear_filter_and_a_depth_mask_bit_is_invalid_operation() {
+        let mut ctx = context();
+        const LINEAR: u32 = 1;
+        let commands = vec![
+            define_surface(1, 4, 4),
+            cmd(OP_SET_DRAW_SURFACE, &[1]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_DEPTH, LINEAR],
+            ),
+        ];
+        let ring = ring_of(&commands);
+        let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, 0, "not a protocol error");
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
+        assert!(
+            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
+        );
+    }
+
+    #[test]
+    fn blit_framebuffer_scaling_a_multisample_colour_source_is_invalid_operation() {
+        let mut ctx = context();
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const NEAREST: u32 = 0;
+        let samples = ctx.state.limits().max_samples as u32;
+        let commands = vec![
+            define_surface(1, 8, 8),
+            cmd(OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, 5, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            // Read side names the multisample renderbuffer (default
+            // READ_BUFFER is COLOR_ATTACHMENT0); the draw side is the
+            // 8x8 non-multisample default surface -- a scaled 4x4 -> 8x8
+            // colour copy with a multisample source must be rejected,
+            // not silently scaled.
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 4, 4, 0, 0, 8, 8, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        let ring = ring_of(&commands);
+        let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, 0, "not a protocol error");
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
+        assert!(
+            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
+        );
+    }
+
+    /// `STENCIL_BUFFER_BIT` against a multisample depth/stencil source
+    /// is rejected outright, even at the *same* size/orientation that
+    /// would be a valid depth-only resolve -- no WGSL fragment-shader
+    /// builtin can forward a per-pixel stencil value the way
+    /// `@builtin(frag_depth)` forwards depth, so this is a documented
+    /// `GL_INVALID_OPERATION` fallback rather than a silent no-op that
+    /// would leave the destination's stencil content untouched with no
+    /// signal that anything went wrong.
+    #[test]
+    fn blit_framebuffer_requesting_stencil_against_a_multisample_source_is_invalid_operation() {
+        let mut ctx = context();
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const DEPTH_STENCIL_ATTACHMENT: u32 = 0x821A;
+        const NEAREST: u32 = 0;
+        let samples = ctx.state.limits().max_samples as u32;
+        let commands = vec![
+            define_surface(1, 4, 4),
+            cmd(OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            // FRAMEBUFFER_COMPLETE requires at least one colour
+            // attachment (this codebase's own `framebuffer_status`
+            // rule) -- otherwise `blit_depth_stencil_source_info` would
+            // see an incomplete read framebuffer and treat this as a
+            // no-op before ever reaching the stencil-specific check.
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, 5, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE, &[2, 4, 4, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2]),
+            // Read side names the multisample renderbuffer (fb 1, bound
+            // to both sides above); point the draw side back at the
+            // default framebuffer (the surface's own non-multisample
+            // depth/stencil buffer) -- same-size, unflipped, exactly the
+            // shape that would be a valid depth-only resolve. The
+            // stencil bit specifically is what makes it invalid.
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 0]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_STENCIL, NEAREST],
+            ),
+        ];
+        let ring = ring_of(&commands);
+        let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config(), &mut out);
+        assert_eq!(ctx.error_code, 0, "not a protocol error");
+        assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
+        assert!(
+            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
+        );
+    }
+
+    #[test]
+    fn draw_buffers_and_read_buffer_are_e_bad_opcode_without_cap_programmable() {
+        let mut config = config();
+        config.programmable = false;
+        for op in [proto::OP_DRAW_BUFFERS, proto::OP_READ_BUFFER] {
+            // A fresh `Context` per opcode -- `ring_head` persists across
+            // `submit` calls on a real ring, so reusing one `ctx` across
+            // iterations without resetting it would decode the second
+            // op's bytes starting from wherever the first left off,
+            // landing on padding zero bytes instead (see
+            // `submit_commands_ctx`'s identical note elsewhere in this
+            // crate).
+            let mut ctx = context();
+            let ring = ring_of(&[cmd(op, &[0])]);
+            let mut out = Vec::new();
+            ctx.submit(&ring, 8, &config, &mut out);
+            assert_eq!(
+                ctx.error_code,
+                ErrorCode::BadOpcode as u32,
+                "opcode {op:#06x} should be E_BAD_OPCODE without CAP_PROGRAMMABLE"
+            );
+        }
     }
 
     #[test]

@@ -223,6 +223,7 @@ mod greg {
     pub const MAX_VARYING_VECTORS: u32 = 0x098;
     pub const MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
     pub const MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
+    pub const MAX_SAMPLES: u32 = 0x0A4;
 }
 
 // ---------------------------------------------------------------------
@@ -771,6 +772,7 @@ impl C3dBoard {
             | MAX_VARYING_VECTORS
             | MAX_COLOR_ATTACHMENTS
             | MAX_RENDERBUFFER_SIZE
+            | MAX_SAMPLES
                 if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
             {
                 0
@@ -797,6 +799,15 @@ impl C3dBoard {
             // not just the attachment-list shape.
             MAX_COLOR_ATTACHMENTS => state::Limits::default().max_color_attachments as u32,
             MAX_RENDERBUFFER_SIZE => self.device_config().max_renderbuffer_size,
+            // Like MAX_COLOR_ATTACHMENTS above, reports the same value
+            // every per-context `state::Limits::default()` enforces --
+            // real multisample storage (`RENDERBUFFER_STORAGE_COLOR_
+            // MULTISAMPLE`/`_DEPTH_STENCIL_MULTISAMPLE`, `BLIT_FRAMEBUFFER`
+            // resolve), not just an advertised number. `2` is the ceiling
+            // (see `state::Limits::max_samples`'s doc comment for why no
+            // real backend can honestly advertise more under this spec's
+            // "every integer up to the limit" rule).
+            MAX_SAMPLES => state::Limits::default().max_samples as u32,
             _ => 0,
         }
     }

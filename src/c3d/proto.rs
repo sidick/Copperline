@@ -183,6 +183,11 @@ pub const CLEAR_MASK_DEPTH: u32 = 1 << 1;
 /// it, per `CLEAR`'s own doc comment.
 pub const CLEAR_MASK_STENCIL: u32 = 1 << 2;
 
+/// `BLIT_FRAMEBUFFER`'s `filter`: a literal `0`/`1` flag, not a GL
+/// enumerant (unlike `TEX_PARAM`'s `TEXTURE_MIN_FILTER`/`_MAG_FILTER`).
+pub const BLIT_FILTER_NEAREST: u32 = 0;
+pub const BLIT_FILTER_LINEAR: u32 = 1;
+
 // ---------------------------------------------------------------------
 // Opcodes (`c3d-command-stream`'s opcode map). Each constant is the full
 // 16-bit `opcode[31:16]` field of word 0, grouped exactly as the spec's
@@ -380,6 +385,16 @@ pub const OP_DRAW_BUFFERS: u16 = 0x0B0B;
 /// colour attachment of the bound read framebuffer `READ_PIXELS`/the
 /// copy-to-texture commands source from.
 pub const OP_READ_BUFFER: u16 = 0x0B0C;
+/// `CAP_PROGRAMMABLE`. `glRenderbufferStorageMultisample`'s wire
+/// equivalent for colour storage.
+pub const OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE: u16 = 0x0B0D;
+/// `CAP_PROGRAMMABLE`. `glRenderbufferStorageMultisample`'s wire
+/// equivalent for combined depth/stencil storage.
+pub const OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE: u16 = 0x0B0E;
+/// `CAP_PROGRAMMABLE`. `glBlitFramebuffer`'s wire equivalent: copies
+/// between the bound read and draw framebuffers, including MSAA resolve
+/// as one case of it.
+pub const OP_BLIT_FRAMEBUFFER: u16 = 0x0B0F;
 
 // Programmable draw (0x0Cxx) -- `c3d-cmd-programmable-draw`,
 // `CAP_PROGRAMMABLE`.
@@ -1426,6 +1441,35 @@ pub enum Command<'a> {
     /// `READ_BUFFER`.
     ReadBuffer {
         buf: u32,
+    },
+    /// `RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE`.
+    RenderbufferStorageColorMultisample {
+        id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        samples: u32,
+    },
+    /// `RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE`.
+    RenderbufferStorageDepthStencilMultisample {
+        id: u32,
+        width: u32,
+        height: u32,
+        samples: u32,
+    },
+    /// `BLIT_FRAMEBUFFER`. Copies between the bound read and draw
+    /// framebuffers; no framebuffer `id`s in the payload.
+    BlitFramebuffer {
+        src_x0: u32,
+        src_y0: u32,
+        src_x1: u32,
+        src_y1: u32,
+        dst_x0: u32,
+        dst_y0: u32,
+        dst_x1: u32,
+        dst_y1: u32,
+        mask: u32,
+        filter: u32,
     },
 
     // Programmable draw (0x0Cxx), `CAP_PROGRAMMABLE`. `prim`/`index_type`

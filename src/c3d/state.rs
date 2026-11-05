@@ -979,6 +979,11 @@ pub struct Limits {
     /// OGLES2 (`EXT_draw_buffers`) and OGLES3 (core) guest libraries can
     /// reach real MRT through this device.
     pub max_color_attachments: usize,
+    /// `MAX_SAMPLES`, `CAP_PROGRAMMABLE`. `2`, not a higher power of two --
+    /// see `ring.rs`'s `DeviceConfig::max_samples` doc comment for why no
+    /// real multisample backend can honestly advertise more than `2` under
+    /// this spec's "every integer up to the limit, no rounding" rule.
+    pub max_samples: usize,
 }
 
 impl Default for Limits {
@@ -999,6 +1004,7 @@ impl Default for Limits {
             max_clip_planes: 6,
             max_vertex_attribs: 8,
             max_color_attachments: 4,
+            max_samples: 2,
         }
     }
 }
@@ -1646,25 +1652,34 @@ pub const GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: u32 = 0x8CD6;
 pub const GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: u32 = 0x8CD7;
 pub const GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS: u32 = 0x8CD9;
 pub const GL_FRAMEBUFFER_UNSUPPORTED: u32 = 0x8CDD;
+/// `FRAMEBUFFER_STATUS`'s result when the framebuffer's attachments don't
+/// all share one sample count (every attachment non-multisample, or every
+/// multisample renderbuffer at the *same* `samples` value).
+pub const GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: u32 = 0x8D56;
 
 /// One renderbuffer object's allocated storage (`RENDERBUFFER_STORAGE_
-/// COLOR`/`RENDERBUFFER_STORAGE_DEPTH_STENCIL`). `None` until either is
-/// called, per `RENDERBUFFER_CREATE`'s "creates an empty renderbuffer
-/// object".
+/// COLOR`/`RENDERBUFFER_STORAGE_DEPTH_STENCIL`, or their `_MULTISAMPLE`
+/// siblings). `None` until one of those is called, per `RENDERBUFFER_
+/// CREATE`'s "creates an empty renderbuffer object".
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderbufferStorage {
     /// Backed exactly like a [`Surface`]'s colour storage -- see this
-    /// section's module doc comment.
+    /// section's module doc comment. `samples` is `0` for plain
+    /// `RENDERBUFFER_STORAGE_COLOR`, `>= 2` for `_MULTISAMPLE`.
     Color {
         width: u32,
         height: u32,
         format: SurfaceFormat,
+        samples: u32,
     },
     /// 24-bit depth, 8-bit stencil, implementation-packed; there is no
     /// separate depth-only or stencil-only renderbuffer kind in version 1.
+    /// `samples` is `0` for plain `RENDERBUFFER_STORAGE_DEPTH_STENCIL`,
+    /// `>= 2` for `_MULTISAMPLE`.
     DepthStencil {
         width: u32,
         height: u32,
+        samples: u32,
     },
 }
 
@@ -2826,14 +2841,56 @@ impl State {
 
     pub fn renderbuffer_storage_color(&mut self, id: u32, width: u32, height: u32, format: SurfaceFormat) {
         if let Some(rb) = self.renderbuffers.get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::Color { width, height, format });
+            rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples: 0 });
         }
     }
 
     pub fn renderbuffer_storage_depth_stencil(&mut self, id: u32, width: u32, height: u32) {
         if let Some(rb) = self.renderbuffers.get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height });
+            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples: 0 });
         }
+    }
+
+    /// `RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE`. `samples < 2` or
+    /// `samples > max_samples` is `E_LIMIT` -- already checked by
+    /// `ring.rs`'s `check_samples` at decode time for the structural case,
+    /// but re-checked here too since this is also the authoritative place
+    /// `state.rs`'s own `Limits::max_samples` lives, matching how
+    /// `max_color_attachments` is enforced in both `draw_buffers`/
+    /// `read_buffer` here and at decode time.
+    pub fn renderbuffer_storage_color_multisample(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        format: SurfaceFormat,
+        samples: u32,
+    ) -> Result<(), ErrorCode> {
+        if !(2..=self.limits.max_samples as u32).contains(&samples) {
+            return Err(ErrorCode::Limit);
+        }
+        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+            rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples });
+        }
+        Ok(())
+    }
+
+    /// `RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE`. Same `samples`
+    /// rule as [`Self::renderbuffer_storage_color_multisample`].
+    pub fn renderbuffer_storage_depth_stencil_multisample(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> Result<(), ErrorCode> {
+        if !(2..=self.limits.max_samples as u32).contains(&samples) {
+            return Err(ErrorCode::Limit);
+        }
+        if let Some(rb) = self.renderbuffers.get_mut(&id) {
+            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples });
+        }
+        Ok(())
     }
 
     /// `FRAMEBUFFER_ATTACH_RENDERBUFFER`. `E_BAD_ID` against the default
@@ -3009,12 +3066,17 @@ impl State {
 
     /// An attachment's declared size, from this module's own records (not
     /// any GPU resource) -- shared by [`Self::framebuffer_status`] across
-    /// every colour attachment index, not just `0`.
+    /// every colour attachment index, not just `0`, and by the
+    /// `blit_*_source_info`/`_dest_info` helpers for depth/stencil too
+    /// (both `RenderbufferStorage` variants carry a size, so this is not
+    /// colour-specific despite the colour-only call sites that happened
+    /// to be its only callers before `BLIT_FRAMEBUFFER`).
     fn attachment_size(&self, attachment: FramebufferAttachment) -> Option<(u32, u32)> {
         match attachment {
             FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
                 Some(RenderbufferStorage::Color { width, height, .. }) => Some((width, height)),
-                _ => None,
+                Some(RenderbufferStorage::DepthStencil { width, height, .. }) => Some((width, height)),
+                None => None,
             },
             FramebufferAttachment::Texture { id, level } => self
                 .textures
@@ -3026,6 +3088,22 @@ impl State {
                 .get(&id)
                 .and_then(|t| t.levels.get(&(face, level)))
                 .map(|l| (l.width, l.height)),
+        }
+    }
+
+    /// An attachment's sample count, `0` for non-multisample -- always `0`
+    /// for a texture/cube-face attachment (this draft has no render-to-
+    /// multisample-texture extension), the renderbuffer's own `samples`
+    /// otherwise. Shared by [`Self::framebuffer_status`]'s `FRAMEBUFFER_
+    /// INCOMPLETE_MULTISAMPLE` check.
+    fn attachment_samples(&self, attachment: FramebufferAttachment) -> u32 {
+        match attachment {
+            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.get(&id).and_then(|rb| rb.storage) {
+                Some(RenderbufferStorage::Color { samples, .. }) => samples,
+                Some(RenderbufferStorage::DepthStencil { samples, .. }) => samples,
+                None => 0,
+            },
+            FramebufferAttachment::Texture { .. } | FramebufferAttachment::TextureFace { .. } => 0,
         }
     }
 
@@ -3041,6 +3119,7 @@ impl State {
             return GL_FRAMEBUFFER_COMPLETE;
         };
         let mut size: Option<(u32, u32)> = None;
+        let mut samples: Option<u32> = None;
         for color in fb.colors.iter().flatten() {
             let Some((width, height)) = self.attachment_size(*color) else {
                 return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
@@ -3049,6 +3128,12 @@ impl State {
                 None => size = Some((width, height)),
                 Some((w, h)) if w == width && h == height => {}
                 Some(_) => return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS,
+            }
+            let s = self.attachment_samples(*color);
+            match samples {
+                None => samples = Some(s),
+                Some(prev) if prev == s => {}
+                Some(_) => return GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE,
             }
         }
         let Some((width, height)) = size else {
@@ -3059,15 +3144,114 @@ impl State {
                 Some(RenderbufferStorage::DepthStencil {
                     width: dw,
                     height: dh,
+                    samples: ds,
                 }) => {
                     if dw != width || dh != height {
                         return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS;
+                    }
+                    if let Some(prev) = samples {
+                        if prev != ds {
+                            return GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE;
+                        }
                     }
                 }
                 _ => return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
             }
         }
         GL_FRAMEBUFFER_COMPLETE
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s colour-copy source: size and sample count of
+    /// the bound read framebuffer's `READ_BUFFER`-selected attachment, or
+    /// the draw surface when the default framebuffer is bound as read --
+    /// the same resolution rule `READ_PIXELS`/`TEX_COPY_IMAGE` already
+    /// follow. `None` for an incomplete read framebuffer, a `READ_BUFFER`
+    /// of `NONE`, or a selection naming an attachment point with nothing
+    /// attached -- the caller treats that as "nothing to copy", matching
+    /// how an incomplete framebuffer already silently no-ops a draw/
+    /// `CLEAR` rather than setting `GL_ERROR` (see this struct's module
+    /// doc comment on this family's known gap).
+    pub fn blit_color_source_info(&self) -> Option<(u32, u32, u32)> {
+        let fb_id = self.read_framebuffer;
+        if fb_id == 0 {
+            let s = self.surfaces.get(&self.draw_surface)?;
+            return Some((s.width, s.height, 0));
+        }
+        if self.framebuffer_status(FramebufferTarget::Read) != GL_FRAMEBUFFER_COMPLETE {
+            return None;
+        }
+        let fb = self.framebuffers.get(&fb_id)?;
+        let idx = fb.read_buffer?;
+        let attachment = (*fb.colors.get(idx)?)?;
+        let (w, h) = self.attachment_size(attachment)?;
+        Some((w, h, self.attachment_samples(attachment)))
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s colour-copy destination(s): one entry per
+    /// colour attachment the bound draw framebuffer's `DRAW_BUFFERS`
+    /// currently names (or the single draw surface, for the default
+    /// framebuffer), each `(width, height, samples)`. Empty, not `None`,
+    /// when there is nowhere to write -- `BLIT_FRAMEBUFFER` with no active
+    /// draw buffer simply copies nothing, like `CLEAR`'s colour bit would.
+    /// `None` only for an incomplete bound draw framebuffer.
+    pub fn blit_color_dest_info(&self) -> Option<Vec<(u32, u32, u32)>> {
+        let fb_id = self.draw_framebuffer;
+        if fb_id == 0 {
+            let s = self.surfaces.get(&self.draw_surface)?;
+            return Some(vec![(s.width, s.height, 0)]);
+        }
+        if self.framebuffer_status(FramebufferTarget::Draw) != GL_FRAMEBUFFER_COMPLETE {
+            return None;
+        }
+        let fb = self.framebuffers.get(&fb_id)?;
+        let mut out = Vec::new();
+        for slot in &fb.draw_buffers {
+            let Some(idx) = slot else { continue };
+            let Some(Some(attachment)) = fb.colors.get(*idx) else { continue };
+            if let Some((w, h)) = self.attachment_size(*attachment) {
+                out.push((w, h, self.attachment_samples(*attachment)));
+            }
+        }
+        Some(out)
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s depth/stencil-copy source: size and sample
+    /// count of the bound read framebuffer's `DEPTH_STENCIL_ATTACHMENT`
+    /// renderbuffer, or the draw surface's own (always non-multisample)
+    /// internal depth/stencil buffer when the default framebuffer is
+    /// bound as read. `None` for an incomplete read framebuffer or no
+    /// depth/stencil attached -- the caller treats that as "nothing to
+    /// copy", the same no-op precedent as the colour-plane helpers above.
+    pub fn blit_depth_stencil_source_info(&self) -> Option<(u32, u32, u32)> {
+        let fb_id = self.read_framebuffer;
+        if fb_id == 0 {
+            let s = self.surfaces.get(&self.draw_surface)?;
+            return Some((s.width, s.height, 0));
+        }
+        if self.framebuffer_status(FramebufferTarget::Read) != GL_FRAMEBUFFER_COMPLETE {
+            return None;
+        }
+        let fb = self.framebuffers.get(&fb_id)?;
+        let attachment = fb.depth_stencil?;
+        let (w, h) = self.attachment_size(attachment)?;
+        Some((w, h, self.attachment_samples(attachment)))
+    }
+
+    /// [`Self::blit_depth_stencil_source_info`], for the bound **draw**
+    /// framebuffer instead.
+    pub fn blit_depth_stencil_dest_info(&self) -> Option<(u32, u32, u32)> {
+        let fb_id = self.draw_framebuffer;
+        if fb_id == 0 {
+            let s = self.surfaces.get(&self.draw_surface)?;
+            return Some((s.width, s.height, 0));
+        }
+        if self.framebuffer_status(FramebufferTarget::Draw) != GL_FRAMEBUFFER_COMPLETE {
+            return None;
+        }
+        let fb = self.framebuffers.get(&fb_id)?;
+        let attachment = fb.depth_stencil?;
+        let (w, h) = self.attachment_size(attachment)?;
+        Some((w, h, self.attachment_samples(attachment)))
     }
 
     // -- Protocol errors this module is in a position to detect ---------
@@ -4766,6 +4950,109 @@ mod tests {
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         let past = GL_COLOR_ATTACHMENT0 + s.limits.max_color_attachments as u32;
         assert_eq!(s.read_buffer(past), Err(ErrorCode::BadArg));
+    }
+
+    #[test]
+    fn renderbuffer_storage_color_multisample_rejects_samples_below_two() {
+        let mut s = state();
+        s.renderbuffer_create(1);
+        assert_eq!(
+            s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, 1),
+            Err(ErrorCode::Limit)
+        );
+        assert_eq!(
+            s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, 0),
+            Err(ErrorCode::Limit)
+        );
+    }
+
+    #[test]
+    fn renderbuffer_storage_color_multisample_rejects_samples_above_max_samples() {
+        let mut s = state();
+        s.renderbuffer_create(1);
+        let past = s.limits.max_samples as u32 + 1;
+        assert_eq!(
+            s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, past),
+            Err(ErrorCode::Limit)
+        );
+    }
+
+    #[test]
+    fn renderbuffer_storage_color_multisample_accepts_max_samples() {
+        let mut s = state();
+        s.renderbuffer_create(1);
+        let max = s.limits.max_samples as u32;
+        assert_eq!(
+            s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, max),
+            Ok(())
+        );
+        assert_eq!(
+            s.renderbuffers.get(&1).unwrap().storage,
+            Some(RenderbufferStorage::Color {
+                width: 64,
+                height: 64,
+                format: SurfaceFormat::A8r8g8b8,
+                samples: max,
+            })
+        );
+    }
+
+    #[test]
+    fn renderbuffer_storage_depth_stencil_multisample_rejects_samples_below_two() {
+        let mut s = state();
+        s.renderbuffer_create(1);
+        assert_eq!(
+            s.renderbuffer_storage_depth_stencil_multisample(1, 64, 64, 1),
+            Err(ErrorCode::Limit)
+        );
+    }
+
+    /// A multisample colour attachment paired with a non-multisample
+    /// depth/stencil attachment (or one at a different `samples` value)
+    /// must be `FRAMEBUFFER_INCOMPLETE_MULTISAMPLE`, not `COMPLETE` --
+    /// the two attachment kinds are already size-matched, so only the
+    /// new sample-count check catches this.
+    #[test]
+    fn mismatched_sample_counts_between_colour_and_depth_stencil_are_incomplete_multisample() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, s.limits.max_samples as u32)
+            .unwrap();
+        s.renderbuffer_create(2);
+        s.renderbuffer_storage_depth_stencil(2, 64, 64); // samples: 0
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
+            .unwrap();
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 2)
+            .unwrap();
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
+        );
+    }
+
+    /// Two colour attachments at the *same* `samples` value, with no
+    /// depth/stencil attached, must stay `COMPLETE` -- the multisample
+    /// check must not fire just because a renderbuffer happens to be
+    /// multisample; only a *mismatch* is incomplete.
+    #[test]
+    fn matching_multisample_colour_attachments_stay_complete() {
+        let mut s = state();
+        s.framebuffer_create(1);
+        s.bind_framebuffer(FramebufferTarget::Both, 1);
+        let samples = s.limits.max_samples as u32;
+        s.renderbuffer_create(1);
+        s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, samples)
+            .unwrap();
+        s.renderbuffer_create(2);
+        s.renderbuffer_storage_color_multisample(2, 64, 64, SurfaceFormat::A8r8g8b8, samples)
+            .unwrap();
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
+            .unwrap();
+        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(1), 2)
+            .unwrap();
+        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
     }
 
     #[test]

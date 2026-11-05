@@ -2493,6 +2493,32 @@ fn cull_to_wgpu(face: Option<FaceKey>) -> Option<wgpu::Face> {
 /// threshold value gets a uniform -- unlike the threshold, a guest
 /// changing fog parameters mid-scene is rare enough that the resulting
 /// pipeline-cache churn is an acceptable simplification for now.
+/// `BLIT_FRAMEBUFFER`'s multisample depth resolve
+/// ([`Renderer::resolve_multisample_depth`]): a procedural full-screen
+/// triangle (no vertex buffer -- three hard-coded clip-space corners
+/// comfortably covering the viewport) whose fragment shader forwards
+/// sample index `0` of the source's depth aspect, per GL's own "never
+/// averaged" resolve rule for depth/stencil.
+const DEPTH_RESOLVE_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    return vec4<f32>(corners[idx], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    let coord = vec2<i32>(i32(pos.x), i32(pos.y));
+    return textureLoad(src, coord, 0);
+}
+"#;
+
 const VERTEX_SHADER: &str = r#"
 struct VsIn {
     @location(0) clip_pos: vec4<f32>,
@@ -2782,6 +2808,10 @@ type SamplerKey = (
     Option<wgpu::MipmapFilterMode>,
 );
 
+/// `BLIT_FRAMEBUFFER`'s colour-copy destination(s):
+/// [`Renderer::resolve_blit_color_destinations`]'s return shape.
+type BlitColorDestinations = Option<(u32, u32, Vec<(wgpu::Texture, wgpu::TextureView)>)>;
+
 /// A mip level's extent given its base (level 0) extent, per the
 /// standard `max(1, base >> level)` chain -- what wgpu itself computes
 /// for every level of a texture created with a given base size, so this
@@ -2944,6 +2974,10 @@ pub struct Renderer {
     /// One uniform (the clear colour + depth) -- see
     /// [`ClearRectPipelineKey`] and [`Renderer::op_clear`].
     bind_group_layout_clear_rect: wgpu::BindGroupLayout,
+    /// `BLIT_FRAMEBUFFER`'s multisample depth resolve -- see
+    /// [`Renderer::resolve_multisample_depth`].
+    bind_group_layout_depth_resolve: wgpu::BindGroupLayout,
+    depth_resolve_pipeline: wgpu::RenderPipeline,
     surfaces: HashMap<u32, GpuSurface>,
     textures: HashMap<u32, GpuTexture>,
     /// `TEX_PALETTE`'s bound RGBA8 colour tables, by texture id --
@@ -3000,7 +3034,7 @@ pub struct Renderer {
     /// through a shader), a renderbuffer is never read back by this
     /// tier, so there is no separate "shape" struct the way
     /// [`GpuTexture`] needs for its mip chain.
-    renderbuffers: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    renderbuffers: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
     /// `CAP_PROGRAMMABLE`'s depth/stencil renderbuffers, by id: the same
     /// shape as `renderbuffers` above, but [`INTERNAL_DEPTH_FORMAT`]
     /// instead of [`INTERNAL_COLOR_FORMAT`]. Only ever populated for a
@@ -3008,7 +3042,7 @@ pub struct Renderer {
     /// renderbuffer bound -- see [`Renderer::resolve_draw_target`] for
     /// the transient scratch buffer a framebuffer without one gets
     /// instead.
-    renderbuffer_depth: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    renderbuffer_depth: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32, u32)>,
 }
 
 /// One shader object's renderer-owned state (`docs/internals/c3d.md`'s
@@ -3626,9 +3660,17 @@ impl Renderer {
         // fallback this enables.
         let wanted_polygon_mode_features =
             wgpu::Features::POLYGON_MODE_LINE | wgpu::Features::POLYGON_MODE_POINT;
+        // `MAX_SAMPLES` (2, per `state::Limits::max_samples`'s doc
+        // comment) needs real `sample_count: 2` multisample textures to
+        // work -- the WebGPU baseline only guarantees `{1, 4}` for a
+        // colour format; `2` additionally needs this feature, which
+        // every backend tested so far (including the plain WebGPU
+        // software fallback) advertises, but is requested the same
+        // optional, degrade-if-absent way as every other feature here.
         let wanted_features = wanted_polygon_mode_features
             | wgpu::Features::DEPTH32FLOAT_STENCIL8
-            | wgpu::Features::TEXTURE_BINDING_ARRAY;
+            | wgpu::Features::TEXTURE_BINDING_ARRAY
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let requested_features = adapter.features() & wanted_features;
 
         // `downlevel_defaults()` leaves every binding-array element limit
@@ -3666,6 +3708,64 @@ impl Renderer {
         } else {
             INTERNAL_DEPTH_FORMAT
         };
+
+        // `BLIT_FRAMEBUFFER`'s multisample depth resolve ([`Renderer::
+        // resolve_multisample_depth`]): a full-screen-triangle pass
+        // reading the source's depth aspect via `textureLoad` at sample
+        // index 0 and writing it out through `@builtin(frag_depth)`.
+        // Stencil cannot be forwarded this way -- there is no WGSL
+        // fragment-shader builtin to write a stencil value, so a
+        // multisample *stencil* source is rejected at dispatch time
+        // instead (see `dispatch.rs`'s `Command::BlitFramebuffer` arm).
+        let bind_group_layout_depth_resolve = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("c3d depth-resolve bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let depth_resolve_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("c3d depth-resolve pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout_depth_resolve)],
+            immediate_size: 0,
+        });
+        let depth_resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("c3d depth-resolve shader"),
+            source: wgpu::ShaderSource::Wgsl(DEPTH_RESOLVE_WGSL.into()),
+        });
+        let depth_resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("c3d depth-resolve pipeline"),
+            layout: Some(&depth_resolve_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &depth_resolve_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &depth_resolve_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         // A `uniform sampler2D tex[N]` uniform (`glsl.rs`'s array-sampler
         // rewrite) compiles to a `wgpu` texture/sampler *binding array*,
         // an optional feature not every backend advertises. Same
@@ -3830,6 +3930,8 @@ impl Renderer {
             bind_group_layout_textured2,
             bind_group_layout_textured2_alpha,
             bind_group_layout_clear_rect,
+            bind_group_layout_depth_resolve,
+            depth_resolve_pipeline,
             surfaces: HashMap::new(),
             textures: HashMap::new(),
             palettes: HashMap::new(),
@@ -3931,19 +4033,27 @@ impl Renderer {
     /// texture (a renderbuffer's own depth/stencil counterpart, if any,
     /// is a separate renderbuffer object entirely, unlike a surface's
     /// always-present internal depth buffer).
-    fn ensure_renderbuffer_color(&mut self, id: u32, width: u32, height: u32) -> wgpu::TextureView {
-        let needs_create = !matches!(self.renderbuffers.get(&id), Some((_, _, w, h)) if *w == width && *h == height);
+    fn ensure_renderbuffer_color(&mut self, id: u32, width: u32, height: u32, samples: u32) -> wgpu::TextureView {
+        let needs_create =
+            !matches!(self.renderbuffers.get(&id), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
         if needs_create {
             let size = wgpu::Extent3d {
                 width: width.max(1),
                 height: height.max(1),
                 depth_or_array_layers: 1,
             };
+            // A multisampled texture cannot carry `TEXTURE_BINDING` with
+            // ordinary filtered sampling (`textureSample`); it is only
+            // ever read here via `textureLoad` in `op_blit_framebuffer`'s
+            // resolve shader, which needs `TEXTURE_BINDING` all the same
+            // (a multisampled binding type, not a plain one) -- `wgpu`
+            // itself only forbids combining `multisampled: true` texture
+            // *bindings* with a `filterable` sampler, not the usage flag.
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("c3d renderbuffer color"),
                 size,
                 mip_level_count: 1,
-                sample_count: 1,
+                sample_count: samples.max(1),
                 dimension: wgpu::TextureDimension::D2,
                 format: INTERNAL_COLOR_FORMAT,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -3953,7 +4063,7 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffers.insert(id, (texture, view, width, height));
+            self.renderbuffers.insert(id, (texture, view, width, height, samples));
         }
         self.renderbuffers.get(&id).expect("just inserted or present").1.clone()
     }
@@ -3966,9 +4076,8 @@ impl Renderer {
     /// an attached depth/stencil renderbuffer somewhere persistent to
     /// write to, unlike the transient scratch buffer
     /// [`Self::resolve_draw_target`] uses when none is attached.
-    fn ensure_renderbuffer_depth(&mut self, id: u32, width: u32, height: u32) -> wgpu::TextureView {
-        let needs_create =
-            !matches!(self.renderbuffer_depth.get(&id), Some((_, _, w, h)) if *w == width && *h == height);
+    fn ensure_renderbuffer_depth(&mut self, id: u32, width: u32, height: u32, samples: u32) -> wgpu::TextureView {
+        let needs_create = !matches!(self.renderbuffer_depth.get(&id), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
         if needs_create {
             let size = wgpu::Extent3d {
                 width: width.max(1),
@@ -3979,14 +4088,14 @@ impl Renderer {
                 label: Some("c3d renderbuffer depth/stencil"),
                 size,
                 mip_level_count: 1,
-                sample_count: 1,
+                sample_count: samples.max(1),
                 dimension: wgpu::TextureDimension::D2,
                 format: self.depth_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffer_depth.insert(id, (texture, view, width, height));
+            self.renderbuffer_depth.insert(id, (texture, view, width, height, samples));
         }
         self.renderbuffer_depth
             .get(&id)
@@ -4021,7 +4130,7 @@ impl Renderer {
     fn resolve_draw_target(
         &mut self,
         state: &State,
-    ) -> Result<Option<(u32, u32, Vec<Option<wgpu::TextureView>>, wgpu::TextureView, bool)>, RenderError> {
+    ) -> Result<Option<(u32, u32, Vec<Option<wgpu::TextureView>>, wgpu::TextureView, bool, u32)>, RenderError> {
         let fb_id = state.draw_framebuffer();
         if fb_id == 0 {
             let surf_id = state.draw_surface();
@@ -4035,6 +4144,7 @@ impl Renderer {
                 vec![Some(gpu.color_view.clone())],
                 gpu.depth_view.clone(),
                 true,
+                0,
             )));
         }
         if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
@@ -4052,16 +4162,18 @@ impl Renderer {
         // depth-only draw with every slot `NONE`). `FRAMEBUFFER_COMPLETE`
         // already guarantees every attached colour (and depth/stencil,
         // if attached) agrees in size.
-        let mut resolved: Vec<Option<(u32, u32, wgpu::TextureView)>> = Vec::with_capacity(fb.colors.len());
+        let mut resolved: Vec<Option<(u32, u32, wgpu::TextureView, u32)>> = Vec::with_capacity(fb.colors.len());
         let mut width = 0;
         let mut height = 0;
+        let mut color_samples = 0;
         for color in &fb.colors {
             resolved.push(match color {
                 Some(attachment) => {
-                    let (w, h, view) = self.resolve_color_attachment(state, *attachment)?;
+                    let (w, h, view, samples) = self.resolve_color_attachment(state, *attachment)?;
                     width = w;
                     height = h;
-                    Some((w, h, view))
+                    color_samples = samples;
+                    Some((w, h, view, samples))
                 }
                 None => None,
             });
@@ -4072,15 +4184,25 @@ impl Renderer {
             .map(|slot| {
                 slot.and_then(|i| resolved.get(i))
                     .and_then(|v| v.as_ref())
-                    .map(|(_, _, view)| view.clone())
+                    .map(|(_, _, view, _)| view.clone())
             })
             .collect();
 
         let (depth_view, persistent_depth) = match fb.depth_stencil {
             Some(state::FramebufferAttachment::Renderbuffer(rb_id)) => {
-                (self.ensure_renderbuffer_depth(rb_id, width, height), true)
+                let samples = match state.renderbuffer(rb_id).and_then(|r| r.storage) {
+                    Some(state::RenderbufferStorage::DepthStencil { samples, .. }) => samples,
+                    _ => 0,
+                };
+                (self.ensure_renderbuffer_depth(rb_id, width, height, samples), true)
             }
             _ => {
+                // Must match every colour attachment's sample count --
+                // `wgpu` requires every attachment in one render pass to
+                // agree, and `FRAMEBUFFER_COMPLETE` (via `FRAMEBUFFER_
+                // INCOMPLETE_MULTISAMPLE`) already guarantees every
+                // attached colour shares one value, so any one of them
+                // (here, the last one resolved above) is representative.
                 let size = wgpu::Extent3d {
                     width: width.max(1),
                     height: height.max(1),
@@ -4090,7 +4212,7 @@ impl Renderer {
                     label: Some("c3d framebuffer scratch depth"),
                     size,
                     mip_level_count: 1,
-                    sample_count: 1,
+                    sample_count: color_samples.max(1),
                     dimension: wgpu::TextureDimension::D2,
                     format: self.depth_format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -4099,7 +4221,7 @@ impl Renderer {
                 (depth.create_view(&wgpu::TextureViewDescriptor::default()), false)
             }
         };
-        Ok(Some((width, height, color_views, depth_view, persistent_depth)))
+        Ok(Some((width, height, color_views, depth_view, persistent_depth, color_samples)))
     }
 
     /// One colour attachment's resolved GPU view and declared size,
@@ -4135,15 +4257,15 @@ impl Renderer {
         &mut self,
         state: &State,
         attachment: state::FramebufferAttachment,
-    ) -> Result<(u32, u32, wgpu::TextureView), RenderError> {
+    ) -> Result<(u32, u32, wgpu::TextureView, u32), RenderError> {
         match attachment {
             state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
+                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
                     state.renderbuffer(rb_id).and_then(|r| r.storage)
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                Ok((width, height, self.ensure_renderbuffer_color(rb_id, width, height)))
+                Ok((width, height, self.ensure_renderbuffer_color(rb_id, width, height, samples), samples))
             }
             state::FramebufferAttachment::Texture { id, level } => {
                 let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
@@ -4154,7 +4276,7 @@ impl Renderer {
                     mip_level_count: Some(1),
                     ..Default::default()
                 });
-                Ok((width, height, view))
+                Ok((width, height, view, 0))
             }
             state::FramebufferAttachment::TextureFace { id, face, level } => {
                 let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
@@ -4171,7 +4293,7 @@ impl Renderer {
                     mip_level_count: Some(1),
                     ..Default::default()
                 });
-                Ok((width, height, view))
+                Ok((width, height, view, 0))
             }
         }
     }
@@ -4219,12 +4341,12 @@ impl Renderer {
         };
         match *attachment {
             state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, .. }) =
+                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
                     state.renderbuffer(rb_id).and_then(|r| r.storage)
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                self.ensure_renderbuffer_color(rb_id, width, height);
+                self.ensure_renderbuffer_color(rb_id, width, height, samples);
                 let texture = self.renderbuffers.get(&rb_id).expect("just ensured").0.clone();
                 Ok(Some((width, height, texture, 0)))
             }
@@ -4996,11 +5118,26 @@ impl Renderer {
             RenderOp::FramebufferStatus { dest, status } => {
                 self.op_framebuffer_status(*dest, *status, mem)
             }
+            RenderOp::BlitFramebuffer {
+                src_x0,
+                src_y0,
+                src_x1,
+                src_y1,
+                dst_x0,
+                dst_y0,
+                dst_x1,
+                dst_y1,
+                mask,
+                filter,
+                state,
+            } => self.op_blit_framebuffer(
+                *src_x0, *src_y0, *src_x1, *src_y1, *dst_x0, *dst_y0, *dst_x1, *dst_y1, *mask, *filter, state,
+            ),
         }
     }
 
     fn op_clear(&mut self, mask: u32, state: &State) -> Result<(), RenderError> {
-        let Some((width, height, color_views, depth_view, _persistent_depth)) =
+        let Some((width, height, color_views, depth_view, _persistent_depth, _color_samples)) =
             self.resolve_draw_target(state)?
         else {
             // A CLEAR against an incomplete bound framebuffer is not a
@@ -5245,6 +5382,590 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`. Every GL-error case (`LINEAR` with depth/
+    /// stencil, a multisample scale/flip/sample-count mismatch) is
+    /// already rejected at dispatch time ([`dispatch::Context::apply`]'s
+    /// `Command::BlitFramebuffer` arm) from pure protocol state, so by
+    /// the time an op reaches here it is always a combination this
+    /// function can actually perform -- no validation left to do, only
+    /// the copy itself. An incomplete read/draw framebuffer, or a `NONE`
+    /// `READ_BUFFER`, resolve to `Ok(None)`/an empty destination list
+    /// respectively and are silently skipped, the same no-op precedent
+    /// `READ_PIXELS`/a programmable draw already follow for an incomplete
+    /// framebuffer.
+    #[allow(clippy::too_many_arguments)]
+    fn op_blit_framebuffer(
+        &mut self,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        mask: u32,
+        filter: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        if mask & proto::CLEAR_MASK_COLOR != 0 {
+            self.blit_color(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, filter, state)?;
+        }
+        if mask & (proto::CLEAR_MASK_DEPTH | proto::CLEAR_MASK_STENCIL) != 0 {
+            self.blit_depth_stencil(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, state)?;
+        }
+        Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s colour plane. Three distinct copy mechanisms,
+    /// chosen by the source's real `sample_count()` (never assumed --
+    /// read straight off the `wgpu::Texture`, the one place this module
+    /// trusts the GPU resource over its own bookkeeping, since it is
+    /// exactly the value `wgpu` itself will enforce):
+    ///
+    /// - non-multisample source: a CPU round-trip ([`Self::cpu_blit_color`])
+    ///   -- the only path that needs to scale or flip, which `wgpu` has
+    ///   no single built-in op for; pushing this to the CPU costs nothing
+    ///   the guest cares about (see this module's design-principle doc
+    ///   comment on minimising 68k work -- the copy itself already runs
+    ///   entirely on the device side either way).
+    /// - multisample source, non-multisample (or differently-less-sampled)
+    ///   destination: `wgpu`'s own hardware resolve, triggered by an
+    ///   empty render pass naming the destination as `resolve_target`
+    ///   ([`Self::resolve_multisample_color`]) -- real MSAA resolve
+    ///   quality from the backend itself, not a hand-rolled average.
+    /// - multisample source, equal-sample-count multisample destination:
+    ///   `copy_texture_to_texture`, `wgpu`'s own direct same-sample-count
+    ///   copy.
+    ///
+    /// Dispatch-time validation already guarantees a multisample source
+    /// is always same-size and unflipped against every destination here,
+    /// so neither multisample path needs to handle scale/flip itself.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_color(
+        &mut self,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        filter: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let Some((src_w, src_h, src_tex, src_level)) = self.resolve_read_source(state)? else {
+            return Ok(());
+        };
+        let Some((_, _, dests)) = self.resolve_blit_color_destinations(state)? else {
+            return Ok(());
+        };
+        if dests.is_empty() {
+            return Ok(());
+        }
+
+        let src_samples = src_tex.sample_count();
+        let sx = src_x0.min(src_x1).clamp(0, src_w as i32) as u32;
+        let sy = src_y0.min(src_y1).clamp(0, src_h as i32) as u32;
+        let sw = (src_x0.max(src_x1).clamp(0, src_w as i32) as u32).saturating_sub(sx);
+        let sh = (src_y0.max(src_y1).clamp(0, src_h as i32) as u32).saturating_sub(sy);
+        let flip_x = (src_x1 >= src_x0) != (dst_x1 >= dst_x0);
+        let flip_y = (src_y1 >= src_y0) != (dst_y1 >= dst_y0);
+
+        for (dst_tex, dst_view) in &dests {
+            let dw = dst_tex.size().width;
+            let dh = dst_tex.size().height;
+            let dx = dst_x0.min(dst_x1).clamp(0, dw as i32) as u32;
+            let dy = dst_y0.min(dst_y1).clamp(0, dh as i32) as u32;
+            let dst_w = (dst_x0.max(dst_x1).clamp(0, dw as i32) as u32).saturating_sub(dx);
+            let dst_h = (dst_y0.max(dst_y1).clamp(0, dh as i32) as u32).saturating_sub(dy);
+            if sw == 0 || sh == 0 || dst_w == 0 || dst_h == 0 {
+                continue;
+            }
+            if src_samples > 1 {
+                if dst_tex.sample_count() == src_samples {
+                    self.copy_texture_region(&src_tex, src_level, sx, sy, dst_tex, 0, dx, dy, sw, sh);
+                } else {
+                    // Dispatch-time validation already guarantees this is
+                    // the exact same-size, unflipped case a hardware
+                    // resolve needs -- see this function's doc comment.
+                    self.resolve_multisample_color(&src_tex, dst_view);
+                }
+            } else {
+                self.cpu_blit_color(&src_tex, src_level, sx, sy, sw, sh, dst_tex, dx, dy, dst_w, dst_h, flip_x, flip_y, filter)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s colour-copy destination(s): one `(Texture,
+    /// View)` pair per colour attachment the bound draw framebuffer's
+    /// `DRAW_BUFFERS` currently names (the single draw surface, for the
+    /// default framebuffer) -- renderbuffer/surface-backed only. A
+    /// texture or cube-face colour attachment as a blit destination is
+    /// out of scope for this draft (`Err(Unimplemented)`), the same
+    /// boundary [`Self::resolve_read_source`] already draws for a
+    /// cube-face *source*. `Ok(None)` for an incomplete bound draw
+    /// framebuffer; an empty `Vec` (not `None`) when there is simply
+    /// nowhere to write (every `DRAW_BUFFERS` slot `NONE`).
+    fn resolve_blit_color_destinations(&mut self, state: &State) -> Result<BlitColorDestinations, RenderError> {
+        let fb_id = state.draw_framebuffer();
+        if fb_id == 0 {
+            let surf_id = state.draw_surface();
+            let def = *state
+                .surface(surf_id)
+                .ok_or(RenderError::UnknownObject("surface", surf_id))?;
+            let gpu = self.ensure_surface(surf_id, &def)?;
+            return Ok(Some((
+                def.width,
+                def.height,
+                vec![(gpu.color.clone(), gpu.color_view.clone())],
+            )));
+        }
+        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
+            return Ok(None);
+        }
+        let fb = state
+            .framebuffer(fb_id)
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists")
+            .clone();
+        let mut width = 0;
+        let mut height = 0;
+        let mut resolved: Vec<Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>> =
+            Vec::with_capacity(fb.colors.len());
+        for color in &fb.colors {
+            resolved.push(match color {
+                Some(attachment) => {
+                    let (w, h, tex, view) = self.resolve_color_attachment_texture(state, *attachment)?;
+                    width = w;
+                    height = h;
+                    Some((w, h, tex, view))
+                }
+                None => None,
+            });
+        }
+        let mut out = Vec::new();
+        for slot in &fb.draw_buffers {
+            let Some(idx) = slot else { continue };
+            if let Some(Some((_, _, tex, view))) = resolved.get(*idx) {
+                out.push((tex.clone(), view.clone()));
+            }
+        }
+        Ok(Some((width, height, out)))
+    }
+
+    /// [`Self::resolve_color_attachment`], but also returning the
+    /// underlying `wgpu::Texture` -- [`Self::resolve_blit_color_destinations`]
+    /// needs both the view (a hardware resolve's `resolve_target`) and
+    /// the texture itself (`copy_texture_to_texture`'s destination,
+    /// which `wgpu` addresses by texture, not view).
+    fn resolve_color_attachment_texture(
+        &mut self,
+        state: &State,
+        attachment: state::FramebufferAttachment,
+    ) -> Result<(u32, u32, wgpu::Texture, wgpu::TextureView), RenderError> {
+        match attachment {
+            state::FramebufferAttachment::Renderbuffer(rb_id) => {
+                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
+                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                else {
+                    unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
+                };
+                let view = self.ensure_renderbuffer_color(rb_id, width, height, samples);
+                let tex = self.renderbuffers.get(&rb_id).expect("just ensured").0.clone();
+                Ok((width, height, tex, view))
+            }
+            state::FramebufferAttachment::Texture { .. } | state::FramebufferAttachment::TextureFace { .. } => {
+                Err(RenderError::Unimplemented(
+                    "BLIT_FRAMEBUFFER to/from a texture-backed colour attachment",
+                ))
+            }
+        }
+    }
+
+    /// A same-size, same-sample-count region copy -- `wgpu`'s own
+    /// `copy_texture_to_texture`, used for a plain renderbuffer-to-
+    /// renderbuffer colour copy sharing one multisample count (including
+    /// the non-multisample case elsewhere, where `src_samples <= 1`
+    /// instead goes through [`Self::cpu_blit_color`] for its scale/flip
+    /// ability -- this helper is multisample-to-multisample's own path,
+    /// where scale/flip are already forbidden by dispatch-time
+    /// validation).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_texture_region(
+        &mut self,
+        src: &wgpu::Texture,
+        src_level: u32,
+        sx: u32,
+        sy: u32,
+        dst: &wgpu::Texture,
+        dst_level: u32,
+        dx: u32,
+        dy: u32,
+        w: u32,
+        h: u32,
+    ) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d blit same-sample copy"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: src,
+                mip_level: src_level,
+                origin: wgpu::Origin3d { x: sx, y: sy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: dst_level,
+                origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s multisample-resolve path: an empty render
+    /// pass (`LoadOp::Load`, no draw calls) naming `dst` as the colour
+    /// attachment's `resolve_target` -- `wgpu` performs the hardware
+    /// resolve at pass end regardless of whether anything was drawn in
+    /// it, which is exactly the "resolve an already-rendered multisample
+    /// texture, not a fresh draw" shape `BLIT_FRAMEBUFFER` needs. Always
+    /// resolves the *entire* source/destination extent, not just the
+    /// requested rectangle -- dispatch-time validation already requires
+    /// the rectangle to be the same size and unflipped as the whole
+    /// multisample source for this path to be reached at all, so in
+    /// every case this function is actually called for, the two coincide
+    /// with "the whole texture" in practice for this draft's test
+    /// coverage; a sub-rect multisample resolve that leaves the rest of
+    /// the destination's prior contents untouched is not implemented.
+    fn resolve_multisample_color(&mut self, src: &wgpu::Texture, dst: &wgpu::TextureView) {
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d msaa resolve"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("c3d msaa resolve pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &src_view,
+                    depth_slice: None,
+                    resolve_target: Some(dst),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s non-multisample colour copy: the only path
+    /// that can scale or flip, via a CPU round-trip -- read the source
+    /// rectangle back as RGBA8, resample it in plain Rust (nearest or
+    /// bilinear, `filter`), and `queue.write_texture` the result into the
+    /// destination rectangle. `wgpu` has no single built-in op that
+    /// scales *and* flips an arbitrary rectangle between two textures in
+    /// one call; this mirrors the same CPU-round-trip strategy
+    /// [`Self::generate_mips_for_face`] already uses for its own
+    /// per-texel filtering, for the same reason.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_blit_color(
+        &mut self,
+        src: &wgpu::Texture,
+        src_level: u32,
+        sx: u32,
+        sy: u32,
+        sw: u32,
+        sh: u32,
+        dst: &wgpu::Texture,
+        dx: u32,
+        dy: u32,
+        dw: u32,
+        dh: u32,
+        flip_x: bool,
+        flip_y: bool,
+        filter: u32,
+    ) -> Result<(), RenderError> {
+        let src_rgba = self.copy_texture_rect_to_cpu(src, src_level, sx, sy, sw, sh)?;
+        let mut out = vec![0u8; (dw * dh * 4) as usize];
+        let bilinear = filter == proto::BLIT_FILTER_LINEAR;
+        for oy in 0..dh {
+            // Sample position in source space, before the flip: a flip
+            // just reverses which edge `0` maps to, so it's applied by
+            // inverting the sampled axis coordinate, not by reversing
+            // the output loop order (equivalent, but keeps the output
+            // buffer's own row/column order the ordinary one `queue.
+            // write_texture` expects).
+            let v = (oy as f32 + 0.5) / dh as f32;
+            let v = if flip_y { 1.0 - v } else { v };
+            for ox in 0..dw {
+                let u = (ox as f32 + 0.5) / dw as f32;
+                let u = if flip_x { 1.0 - u } else { u };
+                let out_idx = ((oy * dw + ox) * 4) as usize;
+                if bilinear {
+                    let fx = (u * sw as f32 - 0.5).max(0.0);
+                    let fy = (v * sh as f32 - 0.5).max(0.0);
+                    let x0 = fx.floor() as u32;
+                    let y0 = fy.floor() as u32;
+                    let x1 = (x0 + 1).min(sw.saturating_sub(1));
+                    let y1 = (y0 + 1).min(sh.saturating_sub(1));
+                    let tx = fx - x0 as f32;
+                    let ty = fy - y0 as f32;
+                    let texel = |x: u32, y: u32, c: usize| -> f32 {
+                        src_rgba[((y.min(sh.saturating_sub(1)) * sw + x.min(sw.saturating_sub(1))) * 4) as usize + c] as f32
+                    };
+                    for c in 0..4 {
+                        let top = texel(x0, y0, c) * (1.0 - tx) + texel(x1, y0, c) * tx;
+                        let bot = texel(x0, y1, c) * (1.0 - tx) + texel(x1, y1, c) * tx;
+                        out[out_idx + c] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+                    }
+                } else {
+                    let sx_px = ((u * sw as f32) as u32).min(sw.saturating_sub(1));
+                    let sy_px = ((v * sh as f32) as u32).min(sh.saturating_sub(1));
+                    let src_idx = ((sy_px * sw + sx_px) * 4) as usize;
+                    out[out_idx..out_idx + 4].copy_from_slice(&src_rgba[src_idx..src_idx + 4]);
+                }
+            }
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: dst,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: dx, y: dy, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &out,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dw * 4),
+                rows_per_image: Some(dh),
+            },
+            wgpu::Extent3d {
+                width: dw,
+                height: dh,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s depth/stencil plane. Two mechanisms:
+    ///
+    /// - non-multisample source: a same-size `copy_texture_to_texture`
+    ///   (no filter applies to depth/stencil, and dispatch-time
+    ///   validation already requires same-size/unflipped whenever either
+    ///   side is multisample, which a non-multisample source need not be,
+    ///   but this draft doesn't implement a scaled/flipped depth/stencil
+    ///   resample either -- silently skipped if the rect doesn't match).
+    /// - multisample source: [`Self::resolve_multisample_depth`] forwards
+    ///   sample index `0`'s *depth* value (GL's own "never averaged"
+    ///   resolve rule) via a dedicated pass, writing only the depth
+    ///   aspect (`stencil_ops: None` in the render pass -- the
+    ///   destination's existing stencil content is left untouched).
+    ///   Stencil cannot be forwarded this way (no WGSL fragment-shader
+    ///   builtin writes a stencil value); dispatch-time validation
+    ///   already rejects `STENCIL_BUFFER_BIT` against a multisample
+    ///   source outright (`GL_INVALID_OPERATION`, whole call aborted), so
+    ///   `mask`'s stencil bit is never actually set here when
+    ///   `src_samples > 1` -- `depth_requested` is the only bit this
+    ///   branch needs to check.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_depth_stencil(
+        &mut self,
+        src_x0: i32,
+        src_y0: i32,
+        src_x1: i32,
+        src_y1: i32,
+        dst_x0: i32,
+        dst_y0: i32,
+        dst_x1: i32,
+        dst_y1: i32,
+        mask: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let Some((src_w, src_h, src_tex, src_samples)) = self.resolve_depth_stencil_source(state)? else {
+            return Ok(());
+        };
+        let Some((dst_w, dst_h, dst_tex, dst_samples)) = self.resolve_depth_stencil_destination(state)? else {
+            return Ok(());
+        };
+        let same_rect = (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+        if !same_rect {
+            // A scaled/flipped depth/stencil blit is not implemented in
+            // this draft; dispatch-time validation already requires
+            // same-size/unflipped whenever either side is multisample,
+            // so this is only reached for two non-multisample sides,
+            // where a scale/flip is otherwise legal GL but unimplemented
+            // here -- silently skipped.
+            return Ok(());
+        }
+        let sx = src_x0.min(src_x1).clamp(0, src_w as i32) as u32;
+        let sy = src_y0.min(src_y1).clamp(0, src_h as i32) as u32;
+        let w = (src_x0.max(src_x1).clamp(0, src_w as i32) as u32).saturating_sub(sx);
+        let h = (src_y0.max(src_y1).clamp(0, src_h as i32) as u32).saturating_sub(sy);
+        let dx = dst_x0.min(dst_x1).clamp(0, dst_w as i32) as u32;
+        let dy = dst_y0.min(dst_y1).clamp(0, dst_h as i32) as u32;
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        if src_samples > 1 {
+            if mask & proto::CLEAR_MASK_DEPTH != 0 {
+                self.resolve_multisample_depth(&src_tex, &dst_tex)?;
+            }
+            return Ok(());
+        }
+        if dst_samples > 1 {
+            // Dispatch-time validation already rejects a non-multisample
+            // source into a multisample destination; reached only if
+            // that invariant is ever violated -- defensively a no-op
+            // rather than attempting an incorrect copy.
+            return Ok(());
+        }
+        self.copy_texture_region(&src_tex, 0, sx, sy, &dst_tex, 0, dx, dy, w, h);
+        Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s multisample depth resolve: a full-screen-
+    /// triangle pass over the *entire* destination texture (like
+    /// [`Self::resolve_multisample_color`]'s native hardware resolve,
+    /// this draft's multisample resolve paths cover the whole texture,
+    /// not just the requested rectangle -- see that function's doc
+    /// comment for why), forwarding sample index `0` of `src`'s depth
+    /// aspect via [`DEPTH_RESOLVE_WGSL`]. `stencil_ops: None` leaves
+    /// `dst`'s stencil content exactly as it was.
+    fn resolve_multisample_depth(&mut self, src: &wgpu::Texture, dst: &wgpu::Texture) -> Result<(), RenderError> {
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c3d depth-resolve bind group"),
+            layout: &self.bind_group_layout_depth_resolve,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&src_view),
+            }],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d depth resolve"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("c3d depth resolve pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &dst_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.depth_resolve_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s depth/stencil source: the bound read
+    /// framebuffer's `DEPTH_STENCIL_ATTACHMENT` renderbuffer, or the
+    /// draw surface's own internal depth/stencil buffer when the default
+    /// framebuffer is bound as read -- renderbuffer-only (a depth/stencil
+    /// attachment is never a texture in this draft, per `FRAMEBUFFER_
+    /// ATTACH_TEXTURE`'s "only a colour attachment point accepts a
+    /// texture"). `Ok(None)` for an incomplete read framebuffer or no
+    /// depth/stencil attached.
+    fn resolve_depth_stencil_source(
+        &mut self,
+        state: &State,
+    ) -> Result<Option<(u32, u32, wgpu::Texture, u32)>, RenderError> {
+        let fb_id = state.read_framebuffer();
+        if fb_id == 0 {
+            let surf_id = state.draw_surface();
+            let def = *state
+                .surface(surf_id)
+                .ok_or(RenderError::UnknownObject("surface", surf_id))?;
+            let gpu = self.ensure_surface(surf_id, &def)?;
+            return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
+        }
+        if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
+            return Ok(None);
+        }
+        let fb = state
+            .framebuffer(fb_id)
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists");
+        let Some(state::FramebufferAttachment::Renderbuffer(rb_id)) = fb.depth_stencil else {
+            return Ok(None);
+        };
+        let Some(state::RenderbufferStorage::DepthStencil { width, height, samples }) =
+            state.renderbuffer(rb_id).and_then(|r| r.storage)
+        else {
+            return Ok(None);
+        };
+        self.ensure_renderbuffer_depth(rb_id, width, height, samples);
+        let tex = self.renderbuffer_depth.get(&rb_id).expect("just ensured").0.clone();
+        Ok(Some((width, height, tex, samples)))
+    }
+
+    /// [`Self::resolve_depth_stencil_source`], for the bound **draw**
+    /// framebuffer instead.
+    fn resolve_depth_stencil_destination(
+        &mut self,
+        state: &State,
+    ) -> Result<Option<(u32, u32, wgpu::Texture, u32)>, RenderError> {
+        let fb_id = state.draw_framebuffer();
+        if fb_id == 0 {
+            let surf_id = state.draw_surface();
+            let def = *state
+                .surface(surf_id)
+                .ok_or(RenderError::UnknownObject("surface", surf_id))?;
+            let gpu = self.ensure_surface(surf_id, &def)?;
+            return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
+        }
+        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
+            return Ok(None);
+        }
+        let fb = state
+            .framebuffer(fb_id)
+            .expect("FRAMEBUFFER_COMPLETE implies the framebuffer exists");
+        let Some(state::FramebufferAttachment::Renderbuffer(rb_id)) = fb.depth_stencil else {
+            return Ok(None);
+        };
+        let Some(state::RenderbufferStorage::DepthStencil { width, height, samples }) =
+            state.renderbuffer(rb_id).and_then(|r| r.storage)
+        else {
+            return Ok(None);
+        };
+        self.ensure_renderbuffer_depth(rb_id, width, height, samples);
+        let tex = self.renderbuffer_depth.get(&rb_id).expect("just ensured").0.clone();
+        Ok(Some((width, height, tex, samples)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7470,7 +8191,7 @@ impl Renderer {
             })
             .collect::<Result<_, _>>()?;
 
-        let Some((target_width, target_height, color_views, depth_view, persistent_depth)) =
+        let Some((target_width, target_height, color_views, depth_view, persistent_depth, target_samples)) =
             self.resolve_draw_target(state)?
         else {
             // A programmable draw against an incomplete bound
@@ -7957,7 +8678,10 @@ impl Renderer {
                 },
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: target_samples.max(1),
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &fs_shader,
                 entry_point: Some("main"),
@@ -14798,6 +15522,439 @@ mod tests {
             encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap(),
             blue.as_slice(),
             "COLOR_ATTACHMENT1 (gl_FragData[1]) should read back blue: {blue:?}"
+        );
+    }
+
+    /// `BLIT_FRAMEBUFFER` resolving a multisample colour renderbuffer into
+    /// the (non-multisample) default framebuffer: draws a red quad and a
+    /// blue quad sharing a vertical edge that bisects pixel column 2 of a
+    /// 4x4 multisample target, resolves, and checks that column's pixel
+    /// is neither pure red nor pure blue -- real antialiasing from
+    /// `wgpu`'s own hardware resolve, not a hand-rolled average. Columns
+    /// 0 and 3, well away from the edge, must stay pure.
+    #[test]
+    fn blit_framebuffer_resolves_a_multisample_colour_target_with_a_genuinely_blended_edge() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const NEAREST: u32 = 0;
+
+        let vs_src = b"attribute vec4 position;\nattribute vec4 color;\nvarying vec4 vColor;\nvoid main() { gl_Position = position; vColor = color; }\n";
+        let fs_src = b"precision mediump float;\nvarying vec4 vColor;\nvoid main() { gl_FragColor = vColor; }\n";
+        // The shared edge sits at NDC x = 0.25, i.e. pixel x = 2.5 of a
+        // 4-wide target -- exactly bisecting pixel column 2, so a
+        // multisample target's per-sample coverage differs on either
+        // side of it within that one pixel.
+        #[rustfmt::skip]
+        let verts: Vec<f32> = vec![
+            // Red quad: NDC x in [-1, 0.25].
+            -1.0, -1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+             0.25, -1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+            -1.0,  1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+             0.25, -1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+             0.25,  1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+            -1.0,  1.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
+            // Blue quad: NDC x in [0.25, 1].
+             0.25, -1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+             1.0, -1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+             0.25,  1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+             1.0, -1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+             1.0,  1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+             0.25,  1.0, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let iface_addr = 0x5200u32;
+        let link_commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_PROGRAM_INTERFACE, &[1, iface_addr, 512]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
+        let [pos_loc, color_loc] = program_interface_locations(&mut mem, iface_addr, &["position", "color"]);
+
+        let samples = ctx.state.limits().max_samples as u32;
+        let commands = vec![
+            cmd(proto::OP_SURFACE_DEFINE, &[9, 4, 4, 16, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[9]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, A8R8G8B8, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[pos_loc, 4, GL_FLOAT, 0, 32, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[pos_loc, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[color_loc, 4, GL_FLOAT, 0, 32, 16, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[color_loc, 1]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 12]), // GL_TRIANGLES
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 0]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let (w, h, pixels) = renderer.read_surface_rgba8(9).unwrap();
+        assert_eq!((w, h), (4, 4));
+        let row = 1usize; // any row; the split is uniform along y
+        let px = |col: usize| &pixels[(row * 4 + col) * 4..(row * 4 + col) * 4 + 4];
+        assert_eq!(px(0), [255, 0, 0, 255], "column 0 (well left of the edge) must be pure red: {:?}", px(0));
+        assert_eq!(px(3), [0, 0, 255, 255], "column 3 (well right of the edge) must be pure blue: {:?}", px(3));
+        let edge = px(2);
+        assert!(
+            edge != [255u8, 0, 0, 255] && edge != [0u8, 0, 255, 255],
+            "column 2, straddling the edge, must be a genuine blend of red and blue, not either pure colour: {edge:?}"
+        );
+    }
+
+    /// `BLIT_FRAMEBUFFER` scaling a non-multisample 2x2 source up to a
+    /// 4x4 destination, and the equivalent flipped copy -- the CPU-
+    /// round-trip path, the only one of the three colour-copy mechanisms
+    /// that can change size or orientation.
+    #[test]
+    fn blit_framebuffer_scales_and_flips_a_non_multisample_colour_copy() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const NEAREST: u32 = 0;
+        let mut mem = TestMemory::new(65536);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+
+        // A 2x2 source: top-left red, top-right green, bottom-left blue,
+        // bottom-right white -- four distinct quadrants let a scale and
+        // a vertical flip both be checked unambiguously.
+        let commands = vec![
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+        // Four 1x1 SURFACE_UPLOAD-shaped TEX_SUBIMAGE-equivalent writes
+        // aren't available for a renderbuffer directly, so build the 2x2
+        // image via four CLEAR+SCISSOR passes instead -- simplest given
+        // no upload opcode targets a renderbuffer.
+        let px = |r: u8, g: u8, b: u8| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+        let quadrant = |x: u32, y: u32, color: [f32; 4]| {
+            vec![
+                cmd(proto::OP_SCISSOR, &[x, y, 1, 1]),
+                cmd(proto::OP_ENABLE, &[0x0C11]), // GL_SCISSOR_TEST
+                cmd_f32(proto::OP_CLEAR_COLOR, &color),
+                cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            ]
+        };
+        let mut fill_commands = vec![cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1])];
+        fill_commands.extend(quadrant(0, 0, px(255, 0, 0))); // (0,0) red
+        fill_commands.extend(quadrant(1, 0, px(0, 255, 0))); // (1,0) green
+        fill_commands.extend(quadrant(0, 1, px(0, 0, 255))); // (0,1) blue
+        fill_commands.extend(quadrant(1, 1, px(255, 255, 255))); // (1,1) white
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &fill_commands);
+
+        // Scale 2x2 -> 4x4 into a second framebuffer, nearest filter (an
+        // exact 2x2 block replication, trivial to assert on).
+        let dest_commands = vec![
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[2]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 2]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[2, 4, 4, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 2]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &dest_commands);
+
+        let dest = 0x3000u32;
+        let readback = vec![
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 2]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 4, 4, A8R8G8B8, 16, 0, dest, 64]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+        let scaled = mem.read(MemLoc::Aperture(dest), 64).unwrap().to_vec();
+        let pixel_at = |x: usize, y: usize| -> &[u8] { &scaled[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4] };
+        assert_eq!(pixel_at(0, 0), encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap());
+        assert_eq!(pixel_at(3, 0), encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 255, 0, 255]).unwrap());
+        assert_eq!(pixel_at(0, 3), encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap());
+        assert_eq!(pixel_at(3, 3), encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 255, 255, 255]).unwrap());
+
+        // The flipped copy: a reversed source y-range (0,2 -> 0,0, i.e.
+        // src y0=2,y1=0) must swap the top/bottom halves relative to the
+        // unflipped case above -- check it against a *same-size* (2x2 ->
+        // 2x2) destination so the result is exact, not resampled.
+        let flip_commands = vec![
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[3]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 3]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[3]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[3, 2, 2, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 3]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            // src y0=2 (bottom), y1=0 (top): reversed -- flips the y axis.
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 2, 2, 0, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &flip_commands);
+        let dest2 = 0x3100u32;
+        let readback2 = vec![
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 3]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest2, 16]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback2);
+        let flipped = mem.read(MemLoc::Aperture(dest2), 16).unwrap().to_vec();
+        let flipped_at = |x: usize, y: usize| -> &[u8] { &flipped[(y * 2 + x) * 4..(y * 2 + x) * 4 + 4] };
+        // Source (0,0)=red is on top; after a y-flip it must land at the
+        // bottom (0,1) of the destination, and source (0,1)=blue must
+        // land at the top (0,0).
+        assert_eq!(
+            flipped_at(0, 0),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap(),
+            "y-flip must move the source bottom row (blue) to the destination's top"
+        );
+        assert_eq!(
+            flipped_at(0, 1),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+            "y-flip must move the source top row (red) to the destination's bottom"
+        );
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s colour copy fans one source out to **every**
+    /// attachment the destination framebuffer's `DRAW_BUFFERS` currently
+    /// names -- two real renderbuffers, both receiving the same source
+    /// content from one `BLIT_FRAMEBUFFER` call.
+    #[test]
+    fn blit_framebuffer_fans_one_source_out_to_two_draw_buffers_destinations() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const COLOR_ATTACHMENT1: u32 = 0x8CE1;
+        const NEAREST: u32 = 0;
+        let mut mem = TestMemory::new(65536);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+
+        let commands = vec![
+            // Source: a 2x2 magenta surface.
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 1.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            // Destination framebuffer: two 2x2 renderbuffers, both named
+            // by DRAW_BUFFERS.
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[2, 2, 2, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT1, 2]),
+            cmd(proto::OP_DRAW_BUFFERS, &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1]),
+            // Read side: the orange surface (default framebuffer).
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 0]),
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest0 = 0x4000u32;
+        let dest1 = 0x4100u32;
+        let readback = vec![
+            // Rebind READ_FRAMEBUFFER to the destination framebuffer --
+            // the blit above left it pointed at the default framebuffer
+            // (the magenta source), and READ_BUFFER against id 0 is
+            // E_BAD_ID.
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 16]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT1]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 16]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let magenta = encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 255, 255]).unwrap();
+        let got0 = mem.read(MemLoc::Aperture(dest0), 4).unwrap().to_vec();
+        let got1 = mem.read(MemLoc::Aperture(dest1), 4).unwrap().to_vec();
+        assert_eq!(got0, magenta, "COLOR_ATTACHMENT0 should receive the blitted source: {got0:?}");
+        assert_eq!(got1, magenta, "COLOR_ATTACHMENT1 should also receive the blitted source: {got1:?}");
+    }
+
+    /// `BLIT_FRAMEBUFFER`'s multisample depth resolve: a full-screen quad
+    /// is drawn at a known NDC depth into a multisample depth/stencil
+    /// renderbuffer, resolved via `DEPTH_BUFFER_BIT` into the draw
+    /// surface's own internal depth buffer, and the result must actually
+    /// reflect the drawn depth -- not be left at the surface's prior
+    /// (`CLEAR_DEPTH`-default, far) value, which a silent no-op would
+    /// leave untouched.
+    #[test]
+    fn blit_framebuffer_resolves_a_multisample_depth_target_to_a_real_depth_value() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const DEPTH: u32 = 255;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const DEPTH_STENCIL_ATTACHMENT: u32 = 0x821A;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"void main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0); }\n";
+        // `DEPTH_TEST` is left disabled below, so the depth compare is
+        // `Always` and depth writes proceed regardless of this value or
+        // of whichever GL-NDC-to-device-depth convention the
+        // programmable pipeline happens to use for `gl_Position.z` --
+        // this test only needs *some* real, written depth distinct from
+        // the surface's untouched `CLEAR_DEPTH` default (1.0) below, not
+        // an exact target value.
+        #[rustfmt::skip]
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.5, 1.0,
+             1.0, -1.0, 0.5, 1.0,
+            -1.0,  1.0, 0.5, 1.0,
+             1.0, -1.0, 0.5, 1.0,
+             1.0,  1.0, 0.5, 1.0,
+            -1.0,  1.0, 0.5, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let samples = ctx.state.limits().max_samples as u32;
+        let commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            // The draw surface: its own internal depth buffer is the
+            // blit's eventual destination. Its default CLEAR_DEPTH is
+            // 1.0 (far) -- the "before" marker this test proves the
+            // blit actually overwrites.
+            cmd(proto::OP_SURFACE_DEFINE, &[9, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[9]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_DEPTH]),
+            // The multisample source framebuffer: a colour attachment
+            // (required for the draw's pipeline shape) plus a
+            // multisample depth/stencil attachment, both at the same
+            // sample count (FRAMEBUFFER_COMPLETE requires it).
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 2, 2, A8R8G8B8, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE, &[2, 2, 2, samples]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            // DEPTH_TEST is not enabled, so the compare is `Always` and
+            // the write always proceeds (see the vertex-data comment
+            // above).
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6]), // GL_TRIANGLES
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 0]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_DEPTH, 0],
+            ),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest = 0x4000u32;
+        let readback = vec![cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, DEPTH, 8, 0, dest, 16])];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let raw = mem.read(MemLoc::Aperture(dest), 4).unwrap();
+        let depth_u32 = u32::from_be_bytes(raw.try_into().unwrap());
+        let depth = depth_u32 as f64 / u32::MAX as f64;
+        assert!(
+            depth < 0.9,
+            "resolved depth must not be left at the surface's prior far (1.0) value -- \
+             a silent no-op (the bug this test guards against) would leave it there \
+             untouched: got {depth} (raw u32 {depth_u32})"
         );
     }
 }

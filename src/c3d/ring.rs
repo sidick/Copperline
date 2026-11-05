@@ -152,6 +152,18 @@ pub struct DeviceConfig {
     /// `MAX_RENDERBUFFER_SIZE`: the largest edge `RENDERBUFFER_STORAGE_COLOR`/
     /// `RENDERBUFFER_STORAGE_DEPTH_STENCIL` accepts, `E_LIMIT` beyond it.
     pub max_renderbuffer_size: u32,
+    /// `MAX_SAMPLES`: the highest `samples` value the two `_MULTISAMPLE`
+    /// storage opcodes accept (`samples < 2` or `samples > max_samples`
+    /// is `E_LIMIT`). `2`, not a higher power of two, because the spec
+    /// requires a device to support *every* integer sample count up to
+    /// this value with no silent rounding -- and every real multisample
+    /// backend (including `wgpu`'s own `TextureFormatFeatureFlags`) only
+    /// ever exposes discrete power-of-two counts (`X2`, `X4`, `X8`...),
+    /// never `3`. `2` is therefore the only value above `1` any such
+    /// backend can advertise here without lying; see `render.rs`'s
+    /// `Renderer::new` for where this is actually measured against the
+    /// adapter rather than assumed.
+    pub max_samples: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -210,6 +222,7 @@ impl Default for DeviceConfig {
             max_vertex_attribs: 8,
             max_color_attachments: 4,
             max_renderbuffer_size: 1024,
+            max_samples: 2,
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9) // I8_INDEXED: TEX_PALETTE itself
@@ -518,6 +531,11 @@ impl<'a> RingCursor<'a> {
                 | OP_FRAMEBUFFER_ATTACH_TEXTURE
                 | OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE
                 | OP_FRAMEBUFFER_STATUS
+                | OP_DRAW_BUFFERS
+                | OP_READ_BUFFER
+                | OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE
+                | OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE
+                | OP_BLIT_FRAMEBUFFER
                 | OP_TEX_CREATE_CUBE
                 | OP_TEX_IMAGE_FACE
                 | OP_TEX_SUBIMAGE_FACE
@@ -1800,6 +1818,62 @@ impl<'a> RingCursor<'a> {
                 fixed!(1);
                 Command::ReadBuffer { buf: w32(body, 0) }
             }
+            OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE => {
+                fixed!(5);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                let width = w32(body, 1);
+                let height = w32(body, 2);
+                check!(self.check_renderbuffer_size(width, height, start));
+                let samples = w32(body, 4);
+                check!(self.check_samples(samples, start));
+                Command::RenderbufferStorageColorMultisample {
+                    id,
+                    width,
+                    height,
+                    format: w32(body, 3),
+                    samples,
+                }
+            }
+            OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE => {
+                fixed!(4);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_renderbuffers, start));
+                let width = w32(body, 1);
+                let height = w32(body, 2);
+                check!(self.check_renderbuffer_size(width, height, start));
+                let samples = w32(body, 3);
+                check!(self.check_samples(samples, start));
+                Command::RenderbufferStorageDepthStencilMultisample {
+                    id,
+                    width,
+                    height,
+                    samples,
+                }
+            }
+            OP_BLIT_FRAMEBUFFER => {
+                fixed!(10);
+                let mask = w32(body, 8);
+                if mask & !(CLEAR_MASK_COLOR | CLEAR_MASK_DEPTH | CLEAR_MASK_STENCIL) != 0 {
+                    return self.raise(ErrorCode::BadArg, start);
+                }
+                let filter = w32(body, 9);
+                if filter > BLIT_FILTER_LINEAR {
+                    return self.raise(ErrorCode::BadArg, start);
+                }
+                Command::BlitFramebuffer {
+                    src_x0: w32(body, 0),
+                    src_y0: w32(body, 1),
+                    src_x1: w32(body, 2),
+                    src_y1: w32(body, 3),
+                    dst_x0: w32(body, 4),
+                    dst_y0: w32(body, 5),
+                    dst_x1: w32(body, 6),
+                    dst_y1: w32(body, 7),
+                    mask,
+                    filter,
+                }
+            }
 
             // Not in the opcode map at all, or LOGIC_OP (see this module's
             // doc comment): E_BAD_OPCODE, skipped by trusting `length`.
@@ -2103,6 +2177,16 @@ impl<'a> RingCursor<'a> {
 
     fn check_surface_size(&mut self, width: u32, height: u32, start: u32) -> Result<(), Step<'a>> {
         if width > self.config.max_surface_width || height > self.config.max_surface_height {
+            return Err(self.raise(ErrorCode::Limit, start));
+        }
+        Ok(())
+    }
+
+    /// `RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE`/`_DEPTH_STENCIL_MULTISAMPLE`'s
+    /// `samples` against `MAX_SAMPLES`: `< 2` or `> max_samples` is
+    /// `E_LIMIT`.
+    fn check_samples(&mut self, samples: u32, start: u32) -> Result<(), Step<'a>> {
+        if samples < 2 || samples > self.config.max_samples {
             return Err(self.raise(ErrorCode::Limit, start));
         }
         Ok(())
