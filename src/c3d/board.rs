@@ -225,6 +225,8 @@ mod greg {
     pub const MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
     pub const MAX_SAMPLES: u32 = 0x0A4;
     pub const PROGRAM_BINARY_FORMAT: u32 = 0x0A8;
+    pub const ALIASED_POINT_SIZE_MIN: u32 = 0x0AC;
+    pub const ALIASED_POINT_SIZE_MAX: u32 = 0x0B0;
 }
 
 // ---------------------------------------------------------------------
@@ -817,6 +819,16 @@ impl C3dBoard {
             // doc comment for why `0x4350_3031` is independently
             // hardcoded here rather than referencing `render.rs`.
             PROGRAM_BINARY_FORMAT => state::Limits::default().program_binary_format,
+            // Deliberately NOT gated by `CAP_PROGRAMMABLE`, unlike every
+            // other register in this guarded block above: this device
+            // draws every point at one pixel regardless of `POINT_SIZE`
+            // (baseline/`CAP_TRANSFORM`) or `gl_PointSize`
+            // (`CAP_PROGRAMMABLE`)'s requested value -- a spec-legal
+            // `[1.0, 1.0]` `ALIASED_POINT_SIZE_RANGE` that governs both
+            // tiers alike, so it must read the same whether or not
+            // `CAP_PROGRAMMABLE` is set.
+            ALIASED_POINT_SIZE_MIN => 1.0f32.to_bits(),
+            ALIASED_POINT_SIZE_MAX => 1.0f32.to_bits(),
             _ => 0,
         }
     }
@@ -1935,6 +1947,39 @@ mod tests {
         assert_eq!(b.read(greg::MAX_VERTEX_UNIFORM_VECTORS, 4, &mut h), 0);
         assert_eq!(b.read(greg::MAX_FRAGMENT_UNIFORM_VECTORS, 4, &mut h), 0);
         assert_eq!(b.read(greg::MAX_VARYING_VECTORS, 4, &mut h), 0);
+    }
+
+    /// `ALIASED_POINT_SIZE_MIN`/`_MAX` must read `1.0`/`1.0` always --
+    /// unlike every other `CAP_PROGRAMMABLE`-era register above, these
+    /// are NOT gated by `CAP_PROGRAMMABLE`: they also bound the
+    /// baseline/`CAP_TRANSFORM` tier's pre-existing `POINT_SIZE` state,
+    /// so they must report the same whether or not `CAP_PROGRAMMABLE`
+    /// is set, never `0`.
+    #[test]
+    fn aliased_point_size_range_reports_one_to_one_regardless_of_cap_programmable() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        assert_eq!(
+            b.read(greg::ALIASED_POINT_SIZE_MIN, 4, &mut h),
+            1.0f32.to_bits()
+        );
+        assert_eq!(
+            b.read(greg::ALIASED_POINT_SIZE_MAX, 4, &mut h),
+            1.0f32.to_bits()
+        );
+
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_PROGRAMMABLE);
+        let mut h = host(&mut mem);
+        assert_eq!(
+            b.read(greg::ALIASED_POINT_SIZE_MIN, 4, &mut h),
+            1.0f32.to_bits(),
+            "must not read 0 just because every CAP_PROGRAMMABLE-gated register does"
+        );
+        assert_eq!(
+            b.read(greg::ALIASED_POINT_SIZE_MAX, 4, &mut h),
+            1.0f32.to_bits()
+        );
     }
 
     /// The CAPS0 flip's own end-to-end guard: a transform-tier opcode

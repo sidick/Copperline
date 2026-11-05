@@ -15721,6 +15721,166 @@ mod tests {
         );
     }
 
+    /// `c3d-cmd-programmable-draw`'s "Point size": a vertex shader
+    /// assigning a huge value to `gl_PointSize` must still compile and
+    /// link successfully (GLSL ES 1.00 requires the builtin to exist),
+    /// and the resulting `POINTS` draw's rendered footprint must stay
+    /// exactly one pixel -- this device's `ALIASED_POINT_SIZE_MIN`/`_MAX`
+    /// both report `1.0`, so `gl_PointSize`'s value has no rasterization
+    /// effect, a spec-legal degenerate case rather than a bug.
+    #[test]
+    fn a_huge_gl_point_size_still_renders_a_single_pixel_footprint() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_POINTS: u32 = 0;
+
+        // 5x5 (odd) so NDC (0,0) maps unambiguously to one centre pixel.
+        let vs_src = b"attribute vec4 position;\nvoid main() {\n    gl_Position = position;\n    gl_PointSize = 1000.0;\n}\n";
+        let fs_src = b"void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        let verts: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 5, 5, 20, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 1.0, 1.0]), // blue background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[GL_POINTS, 0, 1]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest = 0x4000u32;
+        let readback = vec![cmd(proto::OP_READ_PIXELS, &[0, 0, 5, 5, A8R8G8B8, 20, 0, dest, 100])];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let pixels = mem.read(MemLoc::Aperture(dest), 100).unwrap().to_vec();
+        let red = encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap();
+        let blue = encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap();
+        let red_count = pixels.chunks(4).filter(|p| *p == red.as_slice()).count();
+        let blue_count = pixels.chunks(4).filter(|p| *p == blue.as_slice()).count();
+        assert_eq!(
+            red_count, 1,
+            "gl_PointSize = 1000.0 must still touch exactly one pixel, found {red_count}: {pixels:?}"
+        );
+        assert_eq!(
+            blue_count, 24,
+            "every other pixel of the 5x5 surface must remain the untouched background"
+        );
+    }
+
+    /// `c3d-cmd-programmable-draw`'s "Point size": `gl_PointCoord` reads
+    /// a fixed `(0.5, 0.5)` on this device (`ALIASED_POINT_SIZE_MAX ==
+    /// 1.0`) -- the centre of the one-pixel point, since there is no
+    /// real sub-point extent to interpolate across.
+    #[test]
+    fn gl_point_coord_reads_a_fixed_half_half_on_this_device() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_POINTS: u32 = 0;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src =
+            b"precision mediump float;\nvoid main() { gl_FragColor = vec4(gl_PointCoord, 0.0, 1.0); }\n";
+        let verts: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 5, 5, 20, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[GL_POINTS, 0, 1]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest = 0x4000u32;
+        let readback = vec![cmd(proto::OP_READ_PIXELS, &[2, 2, 1, 1, A8R8G8B8, 4, 0, dest, 4])];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let pixel = mem.read(MemLoc::Aperture(dest), 4).unwrap().to_vec();
+        // A8R8G8B8 byte order per `encode_pixel_packs_a8r8g8b8_in_the_
+        // documented_byte_order`: [A, R, G, B] -- R and G should both be
+        // a rounded 0.5 (127 or 128), B should be 0 (gl_PointCoord has no
+        // third component), A should be 255.
+        let (a, r, g, b) = (pixel[0], pixel[1], pixel[2], pixel[3]);
+        assert_eq!(a, 255, "{pixel:?}");
+        assert_eq!(b, 0, "{pixel:?}");
+        assert!((120..=135).contains(&r), "R should be ~0.5*255: {pixel:?}");
+        assert!((120..=135).contains(&g), "G should be ~0.5*255: {pixel:?}");
+    }
+
     /// `PROGRAM_GET_BINARY` on a successfully linked program, followed by
     /// `PROGRAM_BINARY` loading that exact blob into a *different* program
     /// object, draws the same solid colour the original program would --

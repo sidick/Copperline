@@ -637,6 +637,109 @@ fn drop_redundant_binding_array_loads(
     }
 }
 
+/// `c3d-cmd-programmable-draw`'s "Point size": `gl_PointSize` must
+/// compile and link (GLSL ES 1.00 requires the builtin to exist as a
+/// writable vertex-shader output) but its *value* must have no
+/// rasterization effect on this device, whose `ALIASED_POINT_SIZE_MIN`/
+/// `_MAX` both report `1.0`. naga's GLSL front end maps `gl_PointSize`
+/// to an ordinary `BuiltIn::PointSize` struct member, and -- confirmed
+/// by direct inspection -- at least one real backend (`wgpu`'s Metal
+/// backend) honours that output natively and genuinely varies the
+/// rendered point size, which would make this device's actual behaviour
+/// depend on which backend happens to run it, directly contradicting
+/// the fixed `[1.0, 1.0]` this device advertises. `gl_PointSize` is
+/// write-only from GLSL's own perspective (nothing in valid GLSL ES
+/// reads it back), so the synthesized entry-point wrapper that loads it
+/// to build the final output struct is the only reader in practice;
+/// replacing every `Load` of its global variable with a constant `1.0`
+/// literal is therefore enough, with no need to chase down or rewrite
+/// whatever expression the shader's own `main()` originally stored into
+/// it.
+fn force_point_size_to_one(module: &mut naga::Module) {
+    let Some(point_size_global) = module
+        .global_variables
+        .iter()
+        .find_map(|(handle, var)| (var.name.as_deref() == Some("gl_PointSize")).then_some(handle))
+    else {
+        return;
+    };
+    for (_, func) in module.functions.iter_mut() {
+        let replaced = replace_point_size_loads(&mut func.expressions, point_size_global);
+        drop_emits_for(&mut func.body, &replaced);
+    }
+    for ep in module.entry_points.iter_mut() {
+        let replaced = replace_point_size_loads(&mut ep.function.expressions, point_size_global);
+        drop_emits_for(&mut ep.function.body, &replaced);
+    }
+}
+
+fn replace_point_size_loads(
+    expressions: &mut naga::Arena<naga::Expression>,
+    point_size_global: naga::Handle<naga::GlobalVariable>,
+) -> Vec<naga::Handle<naga::Expression>> {
+    let fixes: Vec<_> = expressions
+        .iter()
+        .filter_map(|(handle, expr)| match *expr {
+            naga::Expression::Load { pointer }
+                if matches!(
+                    expressions[pointer],
+                    naga::Expression::GlobalVariable(h) if h == point_size_global
+                ) =>
+            {
+                Some(handle)
+            }
+            _ => None,
+        })
+        .collect();
+    for &handle in &fixes {
+        expressions[handle] = naga::Expression::Literal(naga::Literal::F32(1.0));
+    }
+    fixes
+}
+
+/// A naga `Literal` expression is always "in scope" with no `Emit`
+/// needed (unlike the `Load` it just replaced, which was), so every
+/// `Statement::Emit` range naming one of `replaced` -- recursively,
+/// through nested `If`/`Switch`/`Loop` blocks -- must be dropped or the
+/// validator rejects it ("Expression can't be introduced - it's already
+/// in scope"). Only handles a singleton `Emit` range (one expression per
+/// statement), the shape naga's GLSL front end's synthesized entry-point
+/// wrapper actually produces for this case; a `Load` folded into a
+/// multi-expression `Emit` range would need splitting instead, which
+/// doesn't arise here.
+fn drop_emits_for(block: &mut naga::Block, replaced: &[naga::Handle<naga::Expression>]) {
+    let mut i = 0;
+    while i < block.len() {
+        let drop = matches!(
+            block[i],
+            naga::Statement::Emit(ref range)
+                if range.first_and_last().is_some_and(|(f, l)| f == l && replaced.contains(&f))
+        );
+        if drop {
+            block.cull(i..i + 1);
+            continue;
+        }
+        match &mut block[i] {
+            naga::Statement::Block(inner) => drop_emits_for(inner, replaced),
+            naga::Statement::If { accept, reject, .. } => {
+                drop_emits_for(accept, replaced);
+                drop_emits_for(reject, replaced);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    drop_emits_for(&mut case.body, replaced);
+                }
+            }
+            naga::Statement::Loop { body, continuing, .. } => {
+                drop_emits_for(body, replaced);
+                drop_emits_for(continuing, replaced);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
 pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
     use glsl_lang::ast::TranslationUnit;
     use glsl_lang::parse::{DefaultParse, ParseOptions};
@@ -655,6 +758,7 @@ pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
     match frontend.parse(&options, &rewritten) {
         Ok(mut module) => {
             fix_sampler_binding_array_types(&mut module);
+            force_point_size_to_one(&mut module);
             CompileResult::Ok(Box::new(module))
         }
         Err(errors) => {
@@ -949,6 +1053,20 @@ mod tests {
     #[test]
     fn compiles_the_minimal_vertical_slice_fragment_shader() {
         let result = compile(FRAGMENT_SRC_OK, ShaderStage::Fragment);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn compiles_a_vertex_shader_that_assigns_gl_point_size() {
+        let vs = "attribute vec4 position;\nvoid main() {\n    gl_Position = position;\n    gl_PointSize = 10.0;\n}\n";
+        let result = compile(vs, ShaderStage::Vertex);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn compiles_a_fragment_shader_that_reads_gl_point_coord() {
+        let fs = "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(gl_PointCoord, 0.0, 1.0);\n}\n";
+        let result = compile(fs, ShaderStage::Fragment);
         assert!(result.is_ok(), "{result:?}");
     }
 
