@@ -3204,7 +3204,19 @@ fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32)> {
             let name = gv.name.as_ref()?;
             let base = name.strip_suffix("_tex")?;
             let tex_binding = gv.binding.as_ref()?.binding;
-            let gl_type = match module.types[gv.ty].inner {
+            // A sampler *array* uniform (`uniform sampler2D tex[4];`)
+            // compiles to one `Array`-typed global wrapping the image
+            // type, not the bare `Image` type itself -- see `glsl.rs`'s
+            // `inject_uniform_bindings` doc comment. Unwrap one level so
+            // an array-of-samplers is still reflected as one uniform
+            // (`array_size` itself is a separate, pre-existing, wider gap
+            // -- every uniform, not just samplers, reports `1` today; see
+            // `compute_uniform_interface`).
+            let image_ty = match module.types[gv.ty].inner {
+                naga::TypeInner::Array { base, .. } => &module.types[base].inner,
+                ref inner => inner,
+            };
+            let gl_type = match *image_ty {
                 naga::TypeInner::Image { dim: naga::ImageDimension::D2, .. } => GL_SAMPLER_2D,
                 naga::TypeInner::Image { dim: naga::ImageDimension::Cube, .. } => GL_SAMPLER_CUBE,
                 _ => return None,
@@ -12978,5 +12990,35 @@ mod tests {
         assert!(bindings[tint].vertex_binding.is_none());
         assert!(bindings[tint].fragment_binding.is_some());
         assert_eq!(entries[tint].gl_type, GL_FLOAT_VEC4);
+    }
+
+    /// A sampler *array* uniform (`uniform sampler2D tex[4];`) must still
+    /// show up in the reflected interface as one `GL_SAMPLER_2D` entry --
+    /// `module_samplers` has to unwrap naga's `Array`-typed global to
+    /// find the underlying `Image` type, since an array compiles
+    /// differently from a scalar sampler uniform (see `glsl.rs`'s
+    /// `inject_uniform_bindings` doc comment). No GPU/`Renderer` needed:
+    /// `compute_uniform_interface` is pure over the compiled `naga::
+    /// Module`s.
+    #[test]
+    fn compute_uniform_interface_reflects_a_sampler_array_uniform() {
+        let glsl::CompileResult::Ok(vs) = glsl::compile(
+            "attribute vec4 position;\nvoid main() { gl_Position = position; }\n",
+            naga::ShaderStage::Vertex,
+        ) else {
+            panic!("vertex shader failed to compile");
+        };
+        let glsl::CompileResult::Ok(fs) = glsl::compile(
+            "precision mediump float;\nuniform sampler2D tex[4];\nvarying vec2 uv;\nvoid main() { gl_FragColor = texture2D(tex[1], uv); }\n",
+            naga::ShaderStage::Fragment,
+        ) else {
+            panic!("fragment shader failed to compile");
+        };
+        let (entries, bindings) = compute_uniform_interface(&vs, &fs);
+        let tex = entries.iter().position(|e| e.name == "tex").unwrap();
+        assert_eq!(entries[tex].gl_type, GL_SAMPLER_2D);
+        assert!(bindings[tex].is_sampler);
+        assert!(bindings[tex].fragment_binding.is_some());
+        assert!(bindings[tex].fragment_sampler_binding.is_some());
     }
 }

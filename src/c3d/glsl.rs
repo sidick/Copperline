@@ -86,11 +86,26 @@ use naga::ShaderStage;
 ///   This rewrite produces exactly that split/recombine shape. GLES2 has no
 ///   bare (sampler-less) texture object, so every `textureND(` call site
 ///   necessarily names one of these rewritten uniforms -- there is nothing
-///   else it could be naming. Known gap: an array of samplers (`uniform
-///   sampler2D tex[4];`) is not handled -- the `[4]` suffix lands only on
-///   the synthesised `sampler` declaration, not the paired `textureND`
-///   one, which would miscompile. No GLES2 workload exercising this has
-///   come up yet; revisit if one does.
+///   else it could be naming. An array of samplers (`uniform sampler2D
+///   tex[4];`) is handled too: the `[4]` suffix is duplicated onto *both*
+///   synthesised declarations (`texture2D tex_tex[4]`/`sampler
+///   tex_samp[4]`, one binding each for the whole array, not one per
+///   element -- confirmed directly against naga, which accepts exactly
+///   this shape and recognises `sampler2D(tex_tex[i], tex_samp[i])` for
+///   any index expression `i`), and a call site's own `[i]` suffix (if
+///   any) is carried onto both halves at `texture2D(tex[i], ...)`'s
+///   rewrite the same way. `render.rs`'s `module_samplers` reflects an
+///   array sampler uniform as one `PROGRAM_INTERFACE` entry, same as
+///   every other array uniform (its `array_size` is a separate,
+///   pre-existing gap -- every uniform, array or not, currently reports
+///   `1`; see `compute_uniform_interface`). **Known gap, now narrower
+///   than before**: compiling, linking and reflecting a sampler array
+///   all work, but a programmable draw that actually *uses* one does
+///   not yet -- `draw_prog`'s bind-group builder assumes one texture per
+///   sampler binding and has no support for `wgpu`'s binding-array
+///   mechanism a declared array of N textures/samplers needs. No GLES2
+///   workload exercising either half has come up yet; revisit the draw-
+///   time half if one does.
 /// - `uniform` -> `layout(binding = N) uniform`, `N` counting each
 ///   occurrence in source order, starting at [`VERTEX_BINDING_BASE`] or
 ///   [`FRAGMENT_BINDING_BASE`] depending on stage. Unlike attributes,
@@ -146,6 +161,34 @@ pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
 
 fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// If `source` starts with `[`, returns the byte length of the bracketed
+/// expression *including* both brackets (e.g. `4` for `"[4];\n..."`,
+/// `12` for `"[i + off]..."`), tracking nesting depth so a bracket
+/// appearing inside the index expression itself (unusual for GLSL ES,
+/// but not forbidden) doesn't end the scan early. Returns `None` if
+/// `source` doesn't start with `[` at all, or the brackets never close
+/// (malformed input naga will reject with a real parse error anyway).
+fn leading_bracket_len(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whole-word substitution: `from` is replaced only where it is not
@@ -242,14 +285,26 @@ fn rewrite_sampler_calls(source: &str, fn_name: &str, sampler_ctor: &str) -> Str
             .take_while(|&&c| is_ident_char(c))
             .count();
         let ident = &after_paren[..ident_len];
-        let remainder = &after_paren[ident_len..];
+        let after_ident = &after_paren[ident_len..];
+        // `texture2D(tex[i], uv)`, naming one element of a sampler array
+        // (see `inject_uniform_bindings`'s matching comment): the index
+        // expression `[i]` -- verbatim, whatever it is -- applies to both
+        // halves alike, `sampler2D(tex_tex[i], tex_samp[i])`. Absent for
+        // an ordinary scalar sampler uniform, exactly as before.
+        let index_len = leading_bracket_len(after_ident).unwrap_or(0);
+        let index_suffix = &after_ident[..index_len];
+        let remainder = &after_ident[index_len..];
         out.push_str("texture(");
         out.push_str(sampler_ctor);
         out.push('(');
         out.push_str(ident);
-        out.push_str("_tex, ");
+        out.push_str("_tex");
+        out.push_str(index_suffix);
+        out.push_str(", ");
         out.push_str(ident);
-        out.push_str("_samp)");
+        out.push_str("_samp");
+        out.push_str(index_suffix);
+        out.push(')');
         rest = remainder;
     }
     out
@@ -309,13 +364,24 @@ fn inject_uniform_bindings(source: &str, stage: ShaderStage) -> String {
                 .take_while(|&&c| is_ident_char(c))
                 .count();
             let name = &after_type_ws[..name_len];
+            let after_name = &after_type_ws[name_len..];
+            // `uniform sampler2D tex[4];`: the array suffix must apply to
+            // *both* synthesised declarations (one binding each, for the
+            // whole array -- not one binding per element; confirmed
+            // directly against naga, which accepts `texture2D tex_tex[4]`/
+            // `sampler tex_samp[4]` as a single `Array`-typed global each,
+            // the same shape `sampler2D(tex_tex[i], tex_samp[i])` then
+            // indexes element-wise at the call site). A scalar (non-array)
+            // sampler uniform takes the `""` suffix, unchanged from before.
+            let array_len = leading_bracket_len(after_name).unwrap_or(0);
+            let array_suffix = &after_name[..array_len];
             out.push_str(&format!(
-                "layout(binding = {next_binding}) uniform {texture_type} {name}_tex;\n\
-                 layout(binding = {}) uniform sampler {name}_samp",
+                "layout(binding = {next_binding}) uniform {texture_type} {name}_tex{array_suffix};\n\
+                 layout(binding = {}) uniform sampler {name}_samp{array_suffix}",
                 next_binding + 1
             ));
             next_binding += 2;
-            rest = &after_type_ws[name_len..];
+            rest = &after_name[array_len..];
         } else {
             out.push_str(&format!("layout(binding = {next_binding}) uniform"));
             next_binding += 1;
@@ -671,5 +737,49 @@ mod tests {
             panic!("expected a compile failure");
         };
         assert!(log.contains("unexpected"), "{log}");
+    }
+
+    #[test]
+    fn compiles_a_sampler2d_array_uniform_with_an_indexed_call_site() {
+        let src = "precision mediump float;\n\
+                   uniform sampler2D tex[4];\n\
+                   varying vec2 uv;\n\
+                   void main() {\n    gl_FragColor = texture2D(tex[1], uv);\n}\n";
+        let result = compile(src, ShaderStage::Fragment);
+        let CompileResult::Ok(module) = result else {
+            panic!("{result:?}");
+        };
+        let find = |suffix: &str| {
+            module
+                .global_variables
+                .iter()
+                .find(|(_, gv)| gv.name.as_deref() == Some(suffix))
+                .unwrap_or_else(|| panic!("no global named {suffix:?}"))
+                .1
+        };
+        let tex_tex = find("tex_tex");
+        let tex_samp = find("tex_samp");
+        // One binding each for the *whole* array, not one per element.
+        assert_ne!(tex_tex.binding, tex_samp.binding);
+        for gv in [tex_tex, tex_samp] {
+            assert!(
+                matches!(module.types[gv.ty].inner, naga::TypeInner::Array { size: naga::ArraySize::Constant(n), .. } if n.get() == 4),
+                "expected a 4-element array type, got {:?}",
+                module.types[gv.ty].inner
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_array_sampler_call_site_is_unaffected_by_the_array_rewrite() {
+        // Regression check: the array-index handling added alongside the
+        // sampler-array fix must not touch an ordinary scalar sampler
+        // call site (no `[...]` to find, so `leading_bracket_len` must
+        // return `None` and leave the rewrite exactly as before).
+        let src = "precision mediump float;\n\
+                   uniform sampler2D tex;\n\
+                   varying vec2 uv;\n\
+                   void main() {\n    gl_FragColor = texture2D(tex, uv);\n}\n";
+        assert!(compile(src, ShaderStage::Fragment).is_ok());
     }
 }
