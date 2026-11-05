@@ -62,17 +62,24 @@ pub const GLOBAL_MAX_SURFACE_WIDTH: u32 = 0x070;
 pub const GLOBAL_MAX_SURFACE_HEIGHT: u32 = 0x074;
 /// `CAP_PROGRAMMABLE` (`c3d-programmable-tier`). The shader/program,
 /// buffer, vertex-attribs and framebuffer/renderbuffer object limits are
-/// implemented (see this tier's doc comment in `dispatch.rs`); the
-/// uniform/varying vector-count registers the spec also defines for this
-/// tier (`MAX_VERTEX_UNIFORM_VECTORS`, `MAX_FRAGMENT_UNIFORM_VECTORS`,
-/// `MAX_VARYING_VECTORS`) remain unimplemented, since nothing enforces
-/// those limits yet either.
+/// implemented (see this tier's doc comment in `dispatch.rs`), as are
+/// the uniform/varying vector-count registers below -- fixed values
+/// comfortably above the spec's stated minimums, not shader-compile-time
+/// enforcement: real GPU hardware (via `wgpu`/`naga`) trivially exceeds
+/// GLES2's tiny minimums (128/16/8 `vec4` slots), so there is nothing to
+/// actually enforce against compilation. These registers exist so a
+/// guest library can query truthful limits, per the porting guidance's
+/// "meets the GLES2-derived minimums" requirement for setting
+/// `CAP_PROGRAMMABLE` at all.
 pub const GLOBAL_MAX_SHADERS: u32 = 0x078;
 pub const GLOBAL_MAX_PROGRAMS: u32 = 0x07C;
 pub const GLOBAL_MAX_BUFFERS: u32 = 0x080;
 pub const GLOBAL_MAX_FRAMEBUFFERS: u32 = 0x084;
 pub const GLOBAL_MAX_RENDERBUFFERS: u32 = 0x088;
 pub const GLOBAL_MAX_VERTEX_ATTRIBS: u32 = 0x08C;
+pub const GLOBAL_MAX_VERTEX_UNIFORM_VECTORS: u32 = 0x090;
+pub const GLOBAL_MAX_FRAGMENT_UNIFORM_VECTORS: u32 = 0x094;
+pub const GLOBAL_MAX_VARYING_VECTORS: u32 = 0x098;
 pub const GLOBAL_MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
 pub const GLOBAL_MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
 

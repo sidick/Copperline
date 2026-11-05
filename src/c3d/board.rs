@@ -218,6 +218,9 @@ mod greg {
     pub const MAX_FRAMEBUFFERS: u32 = 0x084;
     pub const MAX_RENDERBUFFERS: u32 = 0x088;
     pub const MAX_VERTEX_ATTRIBS: u32 = 0x08C;
+    pub const MAX_VERTEX_UNIFORM_VECTORS: u32 = 0x090;
+    pub const MAX_FRAGMENT_UNIFORM_VECTORS: u32 = 0x094;
+    pub const MAX_VARYING_VECTORS: u32 = 0x098;
     pub const MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
     pub const MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
 }
@@ -763,6 +766,9 @@ impl C3dBoard {
             | MAX_FRAMEBUFFERS
             | MAX_RENDERBUFFERS
             | MAX_VERTEX_ATTRIBS
+            | MAX_VERTEX_UNIFORM_VECTORS
+            | MAX_FRAGMENT_UNIFORM_VECTORS
+            | MAX_VARYING_VECTORS
             | MAX_COLOR_ATTACHMENTS
             | MAX_RENDERBUFFER_SIZE
                 if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
@@ -777,6 +783,14 @@ impl C3dBoard {
             // Like MAX_LIGHTS etc. above, reports the same value every
             // per-context `state::Limits::default()` enforces.
             MAX_VERTEX_ATTRIBS => state::Limits::default().max_vertex_attribs as u32,
+            // Fixed values comfortably above the spec's stated minimums
+            // (128/16/8) -- not measured against `wgpu`/`naga`'s actual
+            // per-adapter limits, which are always far higher for any
+            // backend this board runs on; see `proto::GLOBAL_MAX_SHADERS`'s
+            // doc comment for why there is nothing to measure against.
+            MAX_VERTEX_UNIFORM_VECTORS => 256,
+            MAX_FRAGMENT_UNIFORM_VECTORS => 64,
+            MAX_VARYING_VECTORS => 16,
             // Fixed at 1: the renderer only ever resolves a framebuffer's
             // `COLOR_ATTACHMENT0`, matching the programmable-tier
             // implementation plan's scoped-down single-attachment pass.
@@ -1879,6 +1893,27 @@ mod tests {
         let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_MULTITEXTURE);
         let mut h = host(&mut mem);
         assert_eq!(b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h), 1);
+    }
+
+    /// `MAX_VERTEX_UNIFORM_VECTORS`/`MAX_FRAGMENT_UNIFORM_VECTORS`/
+    /// `MAX_VARYING_VECTORS` report fixed values at or above the spec's
+    /// stated minimums (128/16/8) when `CAP_PROGRAMMABLE` is set, and
+    /// `0` when it isn't -- the same guarded-register shape every other
+    /// `CAP_PROGRAMMABLE` limit already follows.
+    #[test]
+    fn shader_resource_limit_registers_report_fixed_values_above_the_spec_minimums() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        assert!(b.read(greg::MAX_VERTEX_UNIFORM_VECTORS, 4, &mut h) >= 128);
+        assert!(b.read(greg::MAX_FRAGMENT_UNIFORM_VECTORS, 4, &mut h) >= 16);
+        assert!(b.read(greg::MAX_VARYING_VECTORS, 4, &mut h) >= 8);
+
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_PROGRAMMABLE);
+        let mut h = host(&mut mem);
+        assert_eq!(b.read(greg::MAX_VERTEX_UNIFORM_VECTORS, 4, &mut h), 0);
+        assert_eq!(b.read(greg::MAX_FRAGMENT_UNIFORM_VECTORS, 4, &mut h), 0);
+        assert_eq!(b.read(greg::MAX_VARYING_VECTORS, 4, &mut h), 0);
     }
 
     /// The CAPS0 flip's own end-to-end guard: a transform-tier opcode
