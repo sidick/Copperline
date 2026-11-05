@@ -3058,34 +3058,6 @@ fn shader_stage(kind: ShaderKind) -> naga::ShaderStage {
     }
 }
 
-/// A compiled vertex shader's location-bound inputs, `(name, location)`,
-/// in declaration order. Used to map `VERTEX_ATTRIB_POINTER`'s guest-
-/// chosen index onto the location the shader (or `PROGRAM_BIND_ATTRIB_
-/// LOCATION`) actually expects -- confirmed directly against naga's GLSL
-/// front end that an unbound `attribute` gets a location assigned by
-/// declaration order starting at 0, matching what a guest library that
-/// never calls `PROGRAM_BIND_ATTRIB_LOCATION` (and so cannot have
-/// requested a specific one) would have to assume.
-fn vertex_shader_inputs(module: &naga::Module) -> Vec<(String, u32)> {
-    let Some(ep) = module
-        .entry_points
-        .iter()
-        .find(|e| e.stage == naga::ShaderStage::Vertex)
-    else {
-        return Vec::new();
-    };
-    ep.function
-        .arguments
-        .iter()
-        .filter_map(|arg| {
-            let name = arg.name.clone()?;
-            match arg.binding {
-                Some(naga::Binding::Location { location, .. }) => Some((name, location)),
-                _ => None,
-            }
-        })
-        .collect()
-}
 
 // GL enumerants PROGRAM_INTERFACE/UNIFORM's `type` field can report, for
 // the set `naga_type_to_gl_enum` recognises. Mirrors ring.rs's
@@ -3162,8 +3134,18 @@ fn naga_type_to_gl_enum(module: &naga::Module, ty: naga::Handle<naga::Type>) -> 
     }
 }
 
-/// [`vertex_shader_inputs`] plus each input's GL type, for `PROGRAM_
-/// INTERFACE`'s attribute entries.
+/// A compiled vertex shader's location-bound inputs, `(name, location,
+/// GL type)`, in declaration order. The location is used to map
+/// `VERTEX_ATTRIB_POINTER`'s guest-chosen index onto the location the
+/// shader (or `PROGRAM_BIND_ATTRIB_LOCATION`) actually expects --
+/// confirmed directly against naga's GLSL front end that an unbound
+/// `attribute` gets a location assigned by declaration order starting
+/// at 0, matching what a guest library that never calls `PROGRAM_BIND_
+/// ATTRIB_LOCATION` (and so cannot have requested a specific one) would
+/// have to assume. The GL type feeds both `PROGRAM_INTERFACE`'s
+/// attribute entries and, in [`Renderer::draw_prog`], a disabled
+/// attribute slot's constant-value buffer (`constant_attrib_wgpu_
+/// format`), which has no `VERTEX_ATTRIB_POINTER` to read a type from.
 fn vertex_shader_inputs_typed(module: &naga::Module) -> Vec<(String, u32, u32)> {
     let Some(ep) = module
         .entry_points
@@ -3373,6 +3355,28 @@ fn vertex_attrib_wgpu_format(
         (VertexAttribType::Short, 4, true) => Some(F::Snorm16x4),
         (VertexAttribType::Short, 2, false) => Some(F::Sint16x2),
         (VertexAttribType::Short, 4, false) => Some(F::Sint16x4),
+        _ => None,
+    }
+}
+
+/// The wgpu vertex format and component count used to fill a constant
+/// buffer for a disabled vertex-attribute slot (`VERTEX_ATTRIB_CONSTANT`),
+/// keyed by the shader input's own declared type (`naga_type_to_gl_enum`'s
+/// `gl_type`) rather than a `VERTEX_ATTRIB_POINTER` type/size/normalized
+/// triple -- there is no pointer for a disabled slot, so the shader's own
+/// declaration is the only source of truth for how many components to
+/// supply. GLSL ES 1.00 only allows `float`/`vec2`/`vec3`/`vec4` (never an
+/// integer type, never a matrix) for an `attribute` declaration, so those
+/// are the only cases this needs to cover; anything else is `None`, the
+/// same "no direct wgpu format" outcome an unrepresentable
+/// `VERTEX_ATTRIB_POINTER` combination already produces for the enabled
+/// path.
+fn constant_attrib_wgpu_format(gl_type: u32) -> Option<(wgpu::VertexFormat, usize)> {
+    match gl_type {
+        GL_FLOAT => Some((wgpu::VertexFormat::Float32, 1)),
+        GL_FLOAT_VEC2 => Some((wgpu::VertexFormat::Float32x2, 2)),
+        GL_FLOAT_VEC3 => Some((wgpu::VertexFormat::Float32x3, 3)),
+        GL_FLOAT_VEC4 => Some((wgpu::VertexFormat::Float32x4, 4)),
         _ => None,
     }
 }
@@ -6668,60 +6672,90 @@ impl Renderer {
         // buffer built below, not necessarily the tightest one.
         let vertex_count = final_indices.iter().copied().max().map_or(0, |m| m as usize + 1);
 
-        let inputs = vertex_shader_inputs(&vs_module);
+        let inputs = vertex_shader_inputs_typed(&vs_module);
         let mut layouts = Vec::with_capacity(inputs.len());
         let mut gpu_buffers = Vec::with_capacity(inputs.len());
-        for (shader_location, (name, naga_location)) in inputs.iter().enumerate() {
+        for (shader_location, (name, naga_location, gl_type)) in inputs.iter().enumerate() {
             let attrib_index = bound_attrib_locations.get(name).copied().unwrap_or(*naga_location);
             let attrib = state.vertex_attrib(attrib_index);
-            let Some(pointer) = attrib.filter(|a| a.enabled).and_then(|a| a.pointer.as_ref()) else {
-                return Err(RenderError::Unimplemented(
-                    "programmable draw with a disabled/constant vertex attribute (only buffer-backed, enabled attributes are supported so far)",
-                ));
-            };
-            let Some(format) = vertex_attrib_wgpu_format(pointer.type_, pointer.size, pointer.normalized)
-            else {
-                return Err(RenderError::Unimplemented(
-                    "VERTEX_ATTRIB_POINTER type/size/normalized combination with no direct wgpu vertex format",
-                ));
-            };
-            let raw = self
-                .buffers
-                .get(&pointer.buffer)
-                .ok_or(RenderError::UnknownObject("buffer", pointer.buffer))?;
-            let component_bytes = component_byte_size(pointer.type_);
-            let read_stride = if pointer.stride_bytes == 0 {
-                pointer.size as usize * component_bytes
-            } else {
-                pointer.stride_bytes as usize
-            };
-            // The wire is big-endian throughout, per the spec's own
-            // convention ("the 68k never byte-swaps") -- vertex array
-            // bytes are no exception, but `wgpu`'s vertex-fetch formats
-            // assume host-native (little-endian, on every real target)
-            // byte order, with no "big-endian" format variant to ask
-            // for. Converting per element here, at draw time, is the one
-            // point `VERTEX_ATTRIB_POINTER`'s type is actually known
-            // (`Renderer::buffers`'s doc comment explains why it can't
-            // happen earlier, at upload time).
-            let mut gpu_bytes = Vec::with_capacity(vertex_count * pointer.size as usize * component_bytes);
-            for v in 0..vertex_count {
-                let base = pointer.offset as usize + v * read_stride;
-                for c in 0..pointer.size as usize {
-                    let at = base + c * component_bytes;
-                    let Some(src) = raw.get(at..at + component_bytes) else {
-                        return Err(RenderError::ShortPayload("programmable draw vertex attribute data"));
-                    };
-                    gpu_bytes.extend(src.iter().rev());
+            let pointer = attrib.filter(|a| a.enabled).and_then(|a| a.pointer.as_ref());
+            let (stride, format, gpu_buffer) = if let Some(pointer) = pointer {
+                let Some(format) = vertex_attrib_wgpu_format(pointer.type_, pointer.size, pointer.normalized)
+                else {
+                    return Err(RenderError::Unimplemented(
+                        "VERTEX_ATTRIB_POINTER type/size/normalized combination with no direct wgpu vertex format",
+                    ));
+                };
+                let raw = self
+                    .buffers
+                    .get(&pointer.buffer)
+                    .ok_or(RenderError::UnknownObject("buffer", pointer.buffer))?;
+                let component_bytes = component_byte_size(pointer.type_);
+                let read_stride = if pointer.stride_bytes == 0 {
+                    pointer.size as usize * component_bytes
+                } else {
+                    pointer.stride_bytes as usize
+                };
+                // The wire is big-endian throughout, per the spec's own
+                // convention ("the 68k never byte-swaps") -- vertex array
+                // bytes are no exception, but `wgpu`'s vertex-fetch formats
+                // assume host-native (little-endian, on every real target)
+                // byte order, with no "big-endian" format variant to ask
+                // for. Converting per element here, at draw time, is the
+                // one point `VERTEX_ATTRIB_POINTER`'s type is actually
+                // known (`Renderer::buffers`'s doc comment explains why it
+                // can't happen earlier, at upload time).
+                let mut gpu_bytes = Vec::with_capacity(vertex_count * pointer.size as usize * component_bytes);
+                for v in 0..vertex_count {
+                    let base = pointer.offset as usize + v * read_stride;
+                    for c in 0..pointer.size as usize {
+                        let at = base + c * component_bytes;
+                        let Some(src) = raw.get(at..at + component_bytes) else {
+                            return Err(RenderError::ShortPayload("programmable draw vertex attribute data"));
+                        };
+                        gpu_bytes.extend(src.iter().rev());
+                    }
                 }
-            }
-            let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("c3d programmable vertex attribute buffer"),
-                contents: &gpu_bytes,
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+                let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("c3d programmable vertex attribute buffer"),
+                    contents: &gpu_bytes,
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                ((pointer.size as usize * component_bytes) as u64, format, gpu_buffer)
+            } else {
+                // Disabled (or enabled with no buffer pointer ever set,
+                // which the spec leaves undefined for a real guest but
+                // which this renderer treats the same as disabled rather
+                // than reading uninitialised GPU memory): `VERTEX_ATTRIB_
+                // ENABLE`'s "a disabled slot's draw-time value is its
+                // constant" (`VERTEX_ATTRIB_CONSTANT`, GLES2's initial
+                // `(0, 0, 0, 1)` when never set). A buffer filled with
+                // that constant, repeated for every vertex the draw
+                // touches, reuses every other mechanism below unchanged
+                // (pipeline layout, vertex buffer binding) rather than
+                // threading a second, uniform-based input path through
+                // the shader template.
+                let constant = attrib.map_or([0.0, 0.0, 0.0, 1.0], |a| a.constant);
+                let Some((format, components)) = constant_attrib_wgpu_format(*gl_type) else {
+                    return Err(RenderError::Unimplemented(
+                        "programmable draw vertex shader input type with no direct wgpu vertex format for a constant attribute",
+                    ));
+                };
+                let mut gpu_bytes = Vec::with_capacity(vertex_count * components * 4);
+                for _ in 0..vertex_count {
+                    for c in &constant[..components] {
+                        gpu_bytes.extend_from_slice(&c.to_le_bytes());
+                    }
+                }
+                let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("c3d programmable constant vertex attribute buffer"),
+                    contents: &gpu_bytes,
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                ((components * 4) as u64, format, gpu_buffer)
+            };
             gpu_buffers.push(gpu_buffer);
-            layouts.push(((pointer.size as usize * component_bytes) as u64, format, shader_location as u32));
+            layouts.push((stride, format, shader_location as u32));
         }
 
         let vs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -8412,6 +8446,202 @@ mod tests {
         assert_eq!(
             outside, [0, 0, 255, 255],
             "outside the triangle should still be the draw surface's own blue background: {outside:?}"
+        );
+    }
+
+    /// A disabled programmable-draw vertex attribute must actually reach
+    /// the shader as its `VERTEX_ATTRIB_CONSTANT` value, not merely
+    /// decode and store without effect (`c3d.md`'s `VERTEX_ATTRIB_
+    /// ENABLE`: "A disabled slot's draw-time value is its constant").
+    /// `position` is buffer-backed and enabled as usual; `color` is left
+    /// disabled with a known constant set and must colour every covered
+    /// pixel exactly that constant.
+    #[test]
+    fn a_disabled_vertex_attribute_draws_with_its_constant_value() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+
+        let vs_src = b"attribute vec4 position;\nattribute vec4 color;\nvarying vec4 v_color;\nvoid main() { gl_Position = position; v_color = color; }\n";
+        let fs_src = b"precision mediump float;\nvarying vec4 v_color;\nvoid main() { gl_FragColor = v_color; }\n";
+        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2000u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length] // space 0 (aperture)
+        }
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 64, 64, 256, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 1.0, 1.0]), // blue background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            // `color` (location 1) is left disabled -- never enabled,
+            // never pointed at a buffer -- with a known constant set.
+            cmd(
+                proto::OP_VERTEX_ATTRIB_CONSTANT,
+                &[1, 1.0f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
+            ),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let inside = &pixels[(32 * 64 + 32) * 4..][..4];
+        assert_eq!(
+            inside, [255, 255, 0, 255],
+            "triangle centre should be the disabled attribute's constant (yellow): {inside:?}"
+        );
+        let outside = &pixels[(2 * 64 + 2) * 4..][..4];
+        assert_eq!(
+            outside, [0, 0, 255, 255],
+            "outside the triangle should still be the background: {outside:?}"
+        );
+    }
+
+    /// The GLES2 initial value for a generic vertex attribute is `(0, 0,
+    /// 0, 1)` -- opaque black -- per `c3d.md`'s `VERTEX_ATTRIB_CONSTANT`
+    /// and GLES2 itself, *without* ever calling `VERTEX_ATTRIB_CONSTANT`
+    /// at all. Same shape as the test above but skips that command
+    /// entirely, exercising `State`'s own default rather than an
+    /// explicitly-set one.
+    #[test]
+    fn a_never_set_vertex_attribute_constant_defaults_to_opaque_black() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+
+        let vs_src = b"attribute vec4 position;\nattribute vec4 color;\nvarying vec4 v_color;\nvoid main() { gl_Position = position; v_color = color; }\n";
+        let fs_src = b"precision mediump float;\nvarying vec4 v_color;\nvoid main() { gl_FragColor = v_color; }\n";
+        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2000u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length]
+        }
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 64, 64, 256, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 1.0, 1.0]), // blue background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            // `color` (location 1): never enabled, never pointed, never
+            // given an explicit constant -- the GLES2 default applies.
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let inside = &pixels[(32 * 64 + 32) * 4..][..4];
+        assert_eq!(
+            inside, [0, 0, 0, 255],
+            "triangle centre should be the GLES2 default constant (opaque black): {inside:?}"
         );
     }
 
@@ -12549,10 +12779,13 @@ mod tests {
         ) else {
             panic!("vertex shader failed to compile");
         };
-        let inputs = vertex_shader_inputs(&vs);
+        let inputs = vertex_shader_inputs_typed(&vs);
         assert_eq!(
             inputs,
-            vec![("position".to_string(), 0), ("normal".to_string(), 1)]
+            vec![
+                ("position".to_string(), 0, GL_FLOAT_VEC4),
+                ("normal".to_string(), 1, GL_FLOAT_VEC3),
+            ]
         );
 
         let glsl::CompileResult::Ok(fs) = glsl::compile(
@@ -12561,7 +12794,7 @@ mod tests {
         ) else {
             panic!("fragment shader failed to compile");
         };
-        assert!(vertex_shader_inputs(&fs).is_empty());
+        assert!(vertex_shader_inputs_typed(&fs).is_empty());
     }
 
     #[test]
