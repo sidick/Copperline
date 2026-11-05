@@ -781,6 +781,9 @@ pub fn encode_pixel_into(
         WireSurfaceFormat::Depth => {
             return Err(RenderError::Unimplemented("DEPTH surface readback"));
         }
+        WireSurfaceFormat::Stencil => {
+            return Err(RenderError::Unimplemented("STENCIL surface readback"));
+        }
     };
     out.get_mut(..n)
         .ok_or(RenderError::ShortPayload("encode_pixel destination"))?
@@ -803,6 +806,7 @@ pub fn surface_format_bytes_per_pixel(fmt: WireSurfaceFormat) -> u32 {
         }
         WireSurfaceFormat::R8g8b8 | WireSurfaceFormat::B8g8r8 => 3,
         WireSurfaceFormat::Depth => 4,
+        WireSurfaceFormat::Stencil => 1,
     }
 }
 
@@ -845,9 +849,9 @@ fn unpack555(v: u16) -> (u8, u8, u8, u8) {
 
 /// The exact inverse of [`encode_pixel`], for [`RenderOp::SurfaceUpload`]:
 /// converts one pixel of `fmt` at `src` back to a straight RGBA8 pixel.
-/// `None` if `src` is too short for one pixel of `fmt`, or for `Depth`,
-/// which is not a colour format `SURFACE_UPLOAD` ever targets (surfaces
-/// are colour render targets; `Depth` only ever appears as a
+/// `None` if `src` is too short for one pixel of `fmt`, or for `Depth`/
+/// `Stencil`, neither a colour format `SURFACE_UPLOAD` ever targets
+/// (surfaces are colour render targets; both only ever appear as a
 /// `READ_PIXELS` output format).
 pub fn decode_pixel(fmt: WireSurfaceFormat, src: &[u8]) -> Option<[u8; 4]> {
     Some(match fmt {
@@ -891,7 +895,7 @@ pub fn decode_pixel(fmt: WireSurfaceFormat, src: &[u8]) -> Option<[u8; 4]> {
             let (r, g, b, a) = unpack555(v);
             [r, g, b, a]
         }
-        WireSurfaceFormat::Depth => return None,
+        WireSurfaceFormat::Depth | WireSurfaceFormat::Stencil => return None,
     })
 }
 
@@ -6081,56 +6085,95 @@ impl Renderer {
             .get(&id)
             .ok_or(RenderError::UnknownObject("surface", id))?;
 
-        // Both branches produce one f32-per-channel-or-depth value per
-        // source texel, straight from `copy_texture_to_cpu`'s raw bytes
-        // (4 bytes/texel either way: RGBA8 four channel bytes, or one
-        // little-endian f32 for Depth32Float -- a raw GPU-to-CPU memory
+        // Three branches produce one value per source texel, straight
+        // from `copy_texture_to_cpu`'s raw bytes (a raw GPU-to-CPU memory
         // copy, not a serialised value, so it is read back in the same
         // little-endian convention every other GPU buffer in this module
-        // uses, e.g. `gpu_vertices_to_bytes`).
-        let bpp = if format == WireSurfaceFormat::Depth {
-            4
-        } else {
-            surface_format_bytes_per_pixel(format)
-        };
+        // uses, e.g. `gpu_vertices_to_bytes`): 4 channel bytes for an
+        // ordinary colour format, one little-endian f32 for `Depth32Float`,
+        // or one raw byte for `Stencil8`.
+        let bpp = surface_format_bytes_per_pixel(format);
+        let raw_bpp = bpp; // the *source* copy's own per-texel size, below
         // Writes one encoded pixel into the front of `out` and reports its
         // length, rather than returning a fresh `Vec` per pixel -- see
         // `encode_pixel_into`.
         let encode_at =
             |raw: &[u8], sx: u32, sy: u32, out: &mut [u8]| -> Result<usize, RenderError> {
-                let at = ((sy * def.width + sx) * 4) as usize;
-                if format == WireSurfaceFormat::Depth {
-                    let depth = f32::from_le_bytes(
-                        *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
-                    );
-                    let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
-                    out.get_mut(..4)
-                        .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
-                        .copy_from_slice(&scaled.to_be_bytes());
-                    Ok(4)
-                } else {
-                    let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
-                    encode_pixel_into(format, pixel, out)
+                match format {
+                    WireSurfaceFormat::Depth => {
+                        let at = ((sy * def.width + sx) * 4) as usize;
+                        let depth = f32::from_le_bytes(
+                            *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
+                        );
+                        let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
+                        out.get_mut(..4)
+                            .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
+                            .copy_from_slice(&scaled.to_be_bytes());
+                        Ok(4)
+                    }
+                    WireSurfaceFormat::Stencil => {
+                        // Raw, unscaled -- the spec's "8-bit stencil
+                        // value, one byte per pixel", unlike DEPTH's
+                        // normalised-to-u32 scaling.
+                        let at = (sy * def.width + sx) as usize;
+                        out.first_mut()
+                            .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))
+                            .map(|dst| *dst = raw[at])?;
+                        Ok(1)
+                    }
+                    _ => {
+                        let at = ((sy * def.width + sx) * 4) as usize;
+                        let pixel = [raw[at], raw[at + 1], raw[at + 2], raw[at + 3]];
+                        encode_pixel_into(format, pixel, out)
+                    }
                 }
             };
-        let raw = if format == WireSurfaceFormat::Depth {
-            let depth = gpu.depth.clone();
-            // `INTERNAL_DEPTH_STENCIL_FORMAT` has no single "all aspects"
-            // copy; `INTERNAL_DEPTH_FORMAT` has only the one aspect, for
-            // which `DepthOnly` and `All` are equivalent, so always
-            // asking for `DepthOnly` here is correct either way.
-            self.copy_texture_rect_to_cpu_aspect(
-                &depth,
-                0,
-                0,
-                0,
-                def.width,
-                def.height,
-                wgpu::TextureAspect::DepthOnly,
-            )?
-        } else {
-            let color = gpu.color.clone();
-            self.copy_texture_to_cpu(&color, def.width, def.height)?
+        let raw = match format {
+            WireSurfaceFormat::Depth => {
+                let depth = gpu.depth.clone();
+                // `INTERNAL_DEPTH_STENCIL_FORMAT` has no single "all
+                // aspects" copy; `INTERNAL_DEPTH_FORMAT` has only the one
+                // aspect, for which `DepthOnly` and `All` are equivalent,
+                // so always asking for `DepthOnly` here is correct either
+                // way.
+                self.copy_texture_rect_to_cpu_aspect(
+                    &depth,
+                    0,
+                    0,
+                    0,
+                    def.width,
+                    def.height,
+                    wgpu::TextureAspect::DepthOnly,
+                    raw_bpp,
+                )?
+            }
+            WireSurfaceFormat::Stencil => {
+                // Unlike DEPTH, STENCIL has nothing to read at all on an
+                // adapter that fell back to the depth-only format (no
+                // adapter support for `DEPTH32FLOAT_STENCIL8` -- see
+                // `Renderer::new`'s `depth_format` fallback) -- there is
+                // no stencil aspect on that texture for `wgpu` to copy.
+                if self.depth_format != INTERNAL_DEPTH_STENCIL_FORMAT {
+                    return Err(RenderError::Unimplemented(
+                        "READ_PIXELS(STENCIL) on an adapter without combined depth/stencil storage",
+                    ));
+                }
+                let depth = gpu.depth.clone();
+                self.copy_texture_rect_to_cpu_aspect(
+                    &depth,
+                    0,
+                    0,
+                    0,
+                    def.width,
+                    def.height,
+                    wgpu::TextureAspect::StencilOnly,
+                    raw_bpp,
+                )?
+            }
+            _ => {
+                let color = gpu.color.clone();
+                self.copy_texture_to_cpu(&color, def.width, def.height)?
+            }
         };
 
         let bottom_up = flags & proto::READ_PIXELS_FLAG_ROWS_BOTTOM_UP != 0;
@@ -7139,17 +7182,24 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
-        self.copy_texture_rect_to_cpu_aspect(texture, mip_level, x, y, width, height, wgpu::TextureAspect::All)
+        self.copy_texture_rect_to_cpu_aspect(texture, mip_level, x, y, width, height, wgpu::TextureAspect::All, 4)
     }
 
-    /// [`Self::copy_texture_rect_to_cpu`], plus an explicit copy aspect:
-    /// needed only for [`Self::op_read_pixels`]'s `DEPTH` format against
+    /// [`Self::copy_texture_rect_to_cpu`], plus an explicit copy aspect
+    /// and the aspect's own per-texel byte size: needed for
+    /// [`Self::op_read_pixels`]'s `DEPTH`/`STENCIL` formats against
     /// [`INTERNAL_DEPTH_STENCIL_FORMAT`] -- a combined depth/stencil
     /// texture has no single "all aspects" copy (`wgpu` requires naming
     /// one), unlike every other texture this module ever reads back
-    /// (always single-aspect colour), which is why every other caller
-    /// goes through the `All`-aspect wrapper above instead of this one
-    /// directly.
+    /// (always single-aspect colour, 4 bytes/texel, which is why every
+    /// other caller goes through the `All`-aspect, 4-byte wrapper above
+    /// instead of this one directly). The two aspects are differently
+    /// sized texel-for-texel: `DepthOnly` is 4 bytes (`Depth32Float`'s
+    /// own well-defined layout -- see [`INTERNAL_DEPTH_STENCIL_FORMAT`]'s
+    /// doc comment), `StencilOnly` is 1 (`Stencil8`'s single byte) --
+    /// getting this wrong would ask `wgpu` for a row stride that doesn't
+    /// match what the aspect actually copies, not just misdecode the
+    /// result.
     fn copy_texture_rect_to_cpu_aspect(
         &self,
         texture: &wgpu::Texture,
@@ -7159,8 +7209,9 @@ impl Renderer {
         width: u32,
         height: u32,
         aspect: wgpu::TextureAspect,
+        bytes_per_texel: u32,
     ) -> Result<Vec<u8>, RenderError> {
-        let bytes_per_row_unaligned = width * 4;
+        let bytes_per_row_unaligned = width * bytes_per_texel;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = bytes_per_row_unaligned.div_ceil(align) * align;
 
@@ -7213,12 +7264,12 @@ impl Renderer {
             .map_err(|e| RenderError::Gpu(e.to_string()))?;
 
         let data = slice.get_mapped_range();
-        let mut out = vec![0u8; (width * height * 4) as usize];
+        let row_bytes = (width * bytes_per_texel) as usize;
+        let mut out = vec![0u8; row_bytes * height as usize];
         for row in 0..height as usize {
             let src_start = row * padded_bytes_per_row as usize;
-            let dst_start = row * width as usize * 4;
-            out[dst_start..dst_start + width as usize * 4]
-                .copy_from_slice(&data[src_start..src_start + width as usize * 4]);
+            let dst_start = row * row_bytes;
+            out[dst_start..dst_start + row_bytes].copy_from_slice(&data[src_start..src_start + row_bytes]);
         }
         drop(data);
         buffer.unmap();
@@ -9183,6 +9234,86 @@ mod tests {
                 "expected roughly {expected}, got {value}"
             );
         }
+    }
+
+    /// `READ_PIXELS` with `format = Stencil` reads the stencil buffer as
+    /// a raw, unscaled byte per pixel -- unlike `Depth`'s `[0, 1]`-to-
+    /// `u32` scaling, the spec's "8-bit stencil value, one byte per
+    /// pixel" is exact. `CLEAR_STENCIL`+`CLEAR`'s stencil bit is the
+    /// simplest way to put a known value in the buffer, mirroring
+    /// `read_pixels_of_depth_reads_the_depth_buffer_as_a_scaled_u32`
+    /// above. Skips cleanly (not a failure) on an adapter that fell back
+    /// to depth-only storage -- see `Renderer::new`'s `depth_format`
+    /// feature-detection fallback -- since there is then no stencil
+    /// buffer to read at all, the same reasoning `op_read_pixels` itself
+    /// uses to turn that case into an `Unimplemented` error rather than
+    /// reading garbage.
+    #[test]
+    fn read_pixels_of_stencil_reads_the_stencil_buffer_as_a_raw_byte() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        if renderer.depth_format != INTERNAL_DEPTH_STENCIL_FORMAT {
+            eprintln!("skipping: this adapter has no combined depth/stencil storage");
+            return;
+        }
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 2,
+                height: 2,
+                stride_bytes: 8,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.enable(state::Capability::StencilTest);
+        state.set_stencil_mask(0xFF);
+        state.set_clear_stencil(0x2A);
+        let mut mem = TestMemory::new(64);
+        let errs = renderer.execute(
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_STENCIL,
+                state: state.clone(),
+            }],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let dest = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 4,
+        };
+        let errs = renderer.execute(
+            &[RenderOp::ReadPixels {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+                format: WireSurfaceFormat::Stencil,
+                row_bytes: 2,
+                flags: 0,
+                dest,
+                state: state.clone(),
+            }],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        assert_eq!(
+            &mem.aperture[0..4],
+            &[0x2A, 0x2A, 0x2A, 0x2A],
+            "every pixel should read back the exact CLEAR_STENCIL value, unscaled"
+        );
     }
 
     /// Draws a single fully-covering triangle at a fixed window-space

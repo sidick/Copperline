@@ -561,10 +561,13 @@ impl TexFormat {
 }
 
 /// Surface pixel formats (`docs/internals/c3d.md`'s "Surface formats").
-/// The device's own numbering; see [`TexFormat`]'s note. `Depth` is only
-/// legal as a `READ_PIXELS` destination format, which this module does
-/// not implement (pixel operations are out of scope), but the variant is
-/// included for completeness of the wire enumeration.
+/// The device's own numbering; see [`TexFormat`]'s note. `Depth` and
+/// `Stencil` are only legal as `READ_PIXELS` destination formats
+/// (`Stencil` further gated on `CAP_PROGRAMMABLE` by `ring.rs`'s
+/// `check_read_pixels_format`, since there is no stencil buffer at all
+/// without it) -- this module itself does not implement pixel
+/// operations (out of scope), but both variants are included for
+/// completeness of the wire enumeration.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SurfaceFormat {
     R5g6b5,
@@ -576,6 +579,7 @@ pub enum SurfaceFormat {
     R8g8b8a8,
     R8g8b8,
     B8g8r8,
+    Stencil,
     Depth,
 }
 
@@ -591,6 +595,7 @@ impl SurfaceFormat {
             7 => SurfaceFormat::R8g8b8a8,
             8 => SurfaceFormat::R8g8b8,
             9 => SurfaceFormat::B8g8r8,
+            254 => SurfaceFormat::Stencil,
             255 => SurfaceFormat::Depth,
             _ => return None,
         })
@@ -3596,6 +3601,7 @@ mod tests {
             (7, SurfaceFormat::R8g8b8a8),
             (8, SurfaceFormat::R8g8b8),
             (9, SurfaceFormat::B8g8r8),
+            (254, SurfaceFormat::Stencil),
             (255, SurfaceFormat::Depth),
         ] {
             assert_eq!(SurfaceFormat::from_wire(wire), Some(expected));

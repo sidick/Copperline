@@ -1987,15 +1987,20 @@ impl<'a> RingCursor<'a> {
     /// *destination* (`c3d-cmd-query`, spec draft 0.17) -- independent of
     /// `SURFFMT_SUPPORTED`, which governs render targets (`SURFACE_DEFINE`)
     /// only. Every device converts a readback to any non-reserved surface
-    /// format in the table (`1..=9`, or `255`=`DEPTH`, legal only for
-    /// `READ_PIXELS`) regardless of what it can render to -- so, unlike
-    /// `check_surffmt`, this never consults `self.config.surffmt_supported`
-    /// at all. A reserved value (`CLUT8`=32, or any of the `10-31`/`33-63`
-    /// reserved ranges) is still rejected, the same `E_UNSUPPORTED_FORMAT`
-    /// every other "no such format" case in this module raises.
+    /// format in the table (`1..=9`, `255`=`DEPTH`, or `254`=`STENCIL`
+    /// with `CAP_PROGRAMMABLE`; all three legal only for `READ_PIXELS`)
+    /// regardless of what it can render to -- so, unlike `check_surffmt`,
+    /// this never consults `self.config.surffmt_supported` at all. A
+    /// reserved value (`CLUT8`=32, or any of the `10-31`/`33-63` reserved
+    /// ranges), or `STENCIL` without `CAP_PROGRAMMABLE` (there is then no
+    /// stencil buffer at all, the same reasoning `CLEAR`'s stencil bit
+    /// and `STENCIL_FUNC`/`STENCIL_OP`/etc. already use), is still
+    /// rejected, the same `E_UNSUPPORTED_FORMAT` every other "no such
+    /// format" case in this module raises.
     fn check_read_pixels_format(&mut self, format: u32, start: u32) -> Result<(), Step<'a>> {
         match format {
             1..=9 | 255 => Ok(()),
+            254 if self.config.programmable => Ok(()),
             _ => Err(self.raise(ErrorCode::UnsupportedFormat, start)),
         }
     }
@@ -3206,6 +3211,56 @@ mod tests {
             step,
             Step::Command(Command::ReadPixels { format: 255, .. })
         ));
+    }
+
+    #[test]
+    fn read_pixels_with_stencil_format_is_allowed_under_cap_programmable() {
+        let words = [
+            header(OP_READ_PIXELS, 10),
+            0,
+            0,
+            4,
+            4,
+            254, // STENCIL
+            16,
+            0,
+            0x0010_0000,
+            16,
+        ];
+        let mut c = config(true);
+        c.surffmt_supported = 0; // even with nothing else supported
+        c.programmable = true;
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 40, c);
+        assert!(matches!(
+            step,
+            Step::Command(Command::ReadPixels { format: 254, .. })
+        ));
+    }
+
+    /// `STENCIL` is `E_UNSUPPORTED_FORMAT`, not merely "decodes and does
+    /// nothing", without `CAP_PROGRAMMABLE` -- there is then no stencil
+    /// buffer at all, the same reasoning `CLEAR`'s stencil bit and
+    /// `STENCIL_FUNC`/`STENCIL_OP`/etc. already use.
+    #[test]
+    fn read_pixels_with_stencil_format_is_e_unsupported_format_without_cap_programmable() {
+        let words = [
+            header(OP_READ_PIXELS, 10),
+            0,
+            0,
+            4,
+            4,
+            254, // STENCIL
+            16,
+            0,
+            0x0010_0000,
+            16,
+        ];
+        let mut c = config(true);
+        c.programmable = false;
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 40, c);
+        assert_eq!(step, err(ErrorCode::UnsupportedFormat, 0, false));
     }
 
     /// Spec draft 0.17: `READ_PIXELS`'s `format` is the client layout of

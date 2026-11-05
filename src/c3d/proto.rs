@@ -423,6 +423,9 @@ pub enum SurfaceFormat {
     B8G8R8 = 9,
     /// Reserved: 8-bit indexed, not implemented in version 1.
     Clut8 = 32,
+    /// Only legal as a `READ_PIXELS` format, and only with
+    /// `CAP_PROGRAMMABLE`: 8-bit stencil value, one byte per pixel.
+    Stencil = 254,
     /// Only legal as a `READ_PIXELS` format: 32-bit unsigned depth.
     Depth = 255,
 }
@@ -443,6 +446,10 @@ impl SurfaceFormat {
             SurfaceFormat::R8G8B8 | SurfaceFormat::B8G8R8 => 3,
             // Reserved 8-bit indexed format.
             SurfaceFormat::Clut8 => 1,
+            // 8-bit stencil; only legal as a READ_PIXELS format, so this
+            // value never actually feeds a stride/extent check either,
+            // same reasoning as Depth below.
+            SurfaceFormat::Stencil => 1,
             // 32-bit unsigned depth; only legal as a READ_PIXELS format, so
             // this value never actually feeds a stride/extent check, but
             // the number is correct if it ever does.
@@ -466,6 +473,7 @@ impl TryFrom<u32> for SurfaceFormat {
             8 => SurfaceFormat::R8G8B8,
             9 => SurfaceFormat::B8G8R8,
             32 => SurfaceFormat::Clut8,
+            254 => SurfaceFormat::Stencil,
             255 => SurfaceFormat::Depth,
             _ => return Err(()),
         })
@@ -1415,6 +1423,7 @@ mod tests {
     #[test]
     fn surface_format_try_from_accepts_documented_values_and_rejects_gaps() {
         assert_eq!(SurfaceFormat::try_from(1), Ok(SurfaceFormat::R5G6B5));
+        assert_eq!(SurfaceFormat::try_from(254), Ok(SurfaceFormat::Stencil));
         assert_eq!(SurfaceFormat::try_from(255), Ok(SurfaceFormat::Depth));
         assert!(SurfaceFormat::try_from(0).is_err());
         assert!(SurfaceFormat::try_from(10).is_err());
@@ -1432,6 +1441,7 @@ mod tests {
         assert_eq!(SurfaceFormat::R8G8B8.bytes_per_pixel(), 3);
         assert_eq!(SurfaceFormat::B8G8R8.bytes_per_pixel(), 3);
         assert_eq!(SurfaceFormat::Clut8.bytes_per_pixel(), 1);
+        assert_eq!(SurfaceFormat::Stencil.bytes_per_pixel(), 1);
         assert_eq!(SurfaceFormat::Depth.bytes_per_pixel(), 4);
     }
 
