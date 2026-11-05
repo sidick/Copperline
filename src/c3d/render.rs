@@ -1984,6 +1984,17 @@ pub struct PipelineKey {
     pub polygon_offset: Option<PolygonOffsetKey>,
     pub topology: PrimTopologyKey,
     pub fog: Option<FogKey>,
+    /// `CLIP_PLANE0..5`, `CAP_TRANSFORM`: which of up to 6 planes are
+    /// enabled for this draw. Always all-`false` for a window-space
+    /// draw (see `Renderer::pipeline_key_from_state`'s `window_space`
+    /// parameter) -- user clip planes are an eye-space concept a
+    /// window-space vertex, already fully transformed, has no
+    /// equivalent of. Only *which* planes are active is baked into the
+    /// pipeline (which `discard` checks the fragment shader emits at
+    /// all); the equations themselves are draw-time data carried per
+    /// vertex (`GpuVertex::clip_dist0`/`clip_dist1`), the same split
+    /// `alpha_test`'s operator/threshold divide already uses.
+    pub clip_planes: [bool; 6],
 }
 
 // wgpu's own enums don't implement `Hash`/`Eq` in a way this module wants
@@ -2450,6 +2461,8 @@ struct VsIn {
     @location(2) texcoord0: vec2<f32>,
     @location(3) fog_distance: f32,
     @location(4) texcoord1: vec2<f32>,
+    @location(5) clip_dist0: vec4<f32>,
+    @location(6) clip_dist1: vec2<f32>,
 };
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -2457,6 +2470,8 @@ struct VsOut {
     @location(1) texcoord0: vec2<f32>,
     @location(2) fog_distance: f32,
     @location(3) texcoord1: vec2<f32>,
+    @location(4) clip_dist0: vec4<f32>,
+    @location(5) clip_dist1: vec2<f32>,
 };
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -2466,6 +2481,8 @@ fn vs_main(in: VsIn) -> VsOut {
     out.texcoord0 = in.texcoord0;
     out.fog_distance = in.fog_distance;
     out.texcoord1 = in.texcoord1;
+    out.clip_dist0 = in.clip_dist0;
+    out.clip_dist1 = in.clip_dist1;
     return out;
 }
 "#;
@@ -2483,6 +2500,8 @@ struct VsOut {
     @location(1) texcoord0: vec2<f32>,
     @location(2) fog_distance: f32,
     @location(3) texcoord1: vec2<f32>,
+    @location(4) clip_dist0: vec4<f32>,
+    @location(5) clip_dist1: vec2<f32>,
 };
 "#;
 
@@ -2629,6 +2648,25 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
     } else {
         ""
     };
+    // `CLIP_PLANE0..5`: discard first, before any texturing/shading work
+    // -- GL's own pipeline order (clipping happens upstream of
+    // rasterisation entirely; a fragment-shader discard is this
+    // module's software stand-in for it, see `PipelineKey::clip_planes`'
+    // doc comment) runs well before fragment shading. Only an *enabled*
+    // plane gets a check emitted at all -- an unused `clip_dist0`/
+    // `clip_dist1` component is simply never read, matching
+    // `alpha_test`'s "no check at all when disabled" shape.
+    let clip_test: String = key
+        .clip_planes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &enabled)| enabled)
+        .map(|(i, _)| {
+            let component = ["x", "y", "z", "w"][i % 4];
+            let field = if i < 4 { "clip_dist0" } else { "clip_dist1" };
+            format!("if (in.{field}.{component} < 0.0) {{ discard; }}\n    ")
+        })
+        .collect();
     let mut header = FRAGMENT_SHADER_HEADER.replace("__FLAT__", flat);
     if key.textured {
         header.push_str("@group(0) @binding(0) var tex: texture_2d<f32>;\n@group(0) @binding(1) var samp: sampler;\n");
@@ -2637,7 +2675,7 @@ fn fragment_shader_source(key: &PipelineKey) -> String {
         header.push_str("@group(0) @binding(2) var tex1: texture_2d<f32>;\n@group(0) @binding(3) var samp1: sampler;\n");
     }
     format!(
-        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {sample}\n    {combine}\n    {unit1}    {alpha_test}    {fog}    return outc;\n}}\n",
+        "{header}\n{alpha_ref_decl}@fragment\nfn fs_main(in: VsOut) -> @location(0) vec4<f32> {{\n    {clip_test}{sample}\n    {combine}\n    {unit1}    {alpha_test}    {fog}    return outc;\n}}\n",
     )
 }
 
@@ -3977,6 +4015,16 @@ impl Renderer {
                     offset: 44,
                     shader_location: 4,
                 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 52,
+                    shader_location: 5,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 68,
+                    shader_location: 6,
+                },
             ],
         };
 
@@ -4221,6 +4269,7 @@ impl Renderer {
         unit1_active: bool,
         surface_format: wgpu::TextureFormat,
         topology: PrimTopologyKey,
+        window_space: bool,
     ) -> PipelineKey {
         let raster = &state.raster;
         let alpha_test = if state.is_enabled(state::Capability::AlphaTest) {
@@ -4335,6 +4384,14 @@ impl Renderer {
                 ))
             } else {
                 None
+            },
+            // User clip planes never apply to a window-space draw --
+            // see this field's own doc comment -- regardless of how
+            // many are enabled.
+            clip_planes: if window_space {
+                [false; 6]
+            } else {
+                std::array::from_fn(|i| state.enables.clip_plane.get(i).copied().unwrap_or(false))
             },
         }
     }
@@ -4877,6 +4934,10 @@ impl Renderer {
                 texcoord0: v.texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { clip_w },
                 texcoord1: v.texcoord1,
+                // User clip planes don't apply to a window-space draw --
+                // see `GpuVertex::clip_dist0`'s doc comment.
+                clip_dist0: [0.0; 4],
+                clip_dist1: [0.0; 2],
             }
         };
 
@@ -4888,7 +4949,7 @@ impl Renderer {
             vbuf.push(to_gpu(v));
         }
 
-        self.submit_draw(state, id, def, topology, vbuf)
+        self.submit_draw(state, id, def, topology, vbuf, true)
     }
 
     /// The GL-space (object-space, `CAP_TRANSFORM`) counterpart of
@@ -5125,6 +5186,23 @@ impl Renderer {
                 None => texcoord1,
             };
 
+            // `CLIP_PLANE0..5`: each enabled plane's eye-space equation
+            // (`state.clip_planes`'s entries are already eye-space --
+            // transformed at `CLIP_PLANE` dispatch time, see
+            // `State::set_clip_plane`) evaluated at this vertex's own
+            // eye-space position, the same linear quantity hardware
+            // `gl_ClipDistance` interpolates. Computed unconditionally
+            // (cheap dot products) for every slot up to 6 regardless of
+            // which are actually enabled -- `fragment_shader_source`
+            // only emits a `discard` check for the ones `PipelineKey::
+            // clip_planes` marks active, so an unused slot's value is
+            // simply never read.
+            let clip_dist = |i: usize| -> f32 {
+                let Some(&[a, b, c, d]) = state.clip_planes.0.get(i) else {
+                    return 0.0;
+                };
+                a * eye[0] + b * eye[1] + c * eye[2] + d
+            };
             GpuVertex {
                 clip_pos: [
                     final_ndc_x * safe_w,
@@ -5136,6 +5214,8 @@ impl Renderer {
                 texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { -eye[2] },
                 texcoord1,
+                clip_dist0: [clip_dist(0), clip_dist(1), clip_dist(2), clip_dist(3)],
+                clip_dist1: [clip_dist(4), clip_dist(5)],
             }
         };
 
@@ -5147,7 +5227,7 @@ impl Renderer {
             vbuf.push(to_gpu(v));
         }
 
-        self.submit_draw(state, id, def, topology, vbuf)
+        self.submit_draw(state, id, def, topology, vbuf, false)
     }
 
     /// The shared tail of [`Self::op_draw_inline_win`]/
@@ -5164,6 +5244,7 @@ impl Renderer {
         def: Surface,
         topology: PrimTopologyKey,
         vbuf: Vec<GpuVertex>,
+        window_space: bool,
     ) -> Result<(), RenderError> {
         let unit0 = state.texture_units.first();
         let bound_tex0 = unit0.map(|u| u.bound_texture).unwrap_or(0);
@@ -5187,6 +5268,7 @@ impl Renderer {
             unit1_active,
             surface_format,
             topology,
+            window_space,
         );
 
         if topology == PrimTopologyKey::Triangles && key.cull == Some(FaceKey::FrontAndBack) {
@@ -7097,6 +7179,16 @@ struct GpuVertex {
     texcoord0: [f32; 2],
     fog_distance: f32,
     texcoord1: [f32; 2],
+    /// `CLIP_PLANE0..5`'s per-vertex plane-equation distance (eye-space
+    /// `dot(plane.xyz, eye_pos) + plane.w`), carried unconditionally --
+    /// like `fog_distance` -- even when no clip plane is enabled, and
+    /// always `0.0` (a value no plane ever tests) for a window-space
+    /// draw, which user clip planes never apply to (see
+    /// `Renderer::op_draw_win`'s doc comment). Split across two
+    /// locations (`[f32; 4]` + `[f32; 2]`) rather than one `[f32; 6]`
+    /// purely because WGSL vertex inputs cap out at `vec4`.
+    clip_dist0: [f32; 4],
+    clip_dist1: [f32; 2],
 }
 
 /// Serialises a vertex list to the plain little-endian bytes a wgpu vertex
@@ -7117,6 +7209,12 @@ fn gpu_vertices_to_bytes(vertices: &[GpuVertex]) -> Vec<u8> {
         }
         out.extend_from_slice(&v.fog_distance.to_le_bytes());
         for f in v.texcoord1 {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in v.clip_dist0 {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in v.clip_dist1 {
             out.extend_from_slice(&f.to_le_bytes());
         }
     }
@@ -10363,6 +10461,132 @@ mod tests {
             "the lit colour's blue channel should come from the vertex colour via \
              COLOR_MATERIAL's AMBIENT_AND_DIFFUSE tracking, not the material's own default: {center:?}"
         );
+    }
+
+    /// `CLIP_PLANE0` must actually discard fragments on the wrong side
+    /// of the plane, not just decode and store the equation. Plane
+    /// `(1, 0, 0, 0)` -- `x >= 0` passes -- under the identity modelview
+    /// `draw_gl_space_triangle` sets up (eye space == object space, so
+    /// the plane's own object-space coefficients need no further
+    /// transform to reason about here), against a white triangle
+    /// covering the whole 16x16 surface: object-space `x = 0` lands
+    /// exactly at pixel column 8 (the surface's horizontal midpoint,
+    /// `to_gpu`'s viewport maths), so columns `0..8` (x < 0) must show
+    /// the black `CLEAR` background and columns `8..16` (x >= 0) must
+    /// show the triangle's white.
+    #[test]
+    fn clip_plane_discards_the_half_on_the_wrong_side_of_the_plane() {
+        let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            encode_gl_vertex([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
+        }
+        let format = VertexFormat(VertexFormat::COLOR);
+
+        let Some(pixels) = draw_gl_space_triangle(
+            format,
+            |s| {
+                s.set_clip_plane(state::ClipPlaneId::ClipPlane0, [1.0, 0.0, 0.0, 0.0]);
+                s.enable(state::Capability::ClipPlane(state::ClipPlaneId::ClipPlane0));
+            },
+            &verts,
+        ) else {
+            return; // no adapter
+        };
+
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let px = &pixels[((y * 16 + x) * 4) as usize..][..4];
+                if x < 8 {
+                    assert_eq!(px, [0, 0, 0, 255], "({x}, {y}) is x<0: should be clipped to the background: {px:?}");
+                } else {
+                    assert_eq!(px, [255, 255, 255, 255], "({x}, {y}) is x>=0: should pass the clip plane: {px:?}");
+                }
+            }
+        }
+    }
+
+    /// User clip planes are an eye-space concept a window-space vertex
+    /// -- already fully transformed, with no modelview/projection left
+    /// to place it relative to a plane -- has no equivalent of
+    /// (`PipelineKey::clip_planes`' doc comment). The same plane and
+    /// scene as the test above, but driven through the window-space
+    /// draw path (`RenderOp::Draw`'s `window_space: true`) instead of
+    /// `draw_gl_space_triangle`'s GL-space one: every pixel must show
+    /// the triangle's colour, including the left half a GL-space draw
+    /// with the same plane would have clipped away.
+    #[test]
+    fn clip_plane_does_not_affect_a_window_space_draw() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.set_clip_plane(state::ClipPlaneId::ClipPlane0, [1.0, 0.0, 0.0, 0.0]);
+        state.enable(state::Capability::ClipPlane(state::ClipPlaneId::ClipPlane0));
+
+        // Window-space format: x, y, z, rhw (not an object-space
+        // position at all), covering the whole 16x16 surface.
+        let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_bits().to_be_bytes());
+            }
+            for c in [1.0f32, 1.0, 1.0, 1.0] {
+                verts.extend_from_slice(&c.to_bits().to_be_bytes());
+            }
+        }
+        let format = VertexFormat(VertexFormat::COLOR);
+
+        let mut mem = TestMemory::new(65536);
+        let errs = renderer.execute(
+            &[
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                    state: state.clone(),
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
+                },
+            ],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let px = &pixels[((y * 16 + x) * 4) as usize..][..4];
+                assert_eq!(
+                    px,
+                    [255, 255, 255, 255],
+                    "({x}, {y}): a window-space draw must ignore CLIP_PLANE0 entirely: {px:?}"
+                );
+            }
+        }
     }
 
     /// `parse_gl_vertices` must accept `NORMAL` (illegal only in a
