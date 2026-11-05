@@ -130,7 +130,7 @@
 
 use super::dispatch::{Context, RenderOp};
 use super::proto;
-use super::render::{MemLoc, Memory, Renderer};
+use super::render::{MemLoc, Memory, Renderer, RenderError};
 use super::ring::DeviceConfig;
 use super::state;
 use super::trace::TraceWriter;
@@ -1229,7 +1229,17 @@ impl C3dBoard {
                 };
                 let errors = renderer.execute(&ops, &mut mem);
                 for e in &errors {
-                    log::warn!("c3d: context {n}: render error: {e}");
+                    if let RenderError::GlError(gl_err) = e {
+                        // Not a render failure -- a GL-semantic error the
+                        // op only had the GPU-side state to detect (see
+                        // `RenderError::GlError`'s doc comment). Applied
+                        // to the submitting context's own GL_ERROR, same
+                        // first-error-wins semantics as every other
+                        // `raise_gl_error` call site.
+                        self.contexts[n].ctx.state.raise_gl_error(*gl_err);
+                    } else {
+                        log::warn!("c3d: context {n}: render error: {e}");
+                    }
                 }
             }
             // If this submission queued a guest-address write (a
@@ -1956,22 +1966,26 @@ mod tests {
         assert_eq!(b.read(ctl, 4, &mut h), 0);
     }
 
-    /// Spec draft 0.15's `CTX_CONTROL` rule: freeing a context (`ALLOC`
-    /// cleared) and reallocating it must not carry `FENCE_COMPLETED`/
-    /// `FENCE_IRQ_TARGET` forward -- a stale high value from the previous
-    /// owner would satisfy the new owner's every fence wait instantly
-    /// (unsigned reached-or-passed compare) before any of its work had
-    /// run. `write_context`'s freeing branch already resets the whole
+    /// Spec draft 0.15's `CTX_CONTROL` rule, now also covering
+    /// `CAP_SHARED_CONTEXTS`'s `CTX_SHARE_GROUP`: freeing a context
+    /// (`ALLOC` cleared) and reallocating it must not carry
+    /// `FENCE_COMPLETED`/`FENCE_IRQ_TARGET`/`CTX_SHARE_GROUP` forward --
+    /// a stale high fence value from the previous owner would satisfy
+    /// the new owner's every fence wait instantly (unsigned
+    /// reached-or-passed compare) before any of its work had run, and a
+    /// stale share group would silently join the new owner into a
+    /// stranger's shared-object namespace it never asked to be part of.
+    /// `write_context`'s freeing branch already resets the whole
     /// `ContextSlot` to its default on `ALLOC` 1->0 (every object this
     /// context held is destroyed, per `CTX_CONTROL`'s own doc), which
-    /// already zeroes both registers well before any later realloc --
+    /// already zeroes all three well before any later realloc --
     /// behaviourally equivalent to zeroing on the 0->1 transition itself,
     /// since a context can only reach `ALLOC=1` a second time by first
     /// having passed back through `ALLOC=0`. This test pins that down as
     /// an explicit, spec-cited invariant rather than an incidental
     /// side effect of the freeing branch's existing full wipe.
     #[test]
-    fn fence_state_does_not_survive_a_free_and_realloc() {
+    fn fence_state_and_share_group_do_not_survive_a_free_and_realloc() {
         let mut b = board();
         let mut mem = dummy_mem();
         let mut h = host(&mut mem);
@@ -1988,6 +2002,10 @@ mod tests {
         b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
         b.write(ctl, 4, CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE, &mut h);
         b.write(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, 42, &mut h);
+        // Written before the ring's first command decodes below, so
+        // this join is honoured -- same immutability window `CTX_SHARE_
+        // GROUP` itself enforces.
+        b.write(CONTEXT_PAGE_BASE + creg::SHARE_GROUP, 4, 7, &mut h);
         b.write(
             CONTEXT_PAGE_BASE + creg::RING_TAIL,
             4,
@@ -1998,6 +2016,11 @@ mod tests {
             b.read(CONTEXT_PAGE_BASE + creg::FENCE_COMPLETED, 4, &mut h),
             5,
             "sanity: the fence actually completed before freeing"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::SHARE_GROUP, 4, &mut h),
+            7,
+            "sanity: the join actually took before freeing"
         );
         assert_eq!(
             b.read(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, &mut h),
@@ -2017,6 +2040,11 @@ mod tests {
             b.read(CONTEXT_PAGE_BASE + creg::FENCE_IRQ_TARGET, 4, &mut h),
             0,
             "FENCE_IRQ_TARGET must be disarmed for the new owner"
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::SHARE_GROUP, 4, &mut h),
+            0,
+            "a reallocated page must not silently inherit the previous owner's share group"
         );
     }
 

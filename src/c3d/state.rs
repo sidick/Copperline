@@ -150,6 +150,12 @@ pub enum GlError {
     StackOverflow,
     StackUnderflow,
     OutOfMemory,
+    /// A draw, `CLEAR`, `READ_PIXELS`, copy-to-texture command, or
+    /// `BLIT_FRAMEBUFFER` against a framebuffer whose `FRAMEBUFFER_STATUS`
+    /// is not `FRAMEBUFFER_COMPLETE` -- required detection, per c3d.md's
+    /// GL errors section (not merely "possibly", as an earlier draft of
+    /// that text understated it).
+    InvalidFramebufferOperation,
 }
 
 impl GlError {
@@ -163,6 +169,7 @@ impl GlError {
             GlError::StackOverflow => 0x0503,
             GlError::StackUnderflow => 0x0504,
             GlError::OutOfMemory => 0x0505,
+            GlError::InvalidFramebufferOperation => 0x0506,
         }
     }
 }

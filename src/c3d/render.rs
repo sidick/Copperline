@@ -205,6 +205,16 @@ pub enum RenderError {
     LimitExceeded(&'static str),
     /// A GPU-side operation (texture/buffer creation, mapping) failed.
     Gpu(String),
+    /// A GL-semantic error a dispatched op detected only once it had the
+    /// GPU-side state to check (e.g. `UNIFORM`'s `location` against the
+    /// program's actual compiled interface) -- `Renderer`'s op functions
+    /// have no direct access to any context's `State` to call
+    /// `raise_gl_error` on themselves (see this module's architecture
+    /// notes), so the caller (`board.rs`) is responsible for applying
+    /// this to the submitting context once `execute` returns it here.
+    /// Not a protocol error and never logged as one: a perfectly normal,
+    /// spec-required outcome for a misused-but-valid object.
+    GlError(state::GlError),
 }
 
 impl fmt::Display for RenderError {
@@ -220,6 +230,7 @@ impl fmt::Display for RenderError {
             RenderError::ShortPayload(what) => write!(f, "payload too short for {what}"),
             RenderError::LimitExceeded(what) => write!(f, "exceeds an internal limit: {what}"),
             RenderError::Gpu(e) => write!(f, "GPU error: {e}"),
+            RenderError::GlError(e) => write!(f, "GL error: {e:?}"),
         }
     }
 }
@@ -4429,7 +4440,11 @@ impl Renderer {
             return Ok(Some((def.width, def.height, color, 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
-            return Ok(None);
+            // Required detection (c3d.md's GL errors section), distinct
+            // from the READ_BUFFER == NONE / empty-slot cases just below,
+            // which are GL_INVALID_OPERATION, not this -- see "Reading
+            // from an incomplete or buffer-less framebuffer".
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -5272,15 +5287,23 @@ impl Renderer {
     }
 
     fn op_clear(&mut self, mask: u32, state: &State) -> Result<(), RenderError> {
+        // GL requires a depth clear to honour DEPTH_MASK -- glDepthMask(
+        // GL_FALSE) makes CLEAR's depth bit a no-op for the depth buffer,
+        // the same way the colour mask already restricts the colour bit
+        // below. Masking the bit out here, before anything else reads
+        // `mask`, means every downstream branch (load-op selection, the
+        // scissored-draw fallback) naturally treats a disabled depth
+        // clear as "not requested" with no separate check needed.
+        let mask = if state.raster.depth_mask { mask } else { mask & !proto::CLEAR_MASK_DEPTH };
         let Some((width, height, color_views, depth_view, _persistent_depth, _color_samples)) =
             self.resolve_draw_target(state)?
         else {
             // A CLEAR against an incomplete bound framebuffer is not a
-            // protocol error and has no effect -- the same rule
-            // DRAW_ARRAYS_PROG/DRAW_ELEMENTS_PROG already follow, and
-            // for the same reason (see FRAMEBUFFER_STATUS's doc comment
-            // in c3d.md).
-            return Ok(());
+            // protocol error, but it has no effect AND sets
+            // GL_INVALID_FRAMEBUFFER_OPERATION -- required detection, per
+            // c3d.md's GL errors section, the same rule
+            // DRAW_ARRAYS_PROG/DRAW_ELEMENTS_PROG already follow.
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         };
 
         let mask_full = state.raster.color_mask.r
@@ -5592,11 +5615,17 @@ impl Renderer {
         filter: u32,
         state: &State,
     ) -> Result<(), RenderError> {
+        // `resolve_read_source` itself now raises GL_INVALID_FRAMEBUFFER_
+        // OPERATION for a bound-but-incomplete read framebuffer (required
+        // detection, c3d.md's GL errors section); its remaining `None`
+        // here means only "READ_BUFFER is NONE/an empty slot", unchanged
+        // from before. The draw side's incompleteness follows the same
+        // rule every other draw-shaped op does.
         let Some((src_w, src_h, src_tex, src_level)) = self.resolve_read_source(state)? else {
             return Ok(());
         };
         let Some((_, _, dests)) = self.resolve_blit_color_destinations(state)? else {
-            return Ok(());
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         };
         if dests.is_empty() {
             return Ok(());
@@ -5936,6 +5965,11 @@ impl Renderer {
         mask: u32,
         state: &State,
     ) -> Result<(), RenderError> {
+        // Incompleteness is signalled as `Err` by these two (not folded
+        // into the `None` below, which also covers the legitimate "this
+        // framebuffer is complete but simply has no depth/stencil to
+        // copy" case -- real GL silently drops the mask bit for a
+        // buffer that doesn't exist, rather than erroring).
         let Some((src_w, src_h, src_tex, src_samples)) = self.resolve_depth_stencil_source(state)? else {
             return Ok(());
         };
@@ -6035,8 +6069,12 @@ impl Renderer {
     /// framebuffer is bound as read -- renderbuffer-only (a depth/stencil
     /// attachment is never a texture in this draft, per `FRAMEBUFFER_
     /// ATTACH_TEXTURE`'s "only a colour attachment point accepts a
-    /// texture"). `Ok(None)` for an incomplete read framebuffer or no
-    /// depth/stencil attached.
+    /// texture"). `Err(GlError(InvalidFramebufferOperation))` for an
+    /// incomplete read framebuffer (required detection, c3d.md's GL
+    /// errors section); `Ok(None)`, not an error, for a *complete*
+    /// framebuffer that simply has no depth/stencil attached -- real GL
+    /// silently drops a mask bit for a buffer that doesn't exist, rather
+    /// than erroring.
     fn resolve_depth_stencil_source(
         &mut self,
         state: &State,
@@ -6051,7 +6089,7 @@ impl Renderer {
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
-            return Ok(None);
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -6085,7 +6123,7 @@ impl Renderer {
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
         if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
-            return Ok(None);
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -7456,8 +7494,10 @@ impl Renderer {
         // attachment instead of the draw surface -- see
         // `Self::resolve_read_source`'s doc comment.
         let Some((_, _, color, src_level)) = self.resolve_read_source(state)? else {
-            // Incomplete read framebuffer or `READ_BUFFER` == `NONE`:
-            // not a protocol error, no effect.
+            // `READ_BUFFER` == `NONE` (or an empty slot): not a protocol
+            // error, no effect. An incomplete read framebuffer is instead
+            // `Err(GlError(InvalidFramebufferOperation))`, already
+            // propagated by `?` above before reaching here.
             return Ok(());
         };
 
@@ -7559,7 +7599,10 @@ impl Renderer {
 
         // As `op_tex_copy_image`: sources from the bound read
         // framebuffer's `READ_BUFFER`-selected attachment with
-        // `CAP_PROGRAMMABLE`, the draw surface otherwise.
+        // `CAP_PROGRAMMABLE`, the draw surface otherwise. `None` here
+        // means only `READ_BUFFER` == `NONE`/an empty slot -- an
+        // incomplete read framebuffer is `Err` from `resolve_read_source`
+        // itself, already propagated by `?` above.
         let Some((_, _, color, src_level)) = self.resolve_read_source(state)? else {
             return Ok(());
         };
@@ -7806,11 +7849,11 @@ impl Renderer {
                 // to, by the same rule.
                 let Some((src_width, src_height, color, level)) = self.resolve_read_source(state)?
                 else {
-                    // Incomplete read framebuffer or `READ_BUFFER` ==
-                    // `NONE`: not a protocol error, no effect (`dest`
-                    // left unmodified), the same rule an incomplete
-                    // *draw* framebuffer already follows for a draw/
-                    // `CLEAR`.
+                    // `READ_BUFFER` == `NONE` (or an empty slot): not a
+                    // protocol error, no effect (`dest` left unmodified).
+                    // An incomplete read framebuffer is instead `Err`
+                    // from `resolve_read_source` itself, already
+                    // propagated by `?` above.
                     return Ok(());
                 };
                 let bytes = self.copy_texture_rect_to_cpu(&color, level, 0, 0, src_width, src_height)?;
@@ -8227,16 +8270,32 @@ impl Renderer {
         Ok(())
     }
 
-    /// `UNIFORM`: records the value, converted from the wire's big-endian
-    /// words to native byte order (every word here is 4 bytes regardless
-    /// of `type_`'s float/int kind, so the conversion needs no type-
-    /// specific handling, unlike a vertex attribute's mixed component
-    /// widths). Silently does nothing if `program` doesn't exist yet --
-    /// see `RenderOp::Uniform`'s doc comment on why an invalid `program`/
-    /// `location` isn't a GL error here. `type_`/`count` themselves are
-    /// not stored or re-validated against the program's own interface in
-    /// this draft; a value at a location the interface doesn't actually
-    /// have just sits unused.
+    /// Whether `location` names one of `program`'s currently active
+    /// *uniforms* (not attributes -- `slot.interface`'s first
+    /// `attrib_count` entries are attributes, per [`InterfaceEntry`]'s
+    /// doc comment, and `UNIFORM`/`UNIFORM_SAMPLER` only ever address the
+    /// uniform portion). An array uniform's `InterfaceEntry` carries only
+    /// its base `location` and `array_size`; every location in
+    /// `[location, location + array_size)` addresses one element of it,
+    /// mirroring real GL's `glGetUniformLocation("name[i]")` numbering
+    /// (`array_size` `0` for a non-array uniform is treated as `1`, one
+    /// valid location). `false` for an unknown `program` too -- it
+    /// trivially has no active uniforms at all.
+    fn uniform_location_is_valid(&self, program: u32, location: u32, namespace: Namespace) -> bool {
+        let Some(slot) = self.programs.get(&(namespace, program)) else {
+            return false;
+        };
+        slot.interface[slot.attrib_count as usize..].iter().any(|e| {
+            let span = e.array_size.max(1);
+            location >= e.location && location < e.location + span
+        })
+    }
+
+    /// `UNIFORM`. A `location` that doesn't belong to `program`'s current
+    /// uniform interface -- including one stale after a relink that
+    /// changed it -- is `GL_INVALID_OPERATION` (c3d.md's GL errors
+    /// section), not a protocol error: a misuse of a still-valid object,
+    /// left otherwise unapplied.
     fn op_uniform(
         &mut self,
         program: u32,
@@ -8246,9 +8305,10 @@ impl Renderer {
         values: &[u8],
         namespace: Namespace,
     ) -> Result<(), RenderError> {
-        let Some(slot) = self.programs.get_mut(&(namespace, program)) else {
-            return Ok(());
-        };
+        if !self.uniform_location_is_valid(program, location, namespace) {
+            return Err(RenderError::GlError(state::GlError::InvalidOperation));
+        }
+        let slot = self.programs.get_mut(&(namespace, program)).expect("checked above");
         let native: Vec<u8> = values.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect();
         slot.uniform_values.insert(location, native);
         Ok(())
@@ -8256,6 +8316,8 @@ impl Renderer {
 
     /// `UNIFORM_SAMPLER`. See `ProgramSlot::sampler_bindings`'s doc
     /// comment: applied by `draw_prog` at the next programmable draw.
+    /// Same `GL_INVALID_OPERATION` rule as [`Self::op_uniform`] for a
+    /// `location` outside `program`'s current uniform interface.
     fn op_uniform_sampler(
         &mut self,
         program: u32,
@@ -8263,9 +8325,11 @@ impl Renderer {
         unit: u32,
         namespace: Namespace,
     ) -> Result<(), RenderError> {
-        if let Some(slot) = self.programs.get_mut(&(namespace, program)) {
-            slot.sampler_bindings.insert(location, unit);
+        if !self.uniform_location_is_valid(program, location, namespace) {
+            return Err(RenderError::GlError(state::GlError::InvalidOperation));
         }
+        let slot = self.programs.get_mut(&(namespace, program)).expect("checked above");
+        slot.sampler_bindings.insert(location, unit);
         Ok(())
     }
 
@@ -8354,9 +8418,9 @@ impl Renderer {
         let mut bytes = Vec::with_capacity(16 + slot.info_log.len());
         bytes.extend_from_slice(&(slot.link_status as u32).to_be_bytes());
         bytes.extend_from_slice(&(slot.validate_status as u32).to_be_bytes());
+        bytes.extend_from_slice(&binary_length.to_be_bytes());
         bytes.extend_from_slice(&(slot.info_log.len() as u32).to_be_bytes());
         bytes.extend_from_slice(slot.info_log.as_bytes());
-        bytes.extend_from_slice(&binary_length.to_be_bytes());
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
             return Err(RenderError::BadMemory(format!("PROGRAM_STATUS write to {loc:?}")));
@@ -8547,11 +8611,11 @@ impl Renderer {
         let Some((target_width, target_height, color_views, depth_view, persistent_depth, target_samples)) =
             self.resolve_draw_target(state)?
         else {
-            // A programmable draw against an incomplete bound
-            // framebuffer is not a protocol error and has no effect,
-            // per the spec's `FRAMEBUFFER_STATUS`/`DRAW_ARRAYS_PROG`
-            // sections.
-            return Ok(());
+            // A programmable draw against an incomplete bound framebuffer
+            // is not a protocol error, but it has no effect AND sets
+            // GL_INVALID_FRAMEBUFFER_OPERATION -- required detection, per
+            // c3d.md's GL errors section and `DRAW_ARRAYS_PROG`'s own row.
+            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
         };
 
         // One `wgpu::VertexBufferLayout`/bound buffer per shader input,
@@ -11303,6 +11367,81 @@ mod tests {
             assert!(
                 (value as i64 - expected as i64).abs() <= 1,
                 "expected roughly {expected}, got {value}"
+            );
+        }
+    }
+
+    /// `CLEAR`'s depth bit must honour `DEPTH_MASK`: with it `false`,
+    /// `CLEAR(CLEAR_MASK_DEPTH)` leaves the depth buffer's prior contents
+    /// untouched, per GL. Seeds a known depth via a real (unmasked)
+    /// clear, then a second, masked-off `CLEAR` attempting a different
+    /// depth must not move the value `READ_PIXELS` reads back.
+    #[test]
+    fn clear_depth_is_a_no_op_while_depth_mask_is_false() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 2,
+                height: 2,
+                stride_bytes: 8,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        let mut mem = TestMemory::new(64);
+
+        // Seed a known depth with DEPTH_MASK still true (the default).
+        state.set_clear_depth(0.5);
+        let errs = renderer.execute(
+            &[RenderOp::Clear { mask: proto::CLEAR_MASK_DEPTH, state: state.clone() }],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        // DEPTH_MASK false, then a CLEAR to a different depth -- must be
+        // a no-op for the depth buffer.
+        state.set_depth_mask(false);
+        state.set_clear_depth(0.9);
+        let errs = renderer.execute(
+            &[RenderOp::Clear { mask: proto::CLEAR_MASK_DEPTH, state: state.clone() }],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let dest = Ref { address: 0, space: RefSpace::Aperture, length: 16 };
+        let errs = renderer.execute(
+            &[RenderOp::ReadPixels {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+                format: WireSurfaceFormat::Depth,
+                row_bytes: 8,
+                flags: 0,
+                dest,
+                state: state.clone(),
+            }],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let expected = ((0.5f64) * u32::MAX as f64).round() as u32;
+        for chunk in mem.aperture[0..16].chunks_exact(4) {
+            let value = u32::from_be_bytes(chunk.try_into().unwrap());
+            assert!(
+                (value as i64 - expected as i64).abs() <= 1,
+                "DEPTH_MASK=false CLEAR must not have moved the depth value: expected roughly {expected}, got {value}"
             );
         }
     }
@@ -15795,6 +15934,84 @@ mod tests {
         );
     }
 
+    /// `UNIFORM`/`UNIFORM_SAMPLER` with a `location` that doesn't belong
+    /// to the named program's current interface is `GL_INVALID_OPERATION`
+    /// (c3d.md's GL errors section), surfaced from `Renderer::execute` as
+    /// `RenderError::GlError` for the caller (`board.rs`) to apply to the
+    /// submitting context -- not a protocol error, and the value must not
+    /// be stored (a later valid draw must not see it).
+    #[test]
+    fn uniform_with_a_location_outside_the_programs_interface_is_invalid_operation() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"precision mediump float;\nuniform float x;\nvoid main() { gl_FragColor = vec4(x, 0.0, 0.0, 1.0); }\n";
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let mut mem = TestMemory::new(16384);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+
+        let iface_addr = 0x3000u32;
+        let link_commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_PROGRAM_INTERFACE, &[1, iface_addr, 512]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
+        let [x_loc, _] = program_interface_locations(&mut mem, iface_addr, &["x", "position"]);
+        let bad_loc = x_loc + 100; // nowhere near a real uniform/attribute location
+
+        // Submitted directly (not via `submit_commands_ctx`, which asserts
+        // `errs.is_empty()`) since this command's whole point is to
+        // produce one.
+        let commands: Vec<Vec<u8>> = vec![cmd(
+            proto::OP_UNIFORM,
+            &[1, bad_loc, GL_FLOAT, 1, 1.0f32.to_bits()],
+        )];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+        ctx.ring_head = 0;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "a bad location is a GL error, not a protocol error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(
+            matches!(errs.as_slice(), [RenderError::GlError(state::GlError::InvalidOperation)]),
+            "expected exactly one GL_INVALID_OPERATION, got: {errs:?}"
+        );
+
+        // The real location is unaffected and still accepted normally --
+        // confirms the rejection is specific to the bad location, not a
+        // side effect that broke the program generally.
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[cmd(proto::OP_UNIFORM, &[1, x_loc, GL_FLOAT, 1, 1.0f32.to_bits()])],
+        );
+    }
+
     /// End-to-end MRT: a fragment shader writing `gl_FragData[0]`/`[1]`,
     /// `DRAW_BUFFERS` mapping both slots to two real (renderbuffer)
     /// colour attachments, and `READ_BUFFER`/`READ_PIXELS` reading each
@@ -16149,14 +16366,10 @@ mod tests {
             1,
             "program 1 should link successfully"
         );
-        let log_length = u32::from_be_bytes(status_head[8..12].try_into().unwrap());
-        let binary_length_off = 12 + log_length as usize;
-        let tail = mem
-            .read(MemLoc::Aperture(status_dest), binary_length_off + 4)
-            .unwrap()
-            .to_vec();
-        let binary_length =
-            u32::from_be_bytes(tail[binary_length_off..binary_length_off + 4].try_into().unwrap());
+        // `binary_length` now precedes the variable-length log (so it's
+        // always at this fixed offset, regardless of log length) -- the
+        // whole point of the reordering this field prefix-testability.
+        let binary_length = u32::from_be_bytes(status_head[8..12].try_into().unwrap());
         assert!(
             binary_length > 0,
             "a linked program on a PROGRAM_BINARY_FORMAT-supporting device should have a nonzero binary_length"
@@ -16238,13 +16451,13 @@ mod tests {
                 cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 256]),
             ],
         );
-        let status = mem.read(MemLoc::Aperture(status_dest), 12).unwrap().to_vec();
+        let status = mem.read(MemLoc::Aperture(status_dest), 16).unwrap().to_vec();
         assert_eq!(
             u32::from_be_bytes(status[0..4].try_into().unwrap()),
             0,
             "a format mismatch should fail like a bad link, not succeed"
         );
-        let log_length = u32::from_be_bytes(status[8..12].try_into().unwrap());
+        let log_length = u32::from_be_bytes(status[12..16].try_into().unwrap());
         assert!(log_length > 0, "a format mismatch should leave an explanatory info log");
     }
 
@@ -16324,6 +16537,71 @@ mod tests {
             u32::from_be_bytes(result[4..8].try_into().unwrap()),
             0,
             "length should be 0 for a never-linked program"
+        );
+    }
+
+    /// `BLIT_FRAMEBUFFER` must **not** honour the scissor -- real GL
+    /// doesn't either, since the destination rectangle itself already
+    /// bounds the copy. A scissor rect covering only the destination's
+    /// top-left pixel, with `GL_SCISSOR_TEST` enabled, must not stop the
+    /// blit from writing the far corner too.
+    #[test]
+    fn blit_framebuffer_ignores_the_scissor() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const NEAREST: u32 = 0;
+        const GL_SCISSOR_TEST: u32 = 0x0C11;
+        let mut mem = TestMemory::new(65536);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+
+        let commands = vec![
+            // Source: a 4x4 red surface.
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 4, 4, 16, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            // Destination: a 4x4 renderbuffer, cleared to black so an
+            // un-blitted pixel is unambiguously distinguishable from red.
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 4, 4, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            // A scissor covering only the top-left pixel, enabled.
+            cmd(proto::OP_SCISSOR, &[0, 0, 1, 1]),
+            cmd(proto::OP_ENABLE, &[GL_SCISSOR_TEST]),
+            // Read side: the red surface (default framebuffer).
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 0]),
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let dest = 0x4000u32;
+        let readback = vec![
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[3, 3, 1, 1, A8R8G8B8, 4, 0, dest, 4]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+
+        let red = encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap();
+        let got = mem.read(MemLoc::Aperture(dest), 4).unwrap().to_vec();
+        assert_eq!(
+            got, red,
+            "the far corner, outside the 1x1 scissor rect, must still be blitted -- BLIT_FRAMEBUFFER ignores the scissor: {got:?}"
         );
     }
 
@@ -16635,6 +16913,99 @@ mod tests {
         let got1 = mem.read(MemLoc::Aperture(dest1), 4).unwrap().to_vec();
         assert_eq!(got0, magenta, "COLOR_ATTACHMENT0 should receive the blitted source: {got0:?}");
         assert_eq!(got1, magenta, "COLOR_ATTACHMENT1 should also receive the blitted source: {got1:?}");
+    }
+
+    /// `CLEAR`, `READ_PIXELS`, `TEX_COPY_IMAGE`, and `BLIT_FRAMEBUFFER`
+    /// against a bound-but-incomplete framebuffer (one just created, with
+    /// no attachments at all -- `FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT`)
+    /// must each produce `GL_INVALID_FRAMEBUFFER_OPERATION` -- required
+    /// detection, per c3d.md's GL errors section, not merely "possibly"
+    /// as an earlier draft of that text understated it -- and have no
+    /// effect, never a protocol error. Each op is submitted directly
+    /// (not via `submit_commands_ctx`, which asserts no errors) so its
+    /// own single `RenderError::GlError` can be checked in isolation.
+    #[test]
+    fn clear_read_pixels_copy_and_blit_against_an_incomplete_framebuffer_are_all_invalid_framebuffer_operation() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const RGBA8: u32 = 0;
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const NEAREST: u32 = 0;
+        let mut mem = TestMemory::new(65536);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+
+        // A draw surface (needed so TEX_COPY_IMAGE/BLIT_FRAMEBUFFER's
+        // default-framebuffer fallback path, were it ever taken, would
+        // have somewhere valid to fall back to -- it never is here,
+        // since both bindings below point at the incomplete framebuffer
+        // instead) plus a destination texture for TEX_COPY_IMAGE.
+        let setup = vec![
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            // Bound-but-incomplete: created, bound as both draw and read,
+            // never attached to anything.
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &setup);
+
+        fn submit_and_expect_invalid_framebuffer_operation(
+            ctx: &mut super::super::dispatch::Context,
+            renderer: &mut Renderer,
+            mem: &mut TestMemory,
+            command: Vec<u8>,
+            what: &str,
+        ) {
+            let mut ring = command;
+            let total = ring.len() as u32;
+            ring.resize(ring.len() + 4, 0);
+            ctx.ring_head = 0;
+            let mut out = Vec::new();
+            ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+            assert_eq!(ctx.error_code, 0, "{what}: an incomplete framebuffer is a GL error, not a protocol error");
+            let errs = renderer.execute(&out, mem);
+            assert!(
+                matches!(errs.as_slice(), [RenderError::GlError(state::GlError::InvalidFramebufferOperation)]),
+                "{what}: expected exactly one GL_INVALID_FRAMEBUFFER_OPERATION, got: {errs:?}"
+            );
+        }
+
+        submit_and_expect_invalid_framebuffer_operation(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            "CLEAR",
+        );
+        submit_and_expect_invalid_framebuffer_operation(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, 0x5000, 16]),
+            "READ_PIXELS",
+        );
+        submit_and_expect_invalid_framebuffer_operation(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            cmd(proto::OP_TEX_COPY_IMAGE, &[1, 0, RGBA8, 0, 0, 2, 2]),
+            "TEX_COPY_IMAGE",
+        );
+        submit_and_expect_invalid_framebuffer_operation(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+            "BLIT_FRAMEBUFFER",
+        );
     }
 
     /// `BLIT_FRAMEBUFFER`'s multisample depth resolve: a full-screen quad
