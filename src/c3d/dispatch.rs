@@ -228,6 +228,55 @@ pub enum RenderOp<'a> {
         height: u32,
         state: State,
     },
+    /// `TEX_IMAGE_FACE`. As `TexImage`, for one face of a cube-map object.
+    TexImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        format: state::TexFormat,
+        width: u32,
+        height: u32,
+        row_bytes: u32,
+        data: Ref,
+    },
+    /// `TEX_SUBIMAGE_FACE`. As `TexSubImage`, for one face.
+    TexSubImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        format: state::TexFormat,
+        row_bytes: u32,
+        data: Ref,
+    },
+    /// `TEX_COPY_IMAGE_FACE`. As `TexCopyImage`, for one face.
+    TexCopyImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        format: state::TexFormat,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: State,
+    },
+    /// `TEX_COPY_SUBIMAGE_FACE`. As `TexCopySubImage`, for one face.
+    TexCopySubImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        xoff: u32,
+        yoff: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: State,
+    },
     /// `TEX_PALETTE`. Emitted only once
     /// [`state::State::set_tex_palette`] has bound it against an existing
     /// texture object.
@@ -1095,6 +1144,10 @@ impl Context {
                 let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
                     return;
                 };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Flat) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
                 if self
                     .state
                     .define_tex_level(id, level, fmt, width, height)
@@ -1125,10 +1178,14 @@ impl Context {
                 let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
                     return;
                 };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Flat) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
                 let matches_existing_level = self
                     .state
                     .texture(id)
-                    .and_then(|t| t.levels.get(&level))
+                    .and_then(|t| t.levels.get(&(0, level)))
                     .is_some_and(|existing| existing.format == fmt);
                 if matches_existing_level {
                     out.push(RenderOp::TexSubImage {
@@ -1179,6 +1236,10 @@ impl Context {
                 let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
                     return;
                 };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Flat) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
                 // The source rectangle comes off the draw surface, so this
                 // needs the same `E_NO_SURFACE`/`E_BAD_RECT` pair a readback
                 // does -- checked before the level is defined, so a rejected
@@ -1217,6 +1278,10 @@ impl Context {
                 width,
                 height,
             } => {
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Flat) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
                 // Source rectangle off the draw surface, as above.
                 if let Err(code) = self
                     .state
@@ -1228,7 +1293,7 @@ impl Context {
                 let level_exists = self
                     .state
                     .texture(id)
-                    .is_some_and(|t| t.levels.contains_key(&level));
+                    .is_some_and(|t| t.levels.contains_key(&(0, level)));
                 if level_exists {
                     out.push(RenderOp::TexCopySubImage {
                         id,
@@ -1256,6 +1321,167 @@ impl Context {
             Command::TexGenerateMips { id } => {
                 if self.state.texture(id).is_some() {
                     out.push(RenderOp::TexGenerateMips { id });
+                } else {
+                    self.state.raise_gl_error(GlError::InvalidOperation);
+                }
+            }
+            Command::TexCreateCube { id } => self.state.tex_create_cube(id),
+            Command::TexImageFace {
+                id,
+                face,
+                level,
+                format,
+                width,
+                height,
+                row_bytes,
+                data,
+            } => {
+                let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
+                    return;
+                };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Cube) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                if self
+                    .state
+                    .define_tex_level_face(id, face, level, fmt, width, height)
+                    .is_ok()
+                {
+                    out.push(RenderOp::TexImageFace {
+                        id,
+                        face,
+                        level,
+                        format: fmt,
+                        width,
+                        height,
+                        row_bytes,
+                        data,
+                    });
+                }
+            }
+            Command::TexSubImageFace {
+                id,
+                face,
+                level,
+                x,
+                y,
+                width,
+                height,
+                format,
+                row_bytes,
+                data,
+            } => {
+                let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
+                    return;
+                };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Cube) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                let matches_existing_level = self
+                    .state
+                    .texture(id)
+                    .and_then(|t| t.levels.get(&(face, level)))
+                    .is_some_and(|existing| existing.format == fmt);
+                if matches_existing_level {
+                    out.push(RenderOp::TexSubImageFace {
+                        id,
+                        face,
+                        level,
+                        x,
+                        y,
+                        width,
+                        height,
+                        format: fmt,
+                        row_bytes,
+                        data,
+                    });
+                } else {
+                    self.state.raise_gl_error(GlError::InvalidOperation);
+                }
+            }
+            Command::TexCopyImageFace {
+                id,
+                face,
+                level,
+                format,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let Some(fmt) = self.decode_gl(state::TexFormat::from_wire(format)) else {
+                    return;
+                };
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Cube) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                if let Err(code) = self
+                    .state
+                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                if self
+                    .state
+                    .define_tex_level_face(id, face, level, fmt, width, height)
+                    .is_ok()
+                {
+                    out.push(RenderOp::TexCopyImageFace {
+                        id,
+                        face,
+                        level,
+                        format: fmt,
+                        x,
+                        y,
+                        width,
+                        height,
+                        state: self.state.clone(),
+                    });
+                }
+            }
+            Command::TexCopySubImageFace {
+                id,
+                face,
+                level,
+                xoff,
+                yoff,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Err(code) = self.state.check_texture_kind(id, state::TextureKind::Cube) {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                if let Err(code) = self
+                    .state
+                    .check_draw_surface_rect(x as i32, y as i32, width, height)
+                {
+                    self.latch_protocol_error(code, start);
+                    return;
+                }
+                let level_exists = self
+                    .state
+                    .texture(id)
+                    .is_some_and(|t| t.levels.contains_key(&(face, level)));
+                if level_exists {
+                    out.push(RenderOp::TexCopySubImageFace {
+                        id,
+                        face,
+                        level,
+                        xoff,
+                        yoff,
+                        x,
+                        y,
+                        width,
+                        height,
+                        state: self.state.clone(),
+                    });
                 } else {
                     self.state.raise_gl_error(GlError::InvalidOperation);
                 }
@@ -1601,6 +1827,27 @@ impl Context {
                 // every other op below).
                 let status = self.state.framebuffer_status(target);
                 out.push(RenderOp::FramebufferStatus { dest, status });
+            }
+            Command::FramebufferAttachTextureFace {
+                target,
+                attachment,
+                texture,
+                face,
+                level,
+            } => {
+                let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
+                    return;
+                };
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment))
+                else {
+                    return;
+                };
+                if let Err(code) = self
+                    .state
+                    .framebuffer_attach_texture_face(target, attachment, texture, face, level)
+                {
+                    self.latch_protocol_error(code, start);
+                }
             }
 
             // -- CAP_PROGRAMMABLE: programmable draw -----------------
@@ -2377,7 +2624,7 @@ mod tests {
             }
         ));
         let tex = ctx.state.texture(1).unwrap();
-        assert_eq!(tex.levels.get(&0).unwrap().width, 4);
+        assert_eq!(tex.levels.get(&(0, 0)).unwrap().width, 4);
     }
 
     // -- Reset ---------------------------------------------------------

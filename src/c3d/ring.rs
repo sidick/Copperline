@@ -511,7 +511,13 @@ impl<'a> RingCursor<'a> {
                 | OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL
                 | OP_FRAMEBUFFER_ATTACH_RENDERBUFFER
                 | OP_FRAMEBUFFER_ATTACH_TEXTURE
+                | OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE
                 | OP_FRAMEBUFFER_STATUS
+                | OP_TEX_CREATE_CUBE
+                | OP_TEX_IMAGE_FACE
+                | OP_TEX_SUBIMAGE_FACE
+                | OP_TEX_COPY_IMAGE_FACE
+                | OP_TEX_COPY_SUBIMAGE_FACE
                 | OP_STENCIL_FUNC
                 | OP_STENCIL_OP
                 | OP_STENCIL_MASK
@@ -1178,6 +1184,111 @@ impl<'a> RingCursor<'a> {
                 check!(self.check_id(id, self.config.max_textures, start));
                 Command::TexGenerateMips { id }
             }
+            OP_TEX_CREATE_CUBE => {
+                fixed!(1);
+                let id = w32(body, 0);
+                check!(self.check_id(id, self.config.max_textures, start));
+                Command::TexCreateCube { id }
+            }
+            OP_TEX_IMAGE_FACE => {
+                fixed!(9);
+                let id = w32(body, 0);
+                let face = w32(body, 1);
+                let width = w32(body, 4);
+                let height = w32(body, 5);
+                let format = w32(body, 3);
+                check!(self.check_id(id, self.config.max_textures, start));
+                check!(self.check_face(face, start));
+                check!(self.check_pow2_dims(width, height, start));
+                if width != height {
+                    return self.raise(ErrorCode::BadArg, start);
+                }
+                check!(self.check_texture_size(width, height, start));
+                check!(self.check_texfmt(format, start));
+                check!(self.check_texture_row_bytes(w32(body, 6), start));
+                let data = Ref::decode(w32(body, 7), w32(body, 8));
+                check!(self.validate_ref(data, start));
+                Command::TexImageFace {
+                    id,
+                    face,
+                    level: w32(body, 2),
+                    format,
+                    width,
+                    height,
+                    row_bytes: w32(body, 6),
+                    data,
+                }
+            }
+            OP_TEX_SUBIMAGE_FACE => {
+                fixed!(11);
+                let id = w32(body, 0);
+                let face = w32(body, 1);
+                let width = w32(body, 5);
+                let height = w32(body, 6);
+                let format = w32(body, 7);
+                check!(self.check_id(id, self.config.max_textures, start));
+                check!(self.check_face(face, start));
+                check!(self.check_texture_size(width, height, start));
+                check!(self.check_texfmt(format, start));
+                check!(self.check_texture_row_bytes(w32(body, 8), start));
+                let data = Ref::decode(w32(body, 9), w32(body, 10));
+                check!(self.validate_ref(data, start));
+                Command::TexSubImageFace {
+                    id,
+                    face,
+                    level: w32(body, 2),
+                    x: w32(body, 3),
+                    y: w32(body, 4),
+                    width,
+                    height,
+                    format,
+                    row_bytes: w32(body, 8),
+                    data,
+                }
+            }
+            OP_TEX_COPY_IMAGE_FACE => {
+                fixed!(8);
+                let id = w32(body, 0);
+                let face = w32(body, 1);
+                let width = w32(body, 6);
+                let height = w32(body, 7);
+                let format = w32(body, 3);
+                check!(self.check_id(id, self.config.max_textures, start));
+                check!(self.check_face(face, start));
+                check!(self.check_texture_size(width, height, start));
+                check!(self.check_texfmt(format, start));
+                Command::TexCopyImageFace {
+                    id,
+                    face,
+                    level: w32(body, 2),
+                    format,
+                    x: w32(body, 4),
+                    y: w32(body, 5),
+                    width,
+                    height,
+                }
+            }
+            OP_TEX_COPY_SUBIMAGE_FACE => {
+                fixed!(9);
+                let id = w32(body, 0);
+                let face = w32(body, 1);
+                let width = w32(body, 7);
+                let height = w32(body, 8);
+                check!(self.check_id(id, self.config.max_textures, start));
+                check!(self.check_face(face, start));
+                check!(self.check_texture_size(width, height, start));
+                Command::TexCopySubImageFace {
+                    id,
+                    face,
+                    level: w32(body, 2),
+                    xoff: w32(body, 3),
+                    yoff: w32(body, 4),
+                    x: w32(body, 5),
+                    y: w32(body, 6),
+                    width,
+                    height,
+                }
+            }
 
             OP_CURRENT_COLOR => {
                 fixed!(4);
@@ -1662,6 +1773,20 @@ impl<'a> RingCursor<'a> {
                     dest,
                 }
             }
+            OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE => {
+                fixed!(5);
+                let texture = w32(body, 2);
+                let face = w32(body, 3);
+                check!(self.check_id_or_none(texture, self.config.max_textures, start));
+                check!(self.check_face(face, start));
+                Command::FramebufferAttachTextureFace {
+                    target: w32(body, 0),
+                    attachment: w32(body, 1),
+                    texture,
+                    face,
+                    level: w32(body, 4),
+                }
+            }
 
             // Not in the opcode map at all, or LOGIC_OP (see this module's
             // doc comment): E_BAD_OPCODE, skipped by trusting `length`.
@@ -1905,6 +2030,17 @@ impl<'a> RingCursor<'a> {
     fn check_vertex_attrib_index(&mut self, index: u32, start: u32) -> Result<(), Step<'a>> {
         if index >= self.config.max_vertex_attribs {
             return Err(self.raise(ErrorCode::Limit, start));
+        }
+        Ok(())
+    }
+
+    /// A cube-map face index must be `0..5` (`+X, -X, +Y, -Y, +Z, -Z`).
+    /// `E_BAD_ARG`, not `E_LIMIT`: this is a fixed structural property of
+    /// a cube (always six faces, on every device), not a configurable
+    /// capacity a device could report a different value for.
+    fn check_face(&mut self, face: u32, start: u32) -> Result<(), Step<'a>> {
+        if face >= 6 {
+            return Err(self.raise(ErrorCode::BadArg, start));
         }
         Ok(())
     }

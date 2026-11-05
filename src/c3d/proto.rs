@@ -294,6 +294,17 @@ pub const OP_TEX_COPY_SUBIMAGE: u16 = 0x050B;
 /// see [`TextureFormat::MipgenSupported`] and this opcode's `ring.rs`
 /// gating.
 pub const OP_TEX_GENERATE_MIPS: u16 = 0x050C;
+/// `CAP_PROGRAMMABLE`. Cube-map texture opcodes (`c3d-cmd-textures`'s
+/// "Cube-map completeness"/"Binding" subsections): a texture object is
+/// either 2D (`TEX_CREATE`) or, from here, a cube map (`TEX_CREATE_CUBE`)
+/// -- six independently-defined faces per level, GL-lazy (never an error
+/// for one face's shape disagreeing with another's). `0x0510` is reserved
+/// for a future `TEX_BIND_TARGET` and is not decoded.
+pub const OP_TEX_CREATE_CUBE: u16 = 0x050D;
+pub const OP_TEX_IMAGE_FACE: u16 = 0x050E;
+pub const OP_TEX_SUBIMAGE_FACE: u16 = 0x050F;
+pub const OP_TEX_COPY_IMAGE_FACE: u16 = 0x0511;
+pub const OP_TEX_COPY_SUBIMAGE_FACE: u16 = 0x0512;
 
 /// `TEX_ENV`'s device-own `pname` for texcoord scaling (`c3d-cmd-textures`),
 /// not a GL enumerant: `TEXCOORD_SPACE`, value `0` normalised / `1` texel.
@@ -358,6 +369,9 @@ pub const OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL: u16 = 0x0B06;
 pub const OP_FRAMEBUFFER_ATTACH_RENDERBUFFER: u16 = 0x0B07;
 pub const OP_FRAMEBUFFER_ATTACH_TEXTURE: u16 = 0x0B08;
 pub const OP_FRAMEBUFFER_STATUS: u16 = 0x0B09;
+/// `CAP_PROGRAMMABLE`. Render-to-cube-face: as `FRAMEBUFFER_ATTACH_TEXTURE`,
+/// but names one face of a cube-map texture.
+pub const OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE: u16 = 0x0B0A;
 
 // Programmable draw (0x0Cxx) -- `c3d-cmd-programmable-draw`,
 // `CAP_PROGRAMMABLE`.
@@ -1095,6 +1109,58 @@ pub enum Command<'a> {
     TexGenerateMips {
         id: u32,
     },
+    /// `TEX_CREATE_CUBE`, `CAP_PROGRAMMABLE`.
+    TexCreateCube {
+        id: u32,
+    },
+    /// `TEX_IMAGE_FACE`, `CAP_PROGRAMMABLE`. `face` is `0..5`
+    /// (`+X, -X, +Y, -Y, +Z, -Z`).
+    TexImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        row_bytes: u32,
+        data: Ref,
+    },
+    /// `TEX_SUBIMAGE_FACE`, `CAP_PROGRAMMABLE`.
+    TexSubImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        row_bytes: u32,
+        data: Ref,
+    },
+    /// `TEX_COPY_IMAGE_FACE`, `CAP_PROGRAMMABLE`.
+    TexCopyImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        format: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+    /// `TEX_COPY_SUBIMAGE_FACE`, `CAP_PROGRAMMABLE`.
+    TexCopySubImageFace {
+        id: u32,
+        face: u32,
+        level: u32,
+        xoff: u32,
+        yoff: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
 
     // Current vertex state (0x06xx).
     CurrentColor {
@@ -1330,6 +1396,15 @@ pub enum Command<'a> {
     FramebufferStatus {
         target: u32,
         dest: Ref,
+    },
+    /// `FRAMEBUFFER_ATTACH_TEXTURE_FACE`, `CAP_PROGRAMMABLE`: render-to-
+    /// cube-face.
+    FramebufferAttachTextureFace {
+        target: u32,
+        attachment: u32,
+        texture: u32,
+        face: u32,
+        level: u32,
     },
 
     // Programmable draw (0x0Cxx), `CAP_PROGRAMMABLE`. `prim`/`index_type`

@@ -1366,13 +1366,27 @@ pub struct TexLevel {
     pub format: TexFormat,
 }
 
+/// A texture object's kind, fixed by whichever of `TEX_CREATE`/
+/// `TEX_CREATE_CUBE` most recently (re)created it (`c3d-cmd-textures`).
+/// Opcodes specific to one kind (`TEX_IMAGE` vs `TEX_IMAGE_FACE`, and so
+/// on) are `E_BAD_ARG` against the other -- see [`State::check_texture_kind`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextureKind {
+    Flat,
+    Cube,
+}
+
 /// A texture object's device-owned parameters (`docs/internals/c3d.md`'s
 /// "Textures"). `TEX_IMAGE`/`TEX_SUBIMAGE`/`TEX_COPY_IMAGE`/
 /// `TEX_COPY_SUBIMAGE`'s pixel payloads are out of this module's scope;
 /// only the resulting level shape is recorded, via
-/// [`State::define_tex_level`].
+/// [`State::define_tex_level`]. `levels` is keyed `(face, level)`; a
+/// `Flat` object only ever uses face `0`, a `Cube` object faces `0..5`
+/// independently (GL-lazy: one face/level's shape never depends on any
+/// other's -- see `c3d-cmd-textures`'s "Cube-map completeness").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextureObject {
+    pub kind: TextureKind,
     pub min_filter: TexFilter,
     pub mag_filter: TexFilter,
     pub wrap_s: TexWrap,
@@ -1380,14 +1394,17 @@ pub struct TextureObject {
     /// `TEX_PALETTE`'s bound palette entry count; `None` when unbound
     /// (`entries == 0` on the wire unbinds).
     pub palette_entries: Option<u32>,
-    pub levels: BTreeMap<u32, TexLevel>,
+    pub levels: BTreeMap<(u32, u32), TexLevel>,
 }
 
 impl Default for TextureObject {
     /// GL 1.1 defaults: `MIN_FILTER` is `NEAREST_MIPMAP_LINEAR`,
-    /// `MAG_FILTER` is `LINEAR`, both wrap axes `REPEAT`.
+    /// `MAG_FILTER` is `LINEAR`, both wrap axes `REPEAT`. `kind` defaults
+    /// to `Flat`; callers that want a cube object use
+    /// [`State::tex_create_cube`], which overrides it.
     fn default() -> Self {
         TextureObject {
+            kind: TextureKind::Flat,
             min_filter: TexFilter::NearestMipmapLinear,
             mag_filter: TexFilter::Linear,
             wrap_s: TexWrap::Repeat,
@@ -1628,6 +1645,9 @@ pub struct Renderbuffer {
 pub enum FramebufferAttachment {
     Renderbuffer(u32),
     Texture { id: u32, level: u32 },
+    /// `FRAMEBUFFER_ATTACH_TEXTURE_FACE`: one face of a cube-map texture
+    /// (render-to-cube-face).
+    TextureFace { id: u32, face: u32, level: u32 },
 }
 
 /// One framebuffer object's attachment points (`docs/internals/c3d.md`'s
@@ -2240,6 +2260,37 @@ impl State {
         self.textures.insert(id, TextureObject::default());
     }
 
+    /// `TEX_CREATE_CUBE`: as `TEX_CREATE`, but `id` becomes a cube-map
+    /// object. `TEX_CREATE`/`TEX_CREATE_CUBE` on an existing `id`
+    /// recreates it as the new kind, discarding whatever levels (2D or
+    /// per-face) it previously held -- exactly `TEX_CREATE`'s own
+    /// "resets its parameters and discards its images" rule, just with a
+    /// different resulting kind.
+    pub fn tex_create_cube(&mut self, id: u32) {
+        self.textures.insert(
+            id,
+            TextureObject {
+                kind: TextureKind::Cube,
+                ..TextureObject::default()
+            },
+        );
+    }
+
+    /// Protocol-level kind check for a texture-kind-specific opcode
+    /// (`TEX_IMAGE` vs `TEX_IMAGE_FACE`, `FRAMEBUFFER_ATTACH_TEXTURE` vs
+    /// `_FACE`, and so on): `E_BAD_ARG` if `id` names an existing object
+    /// of the other kind. A nonexistent `id` is not this check's concern
+    /// -- each caller's own GL-error-class "exists at all" check
+    /// (`define_tex_level`, a `levels` lookup, `framebuffer_attach_texture`'s
+    /// own early return) handles that separately, exactly like every
+    /// other texture op's layering.
+    pub fn check_texture_kind(&self, id: u32, want: TextureKind) -> Result<(), ErrorCode> {
+        match self.textures.get(&id) {
+            Some(tex) if tex.kind != want => Err(ErrorCode::BadArg),
+            _ => Ok(()),
+        }
+    }
+
     /// `TEX_DESTROY`: releases the object and unbinds it from every unit.
     /// `TEX_DESTROY`: unbinds it from every unit, and -- matching
     /// `RENDERBUFFER_DESTROY`'s identical rule, and real GL's "deleting
@@ -2259,7 +2310,9 @@ impl State {
             }
         }
         for fb in self.framebuffers.values_mut() {
-            if matches!(fb.color0, Some(FramebufferAttachment::Texture { id: tex, .. }) if tex == id) {
+            let attached = matches!(fb.color0, Some(FramebufferAttachment::Texture { id: tex, .. }) if tex == id)
+                || matches!(fb.color0, Some(FramebufferAttachment::TextureFace { id: tex, .. }) if tex == id);
+            if attached {
                 fb.color0 = None;
             }
         }
@@ -2299,10 +2352,29 @@ impl State {
     }
 
     /// Records `TEX_IMAGE`/`TEX_COPY_IMAGE`'s resulting level shape (the
-    /// pixels themselves are the board/GPU layer's concern).
+    /// pixels themselves are the board/GPU layer's concern). `face` is
+    /// always `0` for these two (2D-only) opcodes; `TEX_IMAGE_FACE`/
+    /// `TEX_COPY_IMAGE_FACE` go through [`State::define_tex_level_face`]
+    /// instead, which also accepts `1..5`.
     pub fn define_tex_level(
         &mut self,
         id: u32,
+        level: u32,
+        format: TexFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<(), GlError> {
+        self.define_tex_level_face(id, 0, level, format, width, height)
+    }
+
+    /// `TEX_IMAGE_FACE`/`TEX_COPY_IMAGE_FACE`'s resulting level shape, for
+    /// one face independently of every other face or level -- GL-lazy,
+    /// per `c3d-cmd-textures`'s "Cube-map completeness": this never
+    /// fails because of another face's or level's shape.
+    pub fn define_tex_level_face(
+        &mut self,
+        id: u32,
+        face: u32,
         level: u32,
         format: TexFormat,
         width: u32,
@@ -2313,7 +2385,7 @@ impl State {
             return Err(GlError::InvalidOperation);
         };
         tex.levels.insert(
-            level,
+            (face, level),
             TexLevel {
                 width,
                 height,
@@ -2734,7 +2806,8 @@ impl State {
 
     /// `FRAMEBUFFER_ATTACH_TEXTURE`. As above, but only a colour
     /// attachment point accepts a texture in version 1 (`E_BAD_ARG`
-    /// otherwise).
+    /// otherwise). `texture` a cube-map object is also `E_BAD_ARG` --
+    /// use `FRAMEBUFFER_ATTACH_TEXTURE_FACE` instead.
     pub fn framebuffer_attach_texture(
         &mut self,
         target: FramebufferTarget,
@@ -2749,10 +2822,41 @@ impl State {
         if attachment != FramebufferAttachmentPoint::Color0 && texture != 0 {
             return Err(ErrorCode::BadArg);
         }
+        self.check_texture_kind(texture, TextureKind::Flat)?;
         let Some(fb) = self.framebuffers.get_mut(&fb_id) else {
             return Ok(());
         };
         fb.color0 = (texture != 0).then_some(FramebufferAttachment::Texture { id: texture, level });
+        Ok(())
+    }
+
+    /// `FRAMEBUFFER_ATTACH_TEXTURE_FACE`: as `FRAMEBUFFER_ATTACH_TEXTURE`,
+    /// but names one face (render-to-cube-face). `texture` a 2D object is
+    /// `E_BAD_ARG`.
+    pub fn framebuffer_attach_texture_face(
+        &mut self,
+        target: FramebufferTarget,
+        attachment: FramebufferAttachmentPoint,
+        texture: u32,
+        face: u32,
+        level: u32,
+    ) -> Result<(), ErrorCode> {
+        let fb_id = self.framebuffer_binding(target);
+        if fb_id == 0 {
+            return Err(ErrorCode::BadId);
+        }
+        if attachment != FramebufferAttachmentPoint::Color0 && texture != 0 {
+            return Err(ErrorCode::BadArg);
+        }
+        self.check_texture_kind(texture, TextureKind::Cube)?;
+        let Some(fb) = self.framebuffers.get_mut(&fb_id) else {
+            return Ok(());
+        };
+        fb.color0 = (texture != 0).then_some(FramebufferAttachment::TextureFace {
+            id: texture,
+            face,
+            level,
+        });
         Ok(())
     }
 
@@ -2776,7 +2880,12 @@ impl State {
             FramebufferAttachment::Texture { id, level } => self
                 .textures
                 .get(&id)
-                .and_then(|t| t.levels.get(&level))
+                .and_then(|t| t.levels.get(&(0, level)))
+                .map(|l| (l.width, l.height)),
+            FramebufferAttachment::TextureFace { id, face, level } => self
+                .textures
+                .get(&id)
+                .and_then(|t| t.levels.get(&(face, level)))
                 .map(|l| (l.width, l.height)),
         };
         let Some((width, height)) = color_size else {
@@ -3861,7 +3970,7 @@ mod tests {
         s.define_tex_level(1, 1, TexFormat::Rgba8, 32, 32).unwrap();
         let tex = s.texture(1).unwrap();
         assert_eq!(
-            tex.levels[&0],
+            tex.levels[&(0, 0)],
             TexLevel {
                 width: 64,
                 height: 64,
@@ -3869,7 +3978,7 @@ mod tests {
             }
         );
         assert_eq!(
-            tex.levels[&1],
+            tex.levels[&(0, 1)],
             TexLevel {
                 width: 32,
                 height: 32,

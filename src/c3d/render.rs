@@ -624,7 +624,7 @@ fn texcoord_texel_scale(state: &State, unit: usize) -> [f32; 2] {
     if tu.coord_space != state::TexCoordSpace::Texel {
         return [1.0, 1.0];
     }
-    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&0)) {
+    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&(0, 0))) {
         Some(level) if level.width > 0 && level.height > 0 => {
             [1.0 / level.width as f32, 1.0 / level.height as f32]
         }
@@ -2738,9 +2738,32 @@ struct GpuSurface {
     depth_view: wgpu::TextureView,
 }
 
+/// How many faces a `GpuTexture` holds -- `1` (an ordinary `D2` texture)
+/// or `6` (a cube, stored as a `6`-layer `D2` array with a `Cube` view
+/// for sampling; `wgpu` is unconditionally seamless across a `Cube`
+/// view's faces, satisfying the spec's mandatory seamless filtering for
+/// free). Mirrors [`state::TextureKind`] rather than reusing it directly,
+/// since this module otherwise has no reason to depend on `state`'s
+/// representation choices for its own GPU-side bookkeeping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TexKind {
+    Flat,
+    Cube,
+}
+
+impl TexKind {
+    fn face_count(self) -> u32 {
+        match self {
+            TexKind::Flat => 1,
+            TexKind::Cube => 6,
+        }
+    }
+}
+
 struct GpuTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    kind: TexKind,
     /// Level 0's shape -- every other level's shape is derived from this
     /// with [`mip_extent`], since that is exactly the formula `texture`
     /// was created with ([`Renderer::define_texture_level`]).
@@ -2839,18 +2862,20 @@ fn decode_wire_rgba8(
 }
 
 /// Writes `data` (tightly packed RGBA8, `w`x`h`) into `texture` at
-/// `level`, clamped to that level's actual extent (`mip_extent` of the
-/// texture's own base size, read back off `texture` itself rather than
-/// threaded through as a parameter). This is the defensive boundary
-/// against a guest-supplied level/shape mismatch that would otherwise
-/// ask wgpu to write outside the mip's bounds -- a zero-sized `w`/`h` or
-/// a clamp down to a smaller rectangle both become a safe no-op/crop
-/// instead of a validation failure. Crops from `data`'s own top-left
-/// corner and repacks rows, since a narrower output width changes the
-/// tightly-packed row stride.
-fn write_level_rect(
+/// `level`, array layer `face` (always `0` for a `Flat` object; `0..5`
+/// for a `Cube` object's independent per-face uploads). Clamped to that
+/// level's actual extent (`mip_extent` of the texture's own base size,
+/// read back off `texture` itself rather than threaded through as a
+/// parameter) -- the defensive boundary against a guest-supplied
+/// level/shape mismatch that would otherwise ask wgpu to write outside
+/// the mip's bounds; a zero-sized `w`/`h` or a clamp down to a smaller
+/// rectangle both become a safe no-op/crop instead of a validation
+/// failure. Crops from `data`'s own top-left corner and repacks rows,
+/// since a narrower output width changes the tightly-packed row stride.
+fn write_level_rect_face(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
+    face: u32,
     level: u32,
     w: u32,
     h: u32,
@@ -2875,7 +2900,7 @@ fn write_level_rect(
         wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: level,
-            origin: wgpu::Origin3d::ZERO,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: face },
             aspect: wgpu::TextureAspect::All,
         },
         &packed,
@@ -4003,6 +4028,23 @@ impl Renderer {
                 });
                 (width, height, view)
             }
+            state::FramebufferAttachment::TextureFace { id, face, level } => {
+                let tex = self.textures.get(&id).ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                // One face, one level, as a plain `D2` slice -- a render
+                // attachment targets a single 2D surface regardless of
+                // the texture object's own `Cube` sampling view.
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: face,
+                    array_layer_count: Some(1),
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                (width, height, view)
+            }
         };
         let (depth_view, persistent_depth) = match fb.depth_stencil {
             Some(state::FramebufferAttachment::Renderbuffer(rb_id)) => {
@@ -4664,6 +4706,57 @@ impl Renderer {
                 self.op_tex_palette(*id, *entries, *data, mem)
             }
             RenderOp::TexGenerateMips { id } => self.op_tex_generate_mips(*id),
+            RenderOp::TexImageFace {
+                id,
+                face,
+                level,
+                format,
+                width,
+                height,
+                row_bytes,
+                data,
+            } => self.op_tex_image_face(
+                *id, *face, *level, *format, *width, *height, *row_bytes, *data, mem,
+            ),
+            RenderOp::TexSubImageFace {
+                id,
+                face,
+                level,
+                x,
+                y,
+                width,
+                height,
+                format,
+                row_bytes,
+                data,
+            } => self.op_tex_subimage_face(
+                *id, *face, *level, *x, *y, *width, *height, *format, *row_bytes, *data, mem,
+            ),
+            RenderOp::TexCopyImageFace {
+                id,
+                face,
+                level,
+                format: _,
+                x,
+                y,
+                width,
+                height,
+                state,
+            } => self.op_tex_copy_image_face(*id, *face, *level, *x, *y, *width, *height, state),
+            RenderOp::TexCopySubImageFace {
+                id,
+                face,
+                level,
+                xoff,
+                yoff,
+                x,
+                y,
+                width,
+                height,
+                state,
+            } => self.op_tex_copy_subimage_face(
+                *id, *face, *level, *xoff, *yoff, *x, *y, *width, *height, state,
+            ),
             RenderOp::ReadPixels {
                 x,
                 y,
@@ -5385,14 +5478,19 @@ impl Renderer {
         vbuf: Vec<GpuVertex>,
         window_space: bool,
     ) -> Result<(), RenderError> {
+        // The fixed-function tier has no cube texcoord source, so a unit
+        // bound to a cube-map texture samples undefined colour, not an
+        // error (`c3d-cmd-textures`'s "Textures" intro) -- treated here,
+        // like an unset texture, as simply not bound for this draw's
+        // pipeline-key/bind-group purposes.
         let unit0 = state.texture_units.first();
         let bound_tex0 = unit0.map(|u| u.bound_texture).unwrap_or(0);
-        let unit0_bound = bound_tex0 != 0 && self.textures.contains_key(&bound_tex0);
+        let unit0_bound = bound_tex0 != 0 && self.is_flat_texture(bound_tex0);
         let unit0_active =
             unit0_bound && state.enables.texture_2d.first().copied().unwrap_or(false);
         let unit1 = state.texture_units.get(1);
         let bound_tex1 = unit1.map(|u| u.bound_texture).unwrap_or(0);
-        let unit1_bound = bound_tex1 != 0 && self.textures.contains_key(&bound_tex1);
+        let unit1_bound = bound_tex1 != 0 && self.is_flat_texture(bound_tex1);
         let unit1_active = unit1_bound && state.enables.texture_2d.get(1).copied().unwrap_or(false);
         // The primary texturing stage: unit 0 when active, else unit 1
         // standing in alone -- see `pipeline_key_from_state`'s doc
@@ -5661,6 +5759,14 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Whether `id` currently names a GPU-side 2D texture: `false` for a
+    /// cube-map object, and (matching the existing "a texture with no
+    /// data uploaded is simply not bound, for pipeline purposes" rule)
+    /// for an id with no GPU texture at all.
+    fn is_flat_texture(&self, id: u32) -> bool {
+        self.textures.get(&id).is_some_and(|t| t.kind == TexKind::Flat)
+    }
+
     fn op_tex_image(
         &mut self,
         id: u32,
@@ -5747,6 +5853,189 @@ impl Renderer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn op_tex_image_face(
+        &mut self,
+        id: u32,
+        face: u32,
+        level: u32,
+        format: TexFormat,
+        width: u32,
+        height: u32,
+        row_bytes: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let rgba = decode_wire_rgba8(
+            format,
+            width,
+            height,
+            row_bytes,
+            data,
+            mem,
+            "TEX_IMAGE_FACE",
+            palette,
+        )?;
+        self.define_texture_level_face(id, face, level, width, height, &rgba)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn op_tex_subimage_face(
+        &mut self,
+        id: u32,
+        face: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        format: TexFormat,
+        row_bytes: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let Some(existing) = self.textures.get(&id) else {
+            return Err(RenderError::UnknownObject("texture", id));
+        };
+        if level >= existing.mip_level_count {
+            return Err(RenderError::UnknownObject("texture level", level));
+        }
+        let level_w = mip_extent(existing.width, level);
+        let level_h = mip_extent(existing.height, level);
+        if x + width > level_w || y + height > level_h {
+            return Err(RenderError::ShortPayload("TEX_SUBIMAGE_FACE rectangle"));
+        }
+
+        let palette = self.palettes.get(&id).map_or(&[][..], Vec::as_slice);
+        let rgba = decode_wire_rgba8(
+            format,
+            width,
+            height,
+            row_bytes,
+            data,
+            mem,
+            "TEX_SUBIMAGE_FACE",
+            palette,
+        )?;
+
+        let texture = &self.textures[&id].texture;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level,
+                origin: wgpu::Origin3d { x, y, z: face },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// `TEX_COPY_IMAGE_FACE`: as [`Self::op_tex_copy_image`], for one
+    /// face. Always goes through the CPU round trip
+    /// ([`Self::copy_texture_rect_to_cpu`] then
+    /// [`Self::define_texture_level_face`]) rather than replicating that
+    /// function's zero-copy GPU-to-GPU fast path for a brand-new level 0
+    /// -- a texture object this rare (render-to-texture sourcing a cube
+    /// face) does not need that optimisation to be correct.
+    fn op_tex_copy_image_face(
+        &mut self,
+        id: u32,
+        face: u32,
+        level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let surface_id = state.draw_surface();
+        let def = *state
+            .surface(surface_id)
+            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
+        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        let rgba = self.copy_texture_rect_to_cpu(&color, 0, x, y, width, height)?;
+        self.define_texture_level_face(id, face, level, width, height, &rgba)
+    }
+
+    /// `TEX_COPY_SUBIMAGE_FACE`: as [`Self::op_tex_copy_subimage`], for
+    /// one face.
+    #[allow(clippy::too_many_arguments)]
+    fn op_tex_copy_subimage_face(
+        &mut self,
+        id: u32,
+        face: u32,
+        level: u32,
+        xoff: u32,
+        yoff: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        state: &State,
+    ) -> Result<(), RenderError> {
+        let Some(existing) = self.textures.get(&id) else {
+            return Err(RenderError::UnknownObject("texture", id));
+        };
+        if level >= existing.mip_level_count {
+            return Err(RenderError::UnknownObject("texture level", level));
+        }
+        let level_w = mip_extent(existing.width, level);
+        let level_h = mip_extent(existing.height, level);
+        if xoff + width > level_w || yoff + height > level_h {
+            return Err(RenderError::ShortPayload("TEX_COPY_SUBIMAGE_FACE rectangle"));
+        }
+
+        let surface_id = state.draw_surface();
+        let def = *state
+            .surface(surface_id)
+            .ok_or(RenderError::UnknownObject("surface", surface_id))?;
+        let color = self.ensure_surface(surface_id, &def)?.color.clone();
+        let dest = &self.textures[&id].texture;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d tex-copy-subimage-face encoder"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: dest,
+                mip_level: level,
+                origin: wgpu::Origin3d {
+                    x: xoff,
+                    y: yoff,
+                    z: face,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
     /// `TEX_PALETTE`: binds (or, at `entries == 0`, unbinds) texture
     /// `id`'s RGBA8 colour table. Only ever reached when
     /// `TEXFMT_SUPPORTED` bit 9 (`I8_INDEXED`) is advertised -- `ring.rs`
@@ -5800,12 +6089,44 @@ impl Renderer {
     /// `TEX_PALETTE`'s own "nothing indexed ever stored" contract), so
     /// box-filtering them produces *some* deterministic result -- the
     /// spec's "undefined" licenses this without requiring it.
+    /// `TEX_GENERATE_MIPS`, both kinds: a cube-map `id` generates each
+    /// face's chain independently from that face's own level 0 -- no
+    /// cross-face filtering at the seams, matching real GL's
+    /// `glGenerateMipmap` (`c3d-cmd-textures`'s "Cube-map completeness").
+    /// A `Flat` object's single "face" `0` is exactly the pre-cube-map
+    /// behaviour.
     fn op_tex_generate_mips(&mut self, id: u32) -> Result<(), RenderError> {
         let Some(tex) = self.textures.get(&id) else {
             return Ok(());
         };
-        let (mut w, mut h) = (tex.width, tex.height);
-        let mut prev = self.copy_texture_to_cpu(&tex.texture, w, h)?;
+        let (base_w, base_h, kind) = (tex.width, tex.height, tex.kind);
+        for face in 0..kind.face_count() {
+            self.generate_mips_for_face(id, kind, face, base_w, base_h)?;
+        }
+        Ok(())
+    }
+
+    /// One face's independent box-filter mip chain for
+    /// [`Self::op_tex_generate_mips`]. A face whose level 0 is undefined
+    /// -- not possible for `Flat` (this is only reached when `id` exists
+    /// at all, and a `Flat` object has exactly one face), but routine for
+    /// `Cube` under GL-lazy per-face uploads -- reads back whatever that
+    /// face's level 0 currently holds (defined or not) and filters it the
+    /// same deterministic way; the spec licenses, but does not require,
+    /// treating an undefined source as a no-op, and filtering it anyway
+    /// is simpler and no less correct, since the result is undefined
+    /// either way.
+    fn generate_mips_for_face(
+        &mut self,
+        id: u32,
+        kind: TexKind,
+        face: u32,
+        base_w: u32,
+        base_h: u32,
+    ) -> Result<(), RenderError> {
+        let (mut w, mut h) = (base_w, base_h);
+        let tex = &self.textures[&id].texture;
+        let mut prev = self.copy_texture_rect_to_cpu_face(tex, face, 0, 0, 0, w, h)?;
 
         let mut level = 1;
         while w > 1 || h > 1 {
@@ -5833,7 +6154,7 @@ impl Renderer {
                     }
                 }
             }
-            self.define_texture_level(id, level, next_w, next_h, &next)?;
+            self.define_texture_level_generic(id, kind, face, level, next_w, next_h, &next)?;
             prev = next;
             w = next_w;
             h = next_h;
@@ -5863,11 +6184,62 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
+        self.define_texture_level_generic(id, TexKind::Flat, 0, level, width, height, rgba)
+    }
+
+    /// `TEX_IMAGE_FACE`/`TEX_COPY_IMAGE_FACE`: as [`Self::define_texture_level`],
+    /// but for one face of a cube-map object, independently of every
+    /// other face (GL-lazy -- `c3d-cmd-textures`'s "Cube-map
+    /// completeness": this never fails, or depends on, another face's
+    /// shape).
+    fn define_texture_level_face(
+        &mut self,
+        id: u32,
+        face: u32,
+        level: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        self.define_texture_level_generic(id, TexKind::Cube, face, level, width, height, rgba)
+    }
+
+    /// Common tail of [`Self::define_texture_level`] and
+    /// [`Self::define_texture_level_face`]: sets face `face`, level
+    /// `level`'s pixel data to `rgba` (tightly packed RGBA8,
+    /// `width`x`height`) and (re)builds the GPU texture object (`1`
+    /// layer for `Flat`, `6` for `Cube`) to cover it.
+    ///
+    /// wgpu fixes a texture's `mip_level_count` (and layer count) at
+    /// creation time, so defining a level this object didn't already
+    /// have room for means recreating the whole thing: every other
+    /// already-defined face/level is first read back from the outgoing
+    /// GPU texture into CPU memory ([`Self::copy_texture_rect_to_cpu_face`])
+    /// and re-uploaded alongside the new one. A guest that only ever
+    /// defines level 0 of each face never pays this beyond the first
+    /// five faces' worth of carry-forward, since `existing.mip_level_count`
+    /// is always `1` in that case. If `id` already names a GPU texture of
+    /// the *other* kind (e.g. `TEX_CREATE` recreated a once-cube object
+    /// as 2D), its faces/levels are discarded outright rather than
+    /// carried forward -- exactly `TEX_CREATE`'s/`TEX_CREATE_CUBE`'s own
+    /// "discards its images" rule, extended to the kind itself.
+    #[allow(clippy::too_many_arguments)]
+    fn define_texture_level_generic(
+        &mut self,
+        id: u32,
+        kind: TexKind,
+        face: u32,
+        level: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        let existing = self.textures.get(&id).filter(|tex| tex.kind == kind);
+        let face_count = kind.face_count();
         // Level 0's shape is the texture's base size; a guest defining a
         // higher level before level 0 (not something any real driver
         // does) gets that level's own shape taken as the base instead,
         // which at least cannot crash -- see `mip_extent`'s use below.
-        let existing = self.textures.get(&id);
         let (base_w, base_h) = match existing {
             Some(tex) if level != 0 => (tex.width, tex.height),
             _ => (width, height),
@@ -5875,7 +6247,7 @@ impl Renderer {
         let size = wgpu::Extent3d {
             width: base_w.max(1),
             height: base_h.max(1),
-            depth_or_array_layers: 1,
+            depth_or_array_layers: face_count,
         };
         // The level count only ever grows across calls -- redefining an
         // already-covered level (e.g. level 1 again, after level 2 has
@@ -5894,23 +6266,25 @@ impl Renderer {
         let mut carried = Vec::new();
         if let Some(tex) = existing {
             for lvl in 0..tex.mip_level_count.min(mip_level_count) {
-                if lvl == write_level {
-                    continue;
+                for f in 0..face_count {
+                    if f == face && lvl == write_level {
+                        continue;
+                    }
+                    // Size this *read* against `tex`'s own base dims, not
+                    // `base_w`/`base_h` -- those name the *new* object's
+                    // base, which can differ from `tex`'s when `level == 0`
+                    // redefines the base size while higher levels from the
+                    // old size still linger (not standard usage, but not an
+                    // error either; see the comment above). `tex.texture`
+                    // is still the old object, so its own levels are still
+                    // sized from its own old base, regardless of what the
+                    // new base will be -- using the new base here asked
+                    // wgpu to read past the old texture's actual bounds.
+                    let w = mip_extent(tex.width, lvl);
+                    let h = mip_extent(tex.height, lvl);
+                    let data = self.copy_texture_rect_to_cpu_face(&tex.texture, f, lvl, 0, 0, w, h)?;
+                    carried.push((f, lvl, w, h, data));
                 }
-                // Size this *read* against `tex`'s own base dims, not
-                // `base_w`/`base_h` -- those name the *new* object's
-                // base, which can differ from `tex`'s when `level == 0`
-                // redefines the base size while higher levels from the
-                // old size still linger (not standard usage, but not an
-                // error either; see the comment above). `tex.texture`
-                // is still the old object, so its own levels are still
-                // sized from its own old base, regardless of what the
-                // new base will be -- using the new base here asked
-                // wgpu to read past the old texture's actual bounds.
-                let w = mip_extent(tex.width, lvl);
-                let h = mip_extent(tex.height, lvl);
-                let data = self.copy_texture_rect_to_cpu(&tex.texture, lvl, 0, 0, w, h)?;
-                carried.push((lvl, w, h, data));
             }
         }
 
@@ -5936,17 +6310,24 @@ impl Renderer {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        for (lvl, w, h, data) in &carried {
-            write_level_rect(&self.queue, &texture, *lvl, *w, *h, data);
+        for (f, lvl, w, h, data) in &carried {
+            write_level_rect_face(&self.queue, &texture, *f, *lvl, *w, *h, data);
         }
-        write_level_rect(&self.queue, &texture, write_level, width, height, rgba);
+        write_level_rect_face(&self.queue, &texture, face, write_level, width, height, rgba);
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(match kind {
+                TexKind::Flat => wgpu::TextureViewDimension::D2,
+                TexKind::Cube => wgpu::TextureViewDimension::Cube,
+            }),
+            ..Default::default()
+        });
         self.textures.insert(
             id,
             GpuTexture {
                 texture,
                 view,
+                kind,
                 width: base_w,
                 height: base_h,
                 mip_level_count,
@@ -6035,6 +6416,7 @@ impl Renderer {
                 GpuTexture {
                     texture,
                     view,
+                    kind: TexKind::Flat,
                     width,
                     height,
                     mip_level_count: 1,
@@ -6988,21 +7370,18 @@ impl Renderer {
         // bound texture object makes the draw a no-op, same reasoning as
         // the "shader destroyed since link" early returns above -- there
         // is nothing correct to bind.
-        let mut sampler_textures: Vec<(UniformBinding, Vec<u32>)> = Vec::new();
+        let mut sampler_textures: Vec<(UniformBinding, TexKind, Vec<u32>)> = Vec::new();
         for (i, binding) in uniform_bindings.iter().enumerate() {
             if !binding.is_sampler {
                 continue;
             }
             let interface_entry = interface.get(attrib_count as usize + i);
             let gl_type = interface_entry.map(|e| e.gl_type).unwrap_or(GL_SAMPLER_2D);
-            if gl_type == GL_SAMPLER_CUBE {
-                // `GpuTexture` has no cube-map representation yet (no
-                // fixed-function path creates one either) -- a real gap,
-                // not a silently-wrong draw.
-                return Err(RenderError::Unimplemented(
-                    "programmable draw sampling a samplerCube uniform (no cube-map GPU texture support yet)",
-                ));
-            }
+            let want_kind = if gl_type == GL_SAMPLER_CUBE {
+                TexKind::Cube
+            } else {
+                TexKind::Flat
+            };
             let array_len = interface_entry.map_or(1, |e| e.array_size).max(1);
             if array_len > 1 && !self.texture_binding_array_supported {
                 return Err(RenderError::Unimplemented(
@@ -7017,12 +7396,23 @@ impl Renderer {
                     .get(unit as usize)
                     .map(|u| u.bound_texture)
                     .unwrap_or(0);
-                if !self.textures.contains_key(&texture_id) {
-                    return Ok(());
+                // A `samplerCube` uniform reading a unit bound to a 2D
+                // texture (or vice versa) is `GL_INVALID_OPERATION` and
+                // the draw has no effect (`c3d-cmd-textures`'s
+                // "Binding") -- treated here, like an unbound unit, as a
+                // silent no-op; this renderer does not yet set `GL_ERROR`
+                // for a draw-time-only GL error detected this deep into
+                // bind-group construction (the same pre-existing gap as
+                // an incomplete-framebuffer draw's `GL_INVALID_
+                // FRAMEBUFFER_OPERATION`, which `resolve_draw_target`
+                // also doesn't set).
+                match self.textures.get(&texture_id) {
+                    Some(tex) if tex.kind == want_kind => {}
+                    _ => return Ok(()),
                 }
                 texture_ids.push(texture_id);
             }
-            sampler_textures.push((binding.clone(), texture_ids));
+            sampler_textures.push((binding.clone(), want_kind, texture_ids));
         }
         // Ensure each bound texture's sampler exists in the cache before
         // building any bind group entries -- `Renderer::sampler` needs
@@ -7030,7 +7420,7 @@ impl Renderer {
         // borrow `self.textures`/`self.sampler_cache` immutably (mirrors
         // `submit_draw`'s identical ensure-then-look-up split).
         let mut sampler_keys: Vec<Vec<SamplerKey>> = Vec::with_capacity(sampler_textures.len());
-        for (_, texture_ids) in &sampler_textures {
+        for (_, _, texture_ids) in &sampler_textures {
             let mut keys = Vec::with_capacity(texture_ids.len());
             for &texture_id in texture_ids {
                 let obj = state.texture(texture_id);
@@ -7101,8 +7491,12 @@ impl Renderer {
         // above).
         let mut bind_group_slot_textures: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut bind_group_slot_samplers: Vec<(u32, Vec<SamplerKey>)> = Vec::new();
-        for ((binding, texture_ids), keys) in sampler_textures.iter().zip(&sampler_keys) {
+        for ((binding, want_kind, texture_ids), keys) in sampler_textures.iter().zip(&sampler_keys) {
             let array_count = std::num::NonZeroU32::new(texture_ids.len() as u32).filter(|n| n.get() > 1);
+            let view_dimension = match want_kind {
+                TexKind::Flat => wgpu::TextureViewDimension::D2,
+                TexKind::Cube => wgpu::TextureViewDimension::Cube,
+            };
             for (slot, visibility) in [
                 (binding.vertex_binding, wgpu::ShaderStages::VERTEX),
                 (binding.fragment_binding, wgpu::ShaderStages::FRAGMENT),
@@ -7113,7 +7507,7 @@ impl Renderer {
                     visibility,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension,
                         multisampled: false,
                     },
                     count: array_count,
@@ -7427,6 +7821,90 @@ impl Renderer {
                 mip_level,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RenderError::Gpu(e.to_string()))?;
+        rx.recv()
+            .map_err(|e| RenderError::Gpu(e.to_string()))?
+            .map_err(|e| RenderError::Gpu(e.to_string()))?;
+
+        let data = slice.get_mapped_range();
+        let row_bytes = (width * bytes_per_texel) as usize;
+        let mut out = vec![0u8; row_bytes * height as usize];
+        for row in 0..height as usize {
+            let src_start = row * padded_bytes_per_row as usize;
+            let dst_start = row * row_bytes;
+            out[dst_start..dst_start + row_bytes].copy_from_slice(&data[src_start..src_start + row_bytes]);
+        }
+        drop(data);
+        buffer.unmap();
+        Ok(out)
+    }
+
+    /// [`Self::copy_texture_rect_to_cpu`], but against array layer `face`
+    /// rather than always layer `0` -- the cube-map per-face readback this
+    /// module's `TEX_IMAGE_FACE`/`TEX_COPY_*_FACE` paths need to carry a
+    /// face's other levels forward across a [`Self::define_texture_level_generic`]
+    /// recreate, or to read a face's rectangle back off a GPU-side
+    /// texture-to-texture copy destination. Always `TextureAspect::All`,
+    /// 4 bytes/texel -- every texture object (unlike the depth/stencil
+    /// surface aspect split) is colour-only.
+    fn copy_texture_rect_to_cpu_face(
+        &self,
+        texture: &wgpu::Texture,
+        face: u32,
+        mip_level: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        let bytes_per_texel = 4u32;
+        let bytes_per_row_unaligned = width * bytes_per_texel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = bytes_per_row_unaligned.div_ceil(align) * align;
+
+        let buffer_size = (padded_bytes_per_row * height) as wgpu::BufferAddress;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c3d cube-face readback buffer"),
+            size: buffer_size.max(4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("c3d cube-face readback encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level,
+                origin: wgpu::Origin3d { x, y, z: face },
+                aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
@@ -8353,6 +8831,36 @@ mod tests {
         assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
         let mut mem = TestMemory::new(4096);
         let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    /// [`submit_commands`], but against an existing `ctx` rather than a
+    /// fresh one -- needed whenever a test must split its commands
+    /// across more than one submission while keeping context-level
+    /// state (bound program, textures, etc.) from the first visible to
+    /// the second, e.g. to read a `PROGRAM_INTERFACE` result back from
+    /// `mem` before issuing the commands that depend on it.
+    fn submit_commands_ctx(
+        ctx: &mut super::super::dispatch::Context,
+        renderer: &mut Renderer,
+        mem: &mut TestMemory,
+        commands: &[Vec<u8>],
+    ) {
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+        // Each call here builds a brand-new, independent ring buffer
+        // starting at byte 0 (unlike a real guest, which keeps writing
+        // into the same physical ring across doorbells) -- `ring_head`
+        // must be reset to match, or the second call's framing starts
+        // from wherever the first call's buffer left `ring_head`, mid-
+        // command in this entirely different buffer.
+        ctx.ring_head = 0;
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
@@ -13472,6 +13980,425 @@ mod tests {
         assert_eq!(left, [255, 0, 0, 255], "left half should sample tex[0] (red): {left:?}");
         let right = &pixels[(32 * 64 + 56) * 4..][..4];
         assert_eq!(right, [0, 255, 0, 255], "right half should sample tex[1] (green): {right:?}");
+    }
+
+    /// Reads back a `PROGRAM_INTERFACE` result written at `addr` and
+    /// returns the `location` of each requested uniform/attribute `name`,
+    /// in the same order as `names` -- panics if any name is missing.
+    /// Uniform/attribute locations are assigned by the compile pipeline,
+    /// not specified by the wire protocol itself, so a test that needs a
+    /// specific uniform's location must look it up this way rather than
+    /// assume a declaration-order numbering.
+    fn program_interface_locations(mem: &mut TestMemory, addr: u32, names: &[&str]) -> [u32; 2] {
+        let header = mem.read(MemLoc::Aperture(addr), 8).unwrap().to_vec();
+        let attrib_count = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        let uniform_count = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        let total_entries = attrib_count + uniform_count;
+        // Over-read a generous fixed window and parse until every entry
+        // is consumed; 512 bytes comfortably covers this module's tiny
+        // test interfaces.
+        let buf = mem.read(MemLoc::Aperture(addr), 512).unwrap().to_vec();
+        let mut found = [None; 2];
+        let mut off = 8usize;
+        for _ in 0..total_entries {
+            let location = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as u32;
+            let name_len = u32::from_be_bytes(buf[off + 12..off + 16].try_into().unwrap());
+            let name = String::from_utf8_lossy(&buf[off + 16..off + 16 + name_len as usize]).to_string();
+            for (i, want) in names.iter().enumerate() {
+                if name == *want {
+                    found[i] = Some(location);
+                }
+            }
+            off += 16 + name_len as usize;
+        }
+        [
+            found[0].unwrap_or_else(|| panic!("{:?} not found in program interface", names[0])),
+            found[1].unwrap_or_else(|| panic!("{:?} not found in program interface", names[1])),
+        ]
+    }
+
+    /// Creates a cube-map texture `id` whose six faces are each a single
+    /// solid 2x2 colour, `LINEAR`-filtered (no mipmap min filter, so each
+    /// 1-level face samples flatly). Shared by every cube-map GPU test
+    /// below.
+    fn cube_commands(mem: &mut TestMemory, id: u32, base_addr: u32, colors: [[u8; 4]; 6]) -> Vec<Vec<u8>> {
+        const RGBA8: u32 = 0;
+        const GL_LINEAR: u32 = 0x2601;
+        const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+        const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+
+        let mut commands = vec![
+            cmd(proto::OP_TEX_CREATE_CUBE, &[id]),
+            cmd(proto::OP_TEX_PARAM, &[id, GL_TEXTURE_MIN_FILTER, GL_LINEAR]),
+            cmd(proto::OP_TEX_PARAM, &[id, GL_TEXTURE_MAG_FILTER, GL_LINEAR]),
+        ];
+        for (face, color) in colors.iter().enumerate() {
+            let pixels = color.repeat(4); // 2x2
+            let addr = base_addr + face as u32 * 64;
+            mem.write(MemLoc::Aperture(addr), &pixels);
+            commands.push(cmd(
+                proto::OP_TEX_IMAGE_FACE,
+                &[id, face as u32, 0, RGBA8, 2, 2, 8, addr, pixels.len() as u32],
+            ));
+        }
+        commands
+    }
+
+    /// End-to-end GPU validation of cube-map sampling (`c3d-cmd-textures`'s
+    /// "Cube-map completeness"/"Binding"): a `samplerCube` uniform
+    /// samples each of the six independently-uploaded faces by GL's own
+    /// face numbering and orientation, and sampling exactly on the edge
+    /// between two faces (equal-magnitude major axes, `LINEAR` filter)
+    /// blends across the seam rather than snapping to one face's pure
+    /// colour -- `wgpu` is unconditionally seamless for a `Cube`-view
+    /// texture, so this is the spec's mandatory seamless filtering
+    /// falling out for free, not special-cased renderer logic.
+    #[test]
+    fn draw_prog_samples_cube_faces_and_blends_seamlessly_across_an_edge() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT_VEC3: u32 = 0x8B51;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"precision mediump float;\nuniform samplerCube cube;\nuniform vec3 dir;\nvoid main() { gl_FragColor = textureCube(cube, dir); }\n";
+
+        // Face order: +X, -X, +Y, -Y, +Z, -Z.
+        let red = [255, 0, 0, 255];
+        let cyan = [0, 255, 255, 255];
+        let green = [0, 255, 0, 255];
+        let magenta = [255, 0, 255, 255];
+        let blue = [0, 0, 255, 255];
+        let yellow = [255, 255, 0, 255];
+        let colors = [red, cyan, green, magenta, blue, yellow];
+
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_cube = 0x2000u32; // 6 faces * 64 bytes = 384 bytes
+        let a_verts = 0x2400u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length]
+        }
+
+        let iface_addr = 0x5200u32;
+        let link_commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_PROGRAM_INTERFACE, &[1, iface_addr, 512]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
+        // Uniform locations are assigned by the compile pipeline, not by
+        // this test -- look them up by name via `PROGRAM_INTERFACE`
+        // rather than assuming a declaration-order numbering that isn't
+        // part of the spec's contract.
+        let [cube_loc, dir_loc] = program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
+
+        let mut commands = vec![
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_UNIFORM_SAMPLER, &[1, cube_loc, 0]),
+        ];
+        commands.extend(cube_commands(&mut mem, 1, a_cube, colors));
+        commands.push(cmd(proto::OP_TEX_BIND, &[0, 1]));
+
+        // One draw per test direction, each into its own tiny surface so
+        // every direction's result is independently readable.
+        let directions: [(u32, [f32; 3]); 7] = [
+            (10, [1.0, 0.0, 0.0]),  // +X: red
+            (11, [-1.0, 0.0, 0.0]), // -X: cyan
+            (12, [0.0, 1.0, 0.0]),  // +Y: green
+            (13, [0.0, -1.0, 0.0]), // -Y: magenta
+            (14, [0.0, 0.0, 1.0]),  // +Z: blue
+            (15, [0.0, 0.0, -1.0]), // -Z: yellow
+            (16, [1.0, 1.0, 0.0]),  // seam: +X/+Y edge
+        ];
+        for (surf_id, dir) in directions {
+            commands.push(cmd(proto::OP_SURFACE_DEFINE, &[surf_id, 2, 2, 8, A8R8G8B8, 0, 0]));
+            commands.push(cmd(proto::OP_SET_DRAW_SURFACE, &[surf_id]));
+            commands.push(cmd(
+                proto::OP_UNIFORM,
+                &[
+                    1,
+                    dir_loc,
+                    GL_FLOAT_VEC3,
+                    1,
+                    dir[0].to_bits(),
+                    dir[1].to_bits(),
+                    dir[2].to_bits(),
+                ],
+            ));
+            commands.push(cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6])); // GL_TRIANGLES
+        }
+
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        for (i, &expected) in colors.iter().enumerate() {
+            let surf_id = 10 + i as u32;
+            let (_, _, pixels) = renderer.read_surface_rgba8(surf_id).unwrap();
+            assert_eq!(
+                &pixels[0..4],
+                &expected[..],
+                "face {i} direction should sample its own colour: {pixels:?}"
+            );
+        }
+
+        let (_, _, seam_pixels) = renderer.read_surface_rgba8(16).unwrap();
+        let seam = &seam_pixels[0..4];
+        assert_ne!(seam, &red[..], "seam direction must not be the pure +X colour: {seam:?}");
+        assert_ne!(seam, &green[..], "seam direction must not be the pure +Y colour: {seam:?}");
+        assert!(
+            seam[0] > 20 && seam[1] > 20,
+            "seam direction should blend red and green across the +X/+Y edge, got {seam:?}"
+        );
+    }
+
+    /// `TEX_GENERATE_MIPS` on a cube-map object generates each face's mip
+    /// chain independently from that face's own level 0, with no
+    /// cross-face filtering -- the generated level 1 of a solid-colour
+    /// face must still be exactly that face's colour, not a blend with
+    /// any neighbour.
+    #[test]
+    fn tex_generate_mips_on_a_cube_generates_each_face_independently() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let red = [255, 0, 0, 255];
+        let cyan = [0, 255, 255, 255];
+        let green = [0, 255, 0, 255];
+        let magenta = [255, 0, 255, 255];
+        let blue = [0, 0, 255, 255];
+        let yellow = [255, 255, 0, 255];
+        let colors = [red, cyan, green, magenta, blue, yellow];
+
+        let mut mem = TestMemory::new(65536);
+        let mut commands = cube_commands(&mut mem, 1, 0x1000, colors);
+        commands.push(cmd(proto::OP_TEX_GENERATE_MIPS, &[1]));
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let tex = &renderer.textures[&1];
+        assert_eq!(tex.mip_level_count, 2, "a 2x2 base should generate exactly one more level (1x1)");
+        for (face, &expected) in colors.iter().enumerate() {
+            let pixel = renderer
+                .copy_texture_rect_to_cpu_face(&tex.texture, face as u32, 1, 0, 0, 1, 1)
+                .unwrap();
+            assert_eq!(
+                pixel, expected,
+                "face {face}'s generated mip 1 must stay that face's own colour, not blend with a neighbour"
+            );
+        }
+    }
+
+    /// `FRAMEBUFFER_ATTACH_TEXTURE_FACE`: render-to-cube-face. Clearing a
+    /// framebuffer whose colour attachment is one face of a cube-map
+    /// texture writes only that face -- a different face read back
+    /// afterwards is untouched (still its original upload, not the
+    /// clear colour).
+    #[test]
+    fn framebuffer_attach_texture_face_renders_into_only_that_face() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let red = [255, 0, 0, 255];
+        let cyan = [0, 255, 255, 255];
+        let green = [0, 255, 0, 255];
+        let magenta = [255, 0, 255, 255];
+        let blue = [0, 0, 255, 255];
+        let yellow = [255, 255, 0, 255];
+        let colors = [red, cyan, green, magenta, blue, yellow];
+
+        const A8R8G8B8: u32 = 5;
+        let mut mem = TestMemory::new(65536);
+        let mut commands = cube_commands(&mut mem, 1, 0x1000, colors);
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        // CLEAR's `E_NO_SURFACE` check is independent of the bound
+        // framebuffer (`c3d-cmd-surfaces`'s "Interaction with the fixed-
+        // function tier"): a draw surface must still be set even though
+        // this CLEAR's actual pixels land on the bound framebuffer's
+        // attachment, not this surface.
+        commands.push(cmd(proto::OP_SURFACE_DEFINE, &[2, 2, 2, 8, A8R8G8B8, 0, 0]));
+        commands.push(cmd(proto::OP_SET_DRAW_SURFACE, &[2]));
+        commands.push(cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]));
+        commands.push(cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 1]));
+        // Render into face 2 (+Y), which was uploaded green.
+        commands.push(cmd(
+            proto::OP_FRAMEBUFFER_ATTACH_TEXTURE_FACE,
+            &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1, 2, 0],
+        ));
+        commands.push(cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0])); // black
+        commands.push(cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]));
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let tex = &renderer.textures[&1];
+        let face2 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 2, 0, 0, 0, 2, 2).unwrap();
+        assert_eq!(&face2[0..4], &[0, 0, 0, 255], "face 2 should now be cleared to black: {face2:?}");
+        let face0 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 0, 0, 0, 0, 2, 2).unwrap();
+        assert_eq!(&face0[0..4], &red[..], "face 0 must be untouched by a face-2 render target: {face0:?}");
+    }
+
+    /// A `samplerCube` uniform reading a unit bound to a *2D* texture is
+    /// `GL_INVALID_OPERATION` and the draw has no effect
+    /// (`c3d-cmd-textures`'s "Binding") -- the surface stays whatever
+    /// `CLEAR` left it, not the colour a correctly-bound cube texture
+    /// would have produced.
+    #[test]
+    fn draw_prog_sampling_a_sampler_cube_uniform_against_a_flat_texture_has_no_effect() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const RGBA8: u32 = 0;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT_VEC3: u32 = 0x8B51;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"precision mediump float;\nuniform samplerCube cube;\nuniform vec3 dir;\nvoid main() { gl_FragColor = textureCube(cube, dir); }\n";
+        let flat_pixels = [0u8, 255, 255, 255].repeat(4); // 2x2 solid cyan -- would never legitimately appear
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_tex = 0x2000u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_tex), &flat_pixels);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length]
+        }
+
+        let iface_addr = 0x5200u32;
+        let link_commands = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_PROGRAM_INTERFACE, &[1, iface_addr, 512]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+        ];
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
+        let [cube_loc, dir_loc] = program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            {
+                let r = reference(a_tex, flat_pixels.len() as u32);
+                cmd(proto::OP_TEX_IMAGE, &[1, 0, RGBA8, 2, 2, 8, r[0], r[1]])
+            },
+            cmd(proto::OP_TEX_BIND, &[0, 1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            cmd(proto::OP_UNIFORM_SAMPLER, &[1, cube_loc, 0]),
+            cmd(
+                proto::OP_UNIFORM,
+                &[1, dir_loc, GL_FLOAT_VEC3, 1, 1.0f32.to_bits(), 0u32, 0u32],
+            ),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        assert_eq!(
+            &pixels[0..4],
+            &[0, 0, 0, 255],
+            "a samplerCube/sampler2D kind mismatch must leave the clear colour untouched: {pixels:?}"
+        );
     }
 
 }
