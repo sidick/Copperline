@@ -603,6 +603,41 @@ fn apply_texture_matrix(m: &Mat4, tc: [f32; 2]) -> [f32; 2] {
     }
 }
 
+/// `TEX_ENV(TEXCOORD_SPACE, TEXEL)`: the scale that converts a texel-
+/// space `(s, t)` -- "texels of the bound texture's level 0" -- into
+/// the `0..1` normalised span every later pipeline stage (texgen,
+/// texture matrix, the sampler itself) already assumes, per `c3d.md`'s
+/// "Texture coordinates are normalised ... by default ... or texel-
+/// space per unit". `[1.0, 1.0]` (a no-op multiply) for `NORMALISED`
+/// (the default) and whenever there's no level 0 to scale against yet
+/// (no texture bound, or one bound but never `TEX_IMAGE`d) -- undefined
+/// per the spec's own "sampling an undefined level yields undefined
+/// colour" rule, so a harmless no-op rather than a divide-by-zero is
+/// the reasonable device-internal choice. Reads the texture's *current*
+/// level-0 size fresh every call (not cached): `TEX_IMAGE` may redefine
+/// it between draws, or even earlier `TEX_IMAGE` calls within one
+/// level-defining sequence.
+fn texcoord_texel_scale(state: &State, unit: usize) -> [f32; 2] {
+    let Some(tu) = state.texture_units.get(unit) else {
+        return [1.0, 1.0];
+    };
+    if tu.coord_space != state::TexCoordSpace::Texel {
+        return [1.0, 1.0];
+    }
+    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&0)) {
+        Some(level) if level.width > 0 && level.height > 0 => {
+            [1.0 / level.width as f32, 1.0 / level.height as f32]
+        }
+        _ => [1.0, 1.0],
+    }
+}
+
+/// [`texcoord_texel_scale`] applied to a raw vertex-supplied `(s, t)`.
+fn apply_texcoord_space(state: &State, unit: usize, tc: [f32; 2]) -> [f32; 2] {
+    let scale = texcoord_texel_scale(state, unit);
+    [tc[0] * scale[0], tc[1] * scale[1]]
+}
+
 /// `CLAMP`/`CLAMP_TO_EDGE` both map to wgpu's edge clamp; `CLAMP` never
 /// gets a border colour (the spec: "this is the behaviour period software
 /// expects and a device must not introduce a border").
@@ -4928,12 +4963,18 @@ impl Renderer {
             let ndc_x = (v.pos[0] / w) * 2.0 - 1.0;
             let ndc_y = 1.0 - (v.pos[1] / h) * 2.0;
             let ndc_z = v.pos[2];
+            // `TEX_ENV(TEXCOORD_SPACE, TEXEL)` applies "in both tiers"
+            // per the spec -- a window-space draw has no texgen/texture-
+            // matrix stage to place this before, so it's the only
+            // per-unit texcoord transform this path needs at all.
+            let texcoord0 = apply_texcoord_space(state, 0, v.texcoord0);
+            let texcoord1 = apply_texcoord_space(state, 1, v.texcoord1);
             GpuVertex {
                 clip_pos: [ndc_x * clip_w, ndc_y * clip_w, ndc_z * clip_w, clip_w],
                 color: v.color,
-                texcoord0: v.texcoord0,
+                texcoord0,
                 fog_distance: if has_fogcoord { v.fogcoord } else { clip_w },
-                texcoord1: v.texcoord1,
+                texcoord1,
                 // User clip planes don't apply to a window-space draw --
                 // see `GpuVertex::clip_dist0`'s doc comment.
                 clip_dist0: [0.0; 4],
@@ -5165,15 +5206,22 @@ impl Renderer {
                 .first()
                 .copied()
                 .unwrap_or(false);
+            // `TEX_ENV(TEXCOORD_SPACE, TEXEL)`: scales the vertex-
+            // supplied coordinate into the `0..1` span every later
+            // stage expects, *before* texgen gets a chance to replace
+            // it -- texgen's own output is already normalised (eye-
+            // linear/sphere-map), so only the raw input is in question.
+            let raw_texcoord0 = apply_texcoord_space(state, 0, v.texcoord0);
+            let raw_texcoord1 = apply_texcoord_space(state, 1, v.texcoord1);
             let texcoord0 = match state.texgen.first() {
-                Some(tg) => apply_texgen(v.texcoord0, gen_s0, gen_t0, tg, v.pos, eye, eye_normal),
-                None => v.texcoord0,
+                Some(tg) => apply_texgen(raw_texcoord0, gen_s0, gen_t0, tg, v.pos, eye, eye_normal),
+                None => raw_texcoord0,
             };
             let gen_s1 = state.enables.texture_gen_s.get(1).copied().unwrap_or(false);
             let gen_t1 = state.enables.texture_gen_t.get(1).copied().unwrap_or(false);
             let texcoord1 = match state.texgen.get(1) {
-                Some(tg) => apply_texgen(v.texcoord1, gen_s1, gen_t1, tg, v.pos, eye, eye_normal),
-                None => v.texcoord1,
+                Some(tg) => apply_texgen(raw_texcoord1, gen_s1, gen_t1, tg, v.pos, eye, eye_normal),
+                None => raw_texcoord1,
             };
             // The per-unit texture matrix applies AFTER texgen, per GL
             // 1.1's pipeline order -- see `apply_texture_matrix`.
@@ -10901,6 +10949,178 @@ mod tests {
             px, blue,
             "S must be generated (overriding the 0.05 decoy) and T must stay the vertex's \
              own 0.75, landing on (s>=.5, t>=.5): {px:?}"
+        );
+    }
+
+    /// `TEX_ENV(TEXCOORD_SPACE, TEXEL)` must actually rescale the
+    /// vertex-supplied texcoord into the `0..1` range the sampler
+    /// expects -- not just decode into unused per-unit state, the same
+    /// gap lighting/clip-planes/the texture matrix each were before
+    /// their own fix. Texel-space `(1.5, 1.5)` is the exact centre of
+    /// texel `(1, 1)` in this `2x2` texture (each texel spans `1.0`
+    /// texel unit), which normalises to `(0.75, 0.75)` -- landing
+    /// unambiguously on the `(s>=.5, t>=.5)` texel (blue). Left
+    /// unscaled (the pre-fix no-op), `1.5` read directly as a
+    /// *normalised* coordinate wraps under `REPEAT` to exactly `0.5`,
+    /// sitting right on the texel boundary -- not a reliable "blue"
+    /// either way, so a wrong or missing scale doesn't coincidentally
+    /// still pass.
+    #[test]
+    fn texcoord_space_texel_scales_wire_coordinates_into_the_normalised_range() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |s| {
+                s.set_tex_env(0, state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel));
+            },
+            [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
+            (1.5, 1.5),
+            [red, green, yellow, blue],
+            (13, 8),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "TEXCOORD_SPACE=TEXEL should scale (1.5, 1.5) texels to (0.75, 0.75), sampling blue: {px:?}"
+        );
+    }
+
+    /// Regression check: `NORMALISED` (the default -- no `TEX_ENV`
+    /// call at all) must sample exactly as it did before `TEXCOORD_
+    /// SPACE` existed. Samples with the already-normalised `(0.75,
+    /// 0.75)` directly -- the same point the `TEXEL` test above scales
+    /// `(1.5, 1.5)` down to -- so both tests target the identical texel
+    /// for an easy side-by-side comparison.
+    #[test]
+    fn texcoord_space_normalised_is_unaffected() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let yellow = [255, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let Some(px) = draw_gl_space_texgen_triangle(
+            |_| {}, // NORMALISED is the default; nothing to set
+            [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
+            (0.75, 0.75),
+            [red, green, yellow, blue],
+            (13, 8),
+        ) else {
+            return; // no adapter
+        };
+        assert_eq!(
+            px, blue,
+            "default NORMALISED sampling must be unaffected by TEXCOORD_SPACE's addition: {px:?}"
+        );
+    }
+
+    /// `TEXCOORD_SPACE` applies "in both tiers" per the spec -- unlike
+    /// user clip planes (GL-space only, no modelview/projection left in
+    /// a window-space vertex to clip against), there is no reason for
+    /// texel-space texcoords to be fixed-function-GL-space-only: a
+    /// window-space draw still samples a texture, and the spec states
+    /// no exemption for it. Drives `DRAW_ARRAYS_WIN`-shaped input (a
+    /// `RenderOp::Draw` with `window_space: true`) directly, rather
+    /// than through [`draw_gl_space_texgen_triangle`] (GL-space only),
+    /// with a big covering triangle in surface pixels and the same
+    /// texel-space `(1.5, 1.5)` the GL-space test above uses.
+    #[test]
+    fn texcoord_space_texel_scales_window_space_coordinates_too() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        let red = [255u8, 0, 0, 255];
+        let green = [0u8, 255, 0, 255];
+        let yellow = [255u8, 255, 0, 255];
+        let blue = [0u8, 0, 255, 255];
+
+        let mut state = State::new(state::Limits::default());
+        state.surface_define(
+            1,
+            Surface {
+                width: 16,
+                height: 16,
+                stride_bytes: 64,
+                format: WireSurfaceFormat::A8r8g8b8,
+                backing: state::Backing::Aperture(0),
+            },
+        );
+        state.set_draw_surface(1);
+        state.set_clear_color(0.0, 0.0, 0.0, 1.0);
+        state.tex_create(1);
+        state.tex_bind(0, 1);
+        state.set_tex_env(0, state::TexEnvParam::Mode(TexEnvMode::Replace));
+        state.set_tex_env(0, state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel));
+        state.enable(state::Capability::Texture2D);
+
+        let mut mem = TestMemory::new(65536);
+        let tex_addr = 0x1000u32;
+        let texels_2x2: [[u8; 4]; 4] = [red, green, yellow, blue];
+        for (i, texel) in texels_2x2.iter().enumerate() {
+            let at = tex_addr as usize + i * 4;
+            mem.aperture[at..at + 4].copy_from_slice(texel);
+        }
+
+        // Covers the whole 16x16 surface: (x, y) in [0, 16] always has
+        // x + y <= 32, the triangle's own hypotenuse.
+        let tri = [(0.0f32, 0.0f32), (0.0, 32.0), (32.0, 0.0)];
+        let mut verts = Vec::new();
+        for (x, y) in tri {
+            for w in [x, y, 0.5f32, 1.0f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+            for w in [1.5f32, 1.5f32] {
+                verts.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        let format = VertexFormat(VertexFormat::TEXCOORD0);
+
+        let errs = renderer.execute(
+            &[
+                RenderOp::TexImage {
+                    id: 1,
+                    level: 0,
+                    format: TexFormat::Rgba8,
+                    width: 2,
+                    height: 2,
+                    row_bytes: 8,
+                    data: Ref {
+                        address: tex_addr,
+                        space: RefSpace::Aperture,
+                        length: 16,
+                    },
+                },
+                RenderOp::Clear {
+                    mask: proto::CLEAR_MASK_COLOR,
+                    state: state.clone(),
+                },
+                RenderOp::Draw {
+                    prim: PrimitiveType::Triangles,
+                    format,
+                    count: 3,
+                    window_space: true,
+                    vertices: DrawVertices::Inline(&verts),
+                    state: state.clone(),
+                },
+            ],
+            &mut mem,
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let at = (8 * 16 + 13) * 4;
+        let px: [u8; 4] = pixels[at..at + 4].try_into().unwrap();
+        assert_eq!(
+            px, blue,
+            "TEXCOORD_SPACE=TEXEL should scale window-space texcoords too: {px:?}"
         );
     }
 
