@@ -984,6 +984,20 @@ pub struct Limits {
     /// real multisample backend can honestly advertise more than `2` under
     /// this spec's "every integer up to the limit, no rounding" rule.
     pub max_samples: usize,
+    /// `PROGRAM_BINARY_FORMAT`, `CAP_PROGRAMMABLE`. Not actually a
+    /// *limit* (nothing is bounded by it), but reported the same way
+    /// `max_samples`/`max_color_attachments` are above: a fixed value
+    /// `board.rs`'s `read_global` echoes verbatim, kept here so that
+    /// register and this module's own notion of the device's
+    /// capabilities can never drift apart. `0` means `PROGRAM_BINARY`/
+    /// `PROGRAM_GET_BINARY` are `E_BAD_OPCODE`; nonzero is this device's
+    /// one opaque binary-format id. Must match `ring::DeviceConfig::
+    /// program_binary_format` and `render.rs`'s own `PROGRAM_BINARY_
+    /// FORMAT` constant exactly -- independently hardcoded in all three
+    /// (this module builds without the `c3d` feature, so it cannot
+    /// reference `render.rs` directly), the same duplication
+    /// `max_samples` already accepts.
+    pub program_binary_format: u32,
 }
 
 impl Default for Limits {
@@ -1005,6 +1019,7 @@ impl Default for Limits {
             max_vertex_attribs: 8,
             max_color_attachments: 4,
             max_samples: 2,
+            program_binary_format: 0x4350_3031, // "CP01" -- see this field's doc comment
         }
     }
 }

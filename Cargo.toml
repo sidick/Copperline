@@ -215,8 +215,14 @@ wgpu = { version = "29", optional = true, features = ["naga-ir"] }
 # naga's GLSL front end parses the GLSL-ES-rewritten-to-core-profile source
 # into a naga::Module, which also feeds wgpu::ShaderSource::Naga directly.
 # Pinned to the exact version wgpu/pixels resolve to, same reasoning as wgpu
-# below -- one naga copy in the dependency graph, not two.
-naga = { version = "=29.0.4", optional = true, features = ["glsl-in"] }
+# below -- one naga copy in the dependency graph, not two. "serialize"/
+# "deserialize" additionally let `naga::Module` round-trip through serde
+# (bincode) for `PROGRAM_BINARY`/`PROGRAM_GET_BINARY`'s opaque blob
+# (src/c3d/render.rs's `ProgramBinaryBlob`) -- this exact pin is *why*
+# that blob is safe to treat as opaque across builds: a `naga::Module`'s
+# derived (De)serialize impls are not guaranteed wire-stable across naga
+# versions, so `PROGRAM_BINARY_FORMAT` must change if this pin ever does.
+naga = { version = "=29.0.4", optional = true, features = ["glsl-in", "serialize", "deserialize"] }
 # Real GLSL ES 1.00 parsing/validation ahead of the naga::front::glsl
 # bridge below (naga's own GLSL front end only accepts core-profile
 # syntax -- no `attribute`/`varying`/`gl_FragColor` -- see src/c3d/glsl.rs).

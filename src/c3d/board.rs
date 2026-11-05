@@ -224,6 +224,7 @@ mod greg {
     pub const MAX_COLOR_ATTACHMENTS: u32 = 0x09C;
     pub const MAX_RENDERBUFFER_SIZE: u32 = 0x0A0;
     pub const MAX_SAMPLES: u32 = 0x0A4;
+    pub const PROGRAM_BINARY_FORMAT: u32 = 0x0A8;
 }
 
 // ---------------------------------------------------------------------
@@ -773,6 +774,7 @@ impl C3dBoard {
             | MAX_COLOR_ATTACHMENTS
             | MAX_RENDERBUFFER_SIZE
             | MAX_SAMPLES
+            | PROGRAM_BINARY_FORMAT
                 if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
             {
                 0
@@ -808,6 +810,13 @@ impl C3dBoard {
             // real backend can honestly advertise more under this spec's
             // "every integer up to the limit" rule).
             MAX_SAMPLES => state::Limits::default().max_samples as u32,
+            // Like MAX_SAMPLES above, reports the same value every
+            // per-context `state::Limits::default()` enforces -- real
+            // PROGRAM_BINARY/PROGRAM_GET_BINARY support, not just an
+            // advertised id. See `state::Limits::program_binary_format`'s
+            // doc comment for why `0x4350_3031` is independently
+            // hardcoded here rather than referencing `render.rs`.
+            PROGRAM_BINARY_FORMAT => state::Limits::default().program_binary_format,
             _ => 0,
         }
     }

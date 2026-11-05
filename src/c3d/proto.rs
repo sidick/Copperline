@@ -351,6 +351,11 @@ pub const OP_PROGRAM_VALIDATE: u16 = 0x090A;
 pub const OP_USE_PROGRAM: u16 = 0x090B;
 pub const OP_UNIFORM: u16 = 0x090C;
 pub const OP_UNIFORM_SAMPLER: u16 = 0x090D;
+/// `CAP_PROGRAMMABLE`, optional (`PROGRAM_BINARY_FORMAT` nonzero;
+/// `E_BAD_OPCODE` otherwise). `glProgramBinary`'s wire equivalent: loads
+/// `program`'s linked state directly from an opaque blob, bypassing
+/// compiling/linking from attached shaders.
+pub const OP_PROGRAM_BINARY: u16 = 0x090E;
 
 // Buffers and vertex attributes (0x0Axx) -- `c3d-cmd-buffers-and-vertex-
 // attributes`, `CAP_PROGRAMMABLE`.
@@ -406,6 +411,9 @@ pub const OP_DRAW_ELEMENTS_PROG: u16 = 0x0C01;
 pub const OP_SHADER_STATUS: u16 = 0x0D00;
 pub const OP_PROGRAM_STATUS: u16 = 0x0D01;
 pub const OP_PROGRAM_INTERFACE: u16 = 0x0D02;
+/// `CAP_PROGRAMMABLE`, optional (`PROGRAM_BINARY_FORMAT` nonzero;
+/// `E_BAD_OPCODE` otherwise). `glGetProgramBinary`'s wire equivalent.
+pub const OP_PROGRAM_GET_BINARY: u16 = 0x0D03;
 
 // ---------------------------------------------------------------------
 // Protocol errors (`c3d-errors`'s "Protocol errors" table).
@@ -1317,6 +1325,16 @@ pub enum Command<'a> {
     UseProgram {
         program: u32,
     },
+    /// `PROGRAM_BINARY`. `format` is the guest's claimed format id,
+    /// unvalidated here -- comparing it against the device's own
+    /// `PROGRAM_BINARY_FORMAT` is render.rs's job (a format mismatch is a
+    /// link failure, not a protocol error; see this module's doc comment
+    /// on the `from_gl`/protocol-error split).
+    ProgramBinary {
+        program: u32,
+        format: u32,
+        data: Ref,
+    },
     /// `UNIFORM`. `values` is the raw wire bytes (big-endian words) for
     /// `count` repetitions of `type_`'s component layout -- interpreted
     /// per-component as `f32` or `i32` downstream, where `type_` (an
@@ -1497,6 +1515,11 @@ pub enum Command<'a> {
         dest: Ref,
     },
     ProgramInterface {
+        program: u32,
+        dest: Ref,
+    },
+    /// `PROGRAM_GET_BINARY`.
+    ProgramGetBinary {
         program: u32,
         dest: Ref,
     },

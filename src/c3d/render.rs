@@ -3101,6 +3101,26 @@ struct ProgramSlot {
     /// defaults to unit 0, matching GLES2's own "a sampler uniform's
     /// initial value is 0" rule.
     sampler_bindings: HashMap<u32, u32>,
+    /// Present only for a program successfully loaded via `PROGRAM_BINARY`
+    /// rather than linked via `PROGRAM_LINK`: the compiled modules
+    /// themselves, owned directly rather than looked up by shader id --
+    /// a program binary is independent of any shader object's lifetime
+    /// (real GL's `glProgramBinary` does not require, or even consult,
+    /// attached shaders). `draw_prog` prefers this over `linked_vertex`/
+    /// `linked_fragment` when present. Always `None` for a normally
+    /// linked program, and cleared by `PROGRAM_LINK` -- "a future
+    /// PROGRAM_LINK re-links from [attached shaders], discarding the
+    /// loaded binary's effect", per the spec.
+    binary_modules: Option<(Box<naga::Module>, Box<naga::Module>)>,
+    /// The exact bytes `PROGRAM_GET_BINARY` writes for this program right
+    /// now: `Some` iff `link_status` and the device supports program
+    /// binaries at all, `None` otherwise (including immediately after
+    /// any failed link/binary load). Populated once -- at a successful
+    /// `PROGRAM_LINK` (freshly serialized) or `PROGRAM_BINARY` (the
+    /// loaded bytes themselves, verbatim, so a get-then-load round trip
+    /// is byte-identical) -- rather than re-serialized on every
+    /// `PROGRAM_STATUS`/`PROGRAM_GET_BINARY` query.
+    cached_binary: Option<Vec<u8>>,
 }
 
 /// One entry in `PROGRAM_INTERFACE`'s report (`c3d-cmd-programmable-
@@ -3112,7 +3132,7 @@ struct ProgramSlot {
 /// uniform -- there is no naga-exposed "location" concept for uniforms
 /// the way there is for vertex attributes, so the device invents one,
 /// exactly as a real GLES2 `glGetUniformLocation` implementation would.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct InterfaceEntry {
     location: u32,
     gl_type: u32,
@@ -3134,13 +3154,44 @@ struct InterfaceEntry {
 /// `draw_prog` binds both halves to the same `GpuTexture`/cached
 /// `wgpu::Sampler` the fixed-function path already uses for the GLES2
 /// `UNIFORM_SAMPLER`-selected texture unit.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct UniformBinding {
     vertex_binding: Option<u32>,
     fragment_binding: Option<u32>,
     is_sampler: bool,
     vertex_sampler_binding: Option<u32>,
     fragment_sampler_binding: Option<u32>,
+}
+
+/// This device's `PROGRAM_BINARY_FORMAT` register value (`c3d-cmd-
+/// shaders-and-programs`/`c3d-cmd-programmable-queries`): nonzero,
+/// identifying both [`ProgramBinaryBlob`]'s serialization shape (this
+/// module) and the pinned `naga` version its `Module`s were serialized
+/// by -- `Cargo.toml` pins `naga` to exactly `"=29.0.4"` for this reason,
+/// since a `naga::Module`'s derived `Serialize`/`Deserialize` impls are
+/// not guaranteed wire-stable across versions. Bump this (and `ring.rs`'s
+/// `DeviceConfig::program_binary_format`/`state.rs`'s `Limits::
+/// program_binary_format`, which must match exactly) whenever either
+/// changes, so a blob captured under a different build is rejected
+/// outright -- treated as a bad link, never deserialized into something
+/// subtly wrong -- rather than silently misbehaving.
+const PROGRAM_BINARY_FORMAT: u32 = 0x4350_3031; // ASCII "CP01"
+
+/// `PROGRAM_BINARY`/`PROGRAM_GET_BINARY`'s opaque blob. Deliberately does
+/// NOT include `uniform_values`/`sampler_bindings`/`validate_status`/
+/// `info_log`/`bound_attrib_locations`: real GL defines a successful
+/// `glProgramBinary` load as leaving the program in the same state as a
+/// freshly linked one, which already resets uniform values/sampler
+/// bindings to their GLES2 defaults (see `ProgramSlot::uniform_values`'s
+/// doc comment) -- there is nothing stage-specific to preserve beyond
+/// the compiled modules and the interface reflected from them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProgramBinaryBlob {
+    vertex_module: naga::Module,
+    fragment_module: naga::Module,
+    interface: Vec<InterfaceEntry>,
+    attrib_count: u32,
+    uniform_bindings: Vec<UniformBinding>,
 }
 
 
@@ -5078,6 +5129,14 @@ impl Renderer {
             RenderOp::ShaderStatus { shader, dest } => self.op_shader_status(*shader, *dest, mem),
             RenderOp::ProgramStatus { program, dest } => {
                 self.op_program_status(*program, *dest, mem)
+            }
+            RenderOp::ProgramBinary {
+                program,
+                format,
+                data,
+            } => self.op_program_binary(*program, *format, *data, mem),
+            RenderOp::ProgramGetBinary { program, dest } => {
+                self.op_program_get_binary(*program, *dest, mem)
             }
             RenderOp::BufferData {
                 id,
@@ -7875,6 +7934,7 @@ impl Renderer {
         let mut interface = Vec::new();
         let mut attrib_count = 0u32;
         let mut uniform_bindings = Vec::new();
+        let mut linked_modules: Option<(naga::Module, naga::Module)> = None;
         if link_status {
             if let (Some(vid), Some(fid)) = (vertex, fragment) {
                 if let (Some(vs_slot), Some(fs_slot)) = (self.shaders.get(&vid), self.shaders.get(&fid)) {
@@ -7895,10 +7955,33 @@ impl Renderer {
                             .collect::<Vec<_>>();
                         interface.extend(uniform_entries);
                         uniform_bindings = bindings;
+                        linked_modules = Some(((**vs).clone(), (**fs).clone()));
                     }
                 }
             }
         }
+
+        // `PROGRAM_GET_BINARY`'s eventual result, built once here rather
+        // than re-serialized on every query -- see `ProgramSlot::
+        // cached_binary`'s doc comment. Skipped entirely on a device
+        // that doesn't support program binaries (`PROGRAM_BINARY_FORMAT`
+        // `0`), and on a defensive (should-never-happen) serialization
+        // failure: either way `cached_binary` just stays `None`, which
+        // `PROGRAM_STATUS`/`PROGRAM_GET_BINARY` already treat as "not
+        // available", not an error.
+        let cached_binary = match (link_status, PROGRAM_BINARY_FORMAT, &linked_modules) {
+            (true, format, Some((vertex_module, fragment_module))) if format != 0 => {
+                let blob = ProgramBinaryBlob {
+                    vertex_module: vertex_module.clone(),
+                    fragment_module: fragment_module.clone(),
+                    interface: interface.clone(),
+                    attrib_count,
+                    uniform_bindings: uniform_bindings.clone(),
+                };
+                bincode::serialize(&blob).ok()
+            }
+            _ => None,
+        };
 
         let slot = self.programs.entry(program).or_default();
         slot.link_status = link_status;
@@ -7906,9 +7989,13 @@ impl Renderer {
         slot.info_log = info_log;
         slot.linked_vertex = if link_status { vertex } else { None };
         slot.linked_fragment = if link_status { fragment } else { None };
+        // A fresh PROGRAM_LINK always re-links from attached shaders,
+        // discarding any earlier PROGRAM_BINARY load's effect, per spec.
+        slot.binary_modules = None;
         slot.interface = interface;
         slot.attrib_count = attrib_count;
         slot.uniform_bindings = uniform_bindings;
+        slot.cached_binary = cached_binary;
         // GLES2: a new link invalidates previous uniform values and
         // sampler bindings, same reasoning as validate_status above.
         // Every active uniform gets a zeroed default (real GL's own
@@ -7923,6 +8010,103 @@ impl Renderer {
             slot.uniform_values.insert(i as u32, vec![0u8; size]);
         }
         slot.sampler_bindings.clear();
+        Ok(())
+    }
+
+    /// `PROGRAM_BINARY`: loads `program`'s linked state directly from the
+    /// opaque blob at `data`, bypassing compiling/linking from attached
+    /// shaders. A `format` not matching this device's own
+    /// [`PROGRAM_BINARY_FORMAT`], or a blob that fails to deserialize
+    /// despite a matching `format` (corrupt, truncated, or simply never
+    /// produced by this exact build), fails exactly like a bad
+    /// `PROGRAM_LINK` -- `link_status` `0` with an explanatory info log,
+    /// never a protocol error and never a panic, since the blob's
+    /// internal structure is guest-supplied and untrusted even when its
+    /// `format` happens to match.
+    fn op_program_binary(
+        &mut self,
+        program: u32,
+        format: u32,
+        data: Ref,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
+        let loc = MemLoc::from_ref(data);
+        let bytes = mem
+            .read(loc, data.length as usize)
+            .ok_or_else(|| RenderError::BadMemory(format!("PROGRAM_BINARY read from {loc:?}")))?;
+
+        let fail = |slot: &mut ProgramSlot, info_log: String| {
+            slot.link_status = false;
+            slot.validate_status = false;
+            slot.info_log = info_log;
+            slot.linked_vertex = None;
+            slot.linked_fragment = None;
+            slot.binary_modules = None;
+            slot.interface = Vec::new();
+            slot.attrib_count = 0;
+            slot.uniform_bindings = Vec::new();
+            slot.cached_binary = None;
+            slot.uniform_values.clear();
+            slot.sampler_bindings.clear();
+        };
+
+        let slot = self.programs.entry(program).or_default();
+        if format != PROGRAM_BINARY_FORMAT {
+            fail(
+                slot,
+                "PROGRAM_BINARY format does not match this device's PROGRAM_BINARY_FORMAT"
+                    .to_string(),
+            );
+            return Ok(());
+        }
+        let blob: ProgramBinaryBlob = match bincode::deserialize(bytes) {
+            Ok(blob) => blob,
+            Err(err) => {
+                fail(slot, format!("PROGRAM_BINARY blob failed to deserialize: {err}"));
+                return Ok(());
+            }
+        };
+
+        slot.link_status = true;
+        slot.validate_status = false;
+        slot.info_log = String::new();
+        slot.linked_vertex = None;
+        slot.linked_fragment = None;
+        slot.binary_modules = Some((Box::new(blob.vertex_module), Box::new(blob.fragment_module)));
+        slot.interface = blob.interface;
+        slot.attrib_count = blob.attrib_count;
+        slot.uniform_bindings = blob.uniform_bindings;
+        slot.cached_binary = Some(bytes.to_vec());
+        slot.uniform_values.clear();
+        for (i, entry) in slot.interface.iter().skip(slot.attrib_count as usize).enumerate() {
+            let size = gl_type_byte_size(entry.gl_type).unwrap_or(0);
+            slot.uniform_values.insert(i as u32, vec![0u8; size]);
+        }
+        slot.sampler_bindings.clear();
+        Ok(())
+    }
+
+    /// `PROGRAM_GET_BINARY`: writes `format (u32), length (u32), binary
+    /// bytes...`. `format`/`length` are both `0` (no bytes) if `program`
+    /// is not currently successfully linked -- not an error.
+    fn op_program_get_binary(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
+        let slot = self.programs.entry(program).or_default();
+        let mut bytes = Vec::new();
+        match &slot.cached_binary {
+            Some(blob) => {
+                bytes.extend_from_slice(&PROGRAM_BINARY_FORMAT.to_be_bytes());
+                bytes.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(blob);
+            }
+            None => {
+                bytes.extend_from_slice(&0u32.to_be_bytes());
+                bytes.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+        let loc = MemLoc::from_ref(dest);
+        if !mem.write(loc, &bytes) {
+            return Err(RenderError::BadMemory(format!("PROGRAM_GET_BINARY write to {loc:?}")));
+        }
         Ok(())
     }
 
@@ -8017,11 +8201,13 @@ impl Renderer {
 
     fn op_program_status(&mut self, program: u32, dest: Ref, mem: &mut dyn Memory) -> Result<(), RenderError> {
         let slot = self.programs.entry(program).or_default();
-        let mut bytes = Vec::with_capacity(12 + slot.info_log.len());
+        let binary_length = slot.cached_binary.as_ref().map_or(0, |b| b.len() as u32);
+        let mut bytes = Vec::with_capacity(16 + slot.info_log.len());
         bytes.extend_from_slice(&(slot.link_status as u32).to_be_bytes());
         bytes.extend_from_slice(&(slot.validate_status as u32).to_be_bytes());
         bytes.extend_from_slice(&(slot.info_log.len() as u32).to_be_bytes());
         bytes.extend_from_slice(slot.info_log.as_bytes());
+        bytes.extend_from_slice(&binary_length.to_be_bytes());
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
             return Err(RenderError::BadMemory(format!("PROGRAM_STATUS write to {loc:?}")));
@@ -8156,8 +8342,26 @@ impl Renderer {
         if !prog.link_status {
             return Ok(());
         }
-        let (Some(vs_id), Some(fs_id)) = (prog.linked_vertex, prog.linked_fragment) else {
-            return Ok(());
+        // A program loaded via `PROGRAM_BINARY` owns its compiled modules
+        // directly (`binary_modules`); a normally `PROGRAM_LINK`ed one is
+        // looked up by shader id instead, as before -- see
+        // `ProgramSlot::binary_modules`'s doc comment for why these are
+        // two separate paths rather than one.
+        let (vs_module, fs_module) = if let Some((vs, fs)) = &prog.binary_modules {
+            ((**vs).clone(), (**fs).clone())
+        } else {
+            let (Some(vs_id), Some(fs_id)) = (prog.linked_vertex, prog.linked_fragment) else {
+                return Ok(());
+            };
+            let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
+                Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
+                _ => return Ok(()), // shader destroyed or re-sourced since link
+            };
+            let fs_module = match self.shaders.get(&fs_id).and_then(|s| s.compiled.as_ref()) {
+                Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
+                _ => return Ok(()),
+            };
+            (vs_module, fs_module)
         };
         let bound_attrib_locations = prog.bound_attrib_locations.clone();
         let uniform_bindings = prog.uniform_bindings.clone();
@@ -8167,14 +8371,6 @@ impl Renderer {
         let sampler_bindings = prog.sampler_bindings.clone();
         let interface = prog.interface.clone();
         let attrib_count = prog.attrib_count;
-        let vs_module = match self.shaders.get(&vs_id).and_then(|s| s.compiled.as_ref()) {
-            Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
-            _ => return Ok(()), // shader destroyed or re-sourced since link
-        };
-        let fs_module = match self.shaders.get(&fs_id).and_then(|s| s.compiled.as_ref()) {
-            Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
-            _ => return Ok(()),
-        };
         let frag_locations = fragment_output_locations(&fs_module);
 
         let (topology, order) = primitive_index_order(prim, count as usize)?;
@@ -15522,6 +15718,264 @@ mod tests {
             encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap(),
             blue.as_slice(),
             "COLOR_ATTACHMENT1 (gl_FragData[1]) should read back blue: {blue:?}"
+        );
+    }
+
+    /// `PROGRAM_GET_BINARY` on a successfully linked program, followed by
+    /// `PROGRAM_BINARY` loading that exact blob into a *different* program
+    /// object, draws the same solid colour the original program would --
+    /// proof the round trip actually skips recompiling GLSL (no shader
+    /// source or shader objects are ever attached to the second program)
+    /// rather than just not crashing.
+    #[test]
+    fn program_binary_round_trip_draws_identically_to_the_original_program() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"void main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+        #[rustfmt::skip]
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.0, 1.0,
+             1.0, -1.0, 0.0, 1.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0, -1.0, 0.0, 1.0,
+             1.0,  1.0, 0.0, 1.0,
+            -1.0,  1.0, 0.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let setup = vec![
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            cmd(proto::OP_SHADER_SOURCE, &[1, a_vs, vs_src.len() as u32]),
+            cmd(proto::OP_SHADER_SOURCE, &[2, a_fs, fs_src.len() as u32]),
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_SURFACE_DEFINE, &[9, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[9]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            cmd(
+                proto::OP_BUFFER_DATA,
+                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+            ),
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &setup);
+
+        // PROGRAM_STATUS's binary_length must say exactly how big the
+        // PROGRAM_GET_BINARY blob about to be fetched is.
+        let status_dest = 0x3000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 512])],
+        );
+        let status_head = mem.read(MemLoc::Aperture(status_dest), 12).unwrap().to_vec();
+        assert_eq!(
+            u32::from_be_bytes(status_head[0..4].try_into().unwrap()),
+            1,
+            "program 1 should link successfully"
+        );
+        let log_length = u32::from_be_bytes(status_head[8..12].try_into().unwrap());
+        let binary_length_off = 12 + log_length as usize;
+        let tail = mem
+            .read(MemLoc::Aperture(status_dest), binary_length_off + 4)
+            .unwrap()
+            .to_vec();
+        let binary_length =
+            u32::from_be_bytes(tail[binary_length_off..binary_length_off + 4].try_into().unwrap());
+        assert!(
+            binary_length > 0,
+            "a linked program on a PROGRAM_BINARY_FORMAT-supporting device should have a nonzero binary_length"
+        );
+
+        let get_binary_dest = 0x4000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[cmd(
+                proto::OP_PROGRAM_GET_BINARY,
+                &[1, get_binary_dest, binary_length + 16],
+            )],
+        );
+        let gb_head = mem.read(MemLoc::Aperture(get_binary_dest), 8).unwrap().to_vec();
+        let format = u32::from_be_bytes(gb_head[0..4].try_into().unwrap());
+        let length = u32::from_be_bytes(gb_head[4..8].try_into().unwrap());
+        assert_eq!(
+            length, binary_length,
+            "PROGRAM_GET_BINARY's length should match PROGRAM_STATUS's binary_length"
+        );
+        let blob_addr = get_binary_dest + 8;
+
+        // Load the blob into a *different* program object -- no shader
+        // objects attached, no SHADER_SOURCE/SHADER_COMPILE at all -- and
+        // draw with it instead.
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[
+                cmd(proto::OP_PROGRAM_CREATE, &[2]),
+                cmd(proto::OP_PROGRAM_BINARY, &[2, format, blob_addr, length]),
+                cmd(proto::OP_USE_PROGRAM, &[2]),
+                cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6]),
+            ],
+        );
+
+        let dest = 0x5000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 32])],
+        );
+        let pixel = mem.read(MemLoc::Aperture(dest), 4).unwrap().to_vec();
+        assert_eq!(
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 255, 0, 255]).unwrap(),
+            pixel.as_slice(),
+            "a program loaded via PROGRAM_BINARY should draw the same green the original program would: {pixel:?}"
+        );
+    }
+
+    /// A `format` not equal to this device's `PROGRAM_BINARY_FORMAT` is
+    /// not a protocol error: it fails exactly like a bad `PROGRAM_LINK`.
+    #[test]
+    fn program_binary_with_a_mismatched_format_fails_like_a_bad_link() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut mem = TestMemory::new(16384);
+        let data_addr = 0x1000u32;
+        mem.write(MemLoc::Aperture(data_addr), &[0xAAu8; 16]);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let status_dest = 0x2000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[
+                cmd(proto::OP_PROGRAM_CREATE, &[1]),
+                cmd(proto::OP_PROGRAM_BINARY, &[1, 0xDEAD_BEEF, data_addr, 16]),
+                cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 256]),
+            ],
+        );
+        let status = mem.read(MemLoc::Aperture(status_dest), 12).unwrap().to_vec();
+        assert_eq!(
+            u32::from_be_bytes(status[0..4].try_into().unwrap()),
+            0,
+            "a format mismatch should fail like a bad link, not succeed"
+        );
+        let log_length = u32::from_be_bytes(status[8..12].try_into().unwrap());
+        assert!(log_length > 0, "a format mismatch should leave an explanatory info log");
+    }
+
+    /// A blob whose `format` matches but whose content doesn't deserialize
+    /// (here, simply truncated to a handful of zero bytes -- nowhere near
+    /// enough to hold a real `ProgramBinaryBlob`) fails the same way a
+    /// format mismatch does: `link_status` `0`, never a panic. Zero bytes
+    /// specifically (rather than, say, `0xFF`) avoid bincode interpreting
+    /// stray bytes as a huge `Vec`/collection length and attempting a
+    /// giant allocation before it gets the chance to fail cleanly --
+    /// deliberately the safest possible "garbage" input for this test.
+    #[test]
+    fn program_binary_with_a_truncated_blob_fails_gracefully_not_a_panic() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut mem = TestMemory::new(16384);
+        let data_addr = 0x1000u32;
+        mem.write(MemLoc::Aperture(data_addr), &[0u8; 4]);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let status_dest = 0x2000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[
+                cmd(proto::OP_PROGRAM_CREATE, &[1]),
+                cmd(proto::OP_PROGRAM_BINARY, &[1, 0x4350_3031, data_addr, 4]),
+                cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 256]),
+            ],
+        );
+        let status = mem.read(MemLoc::Aperture(status_dest), 4).unwrap().to_vec();
+        assert_eq!(
+            u32::from_be_bytes(status[0..4].try_into().unwrap()),
+            0,
+            "a format-matching but undeserializable blob should fail like a bad link, not succeed or panic"
+        );
+    }
+
+    /// `PROGRAM_GET_BINARY` against a program that has never been linked
+    /// (nor loaded via `PROGRAM_BINARY`) writes `format`/`length` both
+    /// `0` -- not an error.
+    #[test]
+    fn program_get_binary_against_an_unlinked_program_reports_format_and_length_zero() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        let mut mem = TestMemory::new(16384);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let dest = 0x2000u32;
+        submit_commands_ctx(
+            &mut ctx,
+            &mut renderer,
+            &mut mem,
+            &[
+                cmd(proto::OP_PROGRAM_CREATE, &[1]),
+                cmd(proto::OP_PROGRAM_GET_BINARY, &[1, dest, 64]),
+            ],
+        );
+        let result = mem.read(MemLoc::Aperture(dest), 8).unwrap().to_vec();
+        assert_eq!(
+            u32::from_be_bytes(result[0..4].try_into().unwrap()),
+            0,
+            "format should be 0 for a never-linked program"
+        );
+        assert_eq!(
+            u32::from_be_bytes(result[4..8].try_into().unwrap()),
+            0,
+            "length should be 0 for a never-linked program"
         );
     }
 

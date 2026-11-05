@@ -164,6 +164,17 @@ pub struct DeviceConfig {
     /// `Renderer::new` for where this is actually measured against the
     /// adapter rather than assumed.
     pub max_samples: u32,
+    /// `PROGRAM_BINARY_FORMAT`: `0` means `PROGRAM_BINARY`/
+    /// `PROGRAM_GET_BINARY` are `E_BAD_OPCODE`; nonzero is this device's
+    /// one opaque binary-format id. Copperline's own value (`0x4350_3031`,
+    /// ASCII "CP01") must match `render.rs`'s own `PROGRAM_BINARY_FORMAT`
+    /// constant exactly -- the two are independently hardcoded (this
+    /// struct is built without the `c3d` feature, so it cannot reference
+    /// `render.rs` directly), the same duplication `max_samples` already
+    /// accepts above. Bump both together if `render.rs`'s
+    /// `ProgramBinaryBlob` shape or its pinned `naga` version ever
+    /// changes.
+    pub program_binary_format: u32,
     /// `TEXFMT_SUPPORTED`: bit `n` set means [`proto::TextureFormat`]
     /// value `n` is accepted.
     pub texfmt_supported: u32,
@@ -223,6 +234,7 @@ impl Default for DeviceConfig {
             max_color_attachments: 4,
             max_renderbuffer_size: 1024,
             max_samples: 2,
+            program_binary_format: 0x4350_3031, // "CP01" -- see this field's doc comment
             texfmt_supported: 0xFF // RGBA8, RGB8, RGB565, RGBA4444, RGBA5551, L8, LA8, A8
                 | (1 << 8) // I8 (intensity, or palette-indexed with TEX_PALETTE)
                 | (1 << 9) // I8_INDEXED: TEX_PALETTE itself
@@ -508,9 +520,11 @@ impl<'a> RingCursor<'a> {
                 | OP_USE_PROGRAM
                 | OP_UNIFORM
                 | OP_UNIFORM_SAMPLER
+                | OP_PROGRAM_BINARY
                 | OP_SHADER_STATUS
                 | OP_PROGRAM_STATUS
                 | OP_PROGRAM_INTERFACE
+                | OP_PROGRAM_GET_BINARY
                 | OP_BUFFER_CREATE
                 | OP_BUFFER_DESTROY
                 | OP_BUFFER_DATA
@@ -574,6 +588,16 @@ impl<'a> RingCursor<'a> {
         // TEXFMT_SUPPORTED bit 10 (MipgenSupported) rather than by tier.
         if opcode == proto::OP_TEX_GENERATE_MIPS
             && (self.config.texfmt_supported >> proto::TextureFormat::MipgenSupported as u32) & 1 == 0
+        {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        // PROGRAM_BINARY/PROGRAM_GET_BINARY are spec-optional the same
+        // way, gated by PROGRAM_BINARY_FORMAT being nonzero rather than
+        // by tier -- "a device reports it with PROGRAM_BINARY_FORMAT
+        // nonzero; without it PROGRAM_BINARY/PROGRAM_GET_BINARY are
+        // E_BAD_OPCODE".
+        if (opcode == proto::OP_PROGRAM_BINARY || opcode == proto::OP_PROGRAM_GET_BINARY)
+            && self.config.program_binary_format == 0
         {
             return self.raise(ErrorCode::BadOpcode, start);
         }
@@ -1570,6 +1594,19 @@ impl<'a> RingCursor<'a> {
                     unit: w32(body, 2),
                 }
             }
+            OP_PROGRAM_BINARY => {
+                fixed!(4);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                let format = w32(body, 1);
+                let data = Ref::decode(w32(body, 2), w32(body, 3));
+                check!(self.validate_ref(data, start));
+                Command::ProgramBinary {
+                    program,
+                    format,
+                    data,
+                }
+            }
 
             // Buffers and vertex attributes (0x0Axx), CAP_PROGRAMMABLE.
             OP_BUFFER_CREATE => {
@@ -1700,6 +1737,14 @@ impl<'a> RingCursor<'a> {
                 let dest = Ref::decode(w32(body, 1), w32(body, 2));
                 check!(self.validate_ref(dest, start));
                 Command::ProgramInterface { program, dest }
+            }
+            OP_PROGRAM_GET_BINARY => {
+                fixed!(3);
+                let program = w32(body, 0);
+                check!(self.check_id(program, self.config.max_programs, start));
+                let dest = Ref::decode(w32(body, 1), w32(body, 2));
+                check!(self.validate_ref(dest, start));
+                Command::ProgramGetBinary { program, dest }
             }
 
             // Framebuffers and renderbuffers (0x0Bxx), CAP_PROGRAMMABLE.
@@ -3141,6 +3186,63 @@ mod tests {
         let ring = ring_with(4096, 0, &words);
         let step = decode_one(&ring, 0, 8);
         assert_eq!(step, Step::Command(Command::TexGenerateMips { id: 1 }));
+    }
+
+    #[test]
+    fn program_binary_is_bad_opcode_without_program_binary_format() {
+        let c = DeviceConfig {
+            program_binary_format: 0,
+            ..DeviceConfig::default()
+        };
+        let words = [
+            header(OP_PROGRAM_BINARY, 5),
+            1, // program
+            0x4350_3031,
+            0x0010_0000,
+            16,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 20, c);
+        assert_eq!(step, err(ErrorCode::BadOpcode, 0, false));
+    }
+
+    #[test]
+    fn program_get_binary_is_bad_opcode_without_program_binary_format() {
+        let c = DeviceConfig {
+            program_binary_format: 0,
+            ..DeviceConfig::default()
+        };
+        let words = [
+            header(OP_PROGRAM_GET_BINARY, 4),
+            1, // program
+            0x0010_0000,
+            16,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one_with(&ring, 0, 16, c);
+        assert_eq!(step, err(ErrorCode::BadOpcode, 0, false));
+    }
+
+    #[test]
+    fn program_binary_decodes_normally_when_program_binary_format_is_nonzero() {
+        // Copperline's own default already advertises PROGRAM_BINARY_FORMAT.
+        let words = [
+            header(OP_PROGRAM_BINARY, 5),
+            1,
+            0x4350_3031,
+            0x0010_0000,
+            16,
+        ];
+        let ring = ring_with(4096, 0, &words);
+        let step = decode_one(&ring, 0, 20);
+        assert_eq!(
+            step,
+            Step::Command(Command::ProgramBinary {
+                program: 1,
+                format: 0x4350_3031,
+                data: Ref::decode(0x0010_0000, 16),
+            })
+        );
     }
 
     #[test]

@@ -348,6 +348,16 @@ pub enum RenderOp<'a> {
     /// variable-length UTF-8 log, a different shape entirely).
     ShaderStatus { shader: u32, dest: Ref },
     ProgramStatus { program: u32, dest: Ref },
+    /// `PROGRAM_BINARY`. `format` is forwarded unvalidated, like
+    /// `ProgramBinary`'s own doc comment -- render.rs compares it against
+    /// the device's own format and treats a mismatch as a link failure.
+    ProgramBinary {
+        program: u32,
+        format: u32,
+        data: Ref,
+    },
+    /// `PROGRAM_GET_BINARY`.
+    ProgramGetBinary { program: u32, dest: Ref },
 
     // -- CAP_PROGRAMMABLE: buffers. `BUFFER_CREATE`/`_DESTROY` and every
     // `VERTEX_ATTRIB_*` opcode carry no ref and are pure `state.rs`
@@ -1710,6 +1720,24 @@ impl Context {
             Command::ProgramStatus { program, dest } => {
                 if self.state.program(program).is_some() {
                     out.push(RenderOp::ProgramStatus { program, dest });
+                }
+            }
+            Command::ProgramBinary {
+                program,
+                format,
+                data,
+            } => {
+                if self.state.program(program).is_some() {
+                    out.push(RenderOp::ProgramBinary {
+                        program,
+                        format,
+                        data,
+                    });
+                }
+            }
+            Command::ProgramGetBinary { program, dest } => {
+                if self.state.program(program).is_some() {
+                    out.push(RenderOp::ProgramGetBinary { program, dest });
                 }
             }
 
