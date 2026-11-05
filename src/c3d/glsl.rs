@@ -462,6 +462,111 @@ impl CompileResult {
 /// reported to the guest as an invalid shader, since blaming the guest
 /// for this module's bug would be actively misleading during
 /// development (and is also just wrong).
+/// `naga`'s GLSL front end has no concept of a sampler/texture *array*
+/// uniform (`GL_EXT_texture_array`-style binding arrays don't exist in
+/// its GLSL grammar at all): `uniform sampler2D tex[4];`, once split by
+/// [`inject_uniform_bindings`] into `texture2D tex_tex[4]`/`sampler
+/// tex_samp[4]`, parses to a plain [`naga::TypeInner::Array`] wrapping an
+/// `Image`/`Sampler` element type -- a shape `naga`'s own validator
+/// rejects outright (confirmed directly: `wgpu`'s `create_shader_module`
+/// reports "Base type \[N\] for the array is invalid", since opaque
+/// types may only appear as a binding array's element, never a plain
+/// array's). The element type naga/wgpu actually wants for this case is
+/// [`naga::TypeInner::BindingArray`] -- structurally identical (`base`,
+/// `size`), just a different tag -- which is exactly the type `wgpu`'s
+/// `TEXTURE_BINDING_ARRAY` feature and `TextureViewArray`/`SamplerArray`
+/// bindings are built around. Since the front end never produces that
+/// tag itself, this rewrites every `Array` global variable type whose
+/// element is an `Image` or `Sampler` into the equivalent `BindingArray`
+/// after parsing, in place (`UniqueArena::replace` preserves the
+/// `Handle`, so every other reference to this type stays valid).
+fn fix_sampler_binding_array_types(module: &mut naga::Module) {
+    let rewrites: Vec<_> = module
+        .types
+        .iter()
+        .filter_map(|(handle, ty)| match ty.inner {
+            naga::TypeInner::Array { base, size, .. } => match module.types[base].inner {
+                naga::TypeInner::Image { .. } | naga::TypeInner::Sampler { .. } => {
+                    Some((handle, base, size))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let rewritten_types: std::collections::HashSet<_> = rewrites.iter().map(|&(h, ..)| h).collect();
+    for (handle, base, size) in rewrites {
+        let name = module.types[handle].name.clone();
+        module.types.replace(
+            handle,
+            naga::Type { name, inner: naga::TypeInner::BindingArray { base, size } },
+        );
+    }
+    // An opaque (image/sampler) global normally lives in naga's `Handle`
+    // address space, not `Uniform` -- but the GLSL front end has no
+    // binding-array concept at all (see this function's doc comment) and
+    // so never makes that distinction for one; it always emits `Uniform`,
+    // matching the `layout(binding = N) uniform ...` syntax it actually
+    // parsed. Only a global whose type was just rewritten above needs
+    // correcting: an ordinary (non-array) sampler/texture global already
+    // comes out of the front end as `Handle` today and must stay that way.
+    let mut rewritten_globals = std::collections::HashSet::new();
+    for (handle, gv) in module.global_variables.iter_mut() {
+        if rewritten_types.contains(&gv.ty) {
+            gv.space = naga::AddressSpace::Handle;
+            rewritten_globals.insert(handle);
+        }
+    }
+    // The front end built every array-element access (`tex[0]`) assuming
+    // its usual value-array shape, where indexing yields a *pointer*
+    // that a wrapping `Load` then dereferences. A `Handle`-space binding
+    // array has no such pointer: indexing one yields the element value
+    // directly (`naga`'s typifier, confirmed by direct inspection --
+    // compare the `Pointer`-wrapped and bare `BindingArray` arms of its
+    // `Access`/`AccessIndex` cases), so the now-redundant `Load` must be
+    // collapsed away or the validator rejects it as "Invalid pointer".
+    for (_, func) in module.functions.iter_mut() {
+        drop_redundant_binding_array_loads(&mut func.expressions, &rewritten_globals);
+    }
+    for ep in module.entry_points.iter_mut() {
+        drop_redundant_binding_array_loads(&mut ep.function.expressions, &rewritten_globals);
+    }
+}
+
+fn expression_indexes_into_binding_array(
+    expressions: &naga::Arena<naga::Expression>,
+    handle: naga::Handle<naga::Expression>,
+    rewritten_globals: &std::collections::HashSet<naga::Handle<naga::GlobalVariable>>,
+) -> bool {
+    match expressions[handle] {
+        naga::Expression::AccessIndex { base, .. } | naga::Expression::Access { base, .. } => {
+            expression_indexes_into_binding_array(expressions, base, rewritten_globals)
+        }
+        naga::Expression::GlobalVariable(h) => rewritten_globals.contains(&h),
+        _ => false,
+    }
+}
+
+fn drop_redundant_binding_array_loads(
+    expressions: &mut naga::Arena<naga::Expression>,
+    rewritten_globals: &std::collections::HashSet<naga::Handle<naga::GlobalVariable>>,
+) {
+    let fixes: Vec<_> = expressions
+        .iter()
+        .filter_map(|(handle, expr)| match *expr {
+            naga::Expression::Load { pointer }
+                if expression_indexes_into_binding_array(expressions, pointer, rewritten_globals) =>
+            {
+                Some((handle, pointer))
+            }
+            _ => None,
+        })
+        .collect();
+    for (handle, pointer) in fixes {
+        expressions[handle] = expressions[pointer].clone();
+    }
+}
+
 pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
     use glsl_lang::ast::TranslationUnit;
     use glsl_lang::parse::{DefaultParse, ParseOptions};
@@ -478,7 +583,10 @@ pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
     let mut frontend = naga::front::glsl::Frontend::default();
     let options = naga::front::glsl::Options::from(stage);
     match frontend.parse(&options, &rewritten) {
-        Ok(module) => CompileResult::Ok(Box::new(module)),
+        Ok(mut module) => {
+            fix_sampler_binding_array_types(&mut module);
+            CompileResult::Ok(Box::new(module))
+        }
         Err(errors) => {
             log::error!(
                 "c3d: glsl_lang accepted this GLSL ES source but naga's \
@@ -762,11 +870,16 @@ mod tests {
         // One binding each for the *whole* array, not one per element.
         assert_ne!(tex_tex.binding, tex_samp.binding);
         for gv in [tex_tex, tex_samp] {
+            // `BindingArray`, not a plain `Array` -- see
+            // `fix_sampler_binding_array_types`'s doc comment for why a
+            // bare `Array` of `Image`/`Sampler` is invalid and must be
+            // rewritten to this tag instead.
             assert!(
-                matches!(module.types[gv.ty].inner, naga::TypeInner::Array { size: naga::ArraySize::Constant(n), .. } if n.get() == 4),
-                "expected a 4-element array type, got {:?}",
+                matches!(module.types[gv.ty].inner, naga::TypeInner::BindingArray { size: naga::ArraySize::Constant(n), .. } if n.get() == 4),
+                "expected a 4-element binding-array type, got {:?}",
                 module.types[gv.ty].inner
             );
+            assert_eq!(gv.space, naga::AddressSpace::Handle);
         }
     }
 

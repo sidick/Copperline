@@ -2916,6 +2916,10 @@ pub struct Renderer {
     /// internal depth/depth-stencil texture and every pipeline's
     /// `DepthStencilState::format` must agree with this exact value.
     depth_format: wgpu::TextureFormat,
+    /// Whether this adapter supports `wgpu::Features::TEXTURE_BINDING_ARRAY`
+    /// -- see `Renderer::new`'s feature-detection and `draw_prog`'s
+    /// sampler-array handling.
+    texture_binding_array_supported: bool,
     /// `CAP_PROGRAMMABLE`'s compiled shader state, by shader id -- the
     /// renderer-side counterpart to `state::ShaderObject`'s metadata-only
     /// record, exactly as `textures` holds pixel data `state::
@@ -3196,7 +3200,14 @@ fn module_uniforms(module: &naga::Module) -> Vec<(String, u32, u32)> {
 /// `(name, texture naga binding, sampler naga binding, GL type)`. Only
 /// `GL_SAMPLER_2D`/`GL_SAMPLER_CUBE` dimensions are recognised, matching
 /// `glsl.rs`'s rewrite (which only splits `sampler2D`/`samplerCube`).
-fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32)> {
+/// `(name, tex_binding, samp_binding, gl_type, array_len)` per sampler
+/// uniform. `array_len` is `1` for an ordinary scalar `sampler2D`/
+/// `samplerCube`, or `N` for `uniform sampler2D tex[N];` -- see the
+/// `Array`-unwrap below. `PROGRAM_INTERFACE`'s `array_size` for a plain
+/// (non-sampler) uniform remains a separate, pre-existing, wider gap:
+/// every non-sampler uniform still reports `1` regardless of its real
+/// GLSL array length; see `compute_uniform_interface`.
+fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32, u32)> {
     module
         .global_variables
         .iter()
@@ -3208,13 +3219,14 @@ fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32)> {
             // compiles to one `Array`-typed global wrapping the image
             // type, not the bare `Image` type itself -- see `glsl.rs`'s
             // `inject_uniform_bindings` doc comment. Unwrap one level so
-            // an array-of-samplers is still reflected as one uniform
-            // (`array_size` itself is a separate, pre-existing, wider gap
-            // -- every uniform, not just samplers, reports `1` today; see
-            // `compute_uniform_interface`).
-            let image_ty = match module.types[gv.ty].inner {
-                naga::TypeInner::Array { base, .. } => &module.types[base].inner,
-                ref inner => inner,
+            // an array-of-samplers is still reflected as one uniform,
+            // and read its length off the same `Array` type.
+            let (image_ty, array_len) = match module.types[gv.ty].inner {
+                naga::TypeInner::Array { base, size: naga::ArraySize::Constant(n), .. }
+                | naga::TypeInner::BindingArray { base, size: naga::ArraySize::Constant(n) } => {
+                    (&module.types[base].inner, n.get())
+                }
+                ref inner => (inner, 1),
             };
             let gl_type = match *image_ty {
                 naga::TypeInner::Image { dim: naga::ImageDimension::D2, .. } => GL_SAMPLER_2D,
@@ -3230,7 +3242,7 @@ fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32)> {
                 .binding
                 .as_ref()?
                 .binding;
-            Some((base.to_string(), tex_binding, samp_binding, gl_type))
+            Some((base.to_string(), tex_binding, samp_binding, gl_type, array_len))
         })
         .collect()
 }
@@ -3247,6 +3259,7 @@ fn compute_uniform_interface(
     struct Merged {
         name: String,
         gl_type: u32,
+        array_len: u32,
         binding: UniformBinding,
     }
     let mut merged: Vec<Merged> = Vec::new();
@@ -3254,6 +3267,7 @@ fn compute_uniform_interface(
         merged.push(Merged {
             name,
             gl_type,
+            array_len: 1,
             binding: UniformBinding {
                 vertex_binding: Some(binding),
                 fragment_binding: None,
@@ -3271,6 +3285,7 @@ fn compute_uniform_interface(
             merged.push(Merged {
                 name,
                 gl_type,
+                array_len: 1,
                 binding: UniformBinding {
                     vertex_binding: None,
                     fragment_binding: Some(binding),
@@ -3279,10 +3294,11 @@ fn compute_uniform_interface(
             });
         }
     }
-    for (name, tex_binding, samp_binding, gl_type) in module_samplers(vs) {
+    for (name, tex_binding, samp_binding, gl_type, array_len) in module_samplers(vs) {
         merged.push(Merged {
             name,
             gl_type,
+            array_len,
             binding: UniformBinding {
                 vertex_binding: Some(tex_binding),
                 vertex_sampler_binding: Some(samp_binding),
@@ -3291,14 +3307,16 @@ fn compute_uniform_interface(
             },
         });
     }
-    for (name, tex_binding, samp_binding, gl_type) in module_samplers(fs) {
+    for (name, tex_binding, samp_binding, gl_type, array_len) in module_samplers(fs) {
         if let Some(existing) = merged.iter_mut().find(|m| m.name == name) {
             existing.binding.fragment_binding = Some(tex_binding);
             existing.binding.fragment_sampler_binding = Some(samp_binding);
+            existing.array_len = existing.array_len.max(array_len);
         } else {
             merged.push(Merged {
                 name,
                 gl_type,
+                array_len,
                 binding: UniformBinding {
                     fragment_binding: Some(tex_binding),
                     fragment_sampler_binding: Some(samp_binding),
@@ -3316,7 +3334,7 @@ fn compute_uniform_interface(
                 InterfaceEntry {
                     location: i as u32,
                     gl_type: m.gl_type,
-                    array_size: 1,
+                    array_size: m.array_len,
                     name: m.name,
                 },
                 m.binding,
@@ -3519,13 +3537,29 @@ impl Renderer {
         // fallback this enables.
         let wanted_polygon_mode_features =
             wgpu::Features::POLYGON_MODE_LINE | wgpu::Features::POLYGON_MODE_POINT;
-        let wanted_features = wanted_polygon_mode_features | wgpu::Features::DEPTH32FLOAT_STENCIL8;
+        let wanted_features = wanted_polygon_mode_features
+            | wgpu::Features::DEPTH32FLOAT_STENCIL8
+            | wgpu::Features::TEXTURE_BINDING_ARRAY;
         let requested_features = adapter.features() & wanted_features;
+
+        // `downlevel_defaults()` leaves every binding-array element limit
+        // at `0` -- harmless for every other feature here, but it would
+        // make `TEXTURE_BINDING_ARRAY` itself useless (any non-trivial
+        // bind group layout entry's `count` would be rejected outright).
+        // Request exactly what this adapter advertises, no more.
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        if requested_features.contains(wgpu::Features::TEXTURE_BINDING_ARRAY) {
+            let adapter_limits = adapter.limits();
+            required_limits.max_binding_array_elements_per_shader_stage =
+                adapter_limits.max_binding_array_elements_per_shader_stage;
+            required_limits.max_binding_array_sampler_elements_per_shader_stage =
+                adapter_limits.max_binding_array_sampler_elements_per_shader_stage;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("c3d headless device"),
             required_features: requested_features,
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits,
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
             ..Default::default()
@@ -3543,6 +3577,15 @@ impl Renderer {
         } else {
             INTERNAL_DEPTH_FORMAT
         };
+        // A `uniform sampler2D tex[N]` uniform (`glsl.rs`'s array-sampler
+        // rewrite) compiles to a `wgpu` texture/sampler *binding array*,
+        // an optional feature not every backend advertises. Same
+        // request-only-if-available, degrade-at-use-time pattern as
+        // `POLYGON_MODE_LINE`/`DEPTH32FLOAT_STENCIL8` above -- see
+        // `draw_prog`'s sampler-array handling for the fallback.
+        let texture_binding_array_supported = device.features().contains(wgpu::Features::TEXTURE_BINDING_ARRAY)
+            && device.limits().max_binding_array_elements_per_shader_stage > 0
+            && device.limits().max_binding_array_sampler_elements_per_shader_stage > 0;
 
         let bind_group_layout_textured =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3705,6 +3748,7 @@ impl Renderer {
             polygon_mode_line_supported,
             polygon_mode_point_supported,
             depth_format,
+            texture_binding_array_supported,
             shaders: HashMap::new(),
             programs: HashMap::new(),
             buffers: HashMap::new(),
@@ -6842,23 +6886,27 @@ impl Renderer {
             })
             .collect();
 
-        // Every `sampler2D`/`samplerCube` uniform's bound texture unit
+        // Every `sampler2D`/`samplerCube` uniform's bound texture unit(s)
         // (`UNIFORM_SAMPLER`, defaulting to unit 0 exactly like GLES2's
         // own "a sampler uniform's initial value is 0" rule, since
         // `sampler_bindings` has no zeroed-default entry the way
-        // `uniform_values` does). A sampler uniform whose unit has no
+        // `uniform_values` does). A sampler *array* uniform
+        // (`uniform sampler2D tex[N];`) occupies `N` consecutive
+        // locations starting at its own (its element `0`'s), exactly
+        // like a real GLES2 `glGetUniformLocation("tex[i]")` -- each is
+        // independently settable via its own `UNIFORM_SAMPLER` call, so
+        // `texture_ids` below collects one resolved texture per element.
+        // A sampler uniform (or any one array element) whose unit has no
         // bound texture object makes the draw a no-op, same reasoning as
         // the "shader destroyed since link" early returns above -- there
         // is nothing correct to bind.
-        let mut sampler_textures: Vec<(UniformBinding, u32)> = Vec::new();
+        let mut sampler_textures: Vec<(UniformBinding, Vec<u32>)> = Vec::new();
         for (i, binding) in uniform_bindings.iter().enumerate() {
             if !binding.is_sampler {
                 continue;
             }
-            let gl_type = interface
-                .get(attrib_count as usize + i)
-                .map(|e| e.gl_type)
-                .unwrap_or(GL_SAMPLER_2D);
+            let interface_entry = interface.get(attrib_count as usize + i);
+            let gl_type = interface_entry.map(|e| e.gl_type).unwrap_or(GL_SAMPLER_2D);
             if gl_type == GL_SAMPLER_CUBE {
                 // `GpuTexture` has no cube-map representation yet (no
                 // fixed-function path creates one either) -- a real gap,
@@ -6867,38 +6915,52 @@ impl Renderer {
                     "programmable draw sampling a samplerCube uniform (no cube-map GPU texture support yet)",
                 ));
             }
-            let unit = sampler_bindings.get(&(i as u32)).copied().unwrap_or(0);
-            let texture_id = state
-                .texture_units
-                .get(unit as usize)
-                .map(|u| u.bound_texture)
-                .unwrap_or(0);
-            if !self.textures.contains_key(&texture_id) {
-                return Ok(());
+            let array_len = interface_entry.map_or(1, |e| e.array_size).max(1);
+            if array_len > 1 && !self.texture_binding_array_supported {
+                return Err(RenderError::Unimplemented(
+                    "programmable draw sampling a sampler array (this adapter lacks wgpu::Features::TEXTURE_BINDING_ARRAY)",
+                ));
             }
-            sampler_textures.push((binding.clone(), texture_id));
+            let mut texture_ids = Vec::with_capacity(array_len as usize);
+            for elem in 0..array_len {
+                let unit = sampler_bindings.get(&(i as u32 + elem)).copied().unwrap_or(0);
+                let texture_id = state
+                    .texture_units
+                    .get(unit as usize)
+                    .map(|u| u.bound_texture)
+                    .unwrap_or(0);
+                if !self.textures.contains_key(&texture_id) {
+                    return Ok(());
+                }
+                texture_ids.push(texture_id);
+            }
+            sampler_textures.push((binding.clone(), texture_ids));
         }
         // Ensure each bound texture's sampler exists in the cache before
         // building any bind group entries -- `Renderer::sampler` needs
         // `&mut self`, so this has to happen before the entries below
         // borrow `self.textures`/`self.sampler_cache` immutably (mirrors
         // `submit_draw`'s identical ensure-then-look-up split).
-        let mut sampler_keys = Vec::with_capacity(sampler_textures.len());
-        for (_, texture_id) in &sampler_textures {
-            let obj = state.texture(*texture_id);
-            let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
-                TexWrap::Repeat,
-                TexWrap::Repeat,
-                TexFilter::Linear,
-            ));
-            let key: SamplerKey = (
-                tex_wrap_to_address_mode(ws),
-                tex_wrap_to_address_mode(wt),
-                tex_filter_to_wgpu(min),
-                tex_filter_mipmap_mode(min),
-            );
-            self.sampler(key.0, key.1, key.2, key.3);
-            sampler_keys.push(key);
+        let mut sampler_keys: Vec<Vec<SamplerKey>> = Vec::with_capacity(sampler_textures.len());
+        for (_, texture_ids) in &sampler_textures {
+            let mut keys = Vec::with_capacity(texture_ids.len());
+            for &texture_id in texture_ids {
+                let obj = state.texture(texture_id);
+                let (ws, wt, min) = obj.map(|t| (t.wrap_s, t.wrap_t, t.min_filter)).unwrap_or((
+                    TexWrap::Repeat,
+                    TexWrap::Repeat,
+                    TexFilter::Linear,
+                ));
+                let key: SamplerKey = (
+                    tex_wrap_to_address_mode(ws),
+                    tex_wrap_to_address_mode(wt),
+                    tex_filter_to_wgpu(min),
+                    tex_filter_mipmap_mode(min),
+                );
+                self.sampler(key.0, key.1, key.2, key.3);
+                keys.push(key);
+            }
+            sampler_keys.push(keys);
         }
 
         // One uniform buffer per active plain-value uniform (group 0),
@@ -6942,9 +7004,17 @@ impl Renderer {
                 bind_group_slot_buffers.push((slot, buf_index));
             }
         }
-        let mut bind_group_slot_textures: Vec<(u32, u32)> = Vec::new(); // (binding, texture_id)
-        let mut bind_group_slot_samplers: Vec<(u32, SamplerKey)> = Vec::new();
-        for ((binding, texture_id), key) in sampler_textures.iter().zip(&sampler_keys) {
+        // `Vec<u32>`/`Vec<SamplerKey>` of length `1` for an ordinary
+        // scalar sampler uniform (using a plain `TextureView`/`Sampler`
+        // resource below, exactly as before this type's array support
+        // existed -- no `wgpu` feature required, unchanged on every
+        // adapter), longer for a sampler array (using `TextureViewArray`/
+        // `SamplerArray`, gated on `texture_binding_array_supported`
+        // above).
+        let mut bind_group_slot_textures: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut bind_group_slot_samplers: Vec<(u32, Vec<SamplerKey>)> = Vec::new();
+        for ((binding, texture_ids), keys) in sampler_textures.iter().zip(&sampler_keys) {
+            let array_count = std::num::NonZeroU32::new(texture_ids.len() as u32).filter(|n| n.get() > 1);
             for (slot, visibility) in [
                 (binding.vertex_binding, wgpu::ShaderStages::VERTEX),
                 (binding.fragment_binding, wgpu::ShaderStages::FRAGMENT),
@@ -6958,9 +7028,9 @@ impl Renderer {
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
-                    count: None,
+                    count: array_count,
                 });
-                bind_group_slot_textures.push((slot, *texture_id));
+                bind_group_slot_textures.push((slot, texture_ids.clone()));
             }
             for (slot, visibility) in [
                 (binding.vertex_sampler_binding, wgpu::ShaderStages::VERTEX),
@@ -6971,9 +7041,9 @@ impl Renderer {
                     binding: slot,
                     visibility,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
+                    count: array_count,
                 });
-                bind_group_slot_samplers.push((slot, *key));
+                bind_group_slot_samplers.push((slot, keys.clone()));
             }
         }
         let uniform_bind_group = if bind_group_layout_entries.is_empty() {
@@ -6990,20 +7060,43 @@ impl Renderer {
                     resource: uniform_gpu_buffers[idx].as_entire_binding(),
                 })
                 .collect();
-            entries.extend(bind_group_slot_textures.iter().map(|&(binding, texture_id)| {
-                wgpu::BindGroupEntry {
+            // One `Vec<&TextureView>`/`Vec<&Sampler>` per slot, kept
+            // alive until `create_bind_group` below runs: `wgpu`'s array
+            // resource variants borrow the slice itself, not just its
+            // elements, so the `Vec`s need to outlive the `BindGroupEntry`
+            // that references them.
+            let texture_views: Vec<Vec<&wgpu::TextureView>> = bind_group_slot_textures
+                .iter()
+                .map(|(_, ids)| ids.iter().map(|id| &self.textures[id].view).collect())
+                .collect();
+            entries.extend(bind_group_slot_textures.iter().zip(&texture_views).map(
+                |(&(binding, _), views)| wgpu::BindGroupEntry {
                     binding,
-                    resource: wgpu::BindingResource::TextureView(&self.textures[&texture_id].view),
-                }
-            }));
-            entries.extend(bind_group_slot_samplers.iter().map(|&(binding, key)| {
-                wgpu::BindGroupEntry {
+                    resource: if let [view] = views[..] {
+                        wgpu::BindingResource::TextureView(view)
+                    } else {
+                        wgpu::BindingResource::TextureViewArray(views)
+                    },
+                },
+            ));
+            let samplers: Vec<Vec<&wgpu::Sampler>> = bind_group_slot_samplers
+                .iter()
+                .map(|(_, keys)| {
+                    keys.iter()
+                        .map(|key| self.sampler_cache.get(key).expect("just ensured"))
+                        .collect()
+                })
+                .collect();
+            entries.extend(bind_group_slot_samplers.iter().zip(&samplers).map(
+                |(&(binding, _), samps)| wgpu::BindGroupEntry {
                     binding,
-                    resource: wgpu::BindingResource::Sampler(
-                        self.sampler_cache.get(&key).expect("just ensured"),
-                    ),
-                }
-            }));
+                    resource: if let [samp] = samps[..] {
+                        wgpu::BindingResource::Sampler(samp)
+                    } else {
+                        wgpu::BindingResource::SamplerArray(samps)
+                    },
+                },
+            ));
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("c3d programmable uniform bind group"),
                 layout: &layout,
@@ -13021,4 +13114,138 @@ mod tests {
         assert!(bindings[tex].fragment_binding.is_some());
         assert!(bindings[tex].fragment_sampler_binding.is_some());
     }
+
+    /// End-to-end GPU validation that `draw_prog` actually samples each
+    /// element of a `uniform sampler2D tex[2];` array from its own,
+    /// independently-bound texture -- not two aliases of the same unit.
+    /// `tex[0]` and `tex[1]` occupy consecutive `UNIFORM_SAMPLER`
+    /// locations (0 and 1, the natural extension of the existing scalar
+    /// opcode semantics -- no wire-protocol change), each pointed at a
+    /// distinct solid-colour texture via a separate `OP_UNIFORM_SAMPLER`
+    /// call. A full-screen quad interpolates a varying from -1 (left) to
+    /// +1 (right); the fragment shader branches on that varying with a
+    /// compile-time-constant array index in each arm (GLSL ES 1.00
+    /// forbids a non-constant sampler-array index, but the branch
+    /// condition itself may be dynamic), so the left half must render
+    /// `tex[0]`'s colour and the right half `tex[1]`'s.
+    #[test]
+    fn draw_prog_samples_each_element_of_a_sampler_array_from_its_own_texture() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        if !renderer.texture_binding_array_supported {
+            eprintln!("skipping: adapter lacks wgpu::Features::TEXTURE_BINDING_ARRAY");
+            return;
+        }
+
+        const RGBA8: u32 = 0;
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+
+        let vs_src = b"attribute vec4 position;\nvarying float side;\nvoid main() { gl_Position = position; side = position.x; }\n";
+        let fs_src = b"precision mediump float;\nvarying float side;\nuniform sampler2D tex[2];\nvoid main() {\n  if (side < 0.0) {\n    gl_FragColor = texture2D(tex[0], vec2(0.5, 0.5));\n  } else {\n    gl_FragColor = texture2D(tex[1], vec2(0.5, 0.5));\n  }\n}\n";
+
+        let tex_red = [255u8, 0, 0, 255].repeat(4 * 4);
+        let tex_green = [0u8, 255, 0, 255].repeat(4 * 4);
+
+        // A full-screen quad: two triangles spanning NDC [-1,1]x[-1,1].
+        let verts: Vec<f32> = vec![
+            -1.0, -1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, //
+            1.0, 1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_tex_red = 0x2000u32;
+        let a_tex_green = 0x2100u32;
+        let a_verts = 0x2200u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_tex_red), &tex_red);
+        mem.write(MemLoc::Aperture(a_tex_green), &tex_green);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length] // space 0 (aperture)
+        }
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 64, 64, 256, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            {
+                let r = reference(a_tex_red, tex_red.len() as u32);
+                cmd(proto::OP_TEX_IMAGE, &[1, 0, RGBA8, 4, 4, 16, r[0], r[1]])
+            },
+            cmd(proto::OP_TEX_CREATE, &[2]),
+            {
+                let r = reference(a_tex_green, tex_green.len() as u32);
+                cmd(proto::OP_TEX_IMAGE, &[2, 0, RGBA8, 4, 4, 16, r[0], r[1]])
+            },
+            cmd(proto::OP_TEX_BIND, &[0, 1]),
+            cmd(proto::OP_TEX_BIND, &[1, 2]),
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            // tex[0] -> texture unit 0 (the red texture); tex[1] -> unit 1 (green).
+            cmd(proto::OP_UNIFORM_SAMPLER, &[1, 0, 0]),
+            cmd(proto::OP_UNIFORM_SAMPLER, &[1, 1, 1]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 6]), // GL_TRIANGLES
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let left = &pixels[(32 * 64 + 8) * 4..][..4];
+        assert_eq!(left, [255, 0, 0, 255], "left half should sample tex[0] (red): {left:?}");
+        let right = &pixels[(32 * 64 + 56) * 4..][..4];
+        assert_eq!(right, [0, 255, 0, 255], "right half should sample tex[1] (green): {right:?}");
+    }
+
 }
