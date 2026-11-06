@@ -478,9 +478,14 @@ impl<'a> RingCursor<'a> {
     }
 
     /// Whether `opcode` needs `CAP_TRANSFORM`: every `0x03xx`/`0x04xx`
-    /// opcode, the GL-space draw commands (not their `_WIN` counterparts),
-    /// and the two raster-state opcodes the spec calls out as transform
-    /// tier (`DEPTH_RANGE`, `VIEWPORT`). See this module's doc comment.
+    /// opcode and the GL-space draw commands (not their `_WIN`
+    /// counterparts). `DEPTH_RANGE`/`VIEWPORT` are deliberately NOT here
+    /// any more (spec commit `a5f8f04`): they need `CAP_TRANSFORM` OR
+    /// `CAP_PROGRAMMABLE`, not `CAP_TRANSFORM` alone -- a programmable
+    /// vertex shader's clip-space `gl_Position` needs the same NDC-to-
+    /// window mapping a GL-space draw does, and `CAP_PROGRAMMABLE` is
+    /// independent of `CAP_TRANSFORM`. See `opcode_needs_transform_or_programmable`
+    /// below and this module's doc comment.
     fn opcode_needs_transform(opcode: u16) -> bool {
         use proto::*;
         matches!(
@@ -503,12 +508,20 @@ impl<'a> RingCursor<'a> {
                 | OP_CLIP_PLANE
                 | OP_TEXGEN
                 | OP_TEXGEN_PLANE
-                | OP_DEPTH_RANGE
-                | OP_VIEWPORT
                 | OP_DRAW_INLINE
                 | OP_DRAW_ARRAYS
                 | OP_DRAW_ELEMENTS
         )
+    }
+
+    /// `DEPTH_RANGE`/`VIEWPORT`: `E_BAD_OPCODE` only in pure baseline mode
+    /// (neither `CAP_TRANSFORM` nor `CAP_PROGRAMMABLE`), per spec commit
+    /// `a5f8f04`. Window-space vertices (the only kind baseline mode ever
+    /// draws) already carry final depth/window coordinates directly, with
+    /// nothing left for either opcode to map.
+    fn opcode_needs_transform_or_programmable(opcode: u16) -> bool {
+        use proto::*;
+        matches!(opcode, OP_DEPTH_RANGE | OP_VIEWPORT)
     }
 
     /// Whether `opcode` needs `CAP_PROGRAMMABLE`: every `0x09xx`-`0x0Dxx`
@@ -588,6 +601,12 @@ impl<'a> RingCursor<'a> {
     /// command's payload words, i.e. `ring[start+4 .. start+length*4]`.
     fn decode_body(&mut self, opcode: u16, start: u32, length_words: u32) -> Step<'a> {
         if !self.config.transform && Self::opcode_needs_transform(opcode) {
+            return self.raise(ErrorCode::BadOpcode, start);
+        }
+        if !self.config.transform
+            && !self.config.programmable
+            && Self::opcode_needs_transform_or_programmable(opcode)
+        {
             return self.raise(ErrorCode::BadOpcode, start);
         }
         if !self.config.programmable && Self::opcode_needs_programmable(opcode) {
@@ -2754,16 +2773,18 @@ mod tests {
         let mut c = config(true);
         c.transform = false;
         // One representative opcode from each transform-gated group: the
-        // matrix group, the lighting group, the two raster-state opcodes,
-        // and the GL-space (not _WIN) draw opcodes.
-        let cases: [(u16, u16); 9] = [
+        // matrix group, the lighting group, and the GL-space (not _WIN)
+        // draw opcodes. DEPTH_RANGE/VIEWPORT are deliberately NOT here --
+        // see `depth_range_and_viewport_need_transform_or_programmable`
+        // below (spec commit `a5f8f04`: either capability is enough for
+        // those two, so this config -- `programmable` still `true` -- is
+        // exactly the case they must NOT be E_BAD_OPCODE in).
+        let cases: [(u16, u16); 7] = [
             (OP_MATRIX_MODE, 2),
             (OP_LOAD_IDENTITY, 1),
             (OP_LIGHT, 7),
             (OP_CLIP_PLANE, 6),
             (OP_TEXGEN, 4),
-            (OP_DEPTH_RANGE, 3),
-            (OP_VIEWPORT, 5),
             (OP_DRAW_ARRAYS, 4), // format=0 -> 1 descriptor -> length 1+3+4=8, use a short bogus one instead
             (OP_DRAW_ELEMENTS, 9),
         ];
@@ -2778,6 +2799,57 @@ mod tests {
                 step,
                 err(ErrorCode::BadOpcode, 0, false),
                 "opcode {opcode:#06x} should be E_BAD_OPCODE without transform"
+            );
+        }
+    }
+
+    /// `DEPTH_RANGE`/`VIEWPORT` need `CAP_TRANSFORM` OR `CAP_PROGRAMMABLE`
+    /// (spec commit `a5f8f04`) -- not `CAP_TRANSFORM` alone, the rule
+    /// every other opcode in the group above still follows. A
+    /// programmable vertex shader's clip-space `gl_Position` needs the
+    /// same NDC-to-window mapping a GL-space draw does, and
+    /// `CAP_PROGRAMMABLE` is independent of `CAP_TRANSFORM` (a device may
+    /// offer either, neither, or both), so a programmable-only device
+    /// must still be able to reach both opcodes.
+    #[test]
+    fn depth_range_and_viewport_need_transform_or_programmable() {
+        let cases: [(u16, u16); 2] = [(OP_DEPTH_RANGE, 3), (OP_VIEWPORT, 5)];
+        for (opcode, length) in cases {
+            let words = vec![header(opcode, length); 1]
+                .into_iter()
+                .chain(std::iter::repeat_n(0, length as usize - 1))
+                .collect::<Vec<_>>();
+            let ring = ring_with(4096, 0, &words);
+
+            // Neither capability: E_BAD_OPCODE.
+            let mut neither = config(true);
+            neither.transform = false;
+            neither.programmable = false;
+            let step = decode_one_with(&ring, 0, length as u32 * 4, neither);
+            assert_eq!(
+                step,
+                err(ErrorCode::BadOpcode, 0, false),
+                "opcode {opcode:#06x} should be E_BAD_OPCODE with neither CAP_TRANSFORM nor CAP_PROGRAMMABLE"
+            );
+
+            // CAP_TRANSFORM alone: decodes.
+            let mut transform_only = config(true);
+            transform_only.transform = true;
+            transform_only.programmable = false;
+            let step = decode_one_with(&ring, 0, length as u32 * 4, transform_only);
+            assert!(
+                matches!(step, Step::Command(_)),
+                "opcode {opcode:#06x} should decode with CAP_TRANSFORM alone, got {step:?}"
+            );
+
+            // CAP_PROGRAMMABLE alone: decodes.
+            let mut programmable_only = config(true);
+            programmable_only.transform = false;
+            programmable_only.programmable = true;
+            let step = decode_one_with(&ring, 0, length as u32 * 4, programmable_only);
+            assert!(
+                matches!(step, Step::Command(_)),
+                "opcode {opcode:#06x} should decode with CAP_PROGRAMMABLE alone, got {step:?}"
             );
         }
     }

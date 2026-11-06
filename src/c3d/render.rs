@@ -6164,6 +6164,43 @@ impl Renderer {
         (sw > 0 && sh > 0).then_some((x, y, sw, sh))
     }
 
+    /// `VIEWPORT`/`DEPTH_RANGE` for a programmable draw (spec commit
+    /// `a5f8f04`: both are reachable under `CAP_PROGRAMMABLE` now, not
+    /// just `CAP_TRANSFORM`). Unlike the fixed-function GL-space path
+    /// (`op_draw_gl`'s `to_gpu` closure), which bakes the viewport/depth-
+    /// range remap into each vertex's position on the CPU specifically so
+    /// it never has to call `set_viewport` (see that function's doc
+    /// comment), a programmable draw's `gl_Position` is computed by
+    /// compiled GLSL running on the GPU -- there is no CPU-side vertex
+    /// position to rewrite, so this is the one draw path that actually
+    /// needs `wgpu`'s own hardware viewport state. `wgpu::RenderPass::
+    /// set_viewport`'s `x, y, width, height` are already origin-top-left
+    /// (`wgpu`'s own convention), matching this spec's `VIEWPORT` exactly
+    /// with no flip needed. Returns `None` (caller skips the call,
+    /// leaving `wgpu`'s own full-target/`[0,1]` default) only for a
+    /// degenerate zero-area viewport after clamping -- `set_viewport`
+    /// itself rejects a zero width/height.
+    fn clamped_viewport_for_programmable_draw(
+        state: &State,
+        width: u32,
+        height: u32,
+    ) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        let vp = state.raster.viewport;
+        let (near, far) = state.raster.depth_range;
+        let x = vp.x.max(0) as u32;
+        let y = vp.y.max(0) as u32;
+        let w = vp.w.min(width.saturating_sub(x));
+        let h = vp.h.min(height.saturating_sub(y));
+        (w > 0 && h > 0).then_some((
+            x as f32,
+            y as f32,
+            w as f32,
+            h as f32,
+            near.clamp(0.0, 1.0),
+            far.clamp(0.0, 1.0),
+        ))
+    }
+
     /// `DRAW_INLINE_WIN`: parses `bytes` per `format` into a `Vec<WinVertex>`
     /// and hands it to [`Self::op_draw_win`], the shared post-parse
     /// pipeline `DRAW_ARRAYS_WIN`/`DRAW_ELEMENTS_WIN` also use.
@@ -9156,6 +9193,11 @@ impl Renderer {
             if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, target_width, target_height) {
                 pass.set_scissor_rect(x, y, sw, sh);
             }
+            if let Some((x, y, w, h, near, far)) =
+                Self::clamped_viewport_for_programmable_draw(state, target_width, target_height)
+            {
+                pass.set_viewport(x, y, w, h, near, far);
+            }
             for (i, buffer) in gpu_buffers.iter().enumerate() {
                 pass.set_vertex_buffer(i as u32, buffer.slice(..));
             }
@@ -10633,6 +10675,122 @@ mod tests {
             outside, [0, 0, 255, 255],
             "outside the triangle should still be the draw surface's own blue background: {outside:?}"
         );
+    }
+
+    /// `VIEWPORT` must be honoured by a programmable draw on a device
+    /// with `CAP_PROGRAMMABLE` but *not* `CAP_TRANSFORM` (spec commit
+    /// `a5f8f04`: either capability is enough, not `CAP_TRANSFORM`
+    /// alone -- a programmable-only device is explicitly legal and must
+    /// still be able to map a vertex shader's clip-space `gl_Position`
+    /// through a sub-rectangle `VIEWPORT`, not just the whole surface).
+    /// A single huge triangle covers the entire `[-1, 1]` NDC square;
+    /// with `VIEWPORT` constrained to a 32x32 sub-rectangle of a 64x64
+    /// surface, the rendered colour must appear only inside that
+    /// sub-rectangle (origin top-left, matching the device's own window-
+    /// space convention) and nowhere else.
+    #[test]
+    fn programmable_draw_honours_viewport_without_cap_transform() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+
+        const A8R8G8B8: u32 = 5;
+        const GL_VERTEX_SHADER: u32 = 0x8B31;
+        const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+        const GL_FLOAT: u32 = 0x1406;
+
+        let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
+        let fs_src = b"precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        // Comfortably covers the whole [-1, 1] NDC square.
+        let verts: Vec<f32> = vec![-3.0, -3.0, 0.0, 1.0, 3.0, -3.0, 0.0, 1.0, 0.0, 3.0, 0.0, 1.0];
+        let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
+
+        let a_vs = 0x1000u32;
+        let a_fs = 0x1100u32;
+        let a_verts = 0x2100u32;
+
+        let mut mem = TestMemory::new(65536);
+        mem.write(MemLoc::Aperture(a_vs), vs_src);
+        mem.write(MemLoc::Aperture(a_fs), fs_src);
+        mem.write(MemLoc::Aperture(a_verts), &verts_bytes);
+
+        fn reference(address: u32, length: u32) -> [u32; 2] {
+            [address, length]
+        }
+
+        let commands = [
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 64, 64, 256, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 1.0, 1.0]), // blue background
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+            cmd(proto::OP_SHADER_CREATE, &[1, GL_VERTEX_SHADER]),
+            cmd(proto::OP_SHADER_CREATE, &[2, GL_FRAGMENT_SHADER]),
+            {
+                let r = reference(a_vs, vs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[1, r[0], r[1]])
+            },
+            {
+                let r = reference(a_fs, fs_src.len() as u32);
+                cmd(proto::OP_SHADER_SOURCE, &[2, r[0], r[1]])
+            },
+            cmd(proto::OP_SHADER_COMPILE, &[1]),
+            cmd(proto::OP_SHADER_COMPILE, &[2]),
+            cmd(proto::OP_PROGRAM_CREATE, &[1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 1]),
+            cmd(proto::OP_PROGRAM_ATTACH, &[1, 2]),
+            cmd(proto::OP_PROGRAM_LINK, &[1]),
+            cmd(proto::OP_USE_PROGRAM, &[1]),
+            cmd(proto::OP_BUFFER_CREATE, &[1]),
+            {
+                let r = reference(a_verts, verts_bytes.len() as u32);
+                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+            },
+            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
+            // Confine rendering to a 32x32 sub-rectangle of the 64x64
+            // surface, origin top-left.
+            cmd(proto::OP_VIEWPORT, &[16, 16, 32, 32]),
+            cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
+        ];
+        let mut ring: Vec<u8> = commands.concat();
+        let total = ring.len() as u32;
+        ring.resize(ring.len() + 4, 0);
+
+        // CAP_PROGRAMMABLE on, CAP_TRANSFORM off -- the exact combination
+        // this test exists to prove.
+        let config = super::super::ring::DeviceConfig {
+            transform: false,
+            programmable: true,
+            ..super::super::ring::DeviceConfig::default()
+        };
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+        let mut out = Vec::new();
+        ctx.submit(&ring, total, &config, &mut out);
+        assert_eq!(ctx.error_code, 0, "unexpected protocol error");
+        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        let errs = renderer.execute(&out, &mut mem);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+
+        let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
+        let px = |x: usize, y: usize| -> &[u8] { &pixels[(y * 64 + x) * 4..][..4] };
+
+        // Inside the 32x32 viewport sub-rect (16..48, 16..48): red.
+        assert_eq!(px(32, 32), [255, 0, 0, 255], "centre of the viewport sub-rect should be red");
+        assert_eq!(px(17, 17), [255, 0, 0, 255], "just inside the viewport sub-rect should be red");
+        assert_eq!(px(46, 46), [255, 0, 0, 255], "just inside the far corner of the viewport sub-rect should be red");
+
+        // Outside it: still the blue background, even though the
+        // triangle itself covers the whole surface in clip space --
+        // proving VIEWPORT, not scissor or luck, is what's constraining
+        // the output.
+        assert_eq!(px(2, 2), [0, 0, 255, 255], "top-left corner, outside the viewport, should stay blue");
+        assert_eq!(px(60, 60), [0, 0, 255, 255], "bottom-right corner, outside the viewport, should stay blue");
+        assert_eq!(px(32, 2), [0, 0, 255, 255], "above the viewport sub-rect should stay blue");
     }
 
     /// A disabled programmable-draw vertex attribute must actually reach
