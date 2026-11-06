@@ -379,8 +379,26 @@ impl ContextSlot {
     /// per slot -- see that method's doc comment for why it cannot be
     /// derived any other way (`State`/`Context` have no board-level
     /// view of "which slot is this").
-    fn new(index: u32) -> Self {
-        let mut ctx = Context::new(state::Limits::default());
+    /// `programmable` is this board's fixed `CAP_PROGRAMMABLE` bit
+    /// (board-fixed CAPS0 never changes after construction, so it's
+    /// safe to bake into `Limits` once here rather than re-deriving it
+    /// per access). A `CAP_PROGRAMMABLE` device's `MAX_TEXTURE_UNITS`
+    /// must be `>= 8` (spec commit 1ec7e4a), which is meaningless
+    /// unless the per-context state actually has 8 texture units' worth
+    /// of storage (`texture`/`texgen`/`enables`/`current.texcoord`
+    /// vectors, all sized from `Limits::texture_units` in
+    /// `State::new`) -- a register claiming 8 units while the state
+    /// backing only has 2 would make unit 2..7 silently out of bounds.
+    fn new(index: u32, programmable: bool) -> Self {
+        let limits = if programmable {
+            state::Limits {
+                texture_units: 8,
+                ..state::Limits::default()
+            }
+        } else {
+            state::Limits::default()
+        };
+        let mut ctx = Context::new(limits);
         ctx.state.set_context_index(index);
         ContextSlot {
             ctx,
@@ -755,11 +773,15 @@ impl C3dBoard {
     pub fn with_masked_caps(window_bytes: u32, mask_caps: u32) -> Self {
         let aperture_offset = proto::APERTURE_OFFSET_DEFAULT;
         let aperture_len = window_bytes.saturating_sub(aperture_offset) as usize;
-        let contexts: Vec<ContextSlot> = (0..CONTEXT_COUNT as u32).map(ContextSlot::new).collect();
+        let caps0 = CAPS0 & !mask_caps;
+        let programmable = caps0 & proto::CAP_PROGRAMMABLE != 0;
+        let contexts: Vec<ContextSlot> = (0..CONTEXT_COUNT as u32)
+            .map(|i| ContextSlot::new(i, programmable))
+            .collect();
         C3dBoard {
             window_bytes,
             aperture_offset,
-            caps0: CAPS0 & !mask_caps,
+            caps0,
             aperture: vec![0u8; aperture_len],
             control: CONTROL_ENABLE,
             irq_status: 0,
@@ -784,14 +806,27 @@ impl C3dBoard {
     /// kept as one function so the register value and the decoder's own
     /// idea of what is legal can never drift apart.
     fn device_config(&self) -> DeviceConfig {
+        let programmable = self.caps0 & proto::CAP_PROGRAMMABLE != 0;
         DeviceConfig {
             guestmem: self.caps0 & proto::CAP_GUESTMEM != 0,
             transform: self.caps0 & proto::CAP_TRANSFORM != 0,
             multitexture: self.caps0 & proto::CAP_MULTITEXTURE != 0,
             surface_guestaddr: self.caps0 & proto::CAP_SURFACE_GUESTADDR != 0,
-            programmable: self.caps0 & proto::CAP_PROGRAMMABLE != 0,
+            programmable,
             shared_contexts: self.caps0 & proto::CAP_SHARED_CONTEXTS != 0,
             aperture_size: self.aperture_size(),
+            // `CAP_PROGRAMMABLE` requires `MAX_TEXTURE_UNITS >= 8` (spec
+            // commit 1ec7e4a, matching GLES2's own `MAX_TEXTURE_IMAGE_
+            // UNITS`/`MAX_COMBINED_TEXTURE_IMAGE_UNITS` minimum); this is
+            // the ring decoder's own bounds check (`unit >= self.config.
+            // max_texture_units`), kept consistent with the register
+            // read and with `ContextSlot::new`'s `Limits::texture_units`
+            // so all three never drift apart.
+            max_texture_units: if programmable {
+                8
+            } else {
+                DeviceConfig::default().max_texture_units
+            },
             ..DeviceConfig::default()
         }
     }
@@ -844,6 +879,15 @@ impl C3dBoard {
             MAX_TEXTURE_SIZE => 1024,
             // `MAX_TEXTURE_UNITS > 1` is documented to imply
             // `CAP_MULTITEXTURE`, so a masked bit caps the report at 1.
+            // `device_config().max_texture_units` is itself `>= 8`
+            // whenever `CAP_PROGRAMMABLE` is set (spec commit 1ec7e4a) --
+            // Copperline's real fitted CAPS0 always sets both bits
+            // together, so that value is reached here unconditionally in
+            // practice; requesting `CAP_PROGRAMMABLE` with `CAP_MULTITEXTURE`
+            // masked off singly is a spec-illegal device configuration
+            // this decoder makes no attempt to handle specially (see the
+            // board.rs test suite: that exact combination is no longer
+            // exercised singly, by design, not by oversight).
             MAX_TEXTURE_UNITS => {
                 if self.caps0 & proto::CAP_MULTITEXTURE != 0 {
                     self.device_config().max_texture_units
@@ -972,8 +1016,9 @@ impl C3dBoard {
     }
 
     fn do_full_reset(&mut self) {
+        let programmable = self.caps0 & proto::CAP_PROGRAMMABLE != 0;
         for (i, slot) in self.contexts.iter_mut().enumerate() {
-            *slot = ContextSlot::new(i as u32);
+            *slot = ContextSlot::new(i as u32, programmable);
         }
         self.share_groups.clear();
         self.irq_status = 0;
@@ -1043,7 +1088,8 @@ impl C3dBoard {
                     // same `Rc` -- correct for free, no explicit "am I
                     // the last member" bookkeeping needed. See
                     // `state::State::set_share_group`'s doc comment.
-                    self.contexts[n] = ContextSlot::new(n as u32);
+                    self.contexts[n] =
+                        ContextSlot::new(n as u32, self.caps0 & proto::CAP_PROGRAMMABLE != 0);
                 } else if value & CTX_CONTROL_RESET != 0 {
                     self.contexts[n].ctx.reset_all();
                     self.contexts[n].ctx.error_code = 0;
@@ -1921,10 +1967,13 @@ mod tests {
             b.read(greg::MAX_MATRIX_DEPTH_TEX, 4, &mut h),
             limits.texture_depth as u32
         );
-        assert_eq!(
-            b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h),
-            limits.texture_units as u32
-        );
+        // Unlike the other limits above, `MAX_TEXTURE_UNITS` is no
+        // longer simply `state::Limits::default().texture_units`: with
+        // `CAP_PROGRAMMABLE` set (as `board()`'s full CAPS0 always is)
+        // it must be `>= 8` regardless (spec commit 1ec7e4a) -- see
+        // `cap_programmable_requires_at_least_eight_texture_units_and_
+        // they_actually_work` for the dedicated coverage of that rule.
+        assert!(b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h) >= 8);
     }
 
     #[test]
@@ -2147,7 +2196,17 @@ mod tests {
             "a masked-off CAP_TRANSFORM must reject its opcodes"
         );
 
-        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_MULTITEXTURE);
+        // `CAP_PROGRAMMABLE` now requires `MAX_TEXTURE_UNITS >= 8` (spec
+        // commit 1ec7e4a), which on its own forces `CAP_MULTITEXTURE`
+        // too (that register's pre-existing `> 1` rule) -- a device
+        // with `CAP_MULTITEXTURE` masked off but `CAP_PROGRAMMABLE`
+        // still set is now spec-illegal, not a configuration a real
+        // board could report. Masking both together is the only
+        // spec-legal way to simulate "a device without multitexture".
+        let mut b = C3dBoard::with_masked_caps(
+            0x0200_0000,
+            proto::CAP_MULTITEXTURE | proto::CAP_PROGRAMMABLE,
+        );
         let mut h = host(&mut mem);
         assert_eq!(b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h), 1);
     }
@@ -2171,6 +2230,54 @@ mod tests {
         assert_eq!(b.read(greg::MAX_VERTEX_UNIFORM_VECTORS, 4, &mut h), 0);
         assert_eq!(b.read(greg::MAX_FRAGMENT_UNIFORM_VECTORS, 4, &mut h), 0);
         assert_eq!(b.read(greg::MAX_VARYING_VECTORS, 4, &mut h), 0);
+    }
+
+    /// `MAX_TEXTURE_UNITS` must be `>= 8` with `CAP_PROGRAMMABLE` set
+    /// (spec commit 1ec7e4a), which on its own forces `CAP_MULTITEXTURE`
+    /// too -- and the bound must be real, not just the register's own
+    /// story: `ACTIVE_UNIT`/`TEX_BIND` at unit 7 must actually decode
+    /// (the ring decoder's own `max_texture_units` bound,
+    /// `device_config()`) and the per-context state must actually have
+    /// 8 units' worth of storage (`ContextSlot::new`'s `Limits`) rather
+    /// than panicking or silently going out of bounds past unit 1.
+    #[test]
+    fn cap_programmable_requires_at_least_eight_texture_units_and_they_actually_work() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        assert!(b.read(greg::MAX_TEXTURE_UNITS, 4, &mut h) >= 8);
+        assert_ne!(b.read(greg::CAPS0, 4, &mut h) & proto::CAP_MULTITEXTURE, 0);
+
+        let words = [
+            ((proto::OP_ACTIVE_UNIT as u32) << 16) | 2,
+            7,
+            ((proto::OP_TEX_BIND as u32) << 16) | 3,
+            7,
+            0,
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        for (i, byte) in bytes.iter().enumerate() {
+            b.write(b.aperture_offset + i as u32, 1, *byte as u32, &mut h);
+        }
+        b.write(CONTEXT_PAGE_BASE + creg::RING_BASE, 4, 0, &mut h);
+        b.write(CONTEXT_PAGE_BASE + creg::RING_SIZE, 4, 0x1000, &mut h);
+        b.write(
+            CONTEXT_PAGE_BASE + creg::CONTROL,
+            4,
+            CTX_CONTROL_ALLOC | CTX_CONTROL_ENABLE,
+            &mut h,
+        );
+        b.write(
+            CONTEXT_PAGE_BASE + creg::RING_TAIL,
+            4,
+            bytes.len() as u32,
+            &mut h,
+        );
+        assert_eq!(
+            b.read(CONTEXT_PAGE_BASE + creg::ERROR_CODE, 4, &mut h),
+            0,
+            "ACTIVE_UNIT/TEX_BIND at unit 7 must decode cleanly on a CAP_PROGRAMMABLE device"
+        );
     }
 
     /// `ALIASED_POINT_SIZE_MIN`/`_MAX` must read `1.0`/`1.0` always --
