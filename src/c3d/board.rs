@@ -238,6 +238,7 @@ mod greg {
     pub const ALIASED_POINT_SIZE_MIN: u32 = 0x0AC;
     pub const ALIASED_POINT_SIZE_MAX: u32 = 0x0B0;
     pub const MAX_SYNC_OBJECTS: u32 = 0x0B4;
+    pub const SHADER_LANGS_SUPPORTED: u32 = 0x0B8;
 }
 
 // ---------------------------------------------------------------------
@@ -936,6 +937,7 @@ impl C3dBoard {
             | MAX_RENDERBUFFER_SIZE
             | MAX_SAMPLES
             | PROGRAM_BINARY_FORMAT
+            | SHADER_LANGS_SUPPORTED
                 if self.caps0 & proto::CAP_PROGRAMMABLE == 0 =>
             {
                 0
@@ -978,6 +980,13 @@ impl C3dBoard {
             // doc comment for why `0x4350_3031` is independently
             // hardcoded here rather than referencing `render.rs`.
             PROGRAM_BINARY_FORMAT => state::Limits::default().program_binary_format,
+            // Bit 0 (GLSL ES 1.00): always set once CAP_PROGRAMMABLE is on
+            // -- the only dialect this device's GLSL frontend (glsl_lang +
+            // naga::front::glsl) accepts today. Bit 1 (GLSL ES 3.00): not
+            // set -- no `#version 300 es` support exists in the compile
+            // pipeline yet (the point of this register's existence: a
+            // device may legitimately not have it).
+            SHADER_LANGS_SUPPORTED => 0b01,
             // `0` without `CAP_SHARED_CONTEXTS` -- its own independent
             // guard, not folded into the `CAP_PROGRAMMABLE` block above:
             // cross-context sharing is independent of the programmable
@@ -2310,6 +2319,27 @@ mod tests {
         assert_eq!(
             b.read(greg::ALIASED_POINT_SIZE_MAX, 4, &mut h),
             1.0f32.to_bits()
+        );
+    }
+
+    /// `SHADER_LANGS_SUPPORTED` bit 0 (GLSL ES 1.00) must be set whenever
+    /// `CAP_PROGRAMMABLE` is -- every device that has the programmable
+    /// tier at all accepts the one mandatory dialect -- and the register
+    /// must read `0` entirely without the capability, like every other
+    /// `CAP_PROGRAMMABLE`-gated register.
+    #[test]
+    fn shader_langs_supported_reports_glsl_es_1_00_with_cap_programmable() {
+        let mut b = board();
+        let mut mem = dummy_mem();
+        let mut h = host(&mut mem);
+        assert_eq!(b.read(greg::SHADER_LANGS_SUPPORTED, 4, &mut h), 0b01);
+
+        let mut b = C3dBoard::with_masked_caps(0x0200_0000, proto::CAP_PROGRAMMABLE);
+        let mut h = host(&mut mem);
+        assert_eq!(
+            b.read(greg::SHADER_LANGS_SUPPORTED, 4, &mut h),
+            0,
+            "must read 0 once CAP_PROGRAMMABLE is masked off"
         );
     }
 
