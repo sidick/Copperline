@@ -9659,7 +9659,7 @@ fn whdload_game_config_path_stores_a_slave_as_its_directory() {
     );
     assert_eq!(
         whdload_game_config_path(PathBuf::from("Turrican.slave")),
-        PathBuf::from("Turrican.slave")
+        PathBuf::from(".")
     );
 }
 
@@ -9672,6 +9672,85 @@ fn dropped_floppy_with_single_drive_inserts_directly() {
     assert_eq!(app.disk_playlists[0], vec![adf.clone()]);
     assert!(app.ui.panel.is_none());
     assert!(app.osd.as_ref().unwrap().text.starts_with("DF0:"));
+    std::fs::remove_file(&adf).unwrap();
+}
+
+#[test]
+fn scheduled_disk_changes_apply_in_time_order_whatever_the_flag_order() {
+    // `--insert-disk-after 0.02 df1 B --eject-disk-after 0.01 df1`: both
+    // come due in the same step, and the eject must land first or it would
+    // throw out the disk just inserted.
+    let mut app = test_app();
+    app.emu
+        .bus_mut()
+        .floppy
+        .set_connected_drives([true, true, false, false]);
+    let first = temp_adf("first.adf");
+    let second = temp_adf("second.adf");
+    app.emu
+        .bus_mut()
+        .floppy
+        .insert_disk_image(1, first.clone(), true)
+        .unwrap();
+    app.pending_auto_disk_changes = vec![
+        super::DiskChangeSpec {
+            secs: 0.02,
+            drive_idx: 1,
+            change: super::DiskChange::Insert {
+                path: second.clone(),
+                write_protected: true,
+            },
+        },
+        super::DiskChangeSpec {
+            secs: 0.01,
+            drive_idx: 1,
+            change: super::DiskChange::Eject,
+        },
+    ];
+    app.arm_scheduled_events();
+    // Armed in time order, so the one-change-per-step netplay path takes
+    // them in that order too.
+    assert_eq!(app.auto_disk_changes[0].change, super::DiskChange::Eject);
+
+    while app.emu.bus().emulated_seconds() < 0.03 {
+        app.emu.step_frame().expect("frame");
+    }
+    app.fire_scheduled_events();
+    assert!(app.auto_disk_changes.is_empty());
+    let name = app.emu.bus().floppy.inserted_disk_name(1).unwrap();
+    assert!(name.contains("second.adf"), "df1 holds {name}");
+    std::fs::remove_file(&first).unwrap();
+    std::fs::remove_file(&second).unwrap();
+}
+
+#[test]
+fn scheduled_disk_eject_empties_the_drive_and_records_only_real_ejects() {
+    let mut app = test_app();
+    let adf = temp_adf("eject.adf");
+    app.emu
+        .bus_mut()
+        .floppy
+        .insert_disk_image(0, adf.clone(), true)
+        .unwrap();
+    app.input_recorder = Some(crate::inputrec::InputRecorder::new(0.0));
+    // The second eject finds the drive already empty: a warning, nothing
+    // recorded, and the drive stays empty.
+    for _ in 0..2 {
+        app.auto_disk_changes.push(super::ScheduledDiskChange {
+            change_at_emulated_secs: 0.0,
+            drive_idx: 0,
+            change: super::DiskChange::Eject,
+        });
+    }
+    app.fire_scheduled_events();
+    assert!(app.auto_disk_changes.is_empty());
+    assert!(!app.emu.bus().floppy.disk_inserted(0));
+    let script = app.input_recorder.take().unwrap().finish();
+    assert_eq!(
+        script.matches("eject-disk-after").count(),
+        1,
+        "only the real eject is recorded: {script}"
+    );
     std::fs::remove_file(&adf).unwrap();
 }
 
@@ -14962,14 +15041,10 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| -> anyhow::Result<()> {
+            use crate::netplay::reserved_sockets;
             use crate::video::launcher::{LauncherField as F, LauncherTab};
-            use std::net::UdpSocket;
-            let reserved = [
-                UdpSocket::bind("127.0.0.1:0")?,
-                UdpSocket::bind("127.0.0.1:0")?,
-            ];
-            let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
-            drop(reserved);
+            use anyhow::Context as _;
+            let addresses = reserved_sockets::addresses(2)?;
             let mut apps = [test_app(), test_app()];
             for (player, app) in apps.iter_mut().enumerate() {
                 app.machine_config.audio.output_enabled = Some(false);
@@ -15024,13 +15099,22 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
                 apps[0].emu.netplay_snapshot()?,
                 apps[1].emu.netplay_snapshot()?
             );
+            // Leaving must close the session's socket: reserving its address
+            // straight afterwards fails while anything still holds it, and
+            // the reservation then carries the port to the retry below.
+            let release = |address| {
+                reserved_sockets::at(address)
+                    .with_context(|| format!("leaving netplay must release {address}"))
+            };
             apps[0].leave_netplay(None);
+            release(addresses[0])?;
             let state = apps[0].launcher_state().unwrap();
             assert_eq!(state.tab, LauncherTab::Netplay);
             assert_eq!(state.netplay.peer, addresses[1].to_string());
             assert!(apps[0].paused);
             assert!(apps[0].netplay.is_none());
             apps[1].leave_netplay(Some("peer timed out".into()));
+            release(addresses[1])?;
             assert!(apps[1]
                 .launcher_state()
                 .unwrap()
@@ -15043,7 +15127,7 @@ fn netplay_gui_peers_connect_and_can_return_to_setup_and_retry() -> anyhow::Resu
                 app.launcher_run();
                 assert!(
                     app.netplay.is_some(),
-                    "retry must release and rebind the socket"
+                    "retry must rebind the retained address"
                 );
                 assert_eq!(app.emu.bus().emulated_cck(), 0);
                 assert!(!app.paused);
@@ -15059,16 +15143,10 @@ fn netplay_continuous_mouse_corrections_present_every_frame() -> anyhow::Result<
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| -> anyhow::Result<()> {
-            use crate::netplay::{Options, Session};
-            use std::net::UdpSocket;
+            use crate::netplay::{reserved_sockets, Options, Session};
             use std::time::{Duration, Instant};
 
-            let reserved = [
-                UdpSocket::bind("127.0.0.1:0")?,
-                UdpSocket::bind("127.0.0.1:0")?,
-            ];
-            let addresses = [reserved[0].local_addr()?, reserved[1].local_addr()?];
-            drop(reserved);
+            let addresses = reserved_sockets::addresses(2)?;
             // Read the remote mouse's JOYDAT into COLOR00, then repeat. The
             // framebuffer must change as delayed movement corrects prediction.
             let program = [0x33f9, 0x00df, 0xf00c, 0x00df, 0xf180, 0x60f4];
@@ -15320,17 +15398,9 @@ fn netplay_gui_spectator_follows_the_players_without_input_or_disk_controls() ->
     std::thread::Builder::new()
         .stack_size(48 * 1024 * 1024)
         .spawn(|| -> anyhow::Result<()> {
-            use crate::netplay::Role;
+            use crate::netplay::{reserved_sockets, Role};
             use crate::video::launcher::{LauncherField as F, LauncherTab};
-            use std::net::UdpSocket;
-            let reserved: Vec<_> = (0..3)
-                .map(|_| UdpSocket::bind("127.0.0.1:0"))
-                .collect::<std::io::Result<_>>()?;
-            let addresses: Vec<_> = reserved
-                .iter()
-                .map(|s| s.local_addr())
-                .collect::<std::io::Result<_>>()?;
-            drop(reserved);
+            let addresses = reserved_sockets::addresses(3)?;
             let mut apps = [test_app(), test_app(), test_app()];
             for (player, app) in apps.iter_mut().take(2).enumerate() {
                 app.machine_config.audio.output_enabled = Some(false);
@@ -15588,4 +15658,149 @@ fn multitap_keyboard_takeover_keeps_guest_key_releases_balanced() {
     assert!(!app.amiga_rawkey_held(raw));
     assert!(app.handle_keyboard_joystick_key(KeyCode::ArrowLeft, false));
     assert!(!app.keyboard_joy_held[0].is_set(KeyCode::ArrowLeft));
+}
+
+/// A picker opens where the last one of its kind was answered, and only
+/// its kind: the floppy folder is not where a Kickstart is looked for.
+#[test]
+fn pickers_open_where_the_last_of_their_kind_was_answered() {
+    use super::native_dialog::{PickDir, PickRequest};
+    let root = tempfile::tempdir().unwrap();
+    let floppies = root.path().join("floppies");
+    let roms = root.path().join("roms");
+    std::fs::create_dir_all(&floppies).unwrap();
+    std::fs::create_dir_all(&roms).unwrap();
+    let mut app = test_app();
+
+    // Nothing answered yet, so the request is left to its caller and the
+    // host, exactly as before there was anything to remember.
+    let mut request = PickRequest::files("DF0").remember(PickDir::Floppy);
+    let then = app.remembering(&mut request, Box::new(|_, _| {}));
+    assert_eq!(request.opens_in(), None);
+    then(
+        &mut app,
+        Some(vec![floppies.join("disk1.adf"), floppies.join("disk2.adf")]),
+    );
+
+    let mut request = PickRequest::files("DF1").remember(PickDir::Floppy);
+    let then = app.remembering(&mut request, Box::new(|_, _| {}));
+    assert_eq!(request.opens_in(), Some(floppies.as_path()));
+    // A cancel forgets nothing.
+    then(&mut app, None);
+    assert_eq!(app.picked_dir(PickDir::Floppy), Some(floppies.clone()));
+
+    // Every kind has its own folder, and a request with no kind is
+    // left alone.
+    assert_eq!(app.picked_dir(PickDir::Rom), None);
+    let mut request = PickRequest::file("Cover art");
+    let _ = app.remembering(&mut request, Box::new(|_, _| {}));
+    assert_eq!(request.opens_in(), None);
+
+    // A caller with an answer of its own keeps it.
+    let mut request = PickRequest::files("DF0")
+        .directory(Some(roms.clone()))
+        .remember(PickDir::Floppy);
+    let _ = app.remembering(&mut request, Box::new(|_, _| {}));
+    assert_eq!(request.opens_in(), Some(roms.as_path()));
+
+    // The answer is noted before the caller sees it, so a second picker
+    // opened from the first's continuation (the extended ROM after the
+    // Kickstart) already starts beside what the first one picked.
+    let seen = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&seen);
+    let mut request = PickRequest::file("Kickstart").remember(PickDir::Rom);
+    let then = app.remembering(
+        &mut request,
+        Box::new(move |app, _| *slot.borrow_mut() = app.picked_dir(PickDir::Rom)),
+    );
+    then(&mut app, Some(vec![roms.join("kick.rom")]));
+    assert_eq!(*seen.borrow(), Some(roms.clone()));
+
+    // A folder that has gone since is not handed to the next dialog.
+    std::fs::remove_dir(&floppies).unwrap();
+    assert_eq!(app.picked_dir(PickDir::Floppy), None);
+}
+
+/// Save writes the screen back over the configuration it was loaded from,
+/// without a picker, and Save As starts beside that file under its name.
+#[test]
+fn save_writes_back_to_the_configuration_last_loaded() {
+    use crate::config::MachineModel;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("my machine.toml");
+    let mut app = test_app();
+    app.open_launcher();
+    let original = app.launcher_state().unwrap().setup.to_toml().unwrap();
+    std::fs::write(&path, &original).unwrap();
+
+    assert_eq!(app.config_file, None, "nothing loaded or saved yet");
+    app.launcher_load_from(&path);
+    assert_eq!(app.config_file.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        app.launcher_state().unwrap().config_file.as_deref(),
+        Some(path.as_path()),
+        "the dialog has the file to name"
+    );
+
+    // Change something, save, and the file holds the change.
+    let state = app.launcher_state_mut().unwrap();
+    let model = if state.setup.model() == Some(MachineModel::A1200) {
+        MachineModel::A500
+    } else {
+        MachineModel::A1200
+    };
+    state.setup.select_model(Some(model));
+    state.save_dialog = true;
+    let changed = state.setup.to_toml().unwrap();
+    assert_ne!(changed, original);
+    app.launcher_save_current();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    let state = app.launcher_state().unwrap();
+    assert!(!state.save_dialog, "Save puts the dialog away");
+    assert_eq!(
+        state.status.as_ref().map(|status| status.text.as_str()),
+        Some("Saved my machine.toml")
+    );
+
+    // The file outlives the screen: closed and reopened over the
+    // running machine, Save still knows where it goes.
+    app.ui.panel = None;
+    app.open_launcher();
+    assert_eq!(
+        app.launcher_state().unwrap().config_file.as_deref(),
+        Some(path.as_path())
+    );
+
+    // Save As offers the same folder and name, to save a copy beside it.
+    let request = app.config_save_request();
+    assert_eq!(request.opens_in(), Some(dir.path()));
+    assert_eq!(request.suggests(), Some("my machine.toml"));
+    assert_eq!(app.config_load_request().opens_in(), Some(dir.path()));
+
+    // Defaults starts a different machine, which Save must not write
+    // over the loaded one without asking.
+    app.activate_ui_control(UiControl::LauncherDefaults);
+    assert_eq!(app.config_file, None);
+    assert_eq!(app.launcher_state().unwrap().config_file, None);
+    assert_eq!(app.config_save_request().suggests(), Some("machine.toml"));
+}
+
+/// A save that fails keeps the file it was aimed at, which is still the
+/// one being edited, and says so on the status line.
+#[test]
+fn a_failed_save_keeps_its_file_and_reports_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the file should be: the write cannot succeed.
+    let path = dir.path().join("blocked.toml");
+    std::fs::create_dir(&path).unwrap();
+    let mut app = test_app();
+    app.open_launcher();
+    app.set_config_file(Some(path.clone()));
+    app.launcher_save_current();
+    assert_eq!(app.config_file.as_deref(), Some(path.as_path()));
+    let state = app.launcher_state().unwrap();
+    assert_eq!(
+        state.status.as_ref().map(|status| status.text.as_str()),
+        Some("Save failed (see log)")
+    );
 }

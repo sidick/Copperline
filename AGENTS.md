@@ -27,8 +27,10 @@ file and no Kickstart at all. Configuration is a TOML file
 `docs/guide/configuration.md`), and the common machine knobs are also CLI
 flags layered on top: `--model A500|A1200|CD32|...`, `--chipset OCS|ECS|AGA`,
 `--cpu 68000..68060`, `--chip`/`--fast`/`--slow` memory sizes,
-`--floppy-drives N`. A bare ROM path (only) is accepted positionally; disk
-images go in via `[floppy.df0] path` in the config or `--insert-disk-after`:
+`--floppy-drives N`. ROM, floppy, WHDLoad package, CD and TOML paths are accepted positionally.
+Multiple floppies form DF0's swap playlist; a positional CD needs a CD32/CDTV
+configuration. Hard disks and SCSI/ATAPI CDs need configured controllers.
+Use `[floppy.df0] path` or `--insert-disk-after` for an explicit drive/timestamp:
 
 ```sh
 ./target/release/copperline --model A1200 --fast 8M KICK31.ROM \
@@ -64,6 +66,14 @@ process exit with the program's AmigaDOS return code (0-255; 4 if the run
 ended before it returned), and a guest calling uaelib `ExitEmu` (function
 13) stops the run with status 0. Exit statuses: 0 ok, 1 Copperline error,
 3 screenshot expectation failed, 4 no guest return code.
+
+`--terminal` shows an interactive session inside the terminal it was started
+from instead of a window (Kitty graphics and keyboard protocols: kitty,
+Ghostty, WezTerm; Unix only), which also works over SSH
+(`docs/guide/terminal.md`). It needs a real terminal on `/dev/tty`, so it is
+for a person at a keyboard: an agent verifying something should still use
+the headless flags below. F12 then `q` quits, and SIGTERM ends the session
+cleanly with status 143.
 
 ## Headless verification
 
@@ -117,6 +127,7 @@ repeat.
 | `--pot-after SECS X Y [PORT]` | Analogue stick/paddle position, 0-255 per axis (default port 2) |
 | `--pen-after SECS X Y [PORT]` | Hold the light pen over pixel (X, Y) of a `--screenshot-after` capture (negative lifts it off); `--joy-after ... red` is its switch |
 | `--insert-disk-after SECS DFN PATH` | Insert a disk image into `df0`..`df3` |
+| `--eject-disk-after SECS DFN` | Eject the disk in `df0`..`df3`, leaving the drive empty (as the status-bar eject button) |
 | `--insert-cd-after SECS PATH` | Swap the CD image in the machine's CD drive (CDTV/CD32/SCSI CD-ROM) |
 | `--expect-screenshot SECS PATH [TOL]` | Compare the frame at SECS with the PNG at PATH (TOL = fraction or pixel count); mismatch writes `<stem>.actual.png` + `<stem>.diff.png`, exit status 3 at run end |
 | `--script FILE` | Same directives from a file, one per line, no leading dashes (`type SECS TEXT`, `expect-screenshot ...` included) |

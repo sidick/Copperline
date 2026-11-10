@@ -104,8 +104,11 @@ cadence, so hi-res ignores nibble bit 3 and super-hi-res bits 2-3 (pinned
 by the `ddfprobe-hscroll` golden probe on the Kickstart 2.05 boot-screen
 constellation, vAmiga-verified). AGA's extended BPLCON1 fields feed the
 same per-plane delays through `aga_bplcon1_scroll_samples`, masked to one
-fetch-unit width (32-bit fetches scroll within 32 lo-res px, 64-bit within
-64).
+fetch-unit width in native samples: 16, 32 or 64 samples for the selected
+FMODE. In hi-res that is 8, 16 or 32 lo-res pixels; in SHRES it is 4, 8 or
+16. Applying a lo-res-sized mask at every resolution left SHRES BPL32 taps
+8/16/24 one or two words too far right. The `ddfprobe-agaresfold` matrix
+checks those wrap points against vAmiga v5 band interiors.
 
 An off-grid DDFSTRT interacts with the scroll in both fetch regimes. An
 FMODE=0 fetch placed off the shifter reload grid rounds UP (the data is
@@ -138,6 +141,20 @@ Roots tap >= 16, pulling the swirl a gulp left and shearing the
 kaleidoscope line by line. The hi-res/SHRES scaling of the pipeline is
 not yet externally verified; only lo-res is pinned.
 
+`timing-test/ddfprobe-agaresfold.asm` supplies the missing observation
+matrix: 48 bands covering hi-res and SHRES, 32/64-bit fetches, on-grid
+starts and off-grid phases, and taps around the candidate pipeline
+boundaries. At vAmiga v5 revision `8ee181c8a4ac420f04402c82de20977b312027c5`,
+the resolution-dependent scroll mask removes the SHRES BPL32 wrap
+disagreements. The complete matrix still differs by 284 of 202,628 aligned
+pixels (0.140%): 28 pixels on the first line and 32 pixels on each of the
+four lines in bands 40 and 44. Those two bands select SHRES BPL64,
+DDFSTRT `$42`, and legacy taps 0/16 (both wrap to native tap 0). vAmiga puts
+their markers one 64-sample gulp to the right. The other 46 band interiors
+agree. The 8-cck pipeline remains a hypothesis for these off-grid SHRES
+cases; the golden records the current output and does not establish
+hardware correctness. Physical AGA verification remains open.
+
 The phase is the fetch run's, not the register's. On ECS Agnus and AGA
 Alice a DDFSTRT below the hardwired start (`$18`) only latches BPHSTART;
 the run starts when SHW rises at `$18`, on every line, so DDFSTRT
@@ -149,6 +166,18 @@ band: the Skeleton Krew CD32 constellation (issue #836: lo-res BPL64,
 DDFSTRT `$10`, taps swept across 0..63 while the camera scrolls) folded
 taps >= 48 from the register's phase-16 boundary, jumping the playfield
 one gulp left with black past the fetched data on the right.
+
+A captured FMODE=0 run at colour clock zero carries an explicit DDF-window
+validity flag in the renderer's per-line control state. Its origin stays at
+zero and the synthesized stop records the captured span, while word counts,
+fetch plans and content bounds recognize the captured window. Register-only
+unprogrammed fallback stays distinct. `ddfprobe-zero` exercises an OCS
+surviving-SHW run at `$00`, with standard and `$08` control bands.
+Its middle band rewrites DDFSTRT to `$10` behind the beam after the run
+starts, then restores `$00` for the next line. That register view must not
+replace the captured origin. The corrected complete probe agrees with the
+vAmiga v5 OCS reference at every pixel after two-line alignment and a
+bijective palette mapping.
 
 BPLCON1-delayed samples at the left edge of a scanline do not reuse the
 previous line's final bitplane word. Before the current line's shifter has a
@@ -593,6 +622,75 @@ made the conservative pre-render key reject the frame. Recording still emits
 the duplicate video frame, and status/UI changes still redraw over a held
 Amiga picture.
 
+## Video-slot tap (`videoslot.rs`)
+
+A card in the A2000/A3000/A4000 video slot watches Denise's digital output
+as it is generated, which the replay architecture above does not provide by
+itself. The tap gives such a card (the NewTek Video Toaster is the
+motivating case) two views of the picture, both side-effect free and both
+painted by the same `render_from_input` the display uses:
+
+- **Completed fields.** At each frame wrap, after `begin_new_beam_frame` has
+  promoted the capture, `Bus::notify_video_slot_field_complete` renders the
+  finished field once more on the main thread and passes it to
+  `VideoSlotDevice::field_complete`. A card that does not need it opts out
+  with `wants_completed_fields`, which skips the extra render.
+- **The field in progress.** A card that reacts within the same field gets
+  a `LiveField` on every guest read of `$BFE101`. Its `pixels()` call
+  renders a `RenderInput` built from the capture side
+  (`RenderInput::from_bus_in_progress`, the in-progress halves of the
+  `frame_*`/`last_frame_*` pairs: the frame-start chip-RAM snapshot and its
+  beam-timed write log, captured bitplane rows and sprite lines, and the
+  frame's register events so far) for the beam's own line alone, whose
+  captured words reach the beam; `line(v)` renders a line the beam has
+  passed the same way. A line render leaves out register writes from later
+  lines, so a passed line shows what it showed then, and starts one line
+  early (a lead row, then dropped) because the painter folds every write on
+  its first row into that row's starting palette: on the lead row, the
+  line's own colour writes keep their beam positions. The render is reused
+  while the beam stays put; a reset, which restarts the frame count,
+  forgets it.
+- **Sync.** A card that supplies sync, or a configured stand-alone genlock,
+  keeps BPLCON0.ERSY from freezing the beam counters. Agnus's flag is
+  recomputed from both wherever either changes under the other: a reset's
+  new Agnus, and a state load, which keeps the live session's card but the
+  state's genlock setting (and freezes the counters at once when ERSY is set
+  and nothing supplies sync).
+
+Both views paint a line wider than the display framebuffer. A video card
+samples the whole active line -- the Toaster's 768 pixels start at lo-res
+`$5C`, left of the capture's `$62`, and run past the capture's right edge --
+so `bitplane::render_wide` paints colour clocks `SLOT_FIRST_CCK` (`$24`)
+onwards for `SLOT_LINE_CCK` clocks, stitched from origin-shifted renders of
+the same field. The shift is `RenderInput::canvas_origin_cck`, installed as
+the thread-local `ACTIVE_CANVAS_ORIGIN_CCK` for the render: every
+beam-to-column anchor (`DIW_HSTART_FB0`, `COPPER_WAIT_HPOS_FB0`,
+`COLOR_WRITE_HPOS_FB0`, `SPRITE_PALETTE_CONTROL_HPOS_FB0`, the H-counter
+framebuffer start tick) is read through a function that adds it, so
+comparator-anchored and beam-anchored positions move together and the
+picture slides on the canvas. Display renders use 0 and keep the calibrated
+constants bit-for-bit. The per-line sprite display enable column is recorded
+in display coordinates, clamped at the capture's edge; a clamped 0 stays
+"from the canvas start" on a shifted render.
+
+Rows start at the capture's first line. With a card fitted the capture
+starts at the first line sprite DMA can run on (`Bus::capture_start_vpos`:
+NTSC `$14`, PAL `$19`) instead of the deep-overscan `$1C`, because the
+Toaster's line headers are sprites on lines from `$15`.
+`FieldPixels::column_for_hpos`, `column_for_lores`, `pixel_at_beam` and
+`rgb12_at_beam` map beam positions to the canvas.
+
+The card can also drive the parallel data pins (`parallel_read`), ahead of
+the Centronics peripheral and the joystick adapter; pins the guest has made
+outputs (DDRB set) stay CIA-driven. A card that supplies genlock sync
+(`supplies_sync`, the Toaster) puts Agnus in genlock mode while fitted:
+`BPLCON0.ERSY` then leaves the beam counters live instead of freezing them
+(`Agnus::set_genlock_sync`; `[chipset] genlock` does the same without a
+card). A fitted card blocks run-ahead, since
+it holds state run-ahead cannot rewind. Like the parallel peripheral it is
+host-attached (`Bus::attach_video_slot`) and survives save-state loads; it
+is not itself serialised.
+
 ## Interlace (`video/deinterlace.rs`)
 
 Interlaced (LACE) content is presented through a motion-adaptive
@@ -907,7 +1005,9 @@ scanout, two-plane cursor, and physical pass-through switch in
 `picasso2/gd5426.rs`, and the Graffity Zorro II/III boards (`graffity.rs`)
 reuse that CL-GD5428 core. The window presents
 that frame at its native resolution through a dedicated GPU texture
-(`window/rtg_texture.rs`) rather than the 716-wide chipset buffer, and the
+(`window/rtg_texture.rs`) rather than the 716-wide chipset buffer, uploaded
+only once the window surface is acquired so a hidden window queues nothing
+([](architecture.md)), and the
 TV aperture crop is suppressed -- it is a chipset crop rect, and applying it
 would show a sub-rect of the board's screen. The GPU pass always draws the
 native RTG texture, including while menus, panels, guest debug overlays or

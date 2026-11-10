@@ -17,6 +17,9 @@ expansion boards have chapters of their own: [Toccata](toccata.md),
 src/
   main.rs           # native binary: config load, boot, execution-mode selection
   cli.rs            # binary-local command-line parser
+  media.rs          # shared file classification for positional startup and drops
+  cli/tokens.rs     # option boundaries, inline values, script-token provenance
+  startup.rs        # desktop launch markers and fatal error presentation
   bin/              # auxiliary binaries, each behind its own cargo feature:
                     #   bench.rs: copperline-bench headless benchmark (native + wasm32-wasip1)
                     #   copperline-ctl.rs: control-protocol client, MCP server, DAP adapter
@@ -32,6 +35,7 @@ src/
   warpboot.rs       # warp boot: run unpaced until a condition holds, then pace
   runprog.rs        # --run: boot straight into a host executable
   whdload.rs        # --whdload direct boot (package.rs, lha.rs: game packages)
+  archive.rs        # shared LHA/ZIP output budgets and bounded streaming I/O
   gamelib/          # WHDLoad game library and OpenRetro database sync
   debugger.rs       # env-driven headless debugger
   waveform.rs       # trigger-based VCD chipset-signal capture (GTKWave)
@@ -136,7 +140,7 @@ src/
   netplay/          # GGPO-style netplay for two to four players
   verdict.rs        # the process exit status of a session
   crashlog.rs       # persistent crash reports from the panic hook
-  winconsole.rs     # closes the console a desktop launch brings (Windows)
+  winconsole.rs     # detects desktop launches and closes their console (Windows)
   timestamp.rs      # compact wall-clock stamps for generated filenames
   timebase.rs       # host clock imports shared with the browser build
   chipset/
@@ -184,7 +188,63 @@ tests/              # self-contained integration tests and ignored local-asset t
 timing-test/        # bootable cross-emulator timing-measurement disk + golden probes
 ```
 
+Archive output is bounded by `archive::Budget`, shared by the LHA and ZIP
+package paths. Advertised member lengths are checked before allocation or
+file creation; a fixed-size copy buffer also counts the actual decoded
+bytes, with at most a one-byte over-limit probe. Both memory reads and
+streamed disk extraction use that reader and retain end-of-stream checksum
+checks. LHA listing walks headers without decoding payloads, and selective
+reads skip unrelated members. Failed WHDLoad staging is discarded before
+its extraction can be promoted. User limits are documented in
+[WHDLoad support](../guide/whdload.md).
+
+Parser fuzzers and stable regression replay share `fuzz/harnesses/`. The
+[testing guide](../../tests/README.md) and
+[fuzzing instructions](../../fuzz/README.md) describe retained crashes and
+scheduled campaigns.
+
+### Desktop file opening
+
+`media::classify` distinguishes ZIP games from floppy archives using member
+names and CHD disks from CDs using metadata. Unknown files retain caller-specific
+fallbacks: the legacy CLI ROM path or the drop handler's floppy content sniffing.
+The CLI collects positional paths before classifying them, detects conflicting
+boot targets, and applies image overrides to `RawConfig` before validation.
+This keeps the running machine, swap playlist and configuration screen consistent.
+
+Windows shell commands and Linux desktop entries pass files to this CLI path.
+On macOS, `window/macos_documents.rs` registers an `aevt/odoc` Apple-event handler
+before winit starts pumping events and re-registers at AppKit's will-finish-launch
+notification, before initial document delivery. It leaves winit's application delegate intact,
+queues file URLs for the main loop, and starts an independent CLI session per
+open request. Only the full desktop binary enables this bridge; player frontends
+do not. The untouched initial window yields after spawning its document session;
+a running guest or an edited launcher stays open. The bridge owns its handler
+for the event loop's lifetime and unregisters it when the app is dropped.
+
+On a logged-in macOS desktop, run
+`python3 packaging/macos/test-document-open.py /path/to/Copperline.app` to verify
+cold and warm Finder delivery. It signs a temporary app copy with an isolated
+bundle ID, uses intentional ROM-read failures to observe the CLI handoff, checks
+that an existing control connection survives, and unregisters its test bundle.
+Linux AppImage CI runs `packaging/linux/test-desktop-setup.py` against the actual
+package, including Exec quoting, MIME detection, reinstall and removal. Windows
+installer lifecycle CI checks both registry hives and unchanged extension defaults.
+
 ## The big picture
+
+The native entry point catches fatal errors and returns status 1. Once the
+arguments identify an interactive session, a desktop launch also shows a
+native error dialog. Windows retains the result of its console-ownership
+check; the Linux desktop entry supplies a leading internal `--desktop`
+marker, consumed before CLI parsing; LaunchServices sets
+`COPPERLINE_DESKTOP_LAUNCH=1` through the macOS bundle's `LSEnvironment`.
+The environment marker is read through `envcfg`. Syntax errors, capture and
+benchmark runs, headless debugger/control servers, listing commands, and
+internal helper actions use stderr only, even with a desktop marker.
+Redirected streams alone never enable dialogs. Launcher Run failures keep
+their existing status-line recovery path, and guest/expectation exit codes
+still come from the session verdict.
 
 Copperline's emulated machine runs synchronously on the main thread inside
 winit's event loop. There is no emulation thread and no locking between CPU
@@ -293,6 +353,19 @@ main thread. This schedules host redraws independently of the emulated
 clock. `COPPERLINE_PRESENT_PROFILE=1` enables per-attempt CPU timings for
 acquisition/upload, draw-command recording, and submission; these do not
 measure GPU completion or display scanout.
+
+Every texture upload for a frame (the picture the scaler samples, the RTG
+board frame and its UI atlas) runs inside that draw callback, after the
+surface has been acquired. A wgpu queue write is staged until the next
+submit, and a skipped present has none: macOS reports a covered, minimised
+or other-Space window as occluded, and pixels returns that as `Ok(())`
+without submitting. Uploading before the acquire left one staged copy of
+the frame behind for every frame the window stayed hidden, so an RTG
+session in a covered window grew by its board frame size times the refresh
+rate (about 95 MB/s at 800x600 16-bit) until the host ran out of memory.
+As a backstop, `presenter.rs` submits an empty command list whenever a
+present does not reach pixels' own submit, which flushes anything still
+staged.
 
 The main presentation path uses the **main thread** (event loop, core,
 and pacer), the **`copperline-render`** and **`copperline-present`**
@@ -414,8 +487,13 @@ snapshot:
   `[machine] rtc_time` / `--rtc-time`. A seed advances in emulated time;
   `--rtc-frozen` holds it constant. `COPPERLINE_RTC_FIXED_SECS` is the
   older fixed-UTC override.
-- Live host-directory mounts expose file contents and timestamps. File-backed
-  hard disks and physical disks retain writes made after a snapshot.
+- Live host-directory mounts expose file contents and timestamps, and a
+  directory given to an `[ide]`/`[scsi]` drive is built into an image with
+  its files' timestamps. In both cases the volume's own date is fixed
+  rather than read from the host clock, because a machine without an RTC
+  sets its system time from the boot volume
+  ([host filesystem service](peripherals.md)). File-backed hard disks and
+  physical disks retain writes made after a snapshot.
 - Network, serial, MIDI, and sampler input can depend on external devices
   or services. A real host serial port (`[serial] mode = "device"`) is
   live I/O like networking: its bytes and handshake lines arrive on the
@@ -478,6 +556,24 @@ when `--emit-relocs` retains relocation records. Unsupported relocations
 or invalid relocation targets/offsets produce a section-specific diagnostic.
 See the [DAP reference](../debugger/dap.md#debug-information) for supported
 toolchains and variable-location expressions.
+
+## Debug transport and WASM resource boundaries
+
+The unauthenticated GDB drivers and TCP DAP adapter share
+`debugger::bind_debug_listener`: resolve the address once, require every
+resolved IP to be loopback unless the caller explicitly enables remote
+debugging, then bind those same resolved addresses. The authenticated CCP
+transport retains its existing address handling. Control tokens come from
+`getrandom`'s OS source with errors propagated to startup, and appear only
+in JSON handoff files, never the startup log. Explicit handoff paths are
+replaced atomically; automatic paths are owned by the server and removed
+when it drops. See the [control protocol](../debugger/control.md).
+
+`WasmRuntime::instantiate` installs a Wasmtime `StoreLimits` limiter before
+instantiating each plugin. Its one memory (64 MiB) and one table (65,536
+elements) limits also cover reset-created stores and host-initiated memory
+growth on restore. The limiter is host state, so this adds no serialized
+field or save-state format version. See [WASM boards](../zorro.md#wasm-plugin-boards).
 
 ## envcfg: environment variables are start-up settings
 

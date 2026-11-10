@@ -61,7 +61,11 @@ instruction samples, converts them to a source-mapped `.cpuprofile`, and opens
 the result in VS Code. The profile includes inlined frames from optimized
 code and a `[Bus wait]` child that isolates time lost to chip-DMA
 contention. Other DAP clients can send the same custom request and open the
-returned `path`.
+returned `path`. The unwind table (six bytes per two bytes of text,
+base64-encoded) travels in a single control-protocol request, which is
+capped at 4 MiB, so a program whose first code hunk holds about 1 MiB of
+text or more cannot be profiled: the adapter reports an error and keeps the
+debug session.
 
 The same toolbar opens Copperline's native Debugger, Console, and Frame
 Analyzer windows (the custom `copperline/ui.show {"window"}` request). The
@@ -88,7 +92,16 @@ dap.configurations.c = {
 ```
 
 Any client that connects to a TCP debug server can use `--dap-listen ADDR`
-instead. Zed loads debug adapters through extensions only; none exists yet.
+instead. It accepts `PORT`, `:PORT`, or `HOST:PORT`; port-only forms bind to
+`127.0.0.1`. TCP DAP accepts only loopback addresses by default. Binding a
+wildcard or non-loopback address requires `--allow-remote-debugging` on
+`copperline-ctl`. DAP has no authentication or encryption: a client can
+launch host programs through the adapter's `copperline` argument and control
+attached sessions. Prefer stdio or an SSH tunnel for remote access. The
+control protocol's token authenticates the adapter to the emulator; it does
+not authenticate an IDE to the TCP DAP adapter.
+
+Zed loads debug adapters through extensions only; none exists yet.
 
 ## Launch and attach
 

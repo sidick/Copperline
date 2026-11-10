@@ -1549,6 +1549,7 @@ impl TryFrom<RawConfig> for Config {
             detect_smc: raw.debug.detect_smc,
             mem_controller,
             video_standard,
+            genlock: raw.chipset.genlock.unwrap_or(false),
             audio,
             ide,
             scsi,
@@ -2988,13 +2989,14 @@ pub(super) fn parse_pcmcia(raw: &RawPcmcia, has_slot: bool) -> Result<PcmciaConf
 }
 
 fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
-    const ADF_SIZE: u64 = 80 * 2 * 11 * 512;
+    const ADF_SIZE: u64 = crate::floppy::ADF_SIZE as u64;
+    const HD_ADF_SIZE: u64 = crate::floppy::HD_ADF_SIZE as u64;
     let meta = std::fs::metadata(path)
         .with_context(|| format!("reading floppy.df{} image {}", idx, path.display()))?;
     if !meta.is_file() {
         bail!("floppy.df{} image {} is not a file", idx, path.display());
     }
-    if meta.len() == ADF_SIZE {
+    if meta.len() == ADF_SIZE || meta.len() == HD_ADF_SIZE {
         return Ok(());
     }
 
@@ -3020,12 +3022,13 @@ fn validate_floppy_image_path(idx: usize, path: &Path) -> Result<()> {
     }
 
     bail!(
-        "floppy.df{} image {} is {} bytes, expected {} bytes (standard DD ADF),
+        "floppy.df{} image {} is {} bytes, expected {} bytes (standard DD ADF) or {} bytes (HD ADF),
         gzip-compressed supported image, UAE extended ADF, IPF, SCP, DMS or single file ZIP",
         idx,
         path.display(),
         meta.len(),
-        ADF_SIZE
+        ADF_SIZE,
+        HD_ADF_SIZE
     );
 }
 

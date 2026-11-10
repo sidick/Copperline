@@ -11,6 +11,9 @@ run headless by itself: add a capture flag to end the run.
 `--warp-boot` and `--warp-until` only affect windowed sessions, since a
 capture run is already unthrottled from the start.
 
+To watch and drive an interactive session where there is no window server,
+for example over SSH, see [Terminal display](terminal.md).
+
 Physical floppy drives attached through [FluxBridge](fluxbridge.md) require
 wall-clock pacing. For repeatable captures, use image-backed media, a fixed
 RTC seed when a clock is fitted, and repeatable inputs. Live networking,
@@ -247,6 +250,7 @@ timestamps. Every flag repeats:
 | `--pen-after SECS X Y [PORT]` | Hold the light pen over pixel (X, Y) of a `--screenshot-after` capture, as `--mouse-to-after` takes; a negative coordinate lifts it off (default: the port with the pen) |
 | `--insert-disk-after SECS DFN PATH` | Insert a disk image into `df0`..`df3` |
 | `--defer-disk-insert SECS DFN` | Start with DFN empty and insert its configured disk at SECS |
+| `--eject-disk-after SECS DFN` | Eject the disk in DFN at SECS, leaving the drive empty ([below](#ejecting-floppy-disks)) |
 | `--insert-cd-after SECS PATH` | Swap the CD image (`.cue`, `.iso`, `.nrg`, `.chd`) in the machine's CD drive |
 | `--freeze-after SECS` | Press the freezer cartridge's button (`--cartridge hrtmon`): HRTMon takes over at SECS |
 | `--expect-screenshot SECS PATH [TOLERANCE]` | Compare the frame at SECS with a PNG ([above](#screenshot-expectations)) |
@@ -325,6 +329,33 @@ Later `--screenshot-after` captures show the monitor screen, and a
 `--save-state-after` snapshot taken inside the monitor resumes inside it.
 Input recordings store freeze events as `freeze-after SECS`.
 
+(ejecting-floppy-disks)=
+### Ejecting floppy disks
+
+`--eject-disk-after SECS DFN` takes the disk out of `df0`..`df3` at SECS and
+leaves the drive empty, exactly as the status bar's eject button does: the
+drive latches `/CHNG` low and reports no disk until another one goes in, so
+the guest's disk-change polling sees the removal. Writes the guest made to
+the image were already saved as each track was written, so an eject loses
+nothing. The log records `floppy.dfN ejected`. Ejecting a drive that holds
+no disk at that moment logs a warning and the run carries on; naming a drive
+that is not connected is refused at startup, as for `--insert-disk-after`
+(raise `--floppy-drives` or configure the drive).
+
+Ejects share one schedule with `--insert-disk-after` and
+`--defer-disk-insert`, applied in timestamp order, so a removal followed by
+a different disk is two flags:
+
+```sh
+./target/release/copperline --config a500-2drives.toml --noaudio \
+  --eject-disk-after 75 df1 \
+  --insert-disk-after 85 df1 other.adf \
+  --screenshot-after 95 /tmp/out.png
+```
+
+Scripts take `eject-disk-after SECS DFN`, and `--record-input` writes that
+line for each eject (status bar or `media.floppy.eject`).
+
 (input-recording-and-script-files)=
 ### Input scripts and recording
 
@@ -336,6 +367,7 @@ the flags without their leading dashes:
 joy-after 60.0 red 300
 key-after 75.0 f1 200
 type 80.0 "dir df1:\n"
+eject-disk-after 88.0 df1
 insert-disk-after 90.0 df1 "disk2.adf"
 joy-after 95.0 red 300 1
 expect-screenshot 100.0 "expected/level.png" 0.001
@@ -345,7 +377,7 @@ freeze-after 120.0
 The accepted directives are `press-after`, `key-after` (also spelled
 `hold-key-after`), `type` (also `type-after`), `click-after`, `joy-after`,
 `mouse-after`, `mouse-to-after`, `pot-after`, `pen-after`,
-`insert-disk-after`, `defer-disk-insert`, `insert-cd-after`,
+`insert-disk-after`, `defer-disk-insert`, `eject-disk-after`, `insert-cd-after`,
 `freeze-after` and `expect-screenshot`, each taking the same arguments as
 its flag. Other flags, including `--screenshot-after` and
 `--save-state-after`, are not accepted in a script, and a script cannot
@@ -440,6 +472,22 @@ p50/p90/p99/max host time per frame, and every frame that took longer than
 expectations, frame dumps, GIF clips, save-state writes, scheduled input,
 scheduled floppy or CD inserts, input recording, `--exit-on-return`,
 `--profile-live-audio`, `--gdb` or `--control`.
+
+For a smaller executable that measures only the core, or the core plus CPU
+rendering, build the standalone benchmark:
+
+```sh
+cargo build --release --locked --no-default-features --features bench-bin --bin copperline-bench
+./target/release/copperline-bench --config tools/performance/a500-pal.toml \
+  --rom assets/aros/aros-amiga-m68k-rom.bin --ext assets/aros/aros-amiga-m68k-ext.bin \
+  --seconds 30 --render
+```
+
+Omit `--render` to measure core execution alone. Unlike `--benchmark-until`,
+`--seconds` is a duration. The tracked configuration freezes the RTC and uses
+the bundled AROS pair with no disk. The [CI performance gate](../internals/jit-performance.md#ci-aros-performance-gate)
+compares these workloads against a pinned source revision using alternating
+trials on one host. It does not include GPU presentation or live audio.
 
 To measure real-time behaviour instead of throughput, `COPPERLINE_HEADLESS_PACED=1`
 paces a windowless capture run (`--screenshot-after`, `--exit-on-return` and

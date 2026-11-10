@@ -35,6 +35,8 @@ project:
       children:
         - file: guide/getting-started.md
         - file: guide/configuration.md
+        - file: guide/troubleshooting.md
+        - file: changelog.md
         - file: guide/ui.md
         - file: guide/whdload.md
         - file: guide/run.md
@@ -47,6 +49,7 @@ project:
         - file: guide/winuae-state.md
         - file: guide/netplay.md
         - file: guide/headless.md
+        - file: guide/terminal.md
         - file: guide/browser.md
         - file: guide/libretro.md
         - file: guide/publishing.md
@@ -130,6 +133,8 @@ project:
         - index.md
         - guide/getting-started.md
         - guide/configuration.md
+        - guide/troubleshooting.md
+        - changelog.md
         - guide/ui.md
         - guide/whdload.md
         - guide/run.md
@@ -142,6 +147,7 @@ project:
         - guide/winuae-state.md
         - guide/netplay.md
         - guide/headless.md
+        - guide/terminal.md
         - guide/browser.md
         - guide/libretro.md
         - guide/publishing.md
@@ -158,6 +164,7 @@ project:
         - debugger/dap.md
         - debugger/diverge.md
         - debugger/control.md
+        - debugger/disk-fault.md
         - debugger/workflows.md
         - internals/architecture.md
         - internals/timing.md
@@ -193,6 +200,13 @@ project:
         - internals/m68000-divider-review-2026-10-15.md
 site:
   template: book-theme
+  # Generated from Cargo.toml and Git by tools/prepare-docs.py. The footer
+  # remains visible after the site-wide banner has been dismissed.
+  parts:
+    banner: _version.md
+    toc_footer: _version.md
+    # The MyST 1.10 book-theme uses the earlier name for this part.
+    primary_sidebar_footer: _version.md
   options:
     favicon: ../assets/brand/copperline.ico
     hide_authors: true

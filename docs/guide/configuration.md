@@ -50,6 +50,11 @@ and out-of-range sizes. Media are opened during startup; depending on the
 device, an unavailable image either stops startup or leaves the unit absent
 with a warning in the log.
 
+For older key spellings and `unknown field` errors, see
+[configuration compatibility](troubleshooting.md#configuration-will-not-load)
+and the [changelog](../changelog.md). Match the manual version to the executable
+before copying a configuration.
+
 ## Paths on Windows
 
 This applies to every path field below (`rom`, disk images, hard-drive
@@ -100,6 +105,17 @@ relative to the working directory. Paths given to scheduled input such as
 `--insert-disk-after` are also used as written.
 
 ## Command-line overrides
+
+Long options taking a value accept either `--flag VALUE` or `--flag=VALUE`,
+including `--config=machine.toml` and `--script=input.clscript`. For an option
+with several arguments, the inline value is its first argument:
+`--screenshot-after=10 out.png` or `--window-position=-40 75`. Values keep
+any further `=` characters. Switches such as `--factory` and `--noaudio`
+take no value; `--noaudio=false` is an error.
+
+`--help` and `--version` print to stdout and exit successfully. Invalid
+arguments print to stderr and exit with status 1. A mistyped long option
+suggests a close, unambiguous match when one is available.
 
 The most common machine knobs can be set on the command line without writing
 a config file. These flags layer on top of the config file (or, when there is
@@ -181,6 +197,9 @@ range checks as the equivalent TOML fields:
 | `--pcmcia-sram SIZE` | `[pcmcia] card = "sram"`, `size` | a session-only SRAM card in the slot, `64K` to `4M` |
 | `--gif-after SECS PATH` | (none) | write an animated GIF clip of the display from SECS emulated seconds, then exit (see [](headless.md#capturing-gif-clips)) |
 | `--gif-seconds N` | (none) | length of each `--gif-after` clip in emulated seconds; defaults to `[recording] clip_seconds` |
+| `--terminal` | (none) | show and drive the machine in a Kitty-protocol terminal instead of a window, also over SSH ([Terminal display](terminal.md)) |
+| `--terminal-fps N` | (none; needs `--terminal`) | send at most N frames a second to the terminal |
+| `--terminal-log PATH` | (none; needs `--terminal`) | log file while `--terminal` owns the terminal (default `copperline-terminal-PID.log` in the temporary directory) |
 
 For example, to boot a stock A1200 profile but with 8 MB of fast RAM and a
 faster CPU, with no config file at all:
@@ -218,7 +237,9 @@ is running under the emulator. It is on by default and does not change the
 machine's usable memory; set `identify = false` for a chain with no
 emulator-identifying board. See [](../zorro) for details.
 
-A positional ROM argument on the command line overrides `rom`. Omit `rom`
+A positional ROM argument on the command line overrides `rom`. Positional media
+and `.toml` configurations are also accepted; see
+[Opening files](getting-started.md#opening-files). Omit `rom`
 entirely (and pass no ROM argument) to boot the bundled AROS open-source
 Kickstart replacement, Copperline's default boot ROM; its main and
 extended halves are found as described under
@@ -330,7 +351,9 @@ instead of the search.
 ```
 
 `[paths]` sets where Copperline writes its output files, where file
-dialogs open when their field is empty, and where a relative media path is
+dialogs open when their field is empty (until a dialog for that kind of
+file has been used in the session -- from then on it opens where the last
+one was answered), and where a relative media path is
 looked for when the working directory does not have it (see
 [Relative media paths](#relative-media-paths)). Every key is optional and falls back
 to the default directory structure under the host data directory
@@ -857,6 +880,7 @@ revision = "OCS"   # OCS, ECS, or AGA preset
 video = "PAL"      # PAL or NTSC
 # agnus = "8372A"  # optional fine-grained override
 # denise = "OCS"   # optional fine-grained override
+# genlock = true   # an external genlock supplies sync (default false)
 ```
 
 `revision` is a preset; `agnus` and `denise` allow the mixed configurations
@@ -874,6 +898,17 @@ The AGA preset resolves to Alice and Lisa: 8 bitplanes, the 256-entry
 sprite fetch (DMA and manual sprites), SSCAN2/BSCAN2 scan doubling, 35 ns
 BPLCON3 SPRES output, BPLCON4, and CLXCON2. Remaining gaps are recorded in
 [](../internals/chipset).
+
+`genlock = true` fits an external genlock supplying sync. Setting
+`BPLCON0.ERSY` then slaves the beam to that sync instead of stopping it, so
+the beam counters (`VPOSR`/`VHPOSR`) keep moving; the external sync runs at
+the machine's own timing. Without a genlock, ERSY freezes the counters, as on
+a real Amiga with nothing in the genlock socket. Software written for a
+genlock or a video-slot card that supplies sync (the NewTek Video Toaster)
+runs with ERSY set and waits on the beam, so it needs this. Kickstart's
+genlock probe also finds the genlock, so the OS hides the programmable 31 kHz
+modes that a genlock cannot follow. A [video-slot card](../internals/video)
+that supplies its own sync sets this for as long as it is fitted.
 
 ## `[display]`
 
@@ -2068,19 +2103,27 @@ playback can break. The menu's *Emulation Settings -> Floppy Speed* changes
 the setting live without restarting the machine. It applies to image-backed
 bays only; a physical drive has its own `replay_speed`.
 
-Supported image formats: standard 901120-byte DD ADF, gzip-compressed
-images (ADZ), single file ZIP archives, DMS archives, UAE extended ADF, and
-read-only IPF and SCP images. DMS, gzip, IPF, and SCP images are decoded at
-load time and always treated as write-protected; set `write_protected = false`
-on a plain ADF to allow write-through updates to the image file. A DMS archive
-is unpacked cylinder by cylinder into the DD image the disk was read from, so
-archives that repeat a cylinder (an advertising boot block ahead of the real
-one) or omit the cylinders that read back blank load normally.
+Supported image formats: standard ADF (901120-byte DD or 1802240-byte
+HD), gzip-compressed images (ADZ), single file ZIP archives, DMS
+archives, UAE extended ADF, and read-only IPF and SCP images. DMS,
+gzip, IPF, and SCP images are decoded at load time and always treated
+as write-protected; set `write_protected = false` on a plain ADF to
+allow write-through updates to the image file. A DMS archive is
+unpacked cylinder by cylinder into the image the disk was read from,
+so archives that repeat a cylinder (an advertising boot block ahead of
+the real one) or omit the cylinders that read back blank load normally.
 
-The emulated drives are double-density units, so high-density images are
-rejected: a 1,802,240-byte HD ADF, a high-density DMS archive, an IPF
-recorded at the HD cell rate, and a UAE extended ADF whose AmigaDOS tracks
-hold more than the 11 sectors a DD track carries.
+The emulated drives take both densities. Density follows the inserted
+image, the way a high-density mechanism senses an HD disk: an HD image
+(a 1,802,240-byte ADF, a high-density DMS archive, or a UAE extended
+ADF whose AmigaDOS tracks hold 22 sectors) runs at HD geometry -- 22
+sectors per track at half rotation speed, with the drive-ID poll
+answering as a high-density drive -- and a DD image runs as it always
+has. Nothing to configure: the same drive reads DD disks after an HD
+one is ejected. The guest needs an HD-aware `trackdisk.device`
+(Kickstart 1.x has none). IPF images of HD disks (signal type 2, the
+1 us cells an HD disk shows a 300 RPM capture drive) are still
+rejected.
 
 IPF (the SPS/CAPS preservation format) is decoded by Copperline itself rather
 than through the closed-source `capsimg` library, so every build reads IPF on
@@ -2094,9 +2137,12 @@ Speedlock, and Brierley density profiles, so the sectors a protection times
 pass the head with the same longer or shorter cells the original disk was
 mastered with. A density model the decoder does not know is decoded with
 uniform 2 us cells, which is logged at load time, so a protection that
-measures cell timing on that track may fail. Weak ("flakey") bits are
-replayed as the single deterministic revolution the file stores rather than
-varying per revolution.
+measures cell timing on that track may fail. Weak ("flakey") spans are decoded
+into eight deterministic revolutions with different noise in those spans;
+the stable cells, index position, track length and density stay fixed. The
+drive cycles through those revolutions, including across save/restore and
+netplay transfer. This is a repeating approximation of weak media, not an
+analogue noise or drive-PLL model.
 The browser frontend shares this decoder, so it reads IPF too.
 
 A `paths` playlist lets multi-disk software that only uses DF0: run
@@ -2211,6 +2257,17 @@ is written back to the host directory, and changes are lost at exit. The
 stock A1200/A600 Kickstart `scsi.device` only probes the IDE master; a
 slave drive needs a guest OS or driver that supports two units (Kickstart
 3.1.4, for example).
+
+Files and subdirectories keep their host modification times, but the
+volume's own dates (creation and last change) are fixed at 1 January
+1978, the AmigaDOS epoch, rather than taken from the host clock when the
+volume is built. On a machine with no battery clock fitted the OS sets its
+system time from the boot volume's date, so booting from a directory
+starts the guest clock at 1 January 1978, as a clockless Amiga does from
+undated media, and a headless run boots to the same moment every time --
+the same as a [`[[filesys]]` mount](#filesys-mounts). Fit a clock
+(`[machine] rtc = true`) for the guest to read the host's time instead, or
+seed one with `rtc_time` for a fixed date.
 
 To override the volume name (instead of inheriting the directory name),
 the boot priority, or the filesystem, give the drive as a table with
@@ -2821,6 +2878,17 @@ directory as `SYS:` under 1.3 exactly as under 3.1 (the service speaks
 both the V36 boot-node protocol and V34's own autoboot and handler
 startup conventions). Kickstart 1.2 and older lack the expansion-ROM
 hook entirely and never see the mounts.
+
+File and directory dates are the host files' own timestamps, but the
+volume itself has no creation date on the host, so every mount reports a
+fixed one: 1 January 1978, the AmigaDOS epoch. That matters on a machine
+with no battery clock fitted (the A500 and A1200 profiles, among others),
+whose OS sets its system time from the boot volume's date: booting from a
+host directory starts the guest clock at 1 January 1978, as a clockless
+Amiga does from undated media, and a headless run boots to the same
+moment every time. Fit a clock (`[machine] rtc = true`) for the guest to
+read the host's time instead, or seed one with `rtc_time` for a fixed
+date.
 
 (clipboard)=
 

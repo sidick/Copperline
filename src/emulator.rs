@@ -488,9 +488,6 @@ impl Emulator {
         if real_pacing_budget_mode == RealPacingBudgetMode::M68kCycles {
             log::info!("real pacing budget: returned m68k cycles plus explicit chip-bus waits");
         }
-        let mut bus = bus;
-        // The chipset/CIA/Paula advance in emulated time, not wall-clock.
-        bus.set_realtime_devices_enabled(false);
         let machine = cpu::build(
             bus,
             cpu_model,
@@ -4654,6 +4651,7 @@ fn build_machine_inner(
         }
     }
     bus.set_video_standard(cfg.video_standard);
+    bus.set_genlock(cfg.genlock);
     bus.set_chipset_revisions(cfg.agnus_revision, cfg.denise_revision);
     bus.set_rtc_present(cfg.rtc_present);
     bus.set_rtc_chip(cfg.rtc_chip);

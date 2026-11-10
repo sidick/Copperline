@@ -3871,15 +3871,6 @@ impl ImageWorkshop {
         }
     }
 
-    /// Whether the floppy described is one Copperline's own drives cannot
-    /// read (the Create Floppy page shows a warning). Every emulated drive
-    /// is a double-density unit: it answers the drive-ID poll as DD and
-    /// spins at the DD rate, so an HD image is made for another emulator
-    /// or a real Amiga with a high-density drive.
-    pub fn floppy_needs_hd_drive(&self) -> bool {
-        self.density == crate::diskimage::Density::Hd
-    }
-
     pub fn floppy_spec(&self) -> crate::diskimage::FloppySpec {
         crate::diskimage::FloppySpec {
             density: self.density,
@@ -4040,10 +4031,15 @@ struct RomNote {
 #[derive(Debug, Clone)]
 pub struct LauncherState {
     pub setup: MachineSetup,
-    /// Whether the Save dialog is up: Save As, Set default, Reset default.
-    /// One flag, because it holds nothing -- three buttons and a close
-    /// gadget, and every click either picks one or puts it away.
+    /// Whether the Save dialog is up: Save, Save As, Save default, Reset
+    /// default. One flag, because it holds nothing -- four buttons and a
+    /// close gadget, and every click either picks one or puts it away.
     pub save_dialog: bool,
+    /// The file Save writes to, which the dialog names: the configuration
+    /// last loaded or saved on this screen this session. `None` until
+    /// there is one, and Save then asks where, as Save As does. A copy of
+    /// the window's own, which outlives this state.
+    pub config_file: Option<PathBuf>,
     /// Whether the "are you sure" over Reset default is up. Only ever set
     /// when there is a default to delete -- with none saved there is
     /// nothing to be sure about, and a dialog asking anyway is a dialog
@@ -5329,6 +5325,7 @@ impl LauncherState {
         setup.adopt_whdload_defaults();
         let mut state = Self {
             save_dialog: false,
+            config_file: None,
             confirm_reset: false,
             #[cfg(feature = "game-library")]
             library: LibraryPage::default(),

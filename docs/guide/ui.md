@@ -4,6 +4,13 @@ Copperline opens a single window: the emulated display presented at a
 TV-like 4:3 aspect ratio, above a status bar with the machine's controls.
 The window scales continuously when resized.
 
+When Copperline is started from Finder, Explorer, or the installed Linux
+desktop entry, fatal session errors also appear in a native error dialog.
+Configuration-screen Run and auto-launch failures remain on the screen's
+status line so the settings can be corrected. Command-line syntax errors
+and headless captures, benchmarks, debugger servers, and listing commands
+report to stderr without opening a dialog; their exit statuses are unchanged.
+
 The display defaults to buffered, synchronised presentation (strict FIFO
 vsync) on all desktop platforms. **Video Settings -> VSync** changes this
 immediately; it is also in the configuration screen's **A/V & Emu -> Display**
@@ -388,15 +395,16 @@ written, so a value that comes from the machine profile -- the CD32 pad in a
 CD32's port 2, say -- is not copied into the default every machine starts
 from. The changes also show on the
 [machine configuration screen](#machine-configuration-screen) when it is
-opened during the session, so **Save As** and **Save default** include them.
+opened during the session, so **Save**, **Save As** and **Save default**
+include them.
 
 A session started from a file you named -- `--config`, or a
 `copperline.toml` in the working directory or beside the executable -- leaves
 that file alone, as does a `--factory` run: their menu changes last for the
-session, and the configuration screen's **Save As** keeps them. A machine started from the
+session, and the configuration screen's **Save** or **Save As** keeps them. A machine started from the
 configuration screen writes to the saved default even when **Load...** brought
-another file in; the loaded file itself is never rewritten. Scheduled headless
-runs never write the default.
+another file in; the loaded file itself is rewritten only when you press
+**Save**. Scheduled headless runs never write the default.
 
 The [Debug workspace](../debugger/window.md) puts the Amiga display beside the
 debugger, Frame Analyzer, and Console in the main window. Switch inspectors with
@@ -957,12 +965,16 @@ The layout is:
       inheriting. The base folder always shows its full path, and swaps
       Browse for Reset once set. Changes take effect immediately -- a
       screenshot taken after moving the row lands where the row now says --
-      and are written to the configuration by **Save As** or **Save
-      default** like everything else.
+      and are written to the configuration by **Save**, **Save As** or
+      **Save default** like everything else.
 - **Settings rows** (right pane). `[<]`/`[>]` step through a value (an
   on/off setting steps between **Enabled** and **Disabled**), and the
   **Browse** and **Clear** buttons set or remove a file path through a
-  native file dialog. For a hard-drive slot on the *Storage* tab or its
+  native file dialog. The dialog opens beside the file the row already
+  holds; for an empty row, in the folder the last dialog for that kind of
+  file (ROM, floppy, CD, hard disk, WHDLoad game) was answered in this
+  session -- the menu's own Load dialogs included -- and before that, in
+  the matching `[paths]` folder. For a hard-drive slot on the *Storage* tab or its
   sub-pages (IDE master/slave, a SCSI unit, a Lide drive, a Copperline HD
   unit, or the SF2000 SD card), **Browse** on macOS lets you pick a
   directory as well as a file, since any of those slots can be a host
@@ -1015,11 +1027,19 @@ The layout is:
   See [](configuration.md) for how the priority ranks against Kickstart's
   DF0: boot node at 5.
 - **Action bar** (bottom). **Load...** reads a `.toml` config through a file
-  dialog. **Save...** opens a small dialog of three buttons, each described
-  in the dialog as the pointer moves over it: **Save As** writes a `.toml`
-  through a file dialog (a minimal file, only the settings that differ from
-  the chosen profile's defaults, so it reads like the example configs);
-  **Save default** saves the running configuration as the one Copperline
+  dialog. **Save...** opens a small dialog of four buttons, each described
+  in the dialog as the pointer moves over it: **Save** writes the
+  configuration back over the file last loaded with **Load...** or saved
+  with **Save As** this session, without asking -- the dialog names that
+  file while the pointer is on the button -- and with no such file yet
+  asks where, as **Save As** does. **Defaults** forgets the file, so the
+  next **Save** asks again rather than writing a fresh machine over it.
+  **Save As** writes a `.toml` through a file dialog (a minimal file, only
+  the settings that differ from the chosen profile's defaults, so it reads
+  like the example configs), opening in the folder of the file **Save**
+  would write and suggesting its name, else where the last configuration
+  dialog was answered, else the `[paths] configs` folder; **Load...** opens
+  in the same place. **Save default** saves the running configuration as the one Copperline
   starts with, including settings changed from the menu during the session:
   this screen opens showing it, and a run with no `--config`
   and no `copperline.toml` boots it (see [](configuration.md));
@@ -1068,7 +1088,7 @@ CHD from the finished image with `chdman createhd`.
 
 | Option | Effect |
 |---|---|
-| **Density** | `DD (880K)` or `HD (1.76M)`. Sets the image size: 901,120 or 1,802,240 bytes. Copperline's floppy drives are double-density only and cannot use an HD image in either container, so the page shows a warning while HD is selected. Make HD images for another emulator, or for a real Amiga with a high-density drive. |
+| **Density** | `DD (880K)` or `HD (1.76M)`. Sets the image size: 901,120 or 1,802,240 bytes. Copperline's floppy drives read both densities in either container; an HD disk needs an HD-aware `trackdisk.device` in the guest (Kickstart 1.x has none). |
 | **Container** | `Standard ADF` writes the sectors in order. `Extended ADF` wraps them in the `UAE-1ADF` container, which stores one record per track. |
 | **Filesystem** | `Unformatted` leaves the image blank for the Amiga to format. `OFS` and `FFS` write a boot block, root block and bitmap. |
 | **DOSType** | The DOS type's options: `International` case folding, `Dir cache`, `Long names`. See **DOSType** below. |
@@ -1242,8 +1262,8 @@ scheduled emulated time (see [](headless.md#capturing-gif-clips)).
 machine -- key presses with their hold times (typed on the host keyboard
 or clicked on the [on-screen one](#on-screen-keyboard), which reaches the
 machine by the same path), mouse buttons and motion, joystick / CD32-pad
-controls, analogue pot positions, and floppy inserts, on whichever port
-carries each device -- each stamped with its emulated time. Pressing it
+controls, analogue pot positions, and floppy inserts and ejects, on
+whichever port carries each device -- each stamped with its emulated time. Pressing it
 again stops the recording and writes
 `copperline-input-<YYYYMMDDHHmmSS>.clscript` in the
 [recordings folder](#where-files-go): a plain text file of scripted-input
@@ -1296,6 +1316,11 @@ versions rather than producing a corrupt machine. A build still needs
 support for every expansion board present in the snapshot. States written
 by Copperline 0.19 and earlier used a flat layout with a single version
 and must be recreated.
+
+For cross-release compatibility and load errors, see
+[save-state troubleshooting](troubleshooting.md#a-save-state-will-not-load)
+and the [changelog](../changelog.md). A newer subsystem chunk can be refused
+even when both builds use the same container version.
 
 Saving over an existing file replaces it only after the new snapshot has
 been completely written and flushed. A failed save leaves the previous
@@ -1425,7 +1450,9 @@ of the folders above -- plus gamepad calibration, keyboard mappings, the
 default WHDLoad library and other per-user host data -- live inside it, so
 the whole installation moves as one folder. Delete `portable.txt` to return
 to the platform location above; Copperline does not move existing files in
-either direction. An installation can also carry its own machine: a
+either direction. The folder must be writable by you, so on Windows use the
+ZIP or a per-user install for this, not an all-users install in Program
+Files. An installation can also carry its own machine: a
 `copperline.toml` in the same folder boots straight into that machine,
 skipping the configuration screen (see [](configuration.md)).
 

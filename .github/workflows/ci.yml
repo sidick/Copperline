@@ -24,6 +24,7 @@ env:
 # checks share one Linux job and one entry rather than one macOS entry each.
 jobs:
   build:
+    timeout-minutes: 30
     # Keep the existing check name for branch-protection rules. The ci
     # profile inherits release semantics without shipping-only fat LTO.
     name: Build (release)
@@ -53,22 +54,29 @@ jobs:
         # tests compiling (#[ignore] only affects execution). The JSON output
         # maps each test target to its hash-suffixed executable so the binaries
         # can be staged under stable names for the fan-out jobs.
+        #
+        # Every ordinary (non-test) binary goes to ci-bins/bin under its own
+        # file name. Integration tests spawn them through compile-time
+        # CARGO_BIN_EXE_<name> paths (target/ci/<name>), so the test jobs copy
+        # the whole directory back there; staging all of them, rather than a
+        # named list, keeps a new CARGO_BIN_EXE_* user from finding its
+        # binary missing.
         run: |
           cargo test --profile ci --locked --no-run --timings --message-format=json > cargo-test-build.json
-          mkdir -p ci-bins
-          cp target/ci/copperline ci-bins/
-          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
-                   | [.target.kind[0], .target.name, .executable] | @tsv' cargo-test-build.json \
-            | while IFS=$'\t' read -r kind name exe; do
-                case "$kind:$name" in
-                  lib:copperline)        cp "$exe" ci-bins/unit-lib ;;
-                  bin:copperline)        cp "$exe" ci-bins/unit-bin-copperline ;;
-                  bin:copperline-ctl)    cp "$exe" ci-bins/unit-bin-copperline-ctl ;;
-                  test:probe_golden)     cp "$exe" ci-bins/probe_golden ;;
-                  test:image_regression) cp "$exe" ci-bins/image_regression ;;
+          mkdir -p ci-bins/bin
+          jq -r 'select(.reason == "compiler-artifact" and .executable != null)
+                   | [(.profile.test | tostring), .target.kind[0], .target.name, .executable] | @tsv' cargo-test-build.json \
+            | while IFS=$'\t' read -r test kind name exe; do
+                case "$test:$kind:$name" in
+                  false:bin:*)            cp "$exe" ci-bins/bin/ ;;
+                  true:lib:copperline)    cp "$exe" ci-bins/unit-lib ;;
+                  true:bin:*)             cp "$exe" "ci-bins/unit-bin-$name" ;;
+                  true:test:probe_golden) cp "$exe" ci-bins/probe_golden ;;
+                  true:test:*)            cp "$exe" "ci-bins/test-$name" ;;
                 esac
               done
-          ls -l ci-bins
+          test -x ci-bins/bin/copperline
+          ls -l ci-bins ci-bins/bin
       - name: Upload binaries for the test jobs
         uses: actions/upload-artifact@v7
         with:
@@ -84,6 +92,7 @@ jobs:
           retention-days: 7
 
   checks:
+    timeout-minutes: 30
     name: Rustfmt, clippy, and feature checks
     # Style, lints, and the check-only feature combinations need no release
     # build, so this runs alongside the build job instead of gating it. It
@@ -106,11 +115,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          workspaces: |
-            . -> target
-            crates/copperline-player -> target
       - name: Formatting
-        run: cargo fmt --check
+        # --all reaches the workspace's frontend crates (browser, libretro,
+        # player) as well as the emulator itself.
+        run: cargo fmt --all --check
       - name: Clippy
         # Hold the binary, tests, examples, and diagnostic feature gates to
         # the same warning-clean standard used for release checks.
@@ -125,43 +133,83 @@ jobs:
         # (docs/guide/publishing.md).
         working-directory: crates/copperline-player
         run: cargo check --locked
-      - name: Player crate formatting
-        # A standalone workspace, so the root Formatting step never
-        # reaches it.
-        working-directory: crates/copperline-player
-        run: cargo fmt --check
 
-  fuzz-build:
-    name: Fuzz harnesses build
-    # Build every untrusted-input harness on each change so parser API
-    # refactors cannot silently leave the fuzz workspace stale. Sustained
-    # campaigns remain a local or scheduled workload.
+  probe-binaries:
+    name: Probe assembly consistency
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
+      - name: Fetch pinned vasm 2.0b source mirror
+        uses: actions/checkout@v7
+        with:
+          repository: StarWolf3000/vasm-mirror
+          ref: 7db75ca16f3f528463ae9846fd057040737d826b
+          path: target/vasm
+          persist-credentials: false
+      - name: Build assembler
+        run: make -C target/vasm -j2 CPU=m68k SYNTAX=mot
+      - name: Compare probe sources and binaries
+        run: python3 tools/check-probe-binaries.py --vasm "$PWD/target/vasm/vasmm68k_mot"
+
+  fuzz-build:
+    timeout-minutes: 30
+    name: Fuzz harnesses build
+    # Build and briefly run every untrusted-input harness on each change.
+    # fuzz.yml runs longer daily campaigns and retains evolved corpora.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Generate the fuzz lockfile
         working-directory: fuzz
         run: |
-          # This test-only workspace follows the root crate by path. Derive its
-          # lockfile from the current manifests so a root Dependabot update
-          # cannot leave a second committed dependency graph stale.
-          cargo generate-lockfile
+          # Preserve the production dependency versions while adding the
+          # fuzz-only packages, without committing a second lockfile.
+          cp ../Cargo.lock Cargo.lock
+          cargo metadata --format-version=1 > /dev/null
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: fuzz
+          key: fuzz-linux
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Build all fuzz targets
         working-directory: fuzz
-        run: cargo fuzz build
+        run: cargo fuzz build --codegen-units=16
+      - name: Exercise every harness
+        working-directory: fuzz
+        # Explicit bash enables pipefail so tee cannot hide a fuzz failure.
+        shell: bash
+        # Run the binaries the build step produced. Every Cargo invocation
+        # in this checkout reruns build.rs and recompiles the core, and
+        # `cargo fuzz run` is two of them per target.
+        env:
+          ASAN_OPTIONS: detect_odr_violation=0
+        run: |
+          mkdir -p logs
+          bin="target/$(rustc -vV | sed -n 's/^host: //p')/release"
+          for target in dms floppy_image cd_image hardfile_classification savestate config_toml archives debug_info control_protocol; do
+            mkdir -p "artifacts/$target" "corpus/$target"
+            "$bin/$target" "corpus/$target" \
+              -max_total_time=10 -timeout=10 -rss_limit_mb=2048 -max_len=1048576 \
+              -artifact_prefix="artifacts/$target/" \
+              2>&1 | tee "logs/$target.log"
+          done
+      - name: Retain fuzz smoke failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-smoke
+          path: |
+            fuzz/artifacts/
+            fuzz/logs/
+          if-no-files-found: ignore
+          retention-days: 30
 
   msrv:
+    timeout-minutes: 30
     name: MSRV (rust-version)
     # Prove that Cargo.toml's declared minimum remains truthful when source
     # or dependency updates land.
@@ -195,9 +243,12 @@ jobs:
         run: cargo +"$MSRV" test --locked --lib --no-run
 
   cargo-deny:
+    timeout-minutes: 30
     name: Dependency policy (${{ matrix.name }})
-    # Frontends have standalone workspaces and lockfiles, so check each
-    # shipped dependency graph explicitly.
+    # The frontends share the root lockfile but each ships its own
+    # dependency graph (the core built with different features), so check
+    # each graph explicitly: a member manifest makes that crate the sole
+    # root of the graph cargo-deny checks.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -222,6 +273,7 @@ jobs:
           # warnings; hide only their verbose dependency inclusion graphs.
 
   unit-tests:
+    timeout-minutes: 30
     name: Unit tests
     needs: build
     runs-on: macos-latest
@@ -238,22 +290,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ci-bins/*
+          chmod +x ci-bins/* ci-bins/bin/*
           ./ci-bins/unit-lib video::window::egui_debugger:: | tee inspector-tests.txt
           grep -Eq '^test result: ok\. [1-9][0-9]* passed;' inspector-tests.txt
       - name: Unit tests
         # The inline #[cfg(test)] suites in the lib and binaries, prebuilt
-        # by the build job (this is everything a root `cargo test` runs
-        # besides tests/probe_golden.rs, which has its own job below; the
-        # crate has no doctests). The GDB remote-protocol suite in
+        # by the build job. Integration targets run in the next step;
+        # probe goldens have their own job below. The crate has no doctests.
+        # The GDB remote-protocol suite in
         # src/gdbstub is part of unit-lib: gdb is a default feature.
         # Inspector tests ran in the preceding step.
         run: |
           ./ci-bins/unit-lib --skip video::window::egui_debugger::
-          ./ci-bins/unit-bin-copperline
-          ./ci-bins/unit-bin-copperline-ctl
+          for suite in ci-bins/unit-bin-*; do
+            "$suite"
+          done
+      - name: Integration tests
+        # The suites spawn copperline, copperline-ctl, and the other ordinary
+        # binaries through compile-time CARGO_BIN_EXE_* paths under target/ci
+        # (the same absolute path in every job of this repo on hosted
+        # runners), so restore everything the build job staged there first.
+        run: |
+          mkdir -p target/ci
+          cp ci-bins/bin/* target/ci/
+          for suite in ci-bins/test-*; do
+            "$suite"
+          done
+          ./ci-bins/test-audio_stems_determinism --ignored
 
   probe-golden:
+    timeout-minutes: 30
     name: Probe golden renders
     needs: build
     runs-on: macos-latest
@@ -279,11 +345,11 @@ jobs:
         # The test harness spawns the emulator through the compile-time
         # CARGO_BIN_EXE_copperline path, which on hosted runners is the
         # same absolute path in every job of this repo -- hence the copy
-        # into target/ci before running.
+        # of the staged binaries into target/ci before running.
         run: |
-          chmod +x ci-bins/*
+          chmod +x ci-bins/* ci-bins/bin/*
           mkdir -p target/ci
-          cp ci-bins/copperline target/ci/copperline
+          cp ci-bins/bin/* target/ci/
           ./ci-bins/probe_golden
       - name: Upload probe render diffs
         # On a golden mismatch the test writes the actual renders and diff
@@ -296,6 +362,7 @@ jobs:
           if-no-files-found: ignore
 
   hostsocket-plugin:
+    timeout-minutes: 30
     name: HostSocket plugin (wasm32)
     # The bundled bsdsocket.library board (crates/hostsocket-plugin) ships
     # as a committed artifact (assets/hostsocket/hostsocket_plugin.wasm, the
@@ -323,6 +390,7 @@ jobs:
         run: cargo test --locked
 
   zz9k-plugin:
+    timeout-minutes: 30
     name: ZZ9K plugin (wasm32)
     # The bundled ZZ9000 crypto board (crates/zz9k-plugin) ships as a
     # committed artifact (assets/zz9k/zz9k_plugin.wasm, the blob a plain
@@ -359,6 +427,7 @@ jobs:
         run: cargo test --locked
 
   diagrom-smoke:
+    timeout-minutes: 30
     name: DiagROM boot smoke
     needs: build
     runs-on: macos-latest
@@ -379,11 +448,11 @@ jobs:
         # The image-regression harness spawns the emulator through the
         # compile-time CARGO_BIN_EXE_copperline path, which on hosted
         # runners is the same absolute path in every job of this repo --
-        # hence the copy into target/ci.
+        # hence the copy of the staged binaries into target/ci.
         run: |
-          chmod +x ci-bins/*
+          chmod +x ci-bins/* ci-bins/bin/*
           mkdir -p target/ci
-          cp ci-bins/copperline target/ci/copperline
+          cp ci-bins/bin/* target/ci/
       - name: Restore cached DiagROM
         id: diagrom-cache
         uses: actions/cache@v6
@@ -424,7 +493,7 @@ jobs:
         run: |
           mkdir -p test-assets
           cp diagrom.rom test-assets/
-          ./ci-bins/image_regression diagrom --ignored --nocapture
+          ./ci-bins/test-image_regression diagrom --ignored --nocapture
       - name: Upload boot screenshot
         if: always()
         uses: actions/upload-artifact@v7
@@ -436,6 +505,7 @@ jobs:
           if-no-files-found: ignore
 
   linux-tests:
+    timeout-minutes: 30
     # Preserve the required check name; the ci profile is release-derived.
     name: Linux tests (release)
     # Functional coverage on Linux: the inline unit suites and
@@ -524,6 +594,7 @@ jobs:
           retention-days: 7
 
   wasm:
+    timeout-minutes: 30
     name: Headless core and browser build
     # Guards the portability split behind the browser build (see
     # docs/guide/browser.md): the core must keep compiling without the
@@ -536,15 +607,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          workspaces: |
-            . -> target
-            crates/copperline-web -> target
       - name: Core without the desktop frontend
         run: cargo check --no-default-features --locked
+      - name: Clippy on the portable core (browser and libretro feature set)
+        # The browser and libretro frontends build the core with
+        # default-features = false. The lint job's --all-features pass
+        # never sees code compiled only in that set (cfg(not(feature))
+        # stand-ins, items whose only users are feature-gated), so lint
+        # the library there too.
+        run: cargo clippy --no-default-features --lib --locked -- -D warnings
       - name: Save-state fixture across optional features
         run: |
           cargo test --locked --no-default-features --lib zorro_device::state::tests
@@ -557,13 +632,10 @@ jobs:
         working-directory: crates/copperline-web
         run: cargo check --target wasm32-unknown-unknown --locked
       - name: Web wrapper unit tests
-        working-directory: crates/copperline-web
-        run: cargo test --locked
-      - name: Web crate formatting
-        # The web crate is a standalone workspace, so the root Formatting
-        # step never reaches it.
-        working-directory: crates/copperline-web
-        run: cargo fmt --check
+        # Run from the workspace root, not the crate directory, so the
+        # root-level entry point (and the test-thread stack it must pick up
+        # from the root .cargo/config.toml) stays covered.
+        run: cargo test -p copperline-web --locked
       - name: Browser rollback netplay on the release WASM bundle
         working-directory: crates/copperline-web
         run: |
@@ -571,7 +643,7 @@ jobs:
           test -n "$version"
           cargo install wasm-bindgen-cli --version "$version" --locked
           RUSTFLAGS="-C target-feature=+simd128" cargo build --release --target wasm32-unknown-unknown --locked
-          wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/copperline_web.wasm
+          wasm-bindgen --target web --out-dir pkg ../../target/wasm32-unknown-unknown/release/copperline_web.wasm
           node ../../tools/check-web-netplay.mjs pkg
           node ../../tools/check-web-netplay-swaps.mjs pkg
       - name: Browser page controller tests
@@ -579,6 +651,7 @@ jobs:
         run: npm test
 
   netplay-service:
+    timeout-minutes: 30
     name: Browser netplay room service
     runs-on: ubuntu-latest
     steps:
@@ -596,6 +669,7 @@ jobs:
         working-directory: services/netplay
 
   docs:
+    timeout-minutes: 30
     name: Docs build (HTML + PDF)
     # Independent of the Rust build: catches MyST/cross-reference breakage
     # (e.g. duplicate labels that only collide in the single-document PDF).
@@ -615,7 +689,9 @@ jobs:
         uses: typst-community/setup-typst@v5
       - name: Build HTML
         working-directory: docs
-        run: myst build --html --ci --strict --check-links
+        run: |
+          python3 ../tools/prepare-docs.py
+          myst build --html --ci --strict --check-links
       - name: Build PDF
         working-directory: docs
         # The PDF export merges every chapter into one document, so it is the

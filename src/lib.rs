@@ -15,6 +15,7 @@ pub mod a2091;
 pub mod a4091;
 pub mod akiko;
 pub mod amigaos;
+pub mod archive;
 pub mod ata;
 pub mod audio;
 // Host block devices: a real disk (an SD card, a CF card, an Amiga's own
@@ -103,6 +104,7 @@ pub mod csynth;
 #[cfg(feature = "frontend")]
 pub mod keymap;
 pub mod lha;
+pub mod media;
 pub mod memory;
 #[cfg(feature = "mhi")]
 pub mod mhi;
@@ -139,6 +141,10 @@ pub mod sdmac;
 pub mod serial;
 pub mod sf2000sd;
 pub mod smc;
+// `--terminal`: the machine inside a Kitty-protocol terminal. Only the
+// desktop frontend drives it.
+#[cfg(feature = "frontend")]
+pub mod terminal;
 pub mod timebase;
 pub mod timestamp;
 pub mod timetravel;
@@ -152,6 +158,7 @@ pub mod update;
 pub mod uss;
 pub mod verdict;
 pub mod video;
+pub mod videoslot;
 pub mod warpboot;
 pub mod wasm_manifest;
 #[cfg(feature = "wasm-boards")]

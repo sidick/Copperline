@@ -147,7 +147,8 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use wasmtime::{
-    Caller, Config, Engine, Extern, Linker, Memory as WasmMemory, Module, Store, TypedFunc,
+    Caller, Config, Engine, Extern, Linker, Memory as WasmMemory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc,
 };
 
 // The manifest structs live in `crate::wasm_manifest` so config/zorro can
@@ -155,10 +156,16 @@ use wasmtime::{
 // `wasmboard::WasmManifest` paths keep working.
 pub use crate::wasm_manifest::{WasmCaps, WasmManifest};
 
+// One memory/table per board makes these per-resource limits also bound the
+// total linear memory and table storage of a plugin instance.
+const MAX_LINEAR_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TABLE_ELEMENTS: usize = 65_536;
+
 /// Store data for host imports. The Amiga-memory pointer is stored as a
 /// `usize` (0 = none) so the store stays `Send`; it is set to the live
 /// `&mut Memory` only for the duration of a plugin call (see [`WasmRuntime::enter`]).
 struct HostCtx {
+    limits: StoreLimits,
     /// Address of the live `Memory`, valid only during a plugin call.
     mem: usize,
     name: String,
@@ -287,6 +294,13 @@ impl WasmRuntime {
         let mut store = Store::new(
             engine,
             HostCtx {
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(MAX_LINEAR_MEMORY_BYTES)
+                    .memories(1)
+                    .table_elements(MAX_TABLE_ELEMENTS)
+                    .tables(1)
+                    .instances(1)
+                    .build(),
                 mem: 0,
                 name: manifest.name.clone(),
                 net,
@@ -301,6 +315,7 @@ impl WasmRuntime {
                 pending_dma_bytes: 0,
             },
         );
+        store.limiter(|ctx| &mut ctx.limits);
         let mut linker = Linker::new(engine);
         register_host_fns(&mut linker, manifest.caps)?;
         let instance = linker
@@ -2345,6 +2360,88 @@ mod tests {
     }
 
     #[test]
+    fn plugin_instantiation_rejects_oversized_or_multiple_memories_and_tables() {
+        for (name, wat) in [
+            ("large-memory", "(module (memory (export \"memory\") 1025))"),
+            (
+                "extra-memory",
+                "(module (memory (export \"memory\") 1) (memory 1))",
+            ),
+            (
+                "large-table",
+                "(module (memory (export \"memory\") 1) (table 65537 funcref))",
+            ),
+            (
+                "extra-table",
+                "(module (memory (export \"memory\") 1) (table 1 funcref) (table 1 funcref))",
+            ),
+        ] {
+            let path = write_wasm(name, wat);
+            let result = WasmBoard::from_file(&path, manifest(name, false));
+            let error = result.err().expect("oversized plugin must be rejected");
+            assert!(
+                format!("{error:#}").contains("instantiating WASM plugin"),
+                "{name}: {error:#}"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn plugin_memory_growth_is_limited_during_calls_reset_and_restore() {
+        let path = write_wasm(
+            "bounded-growth",
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "read") (param $pages i32) (param i32) (result i32)
+                (memory.grow (local.get $pages))))
+        "#,
+        );
+        let mut board = WasmBoard::from_file(&path, manifest("bounded-growth", false)).unwrap();
+        let mut mem = empty_memory();
+        let mut host = DeviceHost::new(&mut mem);
+        let max_pages = (MAX_LINEAR_MEMORY_BYTES / 65536) as u32;
+        for _ in 0..2 {
+            assert_eq!(board.read(1, 0, &mut host), 1);
+            assert_eq!(board.read(max_pages, 0, &mut host), u32::MAX);
+            let mut rt = board.rt.borrow_mut();
+            assert_eq!(rt.memory.size(&rt.store), 2);
+            assert!(!rt.faulted, "a denied memory.grow returns -1 to the plugin");
+            assert!(rt.restore(max_pages as u64 + 1, &[]).is_err());
+            assert_eq!(rt.memory.size(&rt.store), 2);
+            let (pages, bytes) = rt.snapshot();
+            drop(rt);
+            board.reset();
+            board.rt.borrow_mut().restore(pages, &bytes).unwrap();
+            assert_eq!(board.read(max_pages, 0, &mut host), u32::MAX);
+            board.reset();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn plugin_init_cannot_grow_memory_past_the_limit() {
+        let path = write_wasm(
+            "bounded-init",
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "init")
+                (i32.store (i32.const 0) (memory.grow (i32.const 1024))))
+              (func (export "read") (param i32 i32) (result i32)
+                (i32.load (i32.const 0))))
+        "#,
+        );
+        let mut board = WasmBoard::from_file(&path, manifest("bounded-init", false)).unwrap();
+        let mut mem = empty_memory();
+        assert_eq!(board.read(0, 0, &mut DeviceHost::new(&mut mem)), u32::MAX);
+        let rt = board.rt.borrow();
+        assert_eq!(rt.memory.size(&rt.store), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn counter_plugin_reads_writes_and_ticks() {
         let path = write_wasm("counter", COUNTER_WAT);
         let mut board = WasmBoard::from_file(&path, manifest("counter", false)).unwrap();
@@ -3692,6 +3789,32 @@ mod tests {
         }
     }
 
+    /// The port host-backed socket `fd` is bound to, read back through
+    /// `getsockname()`. Tests that need the plugin to own a listening port
+    /// bind port 0 and ask: picking a free port with a probe listener and
+    /// closing it for the plugin's own `bind()` leaves a window in which a
+    /// test running in parallel can be handed that port, and the `bind()`
+    /// then fails.
+    fn hs_local_port(board: &mut WasmBoard, host: &mut DeviceHost, task: u32, fd: i32) -> u16 {
+        const NAME_ADDR: u32 = 0x900;
+        const NAME_LEN_ADDR: u32 = 0x920;
+        let base = NAME_LEN_ADDR as usize;
+        host.memory_mut().chip_ram[base..base + 4].copy_from_slice(&16i32.to_be_bytes());
+        let rc = hs_call(
+            board,
+            host,
+            task,
+            HS_CALL_GETSOCKNAME,
+            [fd, NAME_ADDR as i32, NAME_LEN_ADDR as i32, 0, 0, 0, 0],
+        );
+        assert_eq!(rc, 0, "getsockname (host backend) should succeed");
+        let base = NAME_ADDR as usize;
+        let name = &host.memory_mut().chip_ram[base..base + 4];
+        let port = u16::from_be_bytes([name[2], name[3]]);
+        assert_ne!(port, 0, "getsockname should report the port bind() picked");
+        port
+    }
+
     #[test]
     fn hostsocket_plugin_host_backend_round_trips_a_real_tcp_echo_via_dispatch() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3799,15 +3922,6 @@ mod tests {
 
     #[test]
     fn hostsocket_plugin_host_backend_bind_listen_accept_serves_a_real_tcp_client() {
-        // A free port, released immediately so the dispatch-level bind()
-        // below can claim the same one -- same "ask the OS, then reuse
-        // it" pattern the other host-backend tests use, just via bind()
-        // instead of a listener the test itself keeps open.
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
-
         let cfg = crate::hostsocket::board_config(
             crate::net::NetConfig::Loopback,
             None,
@@ -3833,10 +3947,9 @@ mod tests {
         );
         assert!(listen_fd > 0);
 
-        // bind(listen_fd, 127.0.0.1:port, 16)
+        // bind(listen_fd, 127.0.0.1:0, 16) -- port 0: the OS picks a free one.
         const SOCKADDR_ADDR: u32 = 0x200;
         let mut sockaddr = [0u8; 16];
-        sockaddr[2..4].copy_from_slice(&port.to_be_bytes());
         sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
         let base = SOCKADDR_ADDR as usize;
         host.memory_mut().chip_ram[base..base + 16].copy_from_slice(&sockaddr);
@@ -3858,6 +3971,7 @@ mod tests {
             [listen_fd, 5, 0, 0, 0, 0, 0],
         );
         assert_eq!(rc, 0, "listen (host backend) should succeed");
+        let port = hs_local_port(&mut board, &mut host, task, listen_fd);
 
         let client = std::thread::spawn(move || {
             let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -3968,11 +4082,6 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn hostsocket_plugin_host_backend_waitselect_reports_accept_readiness() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
-
         let cfg = crate::hostsocket::board_config(
             crate::net::NetConfig::Loopback,
             None,
@@ -3999,7 +4108,6 @@ mod tests {
 
         const SOCKADDR_ADDR: u32 = 0x200;
         let mut sockaddr = [0u8; 16];
-        sockaddr[2..4].copy_from_slice(&port.to_be_bytes());
         sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
         let base = SOCKADDR_ADDR as usize;
         host.memory_mut().chip_ram[base..base + 16].copy_from_slice(&sockaddr);
@@ -4023,6 +4131,7 @@ mod tests {
             ),
             0
         );
+        let port = hs_local_port(&mut board, &mut host, task, listen_fd);
 
         // A client connecting is the only thing that should ever make
         // this WaitSelect() stop blocking -- started only after bind()/

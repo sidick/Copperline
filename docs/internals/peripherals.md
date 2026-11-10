@@ -326,7 +326,17 @@ into in-memory FFS or OFS volumes by
 the one every Kickstart from 1.2 onward can read with no guest-side
 setup -- FFS needs a handler loaded from disk or an RDB `FileSystemHeader`
 chain, neither of which Copperline bundles). The volume label defaults to
-the directory name, or a `name` override configured on the drive. The
+the directory name, or a `name` override configured on the drive. Entries
+carry their host files' mtimes, but the root block's dates (root change,
+disk change, creation) are the AmigaDOS epoch, never the host clock: with
+no battery clock the OS sets its system time from the boot volume's date,
+so a build-time wall-clock stamp started the guest clock at a different
+moment on every run, the same leak the `[[filesys]]` volume node had
+(below). `dirfs.rs` reads no clock at all, so the floppy image
+`copperline-ctl exe2adf` writes through the same builder is dated the same
+way; only `build_image_at`, which portable frontends use to stamp every
+entry and the root with one caller-chosen date, overrides it
+(`undated_volume_root_is_the_amigados_epoch_not_the_host_clock`). The
 SCSI-2 disk target in `scsi.rs` answers INQUIRY, REQUEST SENSE, MODE
 SENSE(6)/(10) (pages 3 and 4, or all), MODE SELECT, READ CAPACITY(10)/(16),
 READ/WRITE(6)/(10)/(12)/(16), VERIFY, SYNCHRONIZE CACHE, READ DEFECT DATA,
@@ -761,6 +771,14 @@ live, and `REG_RESULT`/`REG_ARG` tell the handler what to do with the
 packet it just rang in (reply it, `AddDosEntry` a host-built volume
 DosList node, or exit on `ACTION_DIE`). One handler process runs per
 unit against its own bank, so mounts never synchronize with each other.
+The volume node's `dol_VolumeDate` is fixed per unit (the AmigaDOS epoch,
+one tick apart per unit so same-named mounts stay distinct disks), never
+the host clock: with no battery clock the OS sets its system time from
+the boot volume's date, so a wall-clock stamp gave the guest's
+timer.device a different sub-second phase on every run, and two identical
+headless runs drifted apart by a few E-clock ticks
+(`volume_node_date_is_fixed_per_unit_not_the_host_clock`, and the repeat
+checks in `tests/hd_timing.rs`).
 A single global `DIAG_DOORBELL` strobe carries the expansion-init work,
 which runs before any handler process exists. That init strobe is also
 where `[machine] rom_scsi_device_disable` takes effect: the board's
@@ -1251,7 +1269,8 @@ extents, like a CHD's gaps) for both machines and the SCSI/ATAPI drives,
 and lays every `FILE` out as a run of extents over a byte-addressed
 source. Nero NRG images use the same extent model after their 32- or
 64-bit CUE/DAO or ETN footer has supplied the track offsets and stored
-pregaps. A raw read from a cooked MODE1/2048 source synthesizes the complete
+pregaps (the older `CUES` chunk addresses each index as an absolute BCD
+MSF, as the Q sub-channel does; the newer `CUEX` stores a signed LBA). A raw read from a cooked MODE1/2048 source synthesizes the complete
 2352-byte frame: sync and BCD MSF header, EDC, the reserved bytes, and both
 Reed-Solomon P/Q parity fields. MODE2/2336 similarly gains its omitted sync,
 BCD MSF, and mode header without disturbing the stored XA subheader, payload,

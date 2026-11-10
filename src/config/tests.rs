@@ -860,6 +860,7 @@ fn raw_config_serialize_round_trips() {
             video: Some("PAL".to_string()),
             agnus: None,
             denise: None,
+            genlock: None,
         },
         ide: RawIde {
             master: Some(RawDrive::from_path("hd0.hdf")),
@@ -1752,6 +1753,14 @@ fn chipset_video_standard_parses() -> Result<()> {
             "#,
     )?;
     assert_eq!(cfg.video_standard, VideoStandard::Ntsc);
+    assert!(!cfg.genlock, "no genlock unless configured");
+    Ok(())
+}
+
+#[test]
+fn chipset_genlock_parses() -> Result<()> {
+    let cfg = parse_config("[chipset]\ngenlock = true\n")?;
+    assert!(cfg.genlock);
     Ok(())
 }
 
@@ -4942,6 +4951,22 @@ fn bad_floppy_size_fails_cleanly() -> Result<()> {
     .unwrap_err();
     let _ = fs::remove_file(&path);
     assert!(err.to_string().contains("expected 901120 bytes"), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn high_density_floppy_size_is_accepted() -> Result<()> {
+    let path = temp_path("hd.adf");
+    fs::write(&path, vec![0u8; crate::floppy::HD_ADF_SIZE])?;
+    let cfg = parse_config(&format!(
+        r#"
+            [floppy.df0]
+            path = "{}"
+            "#,
+        toml_path(&path)
+    ));
+    let _ = fs::remove_file(&path);
+    cfg?;
     Ok(())
 }
 

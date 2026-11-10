@@ -874,12 +874,24 @@ pub struct GifCaptureSpec {
     pub path: PathBuf,
 }
 
+/// What a scheduled floppy media change does to its drive.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DiskInsertSpec {
+pub enum DiskChange {
+    /// `--insert-disk-after` / `--defer-disk-insert`: mount `path`.
+    Insert {
+        path: PathBuf,
+        write_protected: bool,
+    },
+    /// `--eject-disk-after`: take the disk out and leave the drive empty.
+    Eject,
+}
+
+/// A floppy media change scheduled at `secs` emulated seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskChangeSpec {
     pub secs: f32,
     pub drive_idx: usize,
-    pub path: PathBuf,
-    pub write_protected: bool,
+    pub change: DiskChange,
 }
 
 use anyhow::{anyhow, Context, Result};
@@ -1309,8 +1321,8 @@ pub struct App {
     /// Scheduled analogue pot positions from --pot-after (one-shot each).
     auto_pots: Vec<(f64, u8, u8, u8)>,
     pending_auto_pots: Vec<(f32, u8, u8, u8)>,
-    auto_disk_inserts: Vec<ScheduledDiskInsert>,
-    pending_auto_disk_inserts: Vec<DiskInsertSpec>,
+    auto_disk_changes: Vec<ScheduledDiskChange>,
+    pending_auto_disk_changes: Vec<DiskChangeSpec>,
     /// Scheduled CD swaps from --insert-cd-after (one-shot each);
     /// (at_emulated_secs, image path).
     auto_cd_inserts: Vec<(f64, PathBuf)>,
@@ -1494,6 +1506,15 @@ pub struct App {
     /// wants done with the answer. Only macOS ever has one (see
     /// `native_dialog`); the machine is held while it is there.
     pending_pick: Option<native_dialog::PendingPick>,
+    /// Where each kind of file picker was last answered, so the next one
+    /// of that kind opens there rather than back at its starting folder.
+    picked_dirs: native_dialog::PickedDirs,
+    /// The configuration file the configuration screen's Save writes to:
+    /// the one last loaded or saved there this session. Kept here rather
+    /// than in the screen's own state, which is rebuilt every time it
+    /// opens, so a machine run from a loaded file can be saved back to it
+    /// after it has been running a while.
+    config_file: Option<PathBuf>,
     /// Per-drive disk-swap playlists: the ordered image paths the user can
     /// cycle through for each drive with the disk-swap shortcut. Lets a
     /// multi-disk demo run on a single drive.
@@ -1709,6 +1730,12 @@ pub struct App {
     title_rom_hint: Option<(crate::config::RomId, String)>,
     #[cfg(target_os = "macos")]
     macos_about_wake: Option<winit::event_loop::EventLoopProxy<()>>,
+    #[cfg(target_os = "macos")]
+    macos_documents: Option<macos_documents::Handler>,
+    #[cfg(target_os = "macos")]
+    initial_document_launcher: bool,
+    #[cfg(target_os = "macos")]
+    document_opening_enabled: bool,
     /// The About panel's update check, for the session: not asked until
     /// its button is pressed.
     #[cfg(feature = "update-check")]
@@ -1810,11 +1837,10 @@ struct ScheduledJoy {
 }
 
 #[derive(Debug, Clone)]
-struct ScheduledDiskInsert {
-    insert_at_emulated_secs: f64,
+struct ScheduledDiskChange {
+    change_at_emulated_secs: f64,
     drive_idx: usize,
-    path: PathBuf,
-    write_protected: bool,
+    change: DiskChange,
 }
 
 #[derive(Debug, Clone)]
@@ -2058,15 +2084,25 @@ struct CrtPresent {
 
 /// Draw one frame through the GPU passes and present it. The present
 /// worker runs this for the normal display; the main thread runs it for a
-/// frame that carries something only it has (the RTG texture upload, the
-/// inspector's egui paint through `after`). `notify` is the window whose
+/// frame that carries something only it has (the RTG board frame in
+/// `rtg_frame`, as `(pixels, width, height)`, or the inspector's egui
+/// paint through `after`). `notify` is the window whose
 /// `pre_present_notify` runs after the draw and before the present, as it
 /// always did; see `worker_notify_window` for why the worker passes None
 /// on macOS.
+///
+/// The frame's texture uploads run inside the render callback, after the
+/// surface has handed over a texture to draw into. A queue write is staged
+/// until the next submit, and a present the surface skips has none: macOS
+/// reports a covered, minimised or other-Space window as occluded, which
+/// `pixels` returns as `Ok(())` without submitting. An upload made before
+/// the acquire would leave one staged copy of the frame behind for every
+/// frame the window stays hidden.
 fn present_job(
     gpu: &mut Gpu,
     notify: Option<&Window>,
     job: &PresentJob,
+    rtg_frame: Option<(&[u32], u32, u32)>,
     mut after: Option<PresentAfter<'_>>,
     mut capture: Option<&mut output_capture::OutputCapture>,
 ) -> Result<(), pixels::Error> {
@@ -2088,100 +2124,108 @@ fn present_job(
         }
         dst.copy_from_slice(frame);
     }
-    if let Some(picture) = &job.picture {
-        scaler.upload_picture(
-            pixels.device(),
-            pixels.queue(),
-            &picture.fb,
-            picture.width,
-            picture.rows,
-        );
-    }
-    if let PresentPass::Rtg { ui, .. } = &job.pass {
-        rtg_texture.upload_ui(pixels.device(), pixels.queue(), ui);
-    }
-    let mut draw = |encoder: &mut wgpu::CommandEncoder,
-                    target: &wgpu::TextureView,
-                    ctx: &pixels::PixelsContext<'_>| {
-        scaler.render(
-            &ctx.device,
-            &ctx.queue,
-            &ctx.texture,
-            encoder,
-            target,
-            &job.draws,
-        );
-        match &job.pass {
-            PresentPass::Plain => {}
-            PresentPass::Rtg {
-                rect,
-                integer_scaling,
-                ui,
-                ui_viewport,
-            } => {
-                rtg_texture.render_composited(
-                    &ctx.queue,
-                    encoder,
-                    target,
-                    *ui_viewport,
-                    *rect,
-                    *integer_scaling,
-                    ui,
-                );
-            }
-            PresentPass::Crt(crt) => {
-                if crt.bezel_active {
-                    let opening = bezel::opening_rect(crt.style, crt.viewport);
-                    if crt.crt_active {
-                        crt_shader.render(
-                            &ctx.device,
-                            &ctx.queue,
-                            &ctx.texture,
-                            encoder,
-                            target,
-                            opening,
-                            crt.kind,
-                            crt.uniforms.with_viewport(opening),
-                        );
-                    }
-                    bezel_shader.render(
-                        &ctx.device,
-                        &ctx.queue,
-                        &ctx.texture,
-                        encoder,
-                        target,
-                        crt.viewport,
-                        crt.style,
-                        bezel::uniforms_from(&crt.uniforms, crt.viewport, opening, crt.crt_active),
-                    );
-                    sticker_pass.render(
-                        &ctx.device,
-                        &ctx.queue,
-                        encoder,
-                        target,
-                        crt.viewport,
-                        opening,
-                    );
-                } else {
-                    crt_shader.render(
-                        &ctx.device,
-                        &ctx.queue,
-                        &ctx.texture,
-                        encoder,
-                        target,
-                        crt.viewport,
-                        crt.kind,
-                        crt.uniforms,
-                    );
-                }
-            }
-        }
-    };
     presenter.render(
         pixels,
         notify,
         job.emulated_frame,
         |encoder, target, ctx| {
+            if let Some(picture) = &job.picture {
+                scaler.upload_picture(
+                    &ctx.device,
+                    &ctx.queue,
+                    &picture.fb,
+                    picture.width,
+                    picture.rows,
+                );
+            }
+            if let Some((board, width, height)) = rtg_frame {
+                rtg_texture.upload(&ctx.device, &ctx.queue, board, width, height);
+            }
+            if let PresentPass::Rtg { ui, .. } = &job.pass {
+                rtg_texture.upload_ui(&ctx.device, &ctx.queue, ui);
+            }
+            let mut draw = |encoder: &mut wgpu::CommandEncoder,
+                            target: &wgpu::TextureView,
+                            ctx: &pixels::PixelsContext<'_>| {
+                scaler.render(
+                    &ctx.device,
+                    &ctx.queue,
+                    &ctx.texture,
+                    encoder,
+                    target,
+                    &job.draws,
+                );
+                match &job.pass {
+                    PresentPass::Plain => {}
+                    PresentPass::Rtg {
+                        rect,
+                        integer_scaling,
+                        ui,
+                        ui_viewport,
+                    } => {
+                        rtg_texture.render_composited(
+                            &ctx.queue,
+                            encoder,
+                            target,
+                            *ui_viewport,
+                            *rect,
+                            *integer_scaling,
+                            ui,
+                        );
+                    }
+                    PresentPass::Crt(crt) => {
+                        if crt.bezel_active {
+                            let opening = bezel::opening_rect(crt.style, crt.viewport);
+                            if crt.crt_active {
+                                crt_shader.render(
+                                    &ctx.device,
+                                    &ctx.queue,
+                                    &ctx.texture,
+                                    encoder,
+                                    target,
+                                    opening,
+                                    crt.kind,
+                                    crt.uniforms.with_viewport(opening),
+                                );
+                            }
+                            bezel_shader.render(
+                                &ctx.device,
+                                &ctx.queue,
+                                &ctx.texture,
+                                encoder,
+                                target,
+                                crt.viewport,
+                                crt.style,
+                                bezel::uniforms_from(
+                                    &crt.uniforms,
+                                    crt.viewport,
+                                    opening,
+                                    crt.crt_active,
+                                ),
+                            );
+                            sticker_pass.render(
+                                &ctx.device,
+                                &ctx.queue,
+                                encoder,
+                                target,
+                                crt.viewport,
+                                opening,
+                            );
+                        } else {
+                            crt_shader.render(
+                                &ctx.device,
+                                &ctx.queue,
+                                &ctx.texture,
+                                encoder,
+                                target,
+                                crt.viewport,
+                                crt.kind,
+                                crt.uniforms,
+                            );
+                        }
+                    }
+                }
+            };
             draw(encoder, target, ctx);
             if let Some(capture) = capture.as_mut() {
                 draw(encoder, &capture.view(), ctx);
@@ -2278,7 +2322,8 @@ impl PresentWorker {
                             if let Some(gpu) = held.as_mut() {
                                 if worker_surface_current(job.surface, worker_live_size(&window)) {
                                     let notify = worker_notify_window(&window);
-                                    if let Err(e) = present_job(gpu, notify, &job, None, None) {
+                                    if let Err(e) = present_job(gpu, notify, &job, None, None, None)
+                                    {
                                         log_present_error(&e);
                                     }
                                 }
@@ -2774,7 +2819,7 @@ impl App {
         mouse_to_after: Vec<(f32, i32, i32, u8)>,
         pot_after: Vec<(f32, u8, u8, u8)>,
         pen_after: Vec<(f32, i32, i32, Option<u8>)>,
-        disk_insert_after: Vec<DiskInsertSpec>,
+        disk_change_after: Vec<DiskChangeSpec>,
         cd_insert_after: Vec<(f32, PathBuf)>,
         freeze_after: Vec<f32>,
         record_input: Option<PathBuf>,
@@ -2975,8 +3020,8 @@ impl App {
             active_mouse_to: None,
             auto_pots: Vec::new(),
             pending_auto_pots: pot_after,
-            auto_disk_inserts: Vec::new(),
-            pending_auto_disk_inserts: disk_insert_after,
+            auto_disk_changes: Vec::new(),
+            pending_auto_disk_changes: disk_change_after,
             auto_cd_inserts: Vec::new(),
             pending_auto_cd_inserts: cd_insert_after,
             auto_freezes: Vec::new(),
@@ -3038,6 +3083,8 @@ impl App {
             whdload_job: None,
             image_job: None,
             pending_pick: None,
+            picked_dirs: Default::default(),
+            config_file: None,
             disk_playlists,
             disk_write_protected,
             disk_playlist_index: [0; 4],
@@ -3118,6 +3165,12 @@ impl App {
             title_rom_hint,
             #[cfg(target_os = "macos")]
             macos_about_wake: None,
+            #[cfg(target_os = "macos")]
+            macos_documents: None,
+            #[cfg(target_os = "macos")]
+            initial_document_launcher: false,
+            #[cfg(target_os = "macos")]
+            document_opening_enabled: false,
             #[cfg(feature = "update-check")]
             update_check: app_update::UpdateCheck::Idle,
             machine_config,
@@ -3953,6 +4006,10 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             app.macos_about_wake = Some(event_loop.create_proxy());
+            if app.document_opening_enabled {
+                app.macos_documents =
+                    Some(macos_documents::Handler::install(event_loop.create_proxy()));
+            }
         }
         // Start the control server's socket threads with a wake that
         // kicks the loop out of ControlFlow::Wait, so a command arriving
@@ -4292,21 +4349,34 @@ impl App {
                 pressed: false,
             });
         }
-        for insert in self.pending_auto_disk_inserts.drain(..) {
-            let insert_at_emulated_secs = insert.secs.max(0.0) as f64;
-            info!(
-                "auto-disk armed: df{} insert {} at {:.1}s emulated time",
-                insert.drive_idx,
-                insert.path.display(),
-                insert.secs
-            );
-            self.auto_disk_inserts.push(ScheduledDiskInsert {
-                insert_at_emulated_secs,
-                drive_idx: insert.drive_idx,
-                path: insert.path,
-                write_protected: insert.write_protected,
+        for spec in self.pending_auto_disk_changes.drain(..) {
+            match &spec.change {
+                DiskChange::Insert { path, .. } => info!(
+                    "auto-disk armed: df{} insert {} at {:.1}s emulated time",
+                    spec.drive_idx,
+                    path.display(),
+                    spec.secs
+                ),
+                DiskChange::Eject => info!(
+                    "auto-disk armed: df{} eject at {:.1}s emulated time",
+                    spec.drive_idx, spec.secs
+                ),
+            }
+            self.auto_disk_changes.push(ScheduledDiskChange {
+                change_at_emulated_secs: spec.secs.max(0.0) as f64,
+                drive_idx: spec.drive_idx,
+                change: spec.change,
             });
         }
+        // Keep the queue in timestamp order: `fire_scheduled_events` takes
+        // due entries front to back (one per step under netplay), so an
+        // eject and a later insert apply in time order whatever order the
+        // flags came in. The sort is stable, so equal timestamps keep their
+        // command-line order.
+        self.auto_disk_changes.sort_by(|a, b| {
+            a.change_at_emulated_secs
+                .total_cmp(&b.change_at_emulated_secs)
+        });
         for (secs, path) in self.pending_auto_cd_inserts.drain(..) {
             info!(
                 "auto-cd armed: insert {} at {secs:.1}s emulated time",
@@ -4463,11 +4533,11 @@ impl App {
         for (_, x, y, port) in pen_sets {
             self.apply_scheduled_pen_target(x, y, port);
         }
-        let mut disk_inserts = Vec::new();
+        let mut disk_changes = Vec::new();
         let mut disk_change_available = self.netplay.as_ref().is_none_or(|s| s.can_change_disk());
-        self.auto_disk_inserts.retain(|insert| {
-            if disk_change_available && emu_secs >= insert.insert_at_emulated_secs {
-                disk_inserts.push(insert.clone());
+        self.auto_disk_changes.retain(|change| {
+            if disk_change_available && emu_secs >= change.change_at_emulated_secs {
+                disk_changes.push(change.clone());
                 if self.netplay.is_some() {
                     disk_change_available = false;
                 }
@@ -4476,8 +4546,16 @@ impl App {
                 true
             }
         });
-        for insert in disk_inserts {
-            self.insert_disk_image(insert.drive_idx, insert.path, insert.write_protected);
+        for scheduled in disk_changes {
+            match scheduled.change {
+                DiskChange::Insert {
+                    path,
+                    write_protected,
+                } => {
+                    self.insert_disk_image(scheduled.drive_idx, path, write_protected);
+                }
+                DiskChange::Eject => self.eject_drive_disk(scheduled.drive_idx),
+            }
         }
         // Fire any scheduled --insert-cd-after swaps (one-shot each).
         let mut cd_inserts = Vec::new();
@@ -4879,6 +4957,13 @@ impl ApplicationHandler for App {
         }
         if self.route_debug_workspace_event(&event) {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }
+        ) {
+            self.initial_document_launcher = false;
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -5795,18 +5880,6 @@ impl ApplicationHandler for App {
                         } else {
                             None
                         };
-                        if let (Some((w, h)), Some(gpu)) = (
-                            self.rtg_present_dims.filter(|_| rtg_gpu),
-                            gpu_home.as_deref_mut(),
-                        ) {
-                            gpu.rtg_texture.upload(
-                                gpu.pixels.device(),
-                                gpu.pixels.queue(),
-                                &self.rtg_fb,
-                                w,
-                                h,
-                            );
-                        }
                         let Some(frame) = worker_frame
                             .as_deref_mut()
                             .or_else(|| gpu_home.as_deref_mut().map(|gpu| gpu.pixels.frame_mut()))
@@ -6209,6 +6282,12 @@ impl ApplicationHandler for App {
                                         )
                                     })
                                     .transpose();
+                                // The board frame goes up with the frame, once
+                                // the surface is acquired (see present_job).
+                                let rtg_frame = self
+                                    .rtg_present_dims
+                                    .filter(|_| rtg_gpu)
+                                    .map(|(w, h)| (self.rtg_fb.as_slice(), w, h));
                                 // A frame presented here can block the main
                                 // thread on vsync; the fastest-mode governor
                                 // must not mistake that for frontend load.
@@ -6218,10 +6297,18 @@ impl ApplicationHandler for App {
                                         gpu,
                                         Some(&window),
                                         &job,
+                                        rtg_frame,
                                         after,
                                         capture.as_mut(),
                                     ),
-                                    Err(_) => present_job(gpu, Some(&window), &job, after, None),
+                                    Err(_) => present_job(
+                                        gpu,
+                                        Some(&window),
+                                        &job,
+                                        rtg_frame,
+                                        after,
+                                        None,
+                                    ),
                                 };
                                 self.emu.note_frontend_wait(present_started.elapsed());
                                 if let Err(e) = &result {
@@ -6307,6 +6394,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if self.open_macos_documents() && self.initial_document_launcher {
+            event_loop.exit();
+            return;
+        }
         #[cfg(target_os = "macos")]
         if macos_about::take_request() {
             self.suspend_mouse_capture_for_ui();
@@ -6816,76 +6908,13 @@ fn display_file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// What a file dropped on the window should be treated as. Extensions route
-/// most files; ZIP member names distinguish WHDLoad packages from floppy
-/// images, and CHD metadata distinguishes CDs from hard disks. The floppy
-/// insert path itself sniffs and validates the image content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DroppedMediaKind {
-    /// Anything the floppy loader may accept (floppy::IMAGE_EXTENSIONS and
-    /// unknown extensions): FloppyImage::from_bytes sniffs the content and
-    /// rejects what it cannot read, surfacing a clean OSD failure.
-    Floppy,
-    /// A CD image (cue sheet, bare ISO, Nero NRG, or CD-ROM CHD) for the
-    /// CD drive.
-    Cd,
-    /// Hard disk images cannot be hot-attached; point at the config screen.
-    HardDisk,
-    /// Kickstart ROMs load from the config screen, not at runtime.
-    Rom,
-    /// A WHDLoad game package, or a .slave inside an extracted one:
-    /// something to boot into (src/whdload.rs), not media to insert.
-    WhdloadGame,
-}
+use crate::media::{whdload_game_path as whdload_game_config_path, MediaKind as DroppedMediaKind};
 
 fn classify_dropped_media(path: &std::path::Path) -> DroppedMediaKind {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("chd") if crate::harddrive::chd::is_hard_disk_chd(path) => DroppedMediaKind::HardDisk,
-        Some("cue") | Some("iso") | Some("nrg") | Some("chd") => DroppedMediaKind::Cd,
-        Some("hdf") | Some("hdz") | Some("vhd") | Some("img") => DroppedMediaKind::HardDisk,
-        Some("rom") => DroppedMediaKind::Rom,
-        Some("zip") => {
-            // WHDLoad packages may themselves contain disk images, so a
-            // slave takes precedence. Listing filters macOS metadata and
-            // does not decompress the archive's payloads.
-            let has_slave = crate::package::list(path).is_ok_and(|members| {
-                members
-                    .iter()
-                    .any(|member| crate::package::is_slave_name(&member.to_string_lossy()))
-            });
-            if has_slave {
-                DroppedMediaKind::WhdloadGame
-            } else {
-                DroppedMediaKind::Floppy
-            }
-        }
-        Some(ext)
-            if crate::package::EXTENSIONS.contains(&ext)
-                || crate::package::SLAVE_EXTENSIONS.contains(&ext) =>
-        {
-            DroppedMediaKind::WhdloadGame
-        }
-        _ => DroppedMediaKind::Floppy,
+    match crate::media::classify(path) {
+        DroppedMediaKind::Unknown => DroppedMediaKind::Floppy,
+        kind => kind,
     }
-}
-
-/// A WHDLoad game path as the configuration stores it. Picking or dropping a
-/// bare `.slave` means its directory (an already-extracted package), which is
-/// what `whdload::prepare` mounts; an `.lha` archive or a directory is taken
-/// as given.
-fn whdload_game_config_path(path: PathBuf) -> PathBuf {
-    let is_slave = path
-        .file_name()
-        .is_some_and(|name| crate::package::is_slave_name(&name.to_string_lossy()));
-    if is_slave {
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            return dir.to_path_buf();
-        }
-    }
-    path
 }
 
 /// Shorten any filesystem path in a status message so its file name stays
@@ -8156,12 +8185,17 @@ impl App {
                     state.tab = state.setup.settle_tab(state.tab);
                     state.setup.refresh_host_devices();
                     state.status = Some(StatusMessage::ok("Reset to defaults"));
+                    // What is on the screen no longer came from the file
+                    // last loaded, so Save must not quietly write a fresh
+                    // machine over it: it asks where, as Save As does.
+                    self.set_config_file(None);
                 }
             }
             UiControl::LauncherBrowse(field) => self.launcher_browse(field),
             UiControl::LauncherZorroAdd => self.launcher_add_zorro(),
             UiControl::LauncherLoad => self.launcher_load(),
             UiControl::LauncherSave => self.launcher_toggle_save_dialog(),
+            UiControl::LauncherSaveCurrent => self.launcher_save_current(),
             UiControl::LauncherSaveAs => self.launcher_save(),
             UiControl::LauncherSaveDefault => self.launcher_save_default(),
             UiControl::LauncherResetDefault => self.launcher_reset_default(),
@@ -8215,7 +8249,7 @@ mod app_states;
 #[cfg(feature = "update-check")]
 mod app_update;
 use app_nav::{cycle_hold_delay, PadNav};
-use native_dialog::PickRequest;
+use native_dialog::{PickDir, PickRequest};
 mod adapter;
 mod app_panels;
 mod app_session;
@@ -8233,6 +8267,8 @@ mod host_input;
 mod kbdpanel;
 #[cfg(target_os = "macos")]
 mod macos_about;
+#[cfg(target_os = "macos")]
+mod macos_documents;
 mod monitors;
 #[cfg(feature = "mt32")]
 mod mt32panel;
@@ -8246,6 +8282,8 @@ mod rtg_ui;
 mod scaler;
 pub(in crate::video) mod statusbar;
 mod stickers;
+#[cfg(unix)]
+mod terminal;
 mod title;
 pub(super) use present::{scale_rect, texture_height, texture_width, Rect};
 pub(super) use statusbar::{draw_rect_bevel, fill_rect, fill_rect_blend};

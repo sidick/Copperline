@@ -1,6 +1,6 @@
 [package]
 name = "copperline"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.95"
 license = "GPL-3.0-or-later"
@@ -13,6 +13,38 @@ publish = false
 # `cargo run` should keep launching the emulator now that the headless
 # `copperline-bench` bin target exists.
 default-run = "copperline"
+
+# The emulator and the frontends that build on it by path (browser,
+# libretro, publisher-kit player) form one workspace: one Cargo.lock, one
+# target directory, and this manifest's [patch] and [profile] sections for
+# all of them. A plain `cargo build` or `cargo test` here still builds only
+# the emulator; reach a frontend with `-p` or by running Cargo from its
+# directory. The excluded crates stay standalone with their own lockfiles:
+# the WASM board plugins (size-tuned panic=abort profiles, dependency trees
+# kept out of the emulator's), the cputest runner, the fuzz harnesses, and
+# the bezel preview tool. `.claude` and `target` are excluded because whole
+# checkouts can live there (agent worktrees, the performance gate's baseline
+# in target/performance-baseline): Cargo searches upward for a workspace
+# root, so without the exclusion a nested checkout of a revision that
+# predates this workspace would fail to build as an unlisted member. The
+# root package is a member implicitly; listing "." would claim every path
+# below it and override `exclude`.
+[workspace]
+members = [
+    "crates/copperline-libretro",
+    "crates/copperline-player",
+    "crates/copperline-web",
+]
+default-members = ["."]
+exclude = [
+    ".claude",
+    "crates/cputest-runner",
+    "crates/hostsocket-plugin",
+    "crates/zz9k-plugin",
+    "fuzz",
+    "target",
+    "tools/bezel-preview",
+]
 
 [features]
 default = [
@@ -155,7 +187,7 @@ bench-bin = []
 # over loopback TCP for driving the emulator from scripts and external tools
 # (`--control` headless, `--control-gui` windowed). Uses std::net + threads,
 # so browser builds (--no-default-features) compile it out.
-control = ["dep:base64"]
+control = ["dep:base64", "dep:getrandom"]
 # User-mode NAT backend for emulated NICs (`[a2065] net = "nat"`, src/net/nat/):
 # a slirp-style virtual gateway giving the guest outbound IPv4 with no host
 # privileges. Uses std::net + threads, so browser builds compile it out.
@@ -198,9 +230,10 @@ fluxbridge = ["dep:fluxbridge"]
 host-serial = ["dep:serialport"]
 
 [dependencies]
-# Batch boundaries and physical RAM/ROM regions pending upstream PRs #222/#223.
-# Keep the conformance runner on this same revision (tools/check-m68k-locks.py).
-m68k = { git = "https://github.com/CopperlineHQ/m68k-rs", rev = "fdcdbd20e44b464a6e6e1fd6a01e12aae77a5694", features = ["serde"] }
+# 0.15.0 is the floor: earlier releases have no AddressBus::batch_boundary
+# callback and no physical RAM/ROM regions beyond the primary fastmem window.
+# Keep the conformance runner on this same version (tools/check-m68k-locks.py).
+m68k = { version = "0.15.0", features = ["serde"] }
 # The MT-32 synthesiser engine: our own port of Munt, pinned by revision.
 mt32-rs = { git = "https://github.com/CopperlineHQ/mt32-rs", rev = "aa54c40c232a826f3d6f117ac8a0b165e7571f32", optional = true }
 # The General MIDI synthesiser (Coppersynth), pinned by revision.
@@ -241,6 +274,8 @@ env_logger = { version = "0.11", optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 base64 = { version = "0.23", optional = true }
+# OS randomness for control-server authentication tokens.
+getrandom = { version = "0.4", features = ["std"], optional = true }
 sha2 = { version = "0.11", default-features = false }
 # DWARF and ELF readers for the DAP adapter's debug-info module
 # (src/debuginfo/): line tables, functions, variable locations, and CFI
@@ -303,7 +338,7 @@ flate2 = "1"
 cpal = { version = "0.18", optional = true }
 # Kept unconditional (not `frontend`-gated) because the Windows MIDI backend
 # (src/midi/winmm.rs) also uses it; it is pure Rust and wasm-safe.
-ringbuf = "0.5"
+ringbuf = "0.6"
 hound = "3.5"
 rfd = { version = "0.17.2", optional = true }
 gilrs = { version = "0.11", optional = true }
@@ -320,7 +355,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # (with a migration or a documented refusal), not a routine update.
 # Track an LTS line (24.x, 36.x, 48.x, ...): those keep receiving security
 # backports, which the line this was previously pinned to (27.x) did not.
-wasmtime = { version = "=36.0.19", default-features = false, features = ["cranelift", "runtime"], optional = true }
+wasmtime = { version = "=36.0.20", default-features = false, features = ["cranelift", "runtime"], optional = true }
 # Non-blocking connect + cross-platform socket options for the `host_sockets`
 # wasm-plugin capability (src/wasmboard.rs): the host-socket backend for the
 # bundled HostSocket board (`[hostsocket] net = "host"`). Pure Rust wrapper
@@ -406,7 +441,7 @@ tempfile = { version = "3", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSMenu", "NSMenuItem"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSObject"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSObject", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSURL", "NSString", "objc2-core-services"] }
 pcap = { version = "2.4", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -495,6 +530,10 @@ syn = { version = "3", features = ["full", "visit"] }
 # Compile WAT to wasm bytes in the WASM-plugin-host tests, so golden test
 # plugins live as readable text in the tests rather than checked-in binaries.
 wat = "1"
+# Bind a client socket before it connects (no std API for that), so the
+# serial and modem TCP tests can hold a loopback port that refuses dials
+# (RefusingLoopbackPort in src/serial.rs).
+socket2 = "0.6"
 
 [patch.crates-io]
 # pixels 0.17.2's render_with retries a failed surface acquire in a loop with
@@ -503,8 +542,10 @@ wat = "1"
 # while the present worker holds a frame spins it forever rebuilding the
 # swapchain, and the main thread hangs waiting to reclaim the GPU side. This
 # revision is 0.17.2 plus upstream's bounded retry (parasyte/pixels#462) and
-# an examples-only clippy pass. crates/copperline-player and fuzz carry the
-# same patch. Remove all of them once a pixels release includes #462.
+# an examples-only clippy pass. A [patch] applies only at a workspace root:
+# the player crate is a member of this workspace and gets it from here, and
+# the fuzz workspace builds without the desktop frontend, so this is the
+# only copy. Remove it once a pixels release includes #462.
 pixels = { git = "https://github.com/parasyte/pixels", rev = "c681486feaaaf413b2db5c7b57d342677f0dfd87" }
 
 [lints.clippy]
@@ -530,6 +571,13 @@ opt-level = 3
 # rendering than thin LTO, and the resulting executable is smaller.
 lto = "fat"
 codegen-units = 1
+
+# The libretro core is a shared library: keep it unstripped. Cargo's
+# automatic debuginfo stripping can misalign Mach-O dylib LINKEDIT tables
+# rejected by macOS 27's loader (rust#157750). Profiles inheriting from
+# release (`ci` below) inherit this override.
+[profile.release.package.copperline-libretro]
+strip = "none"
 
 # CI needs optimized emulation, but linking every test executable with fat
 # LTO dominates build time. Keep release semantics (including disabled debug

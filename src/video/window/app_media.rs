@@ -5,6 +5,47 @@
 use super::*;
 
 impl App {
+    /// A Finder launch initially owns only an untouched configuration window.
+    /// Its first document replaces that bootstrap; later opens start separate
+    /// sessions, preserving the running guest and unsaved launcher edits.
+    #[cfg(target_os = "macos")]
+    pub fn enable_document_opening(&mut self, initial_launch: bool) {
+        self.document_opening_enabled = true;
+        self.initial_document_launcher = initial_launch;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn open_macos_documents(&mut self) -> bool {
+        let requests = self
+            .macos_documents
+            .as_ref()
+            .map(macos_documents::Handler::take_requests)
+            .unwrap_or_default();
+        let mut opened = false;
+        for files in requests {
+            let started = std::env::current_exe().and_then(|exe| {
+                std::process::Command::new(exe)
+                    .arg("--")
+                    .args(files)
+                    .spawn()
+            });
+            match started {
+                Ok(mut child) => {
+                    // Reap a session that exits while its parent remains open.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    opened = true;
+                }
+                Err(error) => {
+                    warn!("cannot open Finder documents: {error}");
+                    self.show_osd(format!("Cannot open documents: {error}"));
+                }
+            }
+        }
+        opened
+    }
+
     /// Pick one or more disk images for a drive. The selection replaces
     /// the drive's swap playlist; the first image is inserted right away
     /// and the rest are queued for the swap button / shortcut.
@@ -33,7 +74,8 @@ impl App {
         // freshly inserted disk. insert_disk_image -> bus floppy
         // insert_disk_image already asserts the disk-change/eject signal.
         let dialog = PickRequest::files(format!("Load DF{drive_idx} disk image(s)"))
-            .filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS);
+            .filter("Amiga disk images", crate::floppy::IMAGE_EXTENSIONS)
+            .remember(PickDir::Floppy);
         self.pick_paths(dialog, move |app, picked| {
             if let Some(paths) = picked {
                 app.insert_disk_playlist(drive_idx, paths);
@@ -110,13 +152,26 @@ impl App {
             }
             return;
         }
+        if !self.emu.bus().floppy.drive_connected(drive_idx) {
+            warn!("floppy.df{drive_idx} eject ignored: drive is not connected");
+            self.show_osd(format!("DF{drive_idx}: no drive"));
+            return;
+        }
         if !self.emu.bus().floppy.disk_inserted(drive_idx) {
+            warn!("floppy.df{drive_idx} eject ignored: no disk in the drive");
             self.show_osd(format!("DF{drive_idx}: no disk"));
             return;
         }
         match self.emu.bus_mut().floppy.eject_disk_image(drive_idx) {
             Ok(()) => {
+                self.last_fdd_track = None;
                 info!("floppy.df{drive_idx} ejected");
+                if let Some(rec) = self.input_recorder.as_mut() {
+                    rec.record_disk_eject(drive_idx, self.emu.bus().emulated_seconds());
+                }
+                // Reverse-debug: mark the media change, as for an insert.
+                self.emu
+                    .tt_note_input(crate::inputsched::ReplayAction::DiskChange);
                 self.show_osd(format!("DF{drive_idx}: ejected"));
                 self.request_redraw();
             }
@@ -128,8 +183,9 @@ impl App {
     /// ejecting any current disc first.
     pub(super) fn load_cd_from_dialog(&mut self) {
         // Pacing is re-baselined after the picker, as for floppies.
-        let dialog =
-            PickRequest::file("Load CD image").filter("CD images", &["cue", "iso", "nrg", "chd"]);
+        let dialog = PickRequest::file("Load CD image")
+            .filter("CD images", &["cue", "iso", "nrg", "chd"])
+            .remember(PickDir::Cd);
         self.pick_path(dialog, |app, picked| {
             if let Some(path) = picked {
                 app.insert_cd_image_from_path(&path);
@@ -164,7 +220,8 @@ impl App {
             return;
         }
         let dialog = PickRequest::file("Insert PCMCIA CF card image")
-            .filter("Hard-disk images", crate::harddrive::IMAGE_EXTENSIONS);
+            .filter("Hard-disk images", crate::harddrive::IMAGE_EXTENSIONS)
+            .remember(PickDir::HardDrive);
         self.pick_path(dialog, |app, picked| {
             let Some(path) = picked else { return };
             match crate::pcmcia::CfCard::open(&path) {
@@ -262,7 +319,7 @@ impl App {
         let mut notice: Option<&'static str> = None;
         for path in files {
             match classify_dropped_media(&path) {
-                DroppedMediaKind::Floppy => floppies.push(path),
+                DroppedMediaKind::Floppy | DroppedMediaKind::Unknown => floppies.push(path),
                 // One disc tray; the first CD image wins.
                 DroppedMediaKind::Cd => cd = cd.or(Some(path)),
                 // One machine to reboot; the first game wins.
@@ -272,6 +329,9 @@ impl App {
                 }
                 DroppedMediaKind::Rom => {
                     notice = Some("Kickstart ROMs are configured in the machine screen");
+                }
+                DroppedMediaKind::Config => {
+                    notice = Some("Load configurations in the machine screen");
                 }
             }
         }

@@ -9,16 +9,23 @@ Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and AGA) writte
 
 It boots out of the box with the bundled open-source AROS Kickstart replacement, and supports official Kickstart ROMs (1.x through 3.2, plus the CDTV and CD32 extended ROMs), DiagROM, and standard disk, hardfile, and CD media.
 
+The [manual](https://copperline.dev/docs/),
+[troubleshooting and known limits](docs/guide/troubleshooting.md), and
+[changelog](CHANGELOG.md) cover setup and upgrades. Match the manual's version
+label to **About**, which includes the revision for an untagged source build;
+`copperline --version` prints only the package version. Each release carries
+its own PDF manual.
+
 ## Features
 
 - **Chipset and machine models**: OCS, ECS, and AGA support with profiles from the A500 through the A4000, plus CDTV and CD32.
 - **Configurable CPU and memory**: Motorola 68000 through 68060, optional FPU and MMU support, and configurable Chip, Fast, and Slow RAM.
 - **Accelerated execution**: Optional 68020+ JIT, either at a fixed, reproducible clock or in a `fastest` mode that gives the CPU whatever host time the real-time chipset leaves. See [CPU configuration](docs/guide/configuration.md).
-- **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF, SCP, and ZIP-packed ADF), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
+- **Storage and media**: Floppy disk images (ADF, ADZ, DMS, IPF with deterministic weak-bit revolutions, SCP, and ZIP-packed ADF), physical floppy drives via Greaseweazle (FluxBridge), IDE (Gayle/A4000 and expansion boards), SCSI (A2091, A3000, A4091), virtual hard disks (`copperhf.device`), CD-ROM, and host directory mounts.
 - **Audio and video**: 4-channel Paula audio, RTG graphics cards (Picasso II/II+, Z3660), host MIDI in/out bridging, and built-in Roland MT-32 and General MIDI synthesis.
 - **Expansion and networking**: Zorro II/III autoconfig, A2065 Ethernet, host-backed bsdsocket.library, and sandboxed WebAssembly expansion plugins.
 - **Debugging**: CPU and chipset debugger, reverse stepping, live Kickstart/AROS symbols, frame and [instruction profiling](docs/debugger/profiling.md) with bounded sample buffering and overflow reporting, VCD waveforms, and source debugging through GDB or DAP. Both the native VS Code extension and the [Copperline fork of Bartman's extension](docs/debugger/vscode-bartman.md) are supported.
-- **Automation and replay**: [Save states](docs/guide/ui.md#save-states), [WinUAE state import](docs/guide/winuae-state.md), headless input scripts and captures, and a JSON-RPC control protocol. `copperline-ctl` also provides DAP (`--dap`) and MCP (`--mcp`) servers.
+- **Automation and replay**: [Save states](docs/guide/ui.md#save-states), [WinUAE state import](docs/guide/winuae-state.md), headless input scripts and captures, and a JSON-RPC control protocol. `copperline-ctl` also provides DAP (`--dap`) and MCP (`--mcp`) servers. GDB and TCP DAP listen on loopback unless `--allow-remote-debugging` is supplied; control tokens are handed off through an info file and kept out of logs.
 - **Freezer cartridge**: Action Replay-style cartridge support with bundled HRTMon (`--cartridge hrtmon`), allowing running software to be frozen into the monitor via the menu, a hotkey, headless `--freeze-after`, or the control protocol.
 - **Direct launching**: Boot directly into WHDLoad game packages (`--whdload`) or host-built Amiga executables (`--run`, including bare Kickstart 1.3), with a WinUAE-compatible `uaelib` trap allowing guest code to control warp speed, log debug messages, and register debug resources.
 - **WebAssembly build**: Run directly in modern web browsers at [copperline.dev/try](https://copperline.dev/try/).
@@ -30,8 +37,12 @@ It boots out of the box with the bundled open-source AROS Kickstart replacement,
 
 ```sh
 brew tap copperlinehq/copperline https://github.com/CopperlineHQ/Copperline
+brew trust copperlinehq/copperline
 brew install copperline
 ```
+
+Homebrew 7 and later load formulae only from taps you have trusted, which is
+what `brew trust` records; on an older Homebrew, leave that line out.
 
 To build from the latest development commit instead:
 
@@ -57,9 +68,10 @@ chmod +x Copperline-*.AppImage
 Download `Copperline-X.Y.Z-win-x64-setup.exe` or
 `Copperline-X.Y.Z-win-arm64-setup.exe` from the
 [releases page](https://github.com/CopperlineHQ/Copperline/releases), matching
-your PC's architecture. The installer needs no administrator rights and adds
-a Start menu shortcut. Run a newer installer to update; uninstall through
-Windows Settings. Your settings and saves are preserved.
+your PC's architecture. The installer installs for just you (no
+administrator rights) or for all users in Program Files, and adds a Start
+menu shortcut. Run a newer installer to update; uninstall through Windows
+Settings. Your settings and saves are preserved.
 
 Portable ZIPs remain available for both architectures; extract the whole
 archive and run `copperline.exe`. See the [Windows installation
@@ -114,9 +126,23 @@ To boot directly into a Kickstart ROM, configuration file, or floppy image:
 
 ```sh
 ./target/release/copperline path/to/kickstart.rom
-./target/release/copperline --config path/to/copperline.toml
-./target/release/copperline --model A1200 --fast 8M KICK31.ROM --insert-disk-after 0 df0 game.adf
+./target/release/copperline path/to/copperline.toml
+./target/release/copperline --model A1200 --fast 8M KICK31.ROM game.adf
+./target/release/copperline disk1.adf disk2.adf
+./target/release/copperline game.lha
 ```
+
+Positional files are classified like window drops: floppy images boot in DF0,
+multiple floppies form its swap playlist, and WHDLoad packages boot directly.
+CD images require a CD32/CDTV configuration. Desktop packages offer **Open with**;
+see [Opening files](docs/guide/getting-started.md#opening-files) for registration
+and supported formats.
+
+Long options also accept `--model=A1200` or `--config=machine.toml`.
+For options with several arguments, `=` supplies the first:
+`--screenshot-after=10 out.png`. `--help` writes to stdout, and mistyped
+option names suggest a close match. Desktop launches show fatal session
+errors in a native dialog; terminal and headless commands report to stderr.
 
 For a build pipeline, use `copperline --run build/hello --window-scale 2` to
 start at twice the normal window width and height. `--maximized` opens a
@@ -205,17 +231,41 @@ cd docs && myst build --html
 
 ## Testing
 
-Run the unit test suite:
+Every PR runs a curated 68020/030/040/060 instruction corpus and asset-free
+MMU/native-JIT regressions against the resolved `m68k` dependency. See
+[CPU conformance](crates/cputest-runner/README.md) for local commands and
+coverage limits; scheduled runs add full generated instruction sets.
+
+Run the unit suite and fast integration tests:
 
 ```sh
 cargo test
 ```
 
-Integration tests requiring local ROM and disk assets can be run with:
+Run the optimized native suite, including probe goldens and save-state checks:
 
 ```sh
-cargo test --release -- --ignored
+cargo test --profile ci --locked
 ```
+
+Slow tests are reported as ignored in debug builds. Select asset-backed tests
+explicitly once their required files are installed, for example:
+
+```sh
+cargo test --release --test image_regression kickstart_boot_screen -- --ignored
+```
+
+Selected image regressions fail if their assets are missing.
+
+Every PR also runs the [AROS performance gate](docs/internals/jit-performance.md#ci-aros-performance-gate):
+release builds of the candidate and a tracked baseline run on the same host,
+covering A500/A1200 core execution and rendering. A median slowdown over 10%
+fails the check; raw samples and build provenance are retained.
+
+`cargo test --test fuzz_regressions` replays retained parser inputs without
+nightly or external media. [Fuzzing instructions](fuzz/README.md) cover the
+nine libFuzzer targets, brief PR smoke runs, and daily sustained campaigns.
+WHDLoad archive reads and extraction have [decompression limits](docs/guide/whdload.md).
 
 See [`tests/README.md`](tests/README.md) for details on asset paths and test configuration.
 
@@ -233,7 +283,7 @@ See [CREDITS.md](CREDITS.md) for contributor and third-party software credits.
 - [AROS Research Operating System](https://www.aros.org/) (bundled boot ROM)
 - [DiagROM](https://www.diagrom.com/) by John "Chucky" Hertell
 - [HRTMon](https://github.com/wepl/hrtmon) by Alain Malek, Bert Jahn and contributors (bundled freezer-cartridge monitor, GPL-2.0-or-later)
-- [m68k](https://crates.io/crates/m68k) CPU core (temporarily pinned to the [CopperlineHQ fork](https://github.com/CopperlineHQ/m68k-rs) while the JIT extensions are reviewed upstream)
+- [m68k](https://crates.io/crates/m68k) CPU core
 - Toni Wilen (WinUAE developer), whose [blitter hardware observations](https://eab.abime.net/showpost.php?p=1426048) helped guide the One ROM A500 timing experiments.
 
 ## License

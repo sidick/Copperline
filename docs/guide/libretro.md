@@ -4,12 +4,12 @@ Copperline's libretro core runs Amiga floppy software, CD32 discs and WHDLoad
 packages in RetroArch and other libretro frontends. It includes AROS boot ROMs
 and uses the desktop emulator's CPU, chipset, renderer and audio mixer.
 
-Supported content includes standard 880 KiB ADFs, ISO/CUE/CHD/NRG CD images,
-M3U playlists, and WHDLoad LHA/LZH/ZIP packages. CUE audio tracks can be
-BINARY or WAVE; this build does not enable MP3 track decoding. PAL and NTSC
-are available. The core does not accept extended ADFs, 1760 KiB
-high-density ADFs (Copperline's floppy drives are double-density only),
-arbitrary hardfiles or desktop configuration files.
+Supported content includes standard ADFs (880 KiB double-density and
+1760 KiB high-density), ISO/CUE/CHD/NRG CD images, M3U playlists, and
+WHDLoad LHA/LZH/ZIP packages. CUE audio tracks can be BINARY or WAVE;
+this build does not enable MP3 track decoding. PAL and NTSC are
+available. The core does not accept extended ADFs, arbitrary hardfiles
+or desktop configuration files.
 
 ## Build and install
 
@@ -23,7 +23,8 @@ from the repository root:
 cargo build --manifest-path crates/copperline-libretro/Cargo.toml --release --locked
 ```
 
-The output is under `crates/copperline-libretro/target/release/`:
+The output is under `target/release/` (the libretro core shares the
+repository's Cargo workspace and target directory):
 
 | Platform | Build output | Installed core filename |
 |---|---|---|
@@ -324,9 +325,9 @@ field history or phosphor effects. Frontend shaders can be applied normally.
 
 ```sh
 cargo fmt --manifest-path crates/copperline-libretro/Cargo.toml --check
-cargo clippy --manifest-path crates/copperline-libretro/Cargo.toml --all-targets --locked -- -D warnings
+cargo clippy --manifest-path crates/copperline-libretro/Cargo.toml --all-targets --locked --no-deps -- -D warnings
 cargo test --manifest-path crates/copperline-libretro/Cargo.toml --profile ci --locked
-python3 tools/check-libretro.py crates/copperline-libretro/target/release/libcopperline_libretro.dylib --screenshot /tmp/libretro.png
+python3 tools/check-libretro.py target/release/libcopperline_libretro.dylib --screenshot /tmp/libretro.png
 ```
 
 Use the matching library suffix on Linux or Windows. The Rust test frontend

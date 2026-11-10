@@ -28,8 +28,12 @@ The repository doubles as a Homebrew tap:
 
 ```sh
 brew tap copperlinehq/copperline https://github.com/CopperlineHQ/Copperline
+brew trust copperlinehq/copperline
 brew install copperline
 ```
+
+Homebrew 7 and later load formulae only from taps you have trusted, which is
+what `brew trust` records; on an older Homebrew, leave that line out.
 
 To build directly from the latest development commit:
 
@@ -76,21 +80,38 @@ For virtual machines or older hardware, install the software Vulkan driver (lava
 Download `Copperline-X.Y.Z-win-x64-setup.exe` or
 `Copperline-X.Y.Z-win-arm64-setup.exe`
 from the [releases page](https://github.com/CopperlineHQ/Copperline/releases),
-matching your Windows architecture. The installer puts Copperline, its
-command-line tools and bundled ROMs in
-`%LOCALAPPDATA%\Programs\Copperline` by default, without administrator rights.
-It creates a Start menu shortcut and offers an optional desktop shortcut.
-Start Copperline from either shortcut.
+matching your Windows architecture. The installer first asks who Copperline
+is for:
 
-Run a newer installer to update the same installation. Remove it through
+- **Install for me only** (recommended) needs no administrator rights and
+  puts Copperline, its command-line tools and bundled ROMs in
+  `%LOCALAPPDATA%\Programs\Copperline`.
+- **Install for all users** asks for administrator rights and installs into
+  `C:\Program Files\Copperline`, with shortcuts for every account on the PC.
+
+Either way it creates a Start menu shortcut and offers an optional desktop
+shortcut. Start Copperline from either shortcut. Each user's settings and
+saves stay in their own Documents folder, whichever you choose. For an
+unattended install, pass `/CURRENTUSER` or `/ALLUSERS` to the setup program
+to answer the question in advance.
+
+Run a newer installer to update the same installation; it remembers the
+earlier choice and does not ask again. To switch between a per-user and an
+all-users installation, uninstall the existing one first. Remove it through
 **Settings -> Apps** (**Installed apps** on Windows 11, **Apps & features**
 on Windows 10); uninstalling removes the shipped program files and shortcuts
 while preserving your settings, saves and any media you added. By default,
 user data is in
 `%USERPROFILE%\Documents\Copperline`; see [portable data](ui.md#where-files-go).
 
-The installer and executables are unsigned, so Windows SmartScreen may show
-**Windows protected your PC**. Choose **More info -> Run anyway** to proceed.
+The installer and executables are code-signed, and Windows names **SignPath
+Foundation** as their publisher: free code signing provided by
+[SignPath.io](https://signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/). See the
+[code signing policy](https://copperline.dev/code-signing/). SmartScreen
+also weighs how widely a download has been seen, so shortly after a release
+it may still show **Windows protected your PC**. **More info** shows the
+publisher; **Run anyway** proceeds.
 
 For a portable installation, download `Copperline-X.Y.Z-win-x64.zip` or
 `Copperline-X.Y.Z-win-arm64.zip`. Extract the whole archive and run
@@ -121,7 +142,7 @@ converter](import-uae.md). Where they land depends on the package:
 |---|---|
 | Homebrew | On PATH, next to `copperline`. |
 | macOS dmg | Inside the bundle, `Copperline.app/Contents/MacOS/`. Add that directory to PATH or name the files in the VS Code settings. |
-| Windows installer or ZIP | Next to `copperline.exe`, normally in `%LOCALAPPDATA%\Programs\Copperline` for the installer or in the extracted ZIP folder. Add that folder to PATH or name the `.exe` files in the VS Code settings. |
+| Windows installer or ZIP | Next to `copperline.exe`: `%LOCALAPPDATA%\Programs\Copperline` for a per-user install, `C:\Program Files\Copperline` for an all-users install, or the extracted ZIP folder. Add that folder to PATH or name the `.exe` files in the VS Code settings. |
 | AppImage | The separate `Copperline-X.Y.Z-<arch>-tools.tar.gz` release asset. Unpack it anywhere; set `COPPERLINE_BIN` to the AppImage path so `copperline-ctl` can launch the emulator. |
 
 `copperline-ctl` launches the `copperline` beside it when one is there; the
@@ -187,7 +208,9 @@ cargo test --release -- --ignored   # Integration tests (requires local test med
 The ignored integration tests in `tests/` need Kickstart ROMs and disk images
 that are not part of the repository. They look for them in the directory
 named by `COPPERLINE_TEST_ASSETS`, then in `test-assets/` at the repository
-root, and pass without running when their assets are absent.
+root. Selected `image_regression` tests fail when their assets are absent;
+some older asset-backed suites still pass without running, so check their
+missing-asset diagnostics.
 [`tests/README.md`](https://github.com/CopperlineHQ/Copperline/blob/main/tests/README.md)
 lists what each test needs.
 
@@ -200,8 +223,10 @@ a build report to `target/cargo-timings/cargo-timing.html`.
 
 The golden renders live in `timing-test/golden/`. A hardware-model change
 that alters them on purpose is re-blessed with
-`COPPERLINE_BLESS_GOLDEN=1 cargo test --release --test probe_golden`, and the
-render differences are reviewed as part of the change.
+`COPPERLINE_BLESS_GOLDEN=ddfprobe cargo test --release --test probe_golden golden_ddfprobe -- --exact`
+(replace both names for the probe being updated). Only that reference is
+replaced; review the render difference as part of the change. Debug builds
+report slow optimized-only suites as ignored.
 
 ## First boot
 
@@ -269,6 +294,70 @@ Supported floppy formats include ADF, ADZ (gzip-compressed ADF), single-file ZIP
 DMS, extended ADF, IPF, and SCP. In interactive sessions, disk images can also
 be inserted via drag-and-drop into the emulator window.
 
+(opening-files)=
+## Opening files
+
+Copperline accepts files after its options, with the same media classification
+used for window drops:
+
+```sh
+copperline --factory disk1.adf disk2.adf
+copperline --model A1200 --fast 8M KICK31.ROM game.adf
+copperline machine.toml
+copperline game.lha
+copperline --model CD32 disc.cue
+```
+
+| File | Startup action |
+| --- | --- |
+| ADF, ADZ, DMS, IPF, SCP, `.adf.gz`, floppy ZIP | First image in DF0; further images join its swap playlist |
+| `.lha`, `.lzh`, a ZIP containing a WHDLoad slave, `.slave`/`.slav`, extracted game directory | Direct WHDLoad boot, with the same support archives and Kickstart requirements as `--whdload` |
+| `.cue`, `.iso`, `.nrg`, CD CHD | Disc in the selected CD32/CDTV machine's built-in drive |
+| `.toml` | Configuration, equivalent to `--config FILE` |
+| `.rom` or an otherwise unrecognized filename | ROM override; `.bin` and extensionless ROM paths remain supported |
+
+One ROM and one configuration may accompany floppy or CD media. CLI machine
+options override the named configuration regardless of argument order.
+Positional floppy images replace DF0's configured image playlist while retaining
+its write-protection and wiring. Positional floppy/CD media also overrides a
+remembered `[whdload] game` for this session. A missing DF0 or native CD drive is an error;
+Copperline does not infer a machine model from a disk. A CD32/CDTV profile needs
+an explicitly enabled floppy drive (for example `--floppy-drives 1`) for floppy
+media, and `[floppy.df0] enabled = false` is reported instead of starting empty. Hard-disk images need
+controller and boot settings in a configuration file. SCSI/ATAPI CD drives
+likewise remain configuration-file attachments.
+
+Multiple configurations, ROMs, WHDLoad games or CDs are errors. Positional disk
+images cannot accompany `--run`, a WHDLoad boot, `--load-state` or `--load-uss`.
+Use `--` before filenames that begin with `--`. ZIPs containing a slave select
+WHDLoad even if they also contain disk images; macOS metadata files are ignored.
+
+The Windows installer registers **Open with** choices for Amiga media and TOML
+configurations for the selected user/all-users installation. Uninstall removes
+Copperline's entries and preserves other applications' defaults. Portable ZIPs
+do not change file associations.
+
+The macOS application advertises the same file types in Finder. **Open with →
+Copperline** uses the positional-file startup path. Opening another document
+starts a separate session, preserving an existing guest or edited launcher.
+An untouched startup window closes when it hands the initial document to its
+session. New sessions use the usual default configuration unless opening a TOML
+file. Generic archive and disc defaults are left to the user's chosen app.
+
+For a Linux AppImage, the companion tools archive includes
+`copperline-desktop-setup`. Install Python 3, `shared-mime-info`,
+`desktop-file-utils` and `xdg-utils`, then register its current location:
+
+```sh
+./copperline-desktop-setup install /absolute/path/to/Copperline.AppImage
+./copperline-desktop-setup uninstall
+```
+
+Registration is per-user in `$XDG_DATA_HOME` (normally `~/.local/share`) and adds
+menu and **Open with** entries without changing default applications. Repeat
+`install` after moving or renaming the AppImage. Adding metadata inside an
+AppImage alone does not install it into the host desktop's MIME database.
+
 ## Example configuration
 
 A fully commented example configuration is available in `copperline.example.toml`
@@ -277,6 +366,9 @@ in the root of the repository. Copy it to `copperline.toml` or pass it via `--co
 ```sh
 ./target/release/copperline --config copperline.example.toml
 ```
+
+For configuration errors, failed boots, save-state compatibility and hardware
+limits, start with [Troubleshooting and known limits](troubleshooting.md).
 
 ## Logging and crash reports
 

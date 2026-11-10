@@ -3,13 +3,17 @@
 //! Command-line argument parsing for the Copperline binary: the flag
 //! grammar, `--script` file expansion, and the parsed `CliArgs` shape.
 
-use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
+
+use anyhow::{anyhow, bail, Result};
+
+mod tokens;
+use tokens::Arguments;
 
 use copperline::config::ConfigOverrides;
 use copperline::expect::{ExpectShotSpec, Tolerance};
 use copperline::video::window::{
-    parse_amiga_key, DiskInsertSpec, FrameDumpSpec, KeyPressSpec, DEFAULT_KEY_HOLD_MS,
+    parse_amiga_key, DiskChange, DiskChangeSpec, FrameDumpSpec, KeyPressSpec, DEFAULT_KEY_HOLD_MS,
 };
 use copperline::video::HOST_SHORTCUT_MODIFIER_LABEL;
 
@@ -20,6 +24,10 @@ pub struct CliArgs {
     pub netplay_spectator_invitation_out: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub rom_path: Option<PathBuf>,
+    /// Positional floppy images: first in DF0, the rest in its swap playlist.
+    pub boot_floppies: Vec<PathBuf>,
+    /// Positional CD image for the configured CD32/CDTV drive.
+    pub boot_cd: Option<PathBuf>,
     /// `--whdload GAME`: stage a WHDLoad package (.lha archive or
     /// directory) and boot straight into it (src/whdload.rs).
     pub whdload: Option<PathBuf>,
@@ -96,6 +104,8 @@ pub struct CliArgs {
     /// `--control-gui` attaches the control server.
     pub gdb_gui: Option<String>,
     pub gdb_dialect: Option<String>,
+    /// Explicit opt-in for unauthenticated GDB listeners outside loopback.
+    pub allow_remote_debugging: bool,
     /// `--control ADDR`: run the headless Copperline Control Protocol
     /// server (JSON-RPC over loopback TCP), pausing at reset until a
     /// client resumes. `--control-token`/`--control-info` refine it.
@@ -109,6 +119,11 @@ pub struct CliArgs {
     /// `--control-token TOKEN` / `--control-info PATH` for either mode.
     pub control_token: Option<String>,
     pub control_info: Option<PathBuf>,
+    /// `--terminal`: show and drive the session in the controlling terminal
+    /// (Kitty graphics and keyboard protocols) instead of a window, with
+    /// `--terminal-fps` / `--terminal-log` refining it.
+    pub terminal: bool,
+    pub terminal_options: copperline::terminal::Options,
     /// Dump consecutive rendered frames after an emulated-time delay. This
     /// is intended for debugging flicker and frame-to-frame palette
     /// changes that a single screenshot cannot show.
@@ -163,9 +178,10 @@ pub struct CliArgs {
     /// file to PATH on exit (the windowed toggle is the host shortcut
     /// modifier plus Shift+R).
     pub record_input: Option<PathBuf>,
-    /// Scripted floppy image insertion. This supports both explicit
-    /// paths and deferring a disk image already configured in the TOML.
-    pub disk_insert_after: Vec<CliDiskInsert>,
+    /// Scripted floppy media changes: inserts of explicit paths, deferring
+    /// a disk image already configured in the TOML, and ejects
+    /// (`--eject-disk-after`).
+    pub disk_change_after: Vec<CliDiskChange>,
     /// Scripted CD swaps: (SECS, image path) pairs from --insert-cd-after,
     /// landing in whichever CD drive the machine has (CDTV, CD32, or a
     /// SCSI CD-ROM unit).
@@ -242,20 +258,16 @@ pub struct CliArgs {
 use copperline::video::window::{JoyButtonKind, MouseButtonKind};
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CliDiskInsert {
-    Explicit(DiskInsertSpec),
+pub enum CliDiskChange {
+    Explicit(DiskChangeSpec),
     Configured { secs: f32, drive_idx: usize },
-}
-
-pub fn parse_args() -> Result<CliArgs> {
-    parse_args_from(std::env::args().skip(1))
 }
 
 /// Scripted-input directives accepted inside a `--script` file. These are
 /// the flag names (without the leading dashes) whose effects accumulate;
 /// anything else in a script is an error so a typo cannot silently change
 /// emulator configuration.
-const SCRIPT_DIRECTIVES: [&str; 16] = [
+const SCRIPT_DIRECTIVES: [&str; 17] = [
     "press-after",
     "key-after",
     "type",
@@ -270,6 +282,7 @@ const SCRIPT_DIRECTIVES: [&str; 16] = [
     "pen-after",
     "insert-disk-after",
     "defer-disk-insert",
+    "eject-disk-after",
     "insert-cd-after",
     "freeze-after",
 ];
@@ -308,51 +321,35 @@ fn tokenize_script_line(line: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-/// Expand every `--script FILE` argument in place: each non-empty,
-/// non-`#` line of the file is a scripted-input directive in the flag
-/// syntax without the leading dashes (`key-after 14.0 ctrl 500`), and
-/// expands to the equivalent flags for the main parser. Scripts cannot
-/// include other scripts.
-fn expand_script_files(args: Vec<String>) -> Result<Vec<String>> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        if arg != "--script" {
-            out.push(arg);
+/// Expand one script when the parser reaches its option. Values belonging
+/// to other options (for example `--run-args --script`) stay literal.
+fn expand_script_file(path: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let text = std::fs::read_to_string(path).map_err(|e| anyhow!("reading script {path}: {e}"))?;
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let path = iter
-            .next()
-            .ok_or_else(|| anyhow!("--script requires a path"))?;
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| anyhow!("reading script {path}: {e}"))?;
-        for (lineno, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let tokens = tokenize_script_line(line)?;
-            let Some((directive, rest)) = tokens.split_first() else {
-                continue;
-            };
-            if !SCRIPT_DIRECTIVES.contains(&directive.as_str()) {
-                return Err(anyhow!(
-                    "{path}:{}: {directive:?} is not a scripted-input directive \
-                     (allowed: {})",
-                    lineno + 1,
-                    SCRIPT_DIRECTIVES.join(", ")
-                ));
-            }
-            // `type SECS TEXT` is the natural spelling in a script; the
-            // flag it stands for is --type-after.
-            let flag = if directive == "type" {
-                "type-after"
-            } else {
-                directive.as_str()
-            };
-            out.push(format!("--{flag}"));
-            out.extend(rest.iter().cloned());
+        let tokens = tokenize_script_line(line)?;
+        let Some((directive, rest)) = tokens.split_first() else {
+            continue;
+        };
+        if !SCRIPT_DIRECTIVES.contains(&directive.as_str()) {
+            return Err(anyhow!(
+                "{path}:{}: {directive:?} is not a scripted-input directive \
+                 (allowed: {})",
+                lineno + 1,
+                SCRIPT_DIRECTIVES.join(", ")
+            ));
         }
+        let flag = if directive == "type" {
+            "type-after"
+        } else {
+            directive.as_str()
+        };
+        out.push(format!("--{flag}"));
+        out.extend(rest.iter().cloned());
     }
     Ok(out)
 }
@@ -379,10 +376,7 @@ fn next_arg<T: std::str::FromStr>(
 /// and yields the flag's traditional default port. (A positional ROM/disk
 /// path literally named "1" or "2" therefore cannot directly follow one
 /// of these flags; name it "./1" instead.)
-fn take_port_token(
-    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-    default_port: u8,
-) -> u8 {
+fn take_port_token(args: &mut Arguments, default_port: u8) -> u8 {
     take_port_token_upto(args, 2).unwrap_or(default_port - 1)
 }
 
@@ -391,10 +385,7 @@ fn take_port_token(
 /// leave the argument stream alone when the next token is not one. The
 /// game ports are 1 and 2; the parallel-port adapter's sockets are 3 and 4,
 /// which only the joystick directive can address.
-fn take_port_token_upto(
-    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-    max_port: u8,
-) -> Option<u8> {
+fn take_port_token_upto(args: &mut Arguments, max_port: u8) -> Option<u8> {
     let port = match args.peek().map(String::as_str) {
         Some("1") => 0,
         Some("2") => 1,
@@ -406,11 +397,74 @@ fn take_port_token_upto(
     Some(port)
 }
 
+fn unknown_option(option: &str) -> anyhow::Error {
+    // Help is the public, feature-filtered option list. Keeping suggestions
+    // tied to it avoids advertising internal broker flags or disabled code.
+    let help = help_text();
+    let options = help
+        .split_once("Options:\n")
+        .expect("help option section")
+        .1;
+    let mut candidates: Vec<_> = options
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .filter(|word| word.starts_with("--") && word.len() > 2)
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let suggestion = if option.is_ascii() && (5..=64).contains(&option.len()) {
+        let mut scored: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| (option_distance(option, candidate), candidate))
+            .filter(|(distance, _)| *distance <= 2)
+            .collect();
+        scored.sort_unstable();
+        match scored.as_slice() {
+            [(distance, candidate), rest @ ..]
+                if rest.first().is_none_or(|next| next.0 > *distance) =>
+            {
+                Some(*candidate)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match suggestion {
+        Some(candidate) => {
+            anyhow!("unknown option {option:?}; did you mean {candidate:?}? (see --help)")
+        }
+        None => anyhow!("unknown option {option:?} (see --help)"),
+    }
+}
+
+/// Edit distance including adjacent transpositions, a common flag typo.
+fn option_distance(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut rows = vec![vec![0; b.len() + 1]; a.len() + 1];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, value) in rows[0].iter_mut().enumerate() {
+        *value = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            rows[i][j] = (rows[i - 1][j] + 1)
+                .min(rows[i][j - 1] + 1)
+                .min(rows[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]));
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                rows[i][j] = rows[i][j].min(rows[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    rows[a.len()][b.len()]
+}
+
 pub fn parse_args_from<I>(args: I) -> Result<CliArgs>
 where
     I: IntoIterator<Item = String>,
 {
-    let args = expand_script_files(args.into_iter().collect())?;
     let mut netplay_host = None::<PathBuf>;
     let mut netplay_join = None::<String>;
     let mut netplay_relay = None::<String>;
@@ -427,6 +481,9 @@ where
     let mut netplay_watch = None::<String>;
     let mut config_path: Option<PathBuf> = None;
     let mut rom_path: Option<PathBuf> = None;
+    let mut positional = Vec::new();
+    let mut boot_floppies = Vec::new();
+    let mut boot_cd = None;
     let mut whdload: Option<PathBuf> = None;
     let mut run: Option<PathBuf> = None;
     let mut warp_boot = false;
@@ -449,10 +506,13 @@ where
     let mut gdb: Option<String> = None;
     let mut gdb_gui: Option<String> = None;
     let mut gdb_dialect = None;
+    let mut allow_remote_debugging = false;
     let mut control_listen: Option<String> = None;
     let mut control_gui_listen: Option<String> = None;
     let mut control_token: Option<String> = None;
     let mut control_info: Option<PathBuf> = None;
+    let mut terminal = false;
+    let mut terminal_options = copperline::terminal::Options::default();
     let mut dump_dir: Option<PathBuf> = None;
     let mut dump_start_secs: f32 = 0.0;
     let mut dump_count: Option<u32> = None;
@@ -468,7 +528,7 @@ where
     let mut wave_trigger: Option<copperline::waveform::Trigger> = None;
     let mut wave_duration: Option<copperline::waveform::WaveDuration> = None;
     let mut wave_signals: Option<copperline::waveform::SignalSet> = None;
-    let mut disk_insert_after: Vec<CliDiskInsert> = Vec::new();
+    let mut disk_change_after: Vec<CliDiskChange> = Vec::new();
     let mut cd_insert_after: Vec<(f32, PathBuf)> = Vec::new();
     let mut freeze_after: Vec<f32> = Vec::new();
     let mut factory = false;
@@ -494,9 +554,15 @@ where
     let mut list_sampler_inputs = false;
     let mut list_drive_profiles = false;
     let mut overrides = ConfigOverrides::default();
-    let mut args = args.into_iter().peekable();
-    while let Some(a) = args.next() {
+    let mut args = Arguments::new(args);
+    while let Some(a) = args.next_option()? {
         match a.as_str() {
+            "--script" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--script requires a path"))?;
+                args.prepend(expand_script_file(&path)?);
+            }
             "--calibrate-gamepad" => {
                 calibrate_gamepad = true;
             }
@@ -1260,11 +1326,13 @@ where
                 let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let drive_idx = parse_floppy_drive_idx(&drive_s, "--insert-disk-after")?;
                 let path = args.next().ok_or_else(|| anyhow!(USAGE))?;
-                disk_insert_after.push(CliDiskInsert::Explicit(DiskInsertSpec {
+                disk_change_after.push(CliDiskChange::Explicit(DiskChangeSpec {
                     secs,
                     drive_idx,
-                    path: PathBuf::from(path),
-                    write_protected: true,
+                    change: DiskChange::Insert {
+                        path: PathBuf::from(path),
+                        write_protected: true,
+                    },
                 }));
             }
             "--defer-disk-insert" => {
@@ -1276,7 +1344,19 @@ where
                 )?;
                 let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
                 let drive_idx = parse_floppy_drive_idx(&drive_s, "--defer-disk-insert")?;
-                disk_insert_after.push(CliDiskInsert::Configured { secs, drive_idx });
+                disk_change_after.push(CliDiskChange::Configured { secs, drive_idx });
+            }
+            "--eject-disk-after" => {
+                const USAGE: &str = "--eject-disk-after requires SECS DFN";
+                let secs: f32 =
+                    next_arg(&mut args, USAGE, "--eject-disk-after SECS must be a number")?;
+                let drive_s = args.next().ok_or_else(|| anyhow!(USAGE))?;
+                let drive_idx = parse_floppy_drive_idx(&drive_s, "--eject-disk-after")?;
+                disk_change_after.push(CliDiskChange::Explicit(DiskChangeSpec {
+                    secs,
+                    drive_idx,
+                    change: DiskChange::Eject,
+                }));
             }
             "--insert-cd-after" => {
                 const USAGE: &str = "--insert-cd-after requires SECS PATH";
@@ -1427,6 +1507,7 @@ where
                     .ok_or_else(|| anyhow!("--gdb requires ADDR, :PORT, or PORT"))?;
                 gdb = Some(listen);
             }
+            "--allow-remote-debugging" => allow_remote_debugging = true,
             "--gdb-dialect" => {
                 let dialect = args
                     .next()
@@ -1465,6 +1546,24 @@ where
                     .next()
                     .ok_or_else(|| anyhow!("--control-info requires a file path"))?;
                 control_info = Some(PathBuf::from(path));
+            }
+            "--terminal" => terminal = true,
+            "--terminal-fps" => {
+                let fps: f32 = next_arg(
+                    &mut args,
+                    "--terminal-fps requires N",
+                    "--terminal-fps N must be a number",
+                )?;
+                if !(fps > 0.0 && fps.is_finite()) {
+                    return Err(anyhow!("--terminal-fps N must be greater than zero"));
+                }
+                terminal_options.max_fps = Some(fps);
+            }
+            "--terminal-log" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--terminal-log requires a file path"))?;
+                terminal_options.log_path = Some(PathBuf::from(path));
             }
             "--dump-frames" => {
                 let path = args
@@ -1571,23 +1670,66 @@ where
                 explicit_audio_live = true;
             }
             "--help" | "-h" => {
-                print_help();
+                args.finish_option(&a)?;
+                println!("{}", help_text());
                 std::process::exit(0);
             }
             "--version" | "-V" => {
+                args.finish_option(&a)?;
                 println!("copperline {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
+            "--" => {
+                args.finish_option(&a)?;
+                positional.extend(args.by_ref().map(PathBuf::from));
+                break;
+            }
             other if other.starts_with("--") => {
-                return Err(anyhow!("unknown option {:?} (see --help)", other));
+                return Err(unknown_option(other));
             }
-            _ => {
-                if rom_path.is_some() {
-                    return Err(anyhow!("more than one ROM path given"));
-                }
-                rom_path = Some(PathBuf::from(a));
-            }
+            _ => positional.push(PathBuf::from(&a)),
         }
+        args.finish_option(&a)?;
+    }
+    // Classify after parsing options, so conflicts do not depend on order.
+    for path in positional {
+        use copperline::media::{classify, whdload_game_path, MediaKind};
+        match classify(&path) {
+            MediaKind::Rom | MediaKind::Unknown => {
+                if rom_path.replace(path).is_some() {
+                    bail!("more than one ROM path given");
+                }
+            }
+            MediaKind::Config => {
+                if config_path.replace(path).is_some() {
+                    bail!("more than one configuration given (including --config)");
+                }
+            }
+            MediaKind::Floppy => boot_floppies.push(path),
+            MediaKind::Cd => {
+                if boot_cd.replace(path).is_some() {
+                    bail!("more than one positional CD image given");
+                }
+            }
+            MediaKind::WhdloadGame => {
+                if whdload.replace(whdload_game_path(path)).is_some() {
+                    bail!("more than one WHDLoad game given (including --whdload)");
+                }
+            }
+            MediaKind::HardDisk => bail!(
+                "hard-disk image {} needs a controller and boot settings; use --config FILE \
+                 with the image configured under [ide], [scsi], [lide] or [copperhf]",
+                path.display()
+            ),
+        }
+    }
+    if (!boot_floppies.is_empty() || boot_cd.is_some()) && (whdload.is_some() || run.is_some()) {
+        bail!("positional disk images cannot combine with --run or a WHDLoad game");
+    }
+    if (!boot_floppies.is_empty() || boot_cd.is_some())
+        && (load_state.is_some() || load_uss.is_some())
+    {
+        bail!("positional disk images cannot combine with --load-state or --load-uss");
     }
     if explicit_audio_live && audio_wav.is_some() {
         return Err(anyhow!("--audio and --audio-wav are mutually exclusive"));
@@ -1871,7 +2013,7 @@ where
             || !mouse_to_after.is_empty()
             || !pot_after.is_empty()
             || !pen_after.is_empty()
-            || (role != Role::Host && !disk_insert_after.is_empty())
+            || (role != Role::Host && !disk_change_after.is_empty())
             || joy_after
                 .iter()
                 .any(|j| Some(usize::from(j.3)) != local_port)
@@ -1891,6 +2033,8 @@ where
         netplay_spectator_invitation_out: netplay_spectator_invite,
         config_path,
         rom_path,
+        boot_floppies,
+        boot_cd,
         whdload,
         run,
         warp_boot,
@@ -1913,10 +2057,13 @@ where
         gdb,
         gdb_gui,
         gdb_dialect,
+        allow_remote_debugging,
         control: control_listen,
         control_gui: control_gui_listen,
         control_token,
         control_info,
+        terminal,
+        terminal_options,
         frame_dump,
         waveform,
         press_after,
@@ -1927,7 +2074,7 @@ where
         pot_after,
         pen_after,
         record_input,
-        disk_insert_after,
+        disk_change_after,
         cd_insert_after,
         freeze_after,
         audio_live,
@@ -1952,7 +2099,7 @@ where
     })
 }
 
-fn print_help() {
+fn help_text() -> String {
     let shortcut = HOST_SHORTCUT_MODIFIER_LABEL;
     // The MIDI endpoint options only do anything in a `midi`-feature build, so
     // list them only there. `--serial` itself is always shown: off/stdout work
@@ -2007,10 +2154,13 @@ fn print_help() {
     };
     #[cfg(not(feature = "fluxbridge"))]
     let floppy_bridge = String::new();
-    eprintln!(
+    format!(
         "copperline - Amiga emulator\n\
          \n\
-         Usage: copperline [--config FILE] [--screenshot-after SECS PATH] [ROM]\n\
+         Usage: copperline [OPTIONS] [ROM] [MEDIA ...]\n\
+         \n\
+         Long options with a value also accept --flag=VALUE. For options\n\
+         with several values, = supplies the first; the rest follow separately.\n\
          \n\
          Options:\n  \
          -c, --config FILE              load configuration from FILE (default: ./copperline.toml,\n  \
@@ -2018,6 +2168,9 @@ fn print_help() {
          \x20                            configuration saved with Save default)\n  \
          --factory                      ignore the saved default and a copperline.toml beside the\n  \
          \x20                            executable, and start from Copperline's own settings\n  \
+         [MEDIA ...]                   floppy images boot in DF0 (multiple files form a swap playlist);\n  \
+         \x20                            .lha/.lzh and WHDLoad ZIPs boot as games; .toml loads a config;\n  \
+         \x20                            CD images need a CD32/CDTV machine; ROM paths remain accepted\n  \
          --whdload GAME                 boot a WHDLoad game package: an .lha/.lzh or .zip\n  \
          \x20                            archive, or a directory holding a .slave\n  \
          \x20                            (see docs/guide/whdload.md)\n  \
@@ -2143,12 +2296,19 @@ fn print_help() {
          \x20                            :PORT, or PORT; port-only forms bind 127.0.0.1\n  \
          --gdb-dialect DIALECT         standard (default) or bartman\n  \
          --gdb-gui ADDR                 attach the GDB remote server to the normal window\n  \
+         --allow-remote-debugging       allow unauthenticated GDB outside loopback\n  \
          --control ADDR                 run the headless JSON-RPC control server on ADDR\n  \
          \x20                            (port 0 picks a free port; see docs/debugger/control.md)\n  \
          --control-gui ADDR             attach the control server to the normal window\n  \
          --control-token TOKEN          pin the control auth token (default: generated;\n  \
          \x20                            visible in ps -- prefer --control-info)\n  \
          --control-info PATH            write the control endpoint and token to PATH as JSON\n  \
+         --terminal                     show and drive the machine in this terminal instead of\n  \
+         \x20                            a window (kitty, Ghostty, WezTerm; works over SSH;\n  \
+         \x20                            F12 is the host key; see docs/guide/terminal.md)\n  \
+         --terminal-fps N               send at most N frames a second to the terminal\n  \
+         --terminal-log PATH            log file while --terminal owns the terminal\n  \
+         \x20                            (default: copperline-terminal-PID.log in the temp dir)\n  \
          --dump-frames DIR              dump consecutive PNG frames into DIR, then exit\n  \
          --dump-start SECS              start frame dumping after SECS seconds (default: 0)\n  \
          --dump-count COUNT             number of frames to dump with --dump-frames\n  \
@@ -2193,6 +2353,8 @@ fn print_help() {
          \x20                            insert PATH into DFN after SECS seconds\n  \
          --defer-disk-insert SECS DFN   start with configured DFN empty, then insert\n  \
          \x20                            its configured disk image after SECS seconds\n  \
+         --eject-disk-after SECS DFN    eject the disk in DFN after SECS seconds, leaving\n  \
+         \x20                            the drive empty (as the status-bar eject button)\n  \
          --insert-cd-after SECS PATH    swap the CD image (cue/iso/nrg/chd) in the machine's CD\n  \
          \x20                            drive (CDTV, CD32, or a SCSI CD-ROM unit) after\n  \
          \x20                            SECS seconds\n  \
@@ -2276,7 +2438,7 @@ fn print_help() {
          the config. If no config file exists, built-in defaults are used:\n  \
          CPU: 68000   chip RAM: 512K   slow RAM: 512K   fast RAM: 0   chipset: ECS\n  \
          ROM: bundled AROS"
-    );
+    )
 }
 
 fn parse_floppy_drive_idx(s: &str, option: &str) -> Result<usize> {

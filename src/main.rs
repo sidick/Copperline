@@ -2,17 +2,18 @@
 
 //! Copperline: Amiga emulator.
 //!
-//! Usage: copperline [--config FILE] [ROM]
+//! Usage: copperline [OPTIONS] [ROM] [MEDIA ...]
 //!   If no --config is given, looks for ./copperline.toml, then for a
 //!   copperline.toml beside the executable.
 //!   If no ROM is given (neither argument nor `rom =` in the config), boots
 //!   the bundled AROS open-source Kickstart replacement (see src/romsearch.rs).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 #[cfg(feature = "gdb")]
 use copperline::gdbstub;
 use copperline::{config, crashlog, debugger, emulator, envcfg, gamepad, priority, video};
 use log::{info, warn};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -24,26 +25,34 @@ use copperline::emulator::Emulator;
 use copperline::floppy::FloppyController;
 use copperline::memory::Memory;
 use copperline::serial::StdoutSink;
-use copperline::video::window::{App, DiskInsertSpec, GifCaptureSpec};
+use copperline::video::window::{App, DiskChange, DiskChangeSpec, GifCaptureSpec};
 use copperline::video::HOST_SHORTCUT_MODIFIER_LABEL;
 
 mod cli;
+mod startup;
 
-#[cfg(test)]
 use cli::parse_args_from;
-use cli::{parse_args, CliArgs, CliDiskInsert};
+use cli::{CliArgs, CliDiskChange};
 
-fn resolve_disk_insert_after(
+fn resolve_disk_change_after(
     cfg: &mut Config,
-    disk_insert_after: Vec<CliDiskInsert>,
-) -> Result<Vec<DiskInsertSpec>> {
+    disk_change_after: Vec<CliDiskChange>,
+) -> Result<Vec<DiskChangeSpec>> {
     let mut out = Vec::new();
-    for insert in disk_insert_after {
-        match insert {
-            CliDiskInsert::Explicit(spec) => {
+    for change in disk_change_after {
+        match change {
+            CliDiskChange::Explicit(spec) => {
+                // Drive wiring is fixed when the machine is built, so a
+                // change aimed at a drive that is not connected could never
+                // happen: refuse it up front rather than as a log line deep
+                // into a long headless run.
                 if !cfg.floppy_connected[spec.drive_idx] {
+                    let flag = match spec.change {
+                        DiskChange::Insert { .. } => "--insert-disk-after",
+                        DiskChange::Eject => "--eject-disk-after",
+                    };
                     return Err(anyhow!(
-                        "--insert-disk-after df{} needs a connected drive; \
+                        "{flag} df{} needs a connected drive; \
                          use --floppy-drives {} or configure floppy.df{}",
                         spec.drive_idx,
                         spec.drive_idx + 1,
@@ -52,7 +61,7 @@ fn resolve_disk_insert_after(
                 }
                 out.push(spec);
             }
-            CliDiskInsert::Configured { secs, drive_idx } => {
+            CliDiskChange::Configured { secs, drive_idx } => {
                 let Some(drive) = cfg.floppy.drives[drive_idx].take() else {
                     return Err(anyhow!(
                         "--defer-disk-insert df{} requires configured floppy.df{}",
@@ -60,11 +69,13 @@ fn resolve_disk_insert_after(
                         drive_idx
                     ));
                 };
-                out.push(DiskInsertSpec {
+                out.push(DiskChangeSpec {
                     secs,
                     drive_idx,
-                    path: drive.path,
-                    write_protected: drive.write_protected,
+                    change: DiskChange::Insert {
+                        path: drive.path,
+                        write_protected: drive.write_protected,
+                    },
                 });
             }
         }
@@ -130,12 +141,33 @@ fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
             "--benchmark-until cannot be combined with --record-input"
         ));
     }
-    if !cli.disk_insert_after.is_empty() || !cli.cd_insert_after.is_empty() {
+    if !cli.disk_change_after.is_empty() || !cli.cd_insert_after.is_empty() {
         return Err(anyhow!(
-            "--benchmark-until cannot be combined with scheduled disk or CD inserts"
+            "--benchmark-until cannot be combined with scheduled disk or CD changes"
         ));
     }
 
+    Ok(())
+}
+
+/// Positional media is a startup choice, not a scheduled hot-insert. Refuse
+/// hardware that could not consume it instead of silently starting empty.
+fn validate_positional_media(cli: &CliArgs, cfg: &Config) -> Result<()> {
+    if !cli.boot_floppies.is_empty() && (!cfg.floppy_connected[0] || cfg.floppy.drives[0].is_none())
+    {
+        bail!("positional floppy images need an enabled image-backed DF0; check the drive wiring, enabled setting and bridge configuration");
+    }
+    if cli.boot_cd.is_some() && !cfg.akiko && !cfg.cdtv_cd {
+        bail!("a positional CD image needs a CD32 or CDTV drive; use --model CD32, --model CDTV, or a matching --config");
+    }
+    if (!cli.boot_floppies.is_empty() || cli.boot_cd.is_some())
+        && cli
+            .netplay
+            .as_ref()
+            .is_some_and(|options| options.role() != copperline::netplay::Role::Host)
+    {
+        bail!("netplay guests receive the host's media; positional disk images are only available to the host");
+    }
     Ok(())
 }
 
@@ -177,6 +209,11 @@ fn validate_gdb_args(cli: &CliArgs) -> Result<()> {
         return Err(anyhow!(
             "this build was compiled without the gdb feature; \
              rebuild with --features gdb for --gdb/--gdb-gui"
+        ));
+    }
+    if cli.allow_remote_debugging && cli.gdb.is_none() && cli.gdb_gui.is_none() {
+        return Err(anyhow!(
+            "--allow-remote-debugging requires --gdb or --gdb-gui"
         ));
     }
     if cli.gdb_dialect.is_some() && cli.gdb.is_none() && cli.gdb_gui.is_none() {
@@ -233,9 +270,9 @@ fn validate_gdb_args(cli: &CliArgs) -> Result<()> {
     if cli.record_input.is_some() {
         return Err(anyhow!("--gdb cannot be combined with --record-input"));
     }
-    if !cli.disk_insert_after.is_empty() || !cli.cd_insert_after.is_empty() {
+    if !cli.disk_change_after.is_empty() || !cli.cd_insert_after.is_empty() {
         return Err(anyhow!(
-            "--gdb cannot be combined with scheduled disk or CD inserts"
+            "--gdb cannot be combined with scheduled disk or CD changes"
         ));
     }
     // The stub owns the run loop and never watches the --run completion
@@ -315,9 +352,9 @@ fn validate_control_args(cli: &CliArgs) -> Result<()> {
              and cartridge.freeze)"
         ));
     }
-    if !cli.disk_insert_after.is_empty() || !cli.cd_insert_after.is_empty() {
+    if !cli.disk_change_after.is_empty() || !cli.cd_insert_after.is_empty() {
         return Err(anyhow!(
-            "--control cannot be combined with scheduled disk or CD inserts (use media.*)"
+            "--control cannot be combined with scheduled disk or CD changes (use media.*)"
         ));
     }
     // Like --gdb, the server never watches the --run completion marker.
@@ -325,6 +362,38 @@ fn validate_control_args(cli: &CliArgs) -> Result<()> {
         return Err(anyhow!(
             "--control cannot be combined with --exit-on-return"
         ));
+    }
+    Ok(())
+}
+
+/// `--terminal` runs the App's own loop with the terminal as its display, so
+/// it excludes the forms that own the machine (`--control`, `--gdb`,
+/// `--benchmark-until`) and the window attachments, which need the window's
+/// event loop.
+fn validate_terminal_args(cli: &CliArgs) -> Result<()> {
+    if !cli.terminal {
+        if cli.terminal_options != copperline::terminal::Options::default() {
+            return Err(anyhow!("--terminal-fps and --terminal-log need --terminal"));
+        }
+        return Ok(());
+    }
+    if cfg!(not(unix)) {
+        return Err(anyhow!("--terminal is not available on this platform"));
+    }
+    let conflicts = [
+        (cli.control.is_some(), "--control"),
+        (cli.control_gui.is_some(), "--control-gui"),
+        (cli.gdb.is_some(), "--gdb"),
+        (cli.gdb_gui.is_some(), "--gdb-gui"),
+        (cli.benchmark_until.is_some(), "--benchmark-until"),
+        (cli.netplay.is_some(), "netplay"),
+        (
+            cli.live_audio_profile_secs.is_some(),
+            "--profile-live-audio",
+        ),
+    ];
+    if let Some((_, flag)) = conflicts.iter().find(|(set, _)| *set) {
+        return Err(anyhow!("--terminal cannot be combined with {flag}"));
     }
     Ok(())
 }
@@ -749,11 +818,32 @@ fn list_serial_ports() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Before the logger, which is the first thing that would write to a
     // console this is about to take away (see winconsole).
-    copperline::winconsole::detach_desktop_console();
+    let detached = copperline::winconsole::detach_desktop_console();
+    let (desktop_marker, args) = startup::arguments(std::env::args().skip(1));
+    // LaunchServices supplies the environment marker from the app's plist;
+    // executing the same binary from a terminal does not set it.
+    let desktop = detached
+        || desktop_marker
+        || envcfg::var("COPPERLINE_DESKTOP_LAUNCH").as_deref() == Some("1");
+    let mut error_dialog = false;
+    match run(args, desktop, &mut error_dialog) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // A desktop launcher can leave stderr closed. Reporting there
+            // must not panic before the native dialog has a chance to open.
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+            if error_dialog {
+                startup::show_error(&error);
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+fn run(args: Vec<String>, desktop: bool, error_dialog: &mut bool) -> Result<()> {
     let mut log_builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     // Copperline resolves gamepads through gilrs's bundled SDL controller
@@ -790,7 +880,13 @@ fn main() -> Result<()> {
 
     crashlog::install();
 
-    let cli = parse_args()?;
+    // Syntax errors stay on stderr. Once a session mode is known, fatal
+    // interactive desktop errors also get a dialog; headless commands never do.
+    // The exception is a desktop launch of nothing but files ("Open With"):
+    // the parser rejects selections it cannot combine, and that launch has
+    // no stderr anyone will read.
+    *error_dialog = startup::file_open_launch(desktop, &args);
+    let cli = parse_args_from(args)?;
     if cli.load_uss.is_some()
         && (cli.load_state.is_some() || cli.run.is_some() || cli.whdload.is_some())
     {
@@ -802,6 +898,9 @@ fn main() -> Result<()> {
     validate_run_args(&cli)?;
     validate_gdb_args(&cli)?;
     validate_control_args(&cli)?;
+    validate_terminal_args(&cli)?;
+    let terminal = cli.terminal.then(|| cli.terminal_options.clone());
+    *error_dialog = startup::error_dialog_allowed(desktop, &cli);
     if cli.calibrate_gamepad {
         return gamepad::run_calibration();
     }
@@ -896,8 +995,11 @@ fn main() -> Result<()> {
         let raw = load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
         (copperline::netplay::guest_config(&raw)?, raw)
     } else {
-        load_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?
+        load_cli_config(&cli)?
     };
+    if netplay_guest {
+        validate_positional_media(&cli, &cfg)?;
+    }
     if let Some(p) = &cli.rom_path {
         raw_cfg.rom = Some(p.to_string_lossy().into_owned());
     }
@@ -1061,10 +1163,10 @@ fn main() -> Result<()> {
     } else {
         config::resolve_bundled_rom(&mut cfg)?;
     }
-    let mut disk_insert_after = if netplay_guest {
+    let mut disk_change_after = if netplay_guest {
         Vec::new()
     } else {
-        resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?
+        resolve_disk_change_after(&mut cfg, cli.disk_change_after)?
     };
 
     // Name the boot ROM in the banner: a Kickstart image is identified by
@@ -1141,12 +1243,18 @@ fn main() -> Result<()> {
     // wall-clock time. The emulated result is identical either way.
     // A --coverage run without an interactive server attached is a capture
     // run too: it ends by itself when the program exits. With
-    // --control-gui/--gdb-gui it rides along the windowed session instead.
-    let coverage_capture =
-        cli.coverage.is_some() && cli.control_gui.is_none() && cli.gdb_gui.is_none();
+    // --control-gui/--gdb-gui it rides along the windowed session instead,
+    // and with --terminal along the terminal session.
+    let coverage_capture = cli.coverage.is_some()
+        && cli.control_gui.is_none()
+        && cli.gdb_gui.is_none()
+        && terminal.is_none();
     // --exit-on-return is the same kind of run: it ends by itself when the
     // program returns, so on its own it needs no window either.
-    let exit_capture = cli.exit_on_return && cli.control_gui.is_none() && cli.gdb_gui.is_none();
+    let exit_capture = cli.exit_on_return
+        && cli.control_gui.is_none()
+        && cli.gdb_gui.is_none()
+        && terminal.is_none();
     let headless_capture = !cli.screenshot_after.is_empty()
         || !cli.expect_screenshot.is_empty()
         || cli.frame_dump.is_some()
@@ -1251,6 +1359,7 @@ fn main() -> Result<()> {
     if let Some(listen) = cli.gdb {
         let mut gdb = gdbstub::Config::new(listen);
         gdb.bartman = cli.gdb_dialect.as_deref() == Some("bartman");
+        gdb.allow_remote = cli.allow_remote_debugging;
         // --run + --gdb: stop at the program's first instruction, the
         // moment the guest OS loads it.
         gdb.stop_on_load = run_prog_name.clone();
@@ -1320,7 +1429,8 @@ fn main() -> Result<()> {
         || coverage_capture
         || exit_capture)
         && cli.control_gui.is_none()
-        && cli.gdb_gui.is_none();
+        && cli.gdb_gui.is_none()
+        && terminal.is_none();
     // The warp-launch gate belongs to interactive sessions only: a capture
     // run is already unpaced end to end and must never be re-paced when the
     // program loads.
@@ -1341,16 +1451,32 @@ fn main() -> Result<()> {
         )
     };
     let netplay = if let Some(options) = cli.netplay {
-        let (boot, later): (Vec<_>, Vec<_>) = std::mem::take(&mut disk_insert_after)
+        let (boot, later): (Vec<_>, Vec<_>) = std::mem::take(&mut disk_change_after)
             .into_iter()
             .partition(|disk| disk.secs == 0.0);
-        disk_insert_after = later;
+        disk_change_after = later;
         for disk in boot {
-            emu.bus_mut().floppy.insert_disk_image(
-                disk.drive_idx,
-                disk.path,
-                disk.write_protected,
-            )?;
+            match disk.change {
+                DiskChange::Insert {
+                    path,
+                    write_protected,
+                } => {
+                    emu.bus_mut()
+                        .floppy
+                        .insert_disk_image(disk.drive_idx, path, write_protected)?
+                }
+                // The drive is known to be connected
+                // (resolve_disk_change_after refuses the rest); only whether
+                // it holds a disk is left to check.
+                DiskChange::Eject if emu.bus().floppy.disk_inserted(disk.drive_idx) => {
+                    emu.bus_mut().floppy.eject_disk_image(disk.drive_idx)?;
+                    info!("floppy.df{} ejected", disk.drive_idx);
+                }
+                DiskChange::Eject => warn!(
+                    "floppy.df{} eject ignored: no disk in the drive",
+                    disk.drive_idx
+                ),
+            }
         }
         let session = copperline::netplay::Session::new(options, &mut emu, &cfg)?;
         #[cfg(feature = "netplay-internet")]
@@ -1430,7 +1556,7 @@ fn main() -> Result<()> {
         cli.mouse_to_after,
         cli.pot_after,
         cli.pen_after,
-        disk_insert_after,
+        disk_change_after,
         cli.cd_insert_after,
         cli.freeze_after,
         cli.record_input,
@@ -1471,6 +1597,8 @@ fn main() -> Result<()> {
         live_audio,
         copperline::sampler::SamplerRequest::from_config(&cfg.parallel),
     );
+    #[cfg(target_os = "macos")]
+    app.enable_document_opening(false);
     app.set_menu_settings_file(menu_settings);
     app.set_expect_screenshots(cli.expect_screenshot);
     app.set_native_screenshots(cli.native_screenshots);
@@ -1501,6 +1629,7 @@ fn main() -> Result<()> {
         // opens, socket threads start inside App::run.
         let mut config = gdbstub::Config::new(listen);
         config.bartman = cli.gdb_dialect.as_deref() == Some("bartman");
+        config.allow_remote = cli.allow_remote_debugging;
         // --run + --gdb-gui: stop at the program's first instruction,
         // the moment the guest OS loads it.
         config.stop_on_load = run_prog_name.clone();
@@ -1513,6 +1642,13 @@ fn main() -> Result<()> {
     // the core unthrottled, so priority buys it nothing.
     if realtime_priority && paced {
         priority::elevate_pacer_thread();
+    }
+    // --terminal: the terminal is the display. Like a windowless capture it
+    // never touches winit, so it works over SSH with no display server.
+    #[cfg(unix)]
+    if let Some(options) = terminal {
+        info!("terminal: showing the session in the controlling terminal");
+        return finish_with(app.run_terminal(options)?);
     }
     if windowless_capture {
         info!("headless capture: running without a window (no display connection)");
@@ -1693,6 +1829,8 @@ fn run_configuration_screen(
     );
     app.set_menu_settings_file(menu_settings);
     app.open_launcher();
+    #[cfg(target_os = "macos")]
+    app.enable_document_opening(std::env::args_os().len() == 1);
     // `[emulation] auto_launch` in the configuration the launcher opened
     // showing: straight to the machine, no configuration screen first.
     app.auto_launch_if_asked();
@@ -1713,6 +1851,8 @@ fn launcher_requested(cli: &CliArgs) -> bool {
     cli.netplay.is_none()
         && cli.config_path.is_none()
         && cli.rom_path.is_none()
+        && cli.boot_floppies.is_empty()
+        && cli.boot_cd.is_none()
         && cli.whdload.is_none()
         && cli.run.is_none()
         && cli.overrides.is_empty()
@@ -1740,10 +1880,11 @@ fn launcher_requested(cli: &CliArgs) -> bool {
         && cli.pot_after.is_empty()
         && cli.pen_after.is_empty()
         && cli.freeze_after.is_empty()
-        && cli.disk_insert_after.is_empty()
+        && cli.disk_change_after.is_empty()
         && cli.record_input.is_none()
         && cli.audio_wav.is_none()
         && cli.audio_live
+        && !cli.terminal
 }
 
 fn run_live_audio_profile(secs: f32) -> Result<()> {
@@ -1845,21 +1986,17 @@ fn read_profile_audio_word(chip_ram: &[u8], address: u32) -> u16 {
     ((chip_ram[off] as u16) << 8) | chip_ram[(off + 1) % chip_ram.len()] as u16
 }
 
-/// Load the config, returning both the validated [`Config`] used to build the
-/// machine and the raw TOML view it came from. The configuration screen keeps
-/// the raw view so its "Machine Configuration..." menu item can reopen showing
-/// the running machine's settings.
-fn load_config(
-    explicit: Option<&Path>,
-    overrides: &ConfigOverrides,
-    factory: bool,
-) -> Result<(Config, config::RawConfig)> {
-    let raw = load_raw_config(explicit, overrides, factory)?;
+/// Apply positional media before validation so it replaces stale configured
+/// image paths, while preserving machine choices and the drive's protection.
+fn load_cli_config(cli: &CliArgs) -> Result<(Config, config::RawConfig)> {
+    let mut raw = load_raw_config(cli.config_path.as_deref(), &cli.overrides, cli.factory)?;
+    raw.set_startup_media(&cli.boot_floppies, cli.boot_cd.as_deref())?;
     let cfg = Config::try_from(raw.clone())?;
+    validate_positional_media(cli, &cfg)?;
     Ok((cfg, raw))
 }
 
-/// The raw half of [`load_config`]: find and parse the file, put its
+/// The raw half of [`load_cli_config`]: find and parse the file, put its
 /// `[paths]` in force, validate nothing. The configuration screen starts
 /// from this -- validation belongs to its Run button, where a missing
 /// floppy image is a status line to fix rather than an exit before the
@@ -1939,6 +2076,378 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<CliArgs> {
         parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn positional_media_routes_configs_roms_and_floppy_playlists() -> Result<()> {
+        let cli = parse(&[
+            "disk 1.ADF",
+            "--model",
+            "A1200",
+            "kick.bin",
+            "machine.TOML",
+            "disk2.adz",
+        ])?;
+        assert_eq!(cli.rom_path, Some("kick.bin".into()));
+        assert_eq!(cli.config_path, Some("machine.TOML".into()));
+        assert_eq!(
+            cli.boot_floppies,
+            vec![PathBuf::from("disk 1.ADF"), "disk2.adz".into()]
+        );
+        assert_eq!(cli.overrides.model.as_deref(), Some("A1200"));
+        assert!(!launcher_requested(&cli));
+        assert_eq!(parse(&["kickstart"])?.rom_path, Some("kickstart".into()));
+        assert_eq!(parse(&["game.SLAVE"])?.whdload, Some(".".into()));
+        let cd = parse(&["--model", "CD32", "disc.cue"])?;
+        assert_eq!(cd.boot_cd, Some("disc.cue".into()));
+        assert!(!launcher_requested(&cd));
+        Ok(())
+    }
+
+    #[test]
+    fn positional_launch_conflicts_are_independent_of_option_order() {
+        for args in [
+            vec!["first.toml", "--config", "second.toml"],
+            vec!["--config", "first.toml", "second.toml"],
+            vec!["game.lha", "--whdload", "second.lha"],
+            vec!["--whdload", "game.lha", "second.lha"],
+            vec!["first.cue", "second.iso"],
+            vec!["first.rom", "second.bin"],
+            vec!["game.lha", "disk.adf"],
+            vec!["disk.adf", "--run", "hello"],
+            vec!["disk.adf", "--load-state", "state.clstate"],
+            vec!["disk.adf", "--load-uss", "state.uss"],
+        ] {
+            assert!(
+                parse(&args).is_err(),
+                "accepted conflicting launch targets: {args:?}"
+            );
+        }
+        let error = parse(&["disk.hdf"]).unwrap_err().to_string();
+        assert!(error.contains("controller") && error.contains("--config"));
+    }
+
+    #[test]
+    fn positional_terminator_preserves_filenames_that_look_like_options() -> Result<()> {
+        assert_eq!(
+            parse(&["--", "--script"])?.rom_path,
+            Some("--script".into())
+        );
+        assert_eq!(
+            parse(&["--", "--config.adf"])?.boot_floppies,
+            vec![PathBuf::from("--config.adf")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn positional_terminator_inside_a_flag_value_does_not_hide_later_scripts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join("input.txt");
+        std::fs::write(&script, "press-after 1 a\n")?;
+        let cli = parse(&[
+            "--run",
+            "hello",
+            "--run-args",
+            "--",
+            "--script",
+            script.to_str().unwrap(),
+        ])?;
+        assert_eq!(cli.run_args.as_deref(), Some("--"));
+        assert_eq!(cli.press_after.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn positional_zip_routing_reads_members_before_selecting_a_boot_path() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("game.zip");
+        let path_arg = path.to_str().unwrap();
+        for (member, whdload) in [("disk.adf", false), ("Game/Game.Slave", true)] {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
+            zip.start_file(member, zip::write::SimpleFileOptions::default())?;
+            zip.write_all(b"fixture")?;
+            zip.finish()?;
+            let cli = parse(&[path_arg])?;
+            assert_eq!(cli.whdload.is_some(), whdload);
+            assert_eq!(cli.boot_floppies.is_empty(), whdload);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positional_floppies_replace_stale_paths_and_preserve_drive_settings() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk1 = dir.path().join("first.adf");
+        let disk2 = dir.path().join("second.adf");
+        for disk in [&disk1, &disk2] {
+            std::fs::write(disk, vec![0u8; 901_120])?;
+        }
+        let config = dir.path().join("machine.toml");
+        std::fs::write(&config, "[machine]\nprofile = 'A1200'\n[floppy]\ndrives = 2\n[floppy.df0]\npath = 'missing-old-disk.adf'\nwrite_protected = false\n[whdload]\ngame = 'missing-remembered-game.lha'\n")?;
+        let cli = parse(&[
+            "--factory",
+            config.to_str().unwrap(),
+            disk1.to_str().unwrap(),
+            "--model",
+            "A500",
+            disk2.to_str().unwrap(),
+        ])?;
+        let (cfg, raw) = load_cli_config(&cli)?;
+        assert_eq!(cfg.machine, Some(config::MachineModel::A500));
+        assert_eq!(cfg.floppy_playlists[0], vec![disk1.clone(), disk2]);
+        let drive = cfg.floppy.drives[0].as_ref().unwrap();
+        assert_eq!(drive.path, disk1);
+        assert!(!drive.write_protected);
+        assert!(cfg.floppy_connected[1]);
+        assert!(copperline::whdload::game_and_options(&raw).0.is_none());
+        assert_eq!(
+            Config::try_from(raw)?.floppy_playlists[0],
+            cfg.floppy_playlists[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn positional_cd_supersedes_a_remembered_whdload_boot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("machine.toml");
+        std::fs::write(
+            &config,
+            "[machine]\nprofile='CD32'\n[whdload]\ngame='missing-remembered-game.lha'\n",
+        )?;
+        let cd = dir.path().join("disc.iso");
+        std::fs::write(&cd, vec![0u8; 2048 * 64])?;
+        let cli = parse(&["--factory", config.to_str().unwrap(), cd.to_str().unwrap()])?;
+        let (cfg, raw) = load_cli_config(&cli)?;
+        assert_eq!(cfg.cd_image_path, Some(cd));
+        assert!(copperline::whdload::game_and_options(&raw).0.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn positional_floppies_do_not_add_hardware_to_a_drive_less_profile() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk = dir.path().join("disk.adf");
+        std::fs::write(&disk, vec![0u8; 901_120])?;
+        for model in ["CD32", "CDTV"] {
+            let cli = parse(&["--factory", "--model", model, disk.to_str().unwrap()])?;
+            let error = load_cli_config(&cli).unwrap_err().to_string();
+            assert!(error.contains("DF0"), "{model}: {error}");
+            let cli = parse(&[
+                "--factory",
+                "--model",
+                model,
+                "--floppy-drives",
+                "1",
+                disk.to_str().unwrap(),
+            ])?;
+            let (cfg, _) = load_cli_config(&cli)?;
+            assert!(cfg.floppy_connected[0]);
+            assert!(cfg.floppy.drives[0].is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positional_floppies_reject_disabled_drives_and_preserve_explicit_wiring() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let disk = dir.path().join("disk.adf");
+        std::fs::write(&disk, vec![0u8; 901_120])?;
+        let config = dir.path().join("machine.toml");
+        std::fs::write(&config, "[floppy.df0]\nenabled=false\n")?;
+        let cli = parse(&[
+            "--factory",
+            config.to_str().unwrap(),
+            disk.to_str().unwrap(),
+        ])?;
+        assert!(load_cli_config(&cli)
+            .unwrap_err()
+            .to_string()
+            .contains("disabled"));
+        for selection in ["enabled=true", "path='missing-old-image.adf'"] {
+            std::fs::write(
+                &config,
+                format!("[machine]\nprofile='CD32'\n[floppy.df0]\n{selection}\n"),
+            )?;
+            let (cfg, _) = load_cli_config(&cli)?;
+            assert!(cfg.floppy_connected[0]);
+            assert_eq!(cfg.floppy.drives[0].as_ref().unwrap().path, disk);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positional_media_requires_the_selected_machines_hardware() -> Result<()> {
+        let floppy = parse(&["disk.adf"])?;
+        let mut cfg = Config::default();
+        cfg.floppy.drives[0] = Some(config::FloppyDriveConfig {
+            path: "disk.adf".into(),
+            write_protected: true,
+        });
+        validate_positional_media(&floppy, &cfg)?;
+        cfg.floppy_connected = [false; 4];
+        assert!(validate_positional_media(&floppy, &cfg).is_err());
+        cfg.floppy_connected[0] = true;
+        cfg.floppy.drives[0] = None;
+        assert!(validate_positional_media(&floppy, &cfg).is_err());
+        let cd = parse(&["disc.cue"])?;
+        assert!(validate_positional_media(&cd, &cfg).is_err());
+        cfg.akiko = true;
+        validate_positional_media(&cd, &cfg)?;
+        cfg.akiko = false;
+        cfg.cdtv_cd = true;
+        validate_positional_media(&cd, &cfg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inline_values_compose_with_multiple_arguments_and_repeated_flags() -> Result<()> {
+        let cli = parse(&[
+            "--model=A1200",
+            "--fast=8M",
+            "--window-position=-40",
+            "75",
+            "--mouse-after=1.5",
+            "-20",
+            "30",
+            "2",
+            "--screenshot-after=2",
+            "first=frame.png",
+            "--screenshot-after",
+            "3",
+            "last.png",
+            "--noaudio",
+        ])?;
+        assert_eq!(cli.overrides.model.as_deref(), Some("A1200"));
+        assert_eq!(cli.overrides.fast.as_deref(), Some("8M"));
+        assert_eq!(cli.overrides.window_position, Some([-40, 75]));
+        assert_eq!(cli.mouse_after, [(1.5, -20, 30, 1)]);
+        assert_eq!(
+            cli.screenshot_after,
+            [
+                (2.0, PathBuf::from("first=frame.png")),
+                (3.0, PathBuf::from("last.png")),
+            ]
+        );
+        assert!(!cli.audio_live);
+        Ok(())
+    }
+
+    #[test]
+    fn values_keep_literal_equals_signs_and_option_like_text() -> Result<()> {
+        for spelling in [
+            vec!["--run-args=--guest-option=a=b"],
+            vec!["--run-args", "--guest-option=a=b"],
+        ] {
+            assert_eq!(
+                parse(&spelling)?.run_args.as_deref(),
+                Some("--guest-option=a=b")
+            );
+        }
+        assert_eq!(parse(&["--run-args="])?.run_args.as_deref(), Some(""));
+        assert_eq!(
+            parse(&["--run-args", "--script"])?.run_args.as_deref(),
+            Some("--script")
+        );
+        assert_eq!(
+            parse(&["kick=start.rom"])?.rom_path,
+            Some(PathBuf::from("kick=start.rom"))
+        );
+        let cli = parse(&["--coverage-source-map=old=path=new=path"])?;
+        assert_eq!(
+            cli.coverage_source_map,
+            [("old".to_owned(), "path=new=path".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_script_paths_preserve_values_and_expansion_order() -> Result<()> {
+        let path = temp_script(
+            "equals=path",
+            "type 1 \"--model=A1200\"\npress-after 2 f1\n",
+        );
+        let cli = parse(&[
+            "--press-after=0",
+            "esc",
+            &format!("--script={}", path.display()),
+            "--press-after=3",
+            "f2",
+        ])?;
+        let expected = parse(&[
+            "--press-after",
+            "0",
+            "esc",
+            "--type-after",
+            "1",
+            "--model=A1200",
+            "--press-after",
+            "2",
+            "f1",
+            "--press-after",
+            "3",
+            "f2",
+        ])?;
+        assert_eq!(cli.press_after, expected.press_after);
+        assert!(cli.overrides.model.is_none());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extra_script_tokens_cannot_expand_scripts_or_change_the_machine() -> Result<()> {
+        for tail in [
+            "--script other.clscript",
+            "--script=other.clscript",
+            "--model=A1200",
+        ] {
+            let path = temp_script("extra-option", &format!("press-after 1 esc {tail}\n"));
+            let error = parse(&["--script", path.to_str().unwrap()]).unwrap_err();
+            assert!(
+                error.to_string().contains("not a scripted-input directive"),
+                "{error}"
+            );
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn switches_reject_inline_values_before_side_effects_or_early_exit() {
+        for flag in [
+            "--noaudio",
+            "--factory",
+            "--full-screen",
+            "--help",
+            "--version",
+        ] {
+            for value in ["", "true", "false"] {
+                let error = parse(&[&format!("{flag}={value}")]).unwrap_err();
+                assert_eq!(error.to_string(), format!("{flag} does not take a value"));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_options_suggest_only_a_close_public_option() {
+        for (typo, correct) in [
+            ("--modle=A1200", "--model"),
+            ("--screnshot-after", "--screenshot-after"),
+            ("--hlep", "--help"),
+        ] {
+            let error = parse(&[typo]).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("did you mean {correct:?}?")),
+                "{error}"
+            );
+        }
+        let error = parse(&["--completely-unrelated"]).unwrap_err().to_string();
+        assert!(error.contains("unknown option"));
+        assert!(!error.contains("did you mean"));
+        let error = parse(&["--flga"]).unwrap_err().to_string();
+        assert!(!error.contains("did you mean \"--flag\""), "{error}");
     }
 
     #[test]
@@ -2549,7 +3058,8 @@ mod tests {
              joy-after 60.0 red 300 1\n\
              mouse-after 1.020 -3 10 2\n\
              pot-after 12.0 50 200\n\
-             insert-disk-after 30.0 df1 \"/tmp/with space.adf\"\n",
+             insert-disk-after 30.0 df1 \"/tmp/with space.adf\"\n\
+             eject-disk-after 40.0 df1\n",
         );
         let args = parse(&["--script", path.to_str().unwrap()])?;
         assert_eq!(args.press_after.len(), 2);
@@ -2559,13 +3069,22 @@ mod tests {
         assert_eq!(args.mouse_after, vec![(1.02, -3, 10, 1)]);
         assert_eq!(args.pot_after, vec![(12.0, 50, 200, 1)]);
         assert_eq!(
-            args.disk_insert_after,
-            vec![CliDiskInsert::Explicit(DiskInsertSpec {
-                secs: 30.0,
-                drive_idx: 1,
-                path: PathBuf::from("/tmp/with space.adf"),
-                write_protected: true,
-            })]
+            args.disk_change_after,
+            vec![
+                CliDiskChange::Explicit(DiskChangeSpec {
+                    secs: 30.0,
+                    drive_idx: 1,
+                    change: DiskChange::Insert {
+                        path: PathBuf::from("/tmp/with space.adf"),
+                        write_protected: true,
+                    },
+                }),
+                CliDiskChange::Explicit(DiskChangeSpec {
+                    secs: 40.0,
+                    drive_idx: 1,
+                    change: DiskChange::Eject,
+                }),
+            ]
         );
         let _ = std::fs::remove_file(&path);
         Ok(())
@@ -2714,6 +3233,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_flags_parse_and_exclude_machine_owning_modes() -> Result<()> {
+        let args = parse(&[
+            "--terminal",
+            "--terminal-fps",
+            "12.5",
+            "--terminal-log",
+            "/tmp/t.log",
+        ])?;
+        assert!(args.terminal);
+        assert_eq!(args.terminal_options.max_fps, Some(12.5));
+        assert_eq!(
+            args.terminal_options.log_path.as_deref(),
+            Some(std::path::Path::new("/tmp/t.log"))
+        );
+        assert!(validate_terminal_args(&args).is_ok() || cfg!(not(unix)));
+        // A terminal session is interactive: no launcher in front of it.
+        assert!(!launcher_requested(&parse(&["--terminal"])?));
+        assert!(parse(&["--terminal-fps", "0"]).is_err());
+        let err = validate_terminal_args(&parse(&["--terminal-fps", "10"])?).unwrap_err();
+        assert!(err.to_string().contains("need --terminal"), "{err}");
+        #[cfg(unix)]
+        for conflict in [
+            &["--control", ":0"][..],
+            &["--gdb", ":0"],
+            &["--control-gui", ":0"],
+            &["--benchmark-until", "5"],
+        ] {
+            let mut args = vec!["--terminal"];
+            args.extend_from_slice(conflict);
+            let err = validate_terminal_args(&parse(&args)?).unwrap_err();
+            assert!(err.to_string().contains(conflict[0]), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn script_files_reject_non_input_directives() {
         // Anything outside the scripted-input set is refused, including
         // nesting another script.
@@ -2756,6 +3311,7 @@ mod tests {
         input.ports[0].fire = false;
         rec.observe(&input, 2.5, Some);
         rec.record_disk_insert(0, Path::new("/tmp/demo.adf"), 3.0);
+        rec.record_disk_eject(0, 4.0);
         let path = temp_script("roundtrip", &rec.finish());
 
         let args = parse(&["--script", path.to_str().unwrap()])?;
@@ -2764,7 +3320,7 @@ mod tests {
         assert_eq!(args.press_after[0].hold_ms, 250);
         assert_eq!(args.mouse_after, vec![(2.0, 5, 0, 0)]);
         assert_eq!(args.click_after, vec![(2.0, MouseButtonKind::Left, 500, 0)]);
-        assert_eq!(args.disk_insert_after.len(), 1);
+        assert_eq!(args.disk_change_after.len(), 2);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
@@ -2873,6 +3429,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_debugging_opt_in_requires_a_gdb_listener() -> Result<()> {
+        let args = parse(&["--allow-remote-debugging"])?;
+        assert!(validate_gdb_args(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --gdb"));
+        for flag in ["--gdb", "--gdb-gui"] {
+            let args = parse(&[flag, "0.0.0.0:0", "--allow-remote-debugging"])?;
+            assert!(args.allow_remote_debugging);
+            validate_gdb_args(&args)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gdb_mode_parses_and_defaults_to_null_audio() -> Result<()> {
         let args = parse(&["--gdb", ":2345"])?;
         assert_eq!(args.gdb.as_deref(), Some(":2345"));
@@ -2919,6 +3490,7 @@ mod tests {
     #[test]
     fn server_and_benchmark_modes_refuse_work_they_would_drop() -> Result<()> {
         let cd = ["--insert-cd-after", "5", "game.cue"];
+        let eject = ["--eject-disk-after", "5", "df0"];
         let ret = ["--run", "prog", "--exit-on-return"];
         let shot = ["--expect-screenshot", "5", "ref.png"];
         for (mode, validate) in [
@@ -2930,7 +3502,8 @@ mod tests {
             (["--control", ":7710"], validate_control_args),
         ] {
             for (extra, named) in [
-                (&cd[..], "CD inserts"),
+                (&cd[..], "disk or CD changes"),
+                (&eject[..], "disk or CD changes"),
                 (&ret[..], "--exit-on-return"),
                 (&shot[..], "--expect-screenshot"),
             ] {
@@ -3050,7 +3623,8 @@ mod tests {
             &path,
             "[machine]\nprofile = \"A4000\"\n\n[paths]\nnvram = \"elsewhere\"\n",
         )?;
-        let loaded = load_config(Some(&path), &ConfigOverrides::default(), true);
+        let cli = parse(&["--factory", "--config", path.to_str().unwrap()])?;
+        let loaded = load_cli_config(&cli);
         let _ = std::fs::remove_file(&path);
         let (cfg, _) = loaded?;
         let battmem = cfg.battmem_path.expect("an A4000 fits an RP5C01");
@@ -3133,14 +3707,51 @@ mod tests {
     fn insert_disk_after_parses_explicit_drive_and_path() -> Result<()> {
         let args = parse(&["--insert-disk-after", "10", "df0", "demo-disk.adf"])?;
         assert_eq!(
-            args.disk_insert_after,
-            vec![CliDiskInsert::Explicit(DiskInsertSpec {
+            args.disk_change_after,
+            vec![CliDiskChange::Explicit(DiskChangeSpec {
                 secs: 10.0,
                 drive_idx: 0,
-                path: PathBuf::from("demo-disk.adf"),
-                write_protected: true,
+                change: DiskChange::Insert {
+                    path: PathBuf::from("demo-disk.adf"),
+                    write_protected: true,
+                },
             })]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn eject_disk_after_parses_drive_and_orders_with_inserts() -> Result<()> {
+        let args = parse(&[
+            "--eject-disk-after",
+            "75",
+            "df1",
+            "--insert-disk-after",
+            "85",
+            "df1:",
+            "other.adf",
+        ])?;
+        assert_eq!(
+            args.disk_change_after,
+            vec![
+                CliDiskChange::Explicit(DiskChangeSpec {
+                    secs: 75.0,
+                    drive_idx: 1,
+                    change: DiskChange::Eject,
+                }),
+                CliDiskChange::Explicit(DiskChangeSpec {
+                    secs: 85.0,
+                    drive_idx: 1,
+                    change: DiskChange::Insert {
+                        path: PathBuf::from("other.adf"),
+                        write_protected: true,
+                    },
+                }),
+            ]
+        );
+        assert!(parse(&["--eject-disk-after", "75"]).is_err());
+        assert!(parse(&["--eject-disk-after", "x", "df1"]).is_err());
+        assert!(parse(&["--eject-disk-after", "75", "df4"]).is_err());
         Ok(())
     }
 
@@ -3183,8 +3794,8 @@ mod tests {
     fn defer_disk_insert_parses_configured_drive() -> Result<()> {
         let args = parse(&["--defer-disk-insert", "10", "df0:"])?;
         assert_eq!(
-            args.disk_insert_after,
-            vec![CliDiskInsert::Configured {
+            args.disk_change_after,
+            vec![CliDiskChange::Configured {
                 secs: 10.0,
                 drive_idx: 0,
             }]
@@ -3200,9 +3811,9 @@ mod tests {
             write_protected: true,
         });
 
-        let inserts = resolve_disk_insert_after(
+        let inserts = resolve_disk_change_after(
             &mut cfg,
-            vec![CliDiskInsert::Configured {
+            vec![CliDiskChange::Configured {
                 secs: 10.0,
                 drive_idx: 0,
             }],
@@ -3211,11 +3822,13 @@ mod tests {
         assert!(cfg.floppy.drives[0].is_none());
         assert_eq!(
             inserts,
-            vec![DiskInsertSpec {
+            vec![DiskChangeSpec {
                 secs: 10.0,
                 drive_idx: 0,
-                path: PathBuf::from("demo-disk.adf"),
-                write_protected: true,
+                change: DiskChange::Insert {
+                    path: PathBuf::from("demo-disk.adf"),
+                    write_protected: true,
+                },
             }]
         );
         Ok(())
@@ -3224,30 +3837,57 @@ mod tests {
     #[test]
     fn scheduled_disk_insert_requires_connected_drive() {
         let mut cfg = Config::default();
-        let err = resolve_disk_insert_after(
+        let err = resolve_disk_change_after(
             &mut cfg,
-            vec![CliDiskInsert::Explicit(DiskInsertSpec {
+            vec![CliDiskChange::Explicit(DiskChangeSpec {
                 secs: 10.0,
                 drive_idx: 1,
-                path: PathBuf::from("demo-disk.adf"),
-                write_protected: true,
+                change: DiskChange::Insert {
+                    path: PathBuf::from("demo-disk.adf"),
+                    write_protected: true,
+                },
             })],
         )
         .unwrap_err();
         assert!(err.to_string().contains("connected drive"), "{err:#}");
 
         cfg.floppy_connected[1] = true;
-        let inserts = resolve_disk_insert_after(
+        let inserts = resolve_disk_change_after(
             &mut cfg,
-            vec![CliDiskInsert::Explicit(DiskInsertSpec {
+            vec![CliDiskChange::Explicit(DiskChangeSpec {
                 secs: 10.0,
                 drive_idx: 1,
-                path: PathBuf::from("demo-disk.adf"),
-                write_protected: true,
+                change: DiskChange::Insert {
+                    path: PathBuf::from("demo-disk.adf"),
+                    write_protected: true,
+                },
             })],
         )
         .unwrap();
         assert_eq!(inserts[0].drive_idx, 1);
+    }
+
+    #[test]
+    fn scheduled_disk_eject_requires_connected_drive() {
+        let mut cfg = Config::default();
+        let eject = || {
+            vec![CliDiskChange::Explicit(DiskChangeSpec {
+                secs: 10.0,
+                drive_idx: 2,
+                change: DiskChange::Eject,
+            })]
+        };
+        let err = resolve_disk_change_after(&mut cfg, eject()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--eject-disk-after df2 needs a connected drive"),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("--floppy-drives 3"), "{err:#}");
+
+        cfg.floppy_connected[2] = true;
+        let ejects = resolve_disk_change_after(&mut cfg, eject()).unwrap();
+        assert_eq!(ejects[0].change, DiskChange::Eject);
     }
 
     #[test]

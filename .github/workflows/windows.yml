@@ -15,7 +15,10 @@ name: Windows
 # the full release build on pull requests too. On a v* tag push (or a manual
 # run with release_tag) both ZIPs and installers are attached to the GitHub
 # Release by the release job, which runs only after every check on both
-# architectures has passed.
+# architectures has passed. Those release builds are code-signed through
+# SignPath inside the build job (the executables in the ZIP first, then the
+# installer built from that signed ZIP), so every check downstream runs
+# against the signed bytes that get released; see RELEASE.md "Code signing".
 on:
   push:
     branches: [main, v1]
@@ -24,8 +27,11 @@ on:
       - "src/**"
       - "vendor/**"
       - "assets/**"
+      - "tests/**"
+      - "timing-test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "build.rs"
       - ".cargo/**"
       - "packaging/windows/**"
       - ".github/workflows/windows.yml"
@@ -34,8 +40,11 @@ on:
       - "src/**"
       - "vendor/**"
       - "assets/**"
+      - "tests/**"
+      - "timing-test/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "build.rs"
       - ".cargo/**"
       - "packaging/windows/**"
       - ".github/workflows/windows.yml"
@@ -47,6 +56,11 @@ on:
         description: "Existing release tag to attach the ZIPs and installers to. Leave blank to only upload workflow artifacts."
         required: false
         default: ""
+      signing:
+        description: "SignPath signing. auto release-signs when the run attaches to a release (release_tag set, or run on a v* tag) and builds unsigned otherwise; test-signing tries the whole signing path with SignPath's test certificate and no approval, and is refused for a release."
+        type: choice
+        options: [auto, none, test-signing, release-signing]
+        default: auto
 
 concurrency:
   group: windows-${{ github.ref }}
@@ -56,11 +70,17 @@ concurrency:
 # and crowd out the shared entries when several matrices run together.
 jobs:
   build:
+    timeout-minutes: 120
     name: Build Windows packages (${{ matrix.arch }})
     # Compiles the release binary and packages the portable ZIP and installer;
     # the sibling test-bins job compiles the test executables in parallel on
     # its own runner.
     runs-on: ${{ matrix.runner }}
+    # actions: read lets SignPath fetch the unsigned workflow artifacts with
+    # this job's token.
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -107,19 +127,135 @@ jobs:
         run: |
           $zip = Get-ChildItem Copperline-*-win-${{ matrix.arch }}.zip | Select-Object -First 1
           "path=$($zip.Name)" >> $env:GITHUB_OUTPUT
+          "version=$($zip.BaseName -replace '^Copperline-(.+)-win-${{ matrix.arch }}$', '$1')" >> $env:GITHUB_OUTPUT
+      - name: Choose the signing policy
+        id: signing
+        # A run that attaches to a release is release-signed, which waits
+        # for a person to approve each request in SignPath: a v* tag push,
+        # or a manual run on a v* tag or with release_tag set (the release
+        # job's own condition). A manual run picks its policy (the signing
+        # input), but never test-signing for a release. Pull requests and
+        # branch pushes build unsigned. Signing needs the SIGNPATH_ORGANIZATION_ID variable and
+        # the SIGNPATH_API_TOKEN secret: without them a release fails here,
+        # except in a fork, which has no SignPath project and builds
+        # unsigned with a warning.
+        shell: pwsh
+        env:
+          REQUESTED: ${{ inputs.signing }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releasing = $env:GITHUB_REF -like "refs/tags/v*" -or [bool]$env:RELEASE_TAG
+          $policy = "none"
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $policy = $env:REQUESTED
+            if ($policy -eq "auto") {
+              $policy = if ($releasing) { "release-signing" } else { "none" }
+            } elseif ($policy -eq "test-signing" -and $releasing) {
+              throw "test-signed packages must not be attached to a release"
+            }
+          } elseif ($env:GITHUB_EVENT_NAME -eq "push" -and $releasing) {
+            $policy = "release-signing"
+          }
+          if ($policy -ne "none" -and (-not $env:ORGANIZATION_ID -or $env:HAS_TOKEN -ne "true")) {
+            $missing = "the SIGNPATH_ORGANIZATION_ID variable or the SIGNPATH_API_TOKEN secret is not set"
+            $chosen = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and $env:REQUESTED -ne "auto"
+            if ($env:GITHUB_REPOSITORY -eq "CopperlineHQ/Copperline" -or $chosen) {
+              throw "$policy requested, but $missing"
+            }
+            Write-Output "::warning::Building unsigned packages: $missing"
+            $policy = "none"
+          }
+          Write-Host "Signing policy: $policy"
+          "policy=$policy" >> $env:GITHUB_OUTPUT
+          $timeout = if ($policy -eq "release-signing") { 3600 } else { 600 }
+          "timeout=$timeout" >> $env:GITHUB_OUTPUT
+      - name: Upload the unsigned zip for signing
+        # Named outside the copperline-windows-* pattern the release job
+        # collects, so an unsigned copy can never be attached.
+        if: steps.signing.outputs.policy != 'none'
+        id: unsigned-zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: signpath-unsigned-zip-${{ matrix.arch }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign the executables in the zip
+        # packaging/windows/signpath/windows-zip.xml is the artifact
+        # configuration this slug names.
+        if: steps.signing.outputs.policy != 'none'
+        uses: SignPath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Copperline
+          signing-policy-slug: ${{ steps.signing.outputs.policy }}
+          artifact-configuration-slug: windows-zip
+          github-artifact-id: ${{ steps.unsigned-zip.outputs.artifact-id }}
+          wait-for-completion-timeout-in-seconds: ${{ steps.signing.outputs.timeout }}
+          output-artifact-directory: signpath-signed-zip
+          parameters: |
+            version: "${{ steps.artifact.outputs.version }}"
+      - name: Check and use the signed zip
+        if: steps.signing.outputs.policy != 'none'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signed = "signpath-signed-zip/${{ steps.artifact.outputs.path }}"
+          packaging/windows/check-signatures.ps1 -Path $signed -Policy ${{ steps.signing.outputs.policy }}
+          Move-Item -Force $signed "${{ steps.artifact.outputs.path }}"
       - name: Upload zip
         # Consumed by the zip-smoke and release jobs, and kept as the
-        # workflow artifact. Uploading here (before the checks run) also
-        # means a failing check still leaves the zip downloadable for
-        # debugging.
+        # workflow artifact (signed when this run signs). Uploading here
+        # (before the checks run) also means a failing check still leaves the
+        # zip downloadable for debugging.
         uses: actions/upload-artifact@v7
         with:
           name: copperline-windows-${{ matrix.arch }}
           path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
       - name: Build installer from the release ZIP
+        # From the signed ZIP when this run signs, so the installed
+        # executables carry the same signatures as the portable ones.
         shell: pwsh
         run: packaging/windows/build-installer.ps1 -Target ${{ matrix.target }} -ZipPath "${{ steps.artifact.outputs.path }}"
+      - name: Upload the unsigned installer for signing
+        if: steps.signing.outputs.policy != 'none'
+        id: unsigned-installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: signpath-unsigned-installer-${{ matrix.arch }}
+          path: Copperline-${{ steps.artifact.outputs.version }}-win-${{ matrix.arch }}-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign the installer
+        # packaging/windows/signpath/windows-installer.xml is the artifact
+        # configuration this slug names.
+        if: steps.signing.outputs.policy != 'none'
+        uses: SignPath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Copperline
+          signing-policy-slug: ${{ steps.signing.outputs.policy }}
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion-timeout-in-seconds: ${{ steps.signing.outputs.timeout }}
+          output-artifact-directory: signpath-signed-installer
+          parameters: |
+            version: "${{ steps.artifact.outputs.version }}"
+      - name: Check and use the signed installer
+        if: steps.signing.outputs.policy != 'none'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = "Copperline-${{ steps.artifact.outputs.version }}-win-${{ matrix.arch }}-setup.exe"
+          $signed = "signpath-signed-installer/$installer"
+          packaging/windows/check-signatures.ps1 -Path $signed -Policy ${{ steps.signing.outputs.policy }}
+          Move-Item -Force $signed $installer
       - name: Upload installer
         uses: actions/upload-artifact@v7
         with:
@@ -128,16 +264,18 @@ jobs:
           if-no-files-found: error
 
   test-bins:
+    timeout-minutes: 30
     name: Build test binaries (${{ matrix.arch }})
     # Compiles the #[test] targets once and hands the finished executables
     # to the test jobs below (needs: test-bins) as a workflow artifact.
     # Binaries, not a shared cargo cache: the test executables are plain
-    # libtest binaries and run fine without cargo. cargo builds the emulator
-    # binary here too (the integration tests spawn it through the
-    # compile-time CARGO_BIN_EXE_copperline path), so the staged
-    # copperline.exe pairs with the probe_golden harness compiled alongside
-    # it and this job needs nothing from the zip build. Separate cache keys
-    # keep the shipping and CI profiles warm independently.
+    # libtest binaries and run fine without cargo. cargo builds the ordinary
+    # binaries here too (the integration tests spawn copperline.exe,
+    # copperline-ctl.exe, and friends through compile-time CARGO_BIN_EXE_*
+    # paths), so the staged executables pair with the test harnesses
+    # compiled alongside them and this job needs nothing from the zip build.
+    # Separate cache keys keep the shipping and CI profiles warm
+    # independently.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -179,25 +317,33 @@ jobs:
         # the fan-out jobs. The asset-gated integration tests under tests/
         # keep compiling here too (they are #[ignore]d at run time, not
         # excluded from the build).
+        #
+        # Every ordinary (non-test) binary goes to ci-bins\bin under its own
+        # file name. Integration tests spawn them through compile-time
+        # CARGO_BIN_EXE_<name> paths (target\<triple>\ci\<name>.exe), so the
+        # test jobs copy the whole directory back there; staging all of them,
+        # rather than a named list, keeps a new CARGO_BIN_EXE_* user from
+        # finding its binary missing.
         run: |
           $ErrorActionPreference = "Stop"
           & packaging/windows/enable-clang.ps1 -Target ${{ matrix.target }}
           cargo test --profile ci --locked --target ${{ matrix.target }} --no-run --timings --message-format=json > cargo-test-build.json
           if ($LASTEXITCODE -ne 0) { throw "cargo test --no-run exited with $LASTEXITCODE" }
-          New-Item -ItemType Directory -Force -Path ci-bins | Out-Null
-          Copy-Item target\${{ matrix.target }}\ci\copperline.exe ci-bins\
+          New-Item -ItemType Directory -Force -Path ci-bins\bin | Out-Null
           Get-Content cargo-test-build.json | ForEach-Object {
             $msg = $_ | ConvertFrom-Json
-            if ($msg.reason -eq "compiler-artifact" -and $msg.profile.test -and $msg.executable) {
-              switch ("$($msg.target.kind[0]):$($msg.target.name)") {
-                "lib:copperline"     { Copy-Item $msg.executable ci-bins\unit-lib.exe }
-                "bin:copperline"     { Copy-Item $msg.executable ci-bins\unit-bin-copperline.exe }
-                "bin:copperline-ctl" { Copy-Item $msg.executable ci-bins\unit-bin-copperline-ctl.exe }
-                "test:probe_golden"  { Copy-Item $msg.executable ci-bins\probe_golden.exe }
+            if ($msg.reason -eq "compiler-artifact" -and $msg.executable) {
+              switch -Wildcard ("$($msg.profile.test):$($msg.target.kind[0]):$($msg.target.name)") {
+                "False:bin:*"             { Copy-Item $msg.executable ci-bins\bin\ }
+                "True:lib:copperline"     { Copy-Item $msg.executable ci-bins\unit-lib.exe }
+                "True:bin:*"              { Copy-Item $msg.executable "ci-bins/unit-bin-$($msg.target.name).exe" }
+                "True:test:probe_golden"  { Copy-Item $msg.executable ci-bins\probe_golden.exe; break }
+                "True:test:*"             { Copy-Item $msg.executable "ci-bins/test-$($msg.target.name).exe" }
               }
             }
           }
-          Get-ChildItem ci-bins
+          if (-not (Test-Path ci-bins\bin\copperline.exe)) { throw "copperline.exe was not staged" }
+          Get-ChildItem ci-bins, ci-bins\bin
       - name: Upload binaries for the test jobs
         uses: actions/upload-artifact@v7
         with:
@@ -213,6 +359,7 @@ jobs:
           retention-days: 7
 
   zip-smoke:
+    timeout-minutes: 30
     name: Packaged zip boot smoke (${{ matrix.arch }})
     needs: build
     runs-on: ${{ matrix.runner }}
@@ -259,6 +406,25 @@ jobs:
             & $path --help | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "$tool --help exited with $LASTEXITCODE" }
           }
+          # Every shipped executable carries version details, generated by
+          # build.rs from the Cargo version the zip is named after: Explorer,
+          # Task Manager, SmartScreen and code signing read the product name,
+          # publisher and version there, and the SignPath configuration
+          # (packaging/windows/signpath/windows-zip.xml) signs only files
+          # that match. A new .exe without an entry in build.rs's
+          # WINDOWS_EXECUTABLES fails here.
+          $version = $zip.BaseName -replace '^Copperline-(.+)-win-${{ matrix.arch }}$', '$1'
+          $numeric = ($version -split '[-+]')[0]
+          foreach ($file in Get-ChildItem -Path $exe.DirectoryName -Filter *.exe) {
+            $info = $file.VersionInfo
+            $fileNumeric = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)"
+            if ($info.ProductName -ne "Copperline" -or $info.CompanyName -ne "CopperlineHQ" -or
+                $info.ProductVersion -ne $version -or $info.FileVersion -ne $version -or
+                $fileNumeric -ne $numeric -or $info.OriginalFilename -ne $file.Name -or
+                -not $info.FileDescription) {
+              throw "$($file.Name) has wrong version details:$($info | Format-List | Out-String)"
+            }
+          }
 
   installer-smoke:
     name: Installer lifecycle smoke (${{ matrix.arch }})
@@ -287,7 +453,24 @@ jobs:
         with:
           name: copperline-windows-installer-${{ matrix.arch }}
           path: packages
-      - name: Install, boot, reinstall and uninstall
+      - name: Check the installer's version details
+        # copperline.iss sets these, and the SignPath configuration
+        # (packaging/windows/signpath/windows-installer.xml) signs only a
+        # Setup that carries them, so drift fails on the pull request that
+        # causes it rather than at release signing.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-Item packages/Copperline-*-win-${{ matrix.arch }}-setup.exe
+          $version = $installer.Name -replace '^Copperline-(.+)-win-${{ matrix.arch }}-setup\.exe$', '$1'
+          $info = $installer.VersionInfo
+          if ($info.ProductName -ne "Copperline" -or $info.CompanyName -ne "CopperlineHQ" -or
+              $info.ProductVersion -ne $version) {
+            throw "$($installer.Name) has wrong version details:$($info | Format-List | Out-String)"
+          }
+      - name: Install, boot, reinstall and uninstall (per-user and all-users)
+        # Hosted runners are elevated, so the all-users leg installs into
+        # Program Files without a UAC prompt.
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -306,6 +489,7 @@ jobs:
           retention-days: 7
 
   unit-tests:
+    timeout-minutes: 30
     name: Unit tests (${{ matrix.arch }})
     needs: test-bins
     runs-on: ${{ matrix.runner }}
@@ -315,8 +499,10 @@ jobs:
         include:
           - arch: x64
             runner: windows-latest
+            target: x86_64-pc-windows-msvc
           - arch: arm64
             runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - name: Force LF checkout
         # Keep committed fixture bytes identical to the build job (see the
@@ -330,19 +516,38 @@ jobs:
       - name: Unit tests
         shell: pwsh
         # The inline #[cfg(test)] suites in the lib and binaries, prebuilt
-        # by the test-bins job (this is everything a root `cargo test` runs
-        # besides tests/probe_golden.rs, which has its own job below; the
-        # crate has no doctests).
+        # by the test-bins job. Integration targets run in the next step;
+        # probe goldens have their own job below. The crate has no doctests.
         run: |
           $ErrorActionPreference = "Stop"
           ./ci-bins/unit-lib.exe
           if ($LASTEXITCODE -ne 0) { throw "unit-lib exited with $LASTEXITCODE" }
-          ./ci-bins/unit-bin-copperline.exe
-          if ($LASTEXITCODE -ne 0) { throw "unit-bin-copperline exited with $LASTEXITCODE" }
-          ./ci-bins/unit-bin-copperline-ctl.exe
-          if ($LASTEXITCODE -ne 0) { throw "unit-bin-copperline-ctl exited with $LASTEXITCODE" }
+          foreach ($suite in Get-ChildItem ci-bins/unit-bin-*.exe) {
+            & $suite.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($suite.Name) exited with $LASTEXITCODE" }
+          }
+      - name: Integration tests
+        shell: pwsh
+        # The suites spawn copperline.exe, copperline-ctl.exe, and the other
+        # ordinary binaries through compile-time CARGO_BIN_EXE_* paths under
+        # the --target build directory (the same absolute path in every job
+        # of this repo on hosted runners), so restore everything the
+        # test-bins job staged there first.
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path target\${{ matrix.target }}\ci | Out-Null
+          Copy-Item ci-bins\bin\* target\${{ matrix.target }}\ci\
+          $suites = @(Get-ChildItem ci-bins/test-*.exe)
+          if ($suites.Count -eq 0) { throw "No integration test binaries were staged" }
+          foreach ($suite in $suites) {
+            & $suite.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($suite.Name) exited with $LASTEXITCODE" }
+          }
+          ./ci-bins/test-audio_stems_determinism.exe --ignored
+          if ($LASTEXITCODE -ne 0) { throw "audio stems exited with $LASTEXITCODE" }
 
   probe-golden:
+    timeout-minutes: 30
     name: Probe golden renders (${{ matrix.arch }})
     needs: test-bins
     runs-on: ${{ matrix.runner }}
@@ -379,12 +584,12 @@ jobs:
         #
         # The test harness spawns the emulator through the compile-time
         # CARGO_BIN_EXE_copperline path, which on hosted runners is the same
-        # absolute path in every job of this repo -- hence the copy into the
-        # --target build directory before running.
+        # absolute path in every job of this repo -- hence the copy of the
+        # staged binaries into the --target build directory before running.
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path target\${{ matrix.target }}\ci | Out-Null
-          Copy-Item ci-bins\copperline.exe target\${{ matrix.target }}\ci\copperline.exe
+          Copy-Item ci-bins\bin\* target\${{ matrix.target }}\ci\
           ./ci-bins/probe_golden.exe
           if ($LASTEXITCODE -ne 0) { throw "probe_golden exited with $LASTEXITCODE" }
       - name: Upload probe render diffs
@@ -398,6 +603,7 @@ jobs:
           if-no-files-found: ignore
 
   release:
+    timeout-minutes: 30
     name: Attach Windows packages to release
     # Runs only once every Windows check on both architectures has passed,
     # preserving the old single-job ordering where the tests gated the

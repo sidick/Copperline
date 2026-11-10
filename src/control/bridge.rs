@@ -158,9 +158,20 @@ impl Bridge {
             return Err(format!("session lost: {reason}"));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.shared.lock().pending.insert(id, None);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let line = format!("{msg}\n");
+        let mut line = msg.to_string();
+        // The server drops a connection whose line exceeds MAX_LINE_BYTES.
+        // Refuse such a request here instead, so the caller gets an error
+        // and the session survives.
+        if line.len() > proto::MAX_LINE_BYTES {
+            return Err(format!(
+                "{method} request is {} bytes; a control message carries at most {}",
+                line.len(),
+                proto::MAX_LINE_BYTES
+            ));
+        }
+        line.push('\n');
+        self.shared.lock().pending.insert(id, None);
         let written = {
             let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             writer
@@ -442,11 +453,9 @@ static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pick the `--control-info` path and create the log file for one launch.
 ///
-/// The emulator announces its token on stderr, so the log is readable by
-/// the owner only from the moment it exists, like the info file, and is
-/// never an existing file: a symlink planted under a predictable name in a
-/// shared temp dir would carry the token away. A name that already exists
-/// is simply skipped for the next one in the sequence.
+/// Logs can contain private guest output, so the log is readable by the
+/// owner only from the moment it exists and never reuses an existing file.
+/// A name that already exists is skipped for the next one in the sequence.
 fn create_launch_files() -> Result<(PathBuf, PathBuf, std::fs::File), String> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -667,6 +676,43 @@ mod tests {
     }
 
     #[test]
+    fn a_request_over_the_line_limit_is_refused_locally_and_the_session_survives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = scripted_server(listener, |req| {
+            if let Some(hello) = hello_reply(req) {
+                return vec![hello];
+            }
+            let len = req["params"]["pad"].as_str().map_or(0, str::len);
+            vec![proto::ok_line(&req["id"], json!({"len": len}))]
+        });
+        let bridge = Bridge::connect(&addr.to_string(), "ok").unwrap();
+        // The full wire line counts: envelope, id and params, not just the
+        // payload. Ids stay single-digit here, so one envelope size fits all.
+        let envelope = |pad: usize| {
+            json!({"jsonrpc": "2.0", "id": 9, "method": "big", "params": {"pad": "x".repeat(pad)}})
+                .to_string()
+                .len()
+        };
+        let fits = proto::MAX_LINE_BYTES - envelope(0);
+        assert_eq!(envelope(fits), proto::MAX_LINE_BYTES);
+        let err = bridge
+            .call("big", json!({"pad": "x".repeat(fits + 1)}))
+            .unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+        assert_eq!(bridge.outstanding(), 0);
+        assert_eq!(
+            bridge
+                .call("big", json!({"pad": "x".repeat(fits)}))
+                .unwrap(),
+            Reply::Ok(json!({"len": fits}))
+        );
+        assert!(bridge.closed().is_none());
+        bridge.close();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_forgotten_request_s_late_reply_is_dropped() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -842,8 +888,7 @@ mod tests {
         assert!(err.contains("exited"), "{err}");
         assert!(err.contains("boot failure"), "{err}");
         assert!(err.contains("--control :0"), "{err}");
-        // The log the emulator's stderr went to (where a real emulator
-        // announces its token) is readable by the owner only.
+        // The log the emulator's stderr went to is readable by the owner only.
         let log = err
             .split("; log ")
             .nth(1)
