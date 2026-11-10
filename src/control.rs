@@ -22,6 +22,7 @@
 //! [`Emulator`]: crate::emulator::Emulator
 
 pub mod bridge;
+pub mod c3d;
 pub mod catalogue;
 #[cfg(feature = "dap")]
 pub mod dap;
