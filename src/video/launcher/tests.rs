@@ -5037,7 +5037,7 @@ fn c3d_board_toggles_and_round_trips() {
 
     // The written config has to load back into the same setting.
     let cfg = s.build_config().expect("valid config");
-    assert!(cfg.c3d);
+    assert!(cfg.c3d.enabled);
     let reloaded = MachineSetup::from_raw(&s.to_raw()).expect("valid raw");
     assert!(reloaded.toggle_value(LauncherField::C3d));
 

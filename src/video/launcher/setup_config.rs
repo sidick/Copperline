@@ -389,7 +389,7 @@ impl MachineSetup {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
             mhi: cfg.mhi,
-            c3d: cfg.c3d,
+            c3d: cfg.c3d.enabled,
             bridge_interfaces: Vec::new(),
             // Filled by refresh_sampler_inputs on open, like the audio devices.
             sampler_input_devices: Vec::new(),
@@ -1207,7 +1207,7 @@ impl MachineSetup {
         if self.mhi != base.mhi {
             raw.mhi.enabled = Some(self.mhi);
         }
-        if self.c3d != base.c3d {
+        if self.c3d != base.c3d.enabled {
             raw.c3d.enabled = Some(self.c3d);
         }
         // The Audio output picker is one of default / a named device / Disabled.

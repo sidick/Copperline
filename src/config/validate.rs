@@ -1009,39 +1009,7 @@ impl TryFrom<RawConfig> for Config {
             }
         };
         let mhi = raw.mhi.enabled.unwrap_or(defaults.mhi);
-        let c3d = raw.c3d.enabled.unwrap_or(defaults.c3d);
-        // `[c3d] mask_caps`: names -> CAPS0 bits to clear. Validated even
-        // when the board is disabled, so a typo never hides until a
-        // conformance run flips `enabled` on.
-        let c3d_mask_caps = {
-            let mut mask = 0u32;
-            for name in raw.c3d.mask_caps.as_deref().unwrap_or(&[]) {
-                mask |= match name.as_str() {
-                    "guestmem" => 1 << 0,
-                    "irq" => 1 << 1,
-                    "transform" => 1 << 2,
-                    "multitexture" => 1 << 3,
-                    "surface-guestaddr" => 1 << 4,
-                    "ref-sync" => 1 << 6,
-                    "shared-contexts" => crate::c3d::proto::CAP_SHARED_CONTEXTS,
-                    other => {
-                        return Err(anyhow!(
-                            "[c3d] mask_caps: unknown capability \"{other}\" (expected \
-                             guestmem, irq, transform, multitexture, surface-guestaddr, \
-                             ref-sync or shared-contexts)"
-                        ))
-                    }
-                };
-            }
-            mask
-        };
-        let c3d_trace = raw.c3d.trace.as_ref().map(PathBuf::from);
-        let c3d_trace_enabled = raw.c3d.trace_enabled.unwrap_or(false);
-        if raw.c3d.trace_rolling_bytes == Some(0) {
-            bail!("[c3d] trace_rolling_bytes must be at least 1");
-        }
-        let c3d_trace_rolling_bytes = raw.c3d.trace_rolling_bytes;
-        let c3d_trace_trigger_texture = raw.c3d.trace_trigger_texture;
+        let c3d = C3dConfig::from_raw(&raw.c3d, &defaults.c3d)?;
 
         // `[recording]`: the clip ring is bounded in time (and by a byte
         // budget in gifclip.rs); the rate caps at the field rate.
@@ -1564,11 +1532,6 @@ impl TryFrom<RawConfig> for Config {
             recording,
             mhi,
             c3d,
-            c3d_mask_caps,
-            c3d_trace,
-            c3d_trace_enabled,
-            c3d_trace_rolling_bytes,
-            c3d_trace_trigger_texture,
             hostsocket_net,
             hostsocket_transport,
             rtg,

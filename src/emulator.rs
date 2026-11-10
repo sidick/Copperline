@@ -4427,7 +4427,7 @@ fn build_machine_inner(
     // C3D virtual 3D accelerator board (`[c3d] enabled`): see
     // crate::c3d::board and docs/internals/c3d.md.
     #[cfg(feature = "c3d")]
-    if cfg.c3d {
+    if cfg.c3d.enabled {
         // The whole Zorro III window; not yet a `[c3d]` config knob (see
         // crate::c3d::board's module doc comment). A legal Zorro III size
         // -- BoardSpec::validate checks this the same as any other board.
@@ -4436,7 +4436,7 @@ fn build_machine_inner(
         zorro.add_board(crate::zorro::BoardSpec::c3d(slot, WINDOW_BYTES as usize))?;
         info!("c3d: 3D accelerator board on the Zorro chain (slot {slot})");
         let mut c3d_board =
-            crate::c3d::board::C3dBoard::with_masked_caps(WINDOW_BYTES, cfg.c3d_mask_caps);
+            crate::c3d::board::C3dBoard::with_masked_caps(WINDOW_BYTES, cfg.c3d.mask_caps);
         // `[c3d] trace`/`trace_enabled`/`trace_rolling_bytes`/
         // `trace_trigger_texture`: see `docs/internals/c3d.md`'s "Trace
         // capture" and `C3dBoard::trace_start`'s doc comment for the
@@ -4446,20 +4446,20 @@ fn build_machine_inner(
         // precedence over starting immediately -- the two are the same
         // "now vs. deferred" choice `c3d.trace_start`'s own
         // `trigger_texture` parameter makes at the control layer.
-        if let Some(path) = &cfg.c3d_trace {
+        if let Some(path) = &cfg.c3d.trace {
             c3d_board.set_configured_trace_path(path.clone());
         }
-        if cfg.c3d_trace_enabled {
-            if let Some(texture_id) = cfg.c3d_trace_trigger_texture {
-                c3d_board.trace_arm_on_texture_bind(texture_id, None, cfg.c3d_trace_rolling_bytes);
-            } else if let Err(e) = c3d_board.trace_start(None, cfg.c3d_trace_rolling_bytes) {
+        if cfg.c3d.trace_enabled {
+            if let Some(texture_id) = cfg.c3d.trace_trigger_texture {
+                c3d_board.trace_arm_on_texture_bind(texture_id, None, cfg.c3d.trace_rolling_bytes);
+            } else if let Err(e) = c3d_board.trace_start(None, cfg.c3d.trace_rolling_bytes) {
                 log::warn!("c3d: [c3d] trace_enabled capture failed to start: {e}");
             }
         }
         devices.push(crate::zorro_device::BoardDevice::C3d(Box::new(c3d_board)));
     }
     #[cfg(not(feature = "c3d"))]
-    if cfg.c3d {
+    if cfg.c3d.enabled {
         log::warn!("[c3d] enabled = true needs a build with --features c3d; no board is fitted");
     }
     // RTG board (`[rtg] card`): the Z3660.card P96 driver drives RTG screens
