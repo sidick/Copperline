@@ -1023,11 +1023,12 @@ impl TryFrom<RawConfig> for Config {
                     "multitexture" => 1 << 3,
                     "surface-guestaddr" => 1 << 4,
                     "ref-sync" => 1 << 6,
+                    "shared-contexts" => crate::c3d::proto::CAP_SHARED_CONTEXTS,
                     other => {
                         return Err(anyhow!(
                             "[c3d] mask_caps: unknown capability \"{other}\" (expected \
-                             guestmem, irq, transform, multitexture, surface-guestaddr \
-                             or ref-sync)"
+                             guestmem, irq, transform, multitexture, surface-guestaddr, \
+                             ref-sync or shared-contexts)"
                         ))
                     }
                 };

@@ -5742,10 +5742,55 @@ impl Renderer {
                 let tex = self.renderbuffers.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
                 Ok((width, height, tex, view))
             }
-            state::FramebufferAttachment::Texture { .. } | state::FramebufferAttachment::TextureFace { .. } => {
-                Err(RenderError::Unimplemented(
-                    "BLIT_FRAMEBUFFER to/from a texture-backed colour attachment",
-                ))
+            // Mirrors `resolve_color_attachment`'s identical arms below
+            // (the draw path's own render-to-texture lookup) -- a
+            // texture-backed colour attachment is just as valid a
+            // BLIT_FRAMEBUFFER source or destination as a renderbuffer
+            // one (spec draws no distinction; `FRAMEBUFFER_ATTACH_TEXTURE`/
+            // `FRAMEBUFFER_ATTACH_RENDERBUFFER` are two ways to populate
+            // the same colour attachment point). Previously
+            // `Unimplemented` here while the draw path already supported
+            // it -- a real gap, not a deliberate restriction: nothing in
+            // the spec or this file's own blit validation singles out a
+            // texture destination, and MSAA-resolve-into-a-sampled-texture
+            // is an entirely ordinary GLES2 usage pattern.
+            state::FramebufferAttachment::Texture { id, level } => {
+                let tex = self
+                    .textures
+                    .get(&(state.namespace(), id))
+                    .ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                let texture = tex.texture.clone();
+                Ok((width, height, texture, view))
+            }
+            state::FramebufferAttachment::TextureFace { id, face, level } => {
+                let tex = self
+                    .textures
+                    .get(&(state.namespace(), id))
+                    .ok_or(RenderError::UnknownObject("texture", id))?;
+                let width = mip_extent(tex.width, level);
+                let height = mip_extent(tex.height, level);
+                // One face, one level, as a plain `D2` slice -- same
+                // convention as `resolve_color_attachment`'s identical
+                // arm: a render/copy attachment targets a single 2D
+                // surface regardless of the texture object's own `Cube`
+                // sampling view.
+                let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: face,
+                    array_layer_count: Some(1),
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                let texture = tex.texture.clone();
+                Ok((width, height, texture, view))
             }
         }
     }
@@ -17002,6 +17047,107 @@ mod tests {
             encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
             "y-flip must move the source top row (red) to the destination's bottom"
         );
+    }
+
+    /// `BLIT_FRAMEBUFFER` into a TEXTURE-backed colour attachment (as
+    /// opposed to every other blit test in this module, which targets a
+    /// renderbuffer or the default surface). Regression test for a real
+    /// gap found and fixed this session: `resolve_color_attachment_texture`
+    /// (the helper `resolve_blit_color_destinations`/the colour-source
+    /// lookup both go through) used to return
+    /// `RenderError::Unimplemented("BLIT_FRAMEBUFFER to/from a
+    /// texture-backed colour attachment")` for `FramebufferAttachment::
+    /// Texture`/`TextureFace`, even though the ordinary draw path's
+    /// equivalent lookup (`resolve_color_attachment`, right above in this
+    /// file) already handled exactly the same attachment kind correctly.
+    /// Nothing in the spec or this file's own blit validation singles out
+    /// a texture destination -- `FRAMEBUFFER_ATTACH_TEXTURE`/
+    /// `FRAMEBUFFER_ATTACH_RENDERBUFFER` are two ways to populate the same
+    /// colour attachment point, and MSAA-resolve-into-a-sampled-texture
+    /// (or a plain same-size colour copy into one, exercised here with no
+    /// multisampling to isolate the destination-kind bug alone) is an
+    /// entirely ordinary GLES2 usage pattern a guest driver is expected to
+    /// rely on. Fixed by mirroring `resolve_color_attachment`'s `Texture`/
+    /// `TextureFace` arms into `resolve_color_attachment_texture`.
+    #[test]
+    fn blit_framebuffer_into_a_texture_backed_destination_copies_correctly() {
+        let mut renderer = match Renderer::new() {
+            Ok(r) => r,
+            Err(RenderError::NoAdapter) => {
+                eprintln!("skipping: no wgpu adapter available");
+                return;
+            }
+            Err(e) => panic!("unexpected renderer error: {e}"),
+        };
+        const A8R8G8B8: u32 = 5;
+        const RGBA8: u32 = 0;
+        const FRAMEBUFFER: u32 = 0x8D40;
+        const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+        const READ_FRAMEBUFFER: u32 = 0x8CA8;
+        const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const NEAREST: u32 = 0;
+        let mut mem = TestMemory::new(65536);
+        let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
+
+        // Source: a 2x2 renderbuffer-backed framebuffer, filled solid
+        // red via CLEAR (same "no upload opcode targets a renderbuffer
+        // directly" reasoning as the scale/flip test just above).
+        let commands = vec![
+            cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
+            cmd(proto::OP_SET_DRAW_SURFACE, &[1]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
+            cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
+            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]),
+            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
+
+        // Destination: a same-size (2x2) TEXTURE attached at
+        // COLOR_ATTACHMENT0 of a second framebuffer -- the exact
+        // attachment kind `resolve_color_attachment_texture` used to
+        // reject. Initialised to green so a no-op blit (the pre-fix
+        // behaviour: the `Err` path was swallowed by the caller, leaving
+        // the destination untouched) would read back green, not red.
+        let tex_init = [0u8, 255, 0, 255].repeat(2 * 2);
+        let a_tex_init = 0x2000u32;
+        mem.write(MemLoc::Aperture(a_tex_init), &tex_init);
+        let dest_commands = vec![
+            cmd(proto::OP_TEX_CREATE, &[1]),
+            cmd(proto::OP_TEX_IMAGE, &[1, 0, RGBA8, 2, 2, 8, a_tex_init, tex_init.len() as u32]),
+            cmd(proto::OP_FRAMEBUFFER_CREATE, &[2]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 2]),
+            cmd(proto::OP_FRAMEBUFFER_ATTACH_TEXTURE, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1, 0]),
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
+            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &dest_commands);
+
+        let dest = 0x3000u32;
+        let readback = vec![
+            cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 2]),
+            cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
+            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 16]),
+        ];
+        submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
+        let pixels = mem.read(MemLoc::Aperture(dest), 16).unwrap().to_vec();
+        for (i, want) in [
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let got = &pixels[i * 4..i * 4 + 4];
+            assert_eq!(
+                got, want,
+                "texel {i} of the texture-backed destination must be the blitted red, not the original green or any other leftover content: {got:?}"
+            );
+        }
     }
 
     /// `BLIT_FRAMEBUFFER`'s colour copy fans one source out to **every**
