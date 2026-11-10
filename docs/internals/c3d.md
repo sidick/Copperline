@@ -30,7 +30,7 @@ excluded from CI. Only the renderer needs the feature.
 ## Implementation notes
 
 These describe the Copperline host board (`src/c3d/`, `[c3d]`, cargo
-feature `c3d`, **off by default**). They are updated as the milestones
+feature `c3d`, **on by default**). They are updated as the milestones
 land; the specification is revised separately and first. Where an
 earlier draft of this section described a shape the code ended up not
 taking, the note says so rather than quietly disappearing -- a design

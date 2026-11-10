@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct C3dConfig {
     /// `[c3d] enabled`: when true, a C3D board autoconfigs on the Zorro
-    /// chain. Needs a build with the `c3d` feature (off by default).
+    /// chain. Needs a build with the `c3d` feature (on by default).
     pub enabled: bool,
     /// `[c3d] mask_caps`: `CAPS0` bits to force clear, resolved from the
     /// raw config's capability names (see [`RawC3d::mask_caps`]). `0` when

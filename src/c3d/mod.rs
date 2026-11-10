@@ -20,7 +20,7 @@
 //! - [`trace`] -- the conformance/capture trace container
 //!
 //! One module is not pure logic and is gated accordingly: [`render`]
-//! (cargo feature `c3d`, off by default) is the wgpu backend that turns
+//! (cargo feature `c3d`, on by default) is the wgpu backend that turns
 //! [`dispatch`]'s renderer operations into pixels, and it is what the
 //! `copperline-c3d-trace` conformance runner drives.
 

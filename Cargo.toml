@@ -64,6 +64,7 @@ default = [
     "game-library",
     "update-check",
     "mhi",
+    "c3d",
     "cd-mp3",
     "cd32-fmv",
     "gdb",
@@ -120,20 +121,26 @@ cd32-fmv = [
     "symphonia-bundle-mp3/mp2",
 ]
 # The C3D virtual 3D accelerator board's renderer and its conformance-trace
-# runner (src/c3d/render.rs, the `copperline-c3d-trace` binary). **Off by
-# default**, unlike the other board features: this is the only part of the
-# tree that creates a GPU device of its own, so a build that does not want
-# 3D pays nothing for it -- no adapter enumeration at startup, and no wgpu
-# in a `--no-default-features` core. The board's pure logic (the ring
-# decoder, the GL state machine, the dispatch layer and the trace
-# container, src/c3d/) is deliberately NOT behind this feature: it depends
-# on nothing and builds everywhere the core does, including wasm32, so the
-# conformance logic is never silently excluded from CI.
+# runner (src/c3d/render.rs, the `copperline-c3d-trace` binary). On by
+# default, like the other board features. This is the only part of the tree
+# that creates a GPU device of its own, but it creates it lazily -- the
+# board holds an `Option<Renderer>` and `Renderer::new` runs on the first
+# render, not at startup, so a default build that never fits a C3D board
+# (`[c3d] enabled` defaults to false) enumerates no adapters and opens no
+# GPU device. Turning the feature off is therefore a build-size and
+# compile-time choice, not a startup-cost one; `--no-default-features`
+# still carries no wgpu at all, which is what the portable/WASM core
+# needs. The board's pure logic (the ring decoder, the GL state machine,
+# the dispatch layer and the trace container, src/c3d/) is deliberately NOT
+# behind this feature: it depends on nothing and builds everywhere the core
+# does, including wasm32, so the conformance logic is never silently
+# excluded from CI.
 #
-# wgpu and pollster are already in the default build's dependency graph
-# through `pixels`, so enabling this adds no new crate copies; the version
-# is pinned to the one `pixels` resolves to for that reason, and moves with
-# it (see the pixels/egui lockstep note below).
+# wgpu, pollster and naga are already in the default build's dependency
+# graph through `pixels`, so enabling this adds no new crate copies (only
+# naga's `glsl-in` front end and the standalone `glsl-lang` parser); the
+# version is pinned to the one `pixels` resolves to for that reason, and
+# moves with it (see the pixels/egui lockstep note below).
 c3d = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:glsl-lang", "dep:env_logger"]
 display-plan-trace = []
 # Detailed host-cost counters used by native diagnostics. The browser crate

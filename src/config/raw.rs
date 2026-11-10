@@ -1318,7 +1318,7 @@ pub(crate) struct RawMhi {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawC3d {
     /// Fit the board. Absent/false means no C3D board is on the chain.
-    /// Needs a build with the `c3d` feature (off by default); see
+    /// Needs a build with the `c3d` feature (on by default); see
     /// `docs/internals/c3d.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) enabled: Option<bool>,

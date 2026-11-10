@@ -5,7 +5,7 @@
 //! `docs/internals/c3d.md` is the device specification this module renders
 //! against; where this module and that spec disagree, the spec wins. This
 //! is the one part of `src/c3d/` that owns a GPU device (cargo feature
-//! `c3d`, off by default -- see `src/c3d/mod.rs`), and it owns its *own*
+//! `c3d`, on by default -- see `src/c3d/mod.rs`), and it owns its *own*
 //! headless `wgpu` device: it never assumes a window or a surface exists,
 //! because neither the conformance-trace runner (`src/bin/c3d-trace.rs`)
 //! nor a headless capture has one. [`Renderer::new`] blocks (via

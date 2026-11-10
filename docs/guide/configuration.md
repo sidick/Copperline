@@ -3195,9 +3195,10 @@ enabled = true
 
 Fits a virtual fixed-function 3D accelerator board on the Zorro chain,
 targeted by a guest OpenGL 1.x library. Omit the section (or `enabled =
-false`) for no board. Needs a build with the `c3d` feature (**off by
-default**, unlike `mhi`: this is the only board that creates a GPU device
-of its own, so a build that does not want 3D pays nothing for it). It
+false`) for no board. Needs a build with the `c3d` feature (**on by
+default**, like `mhi`; a build without it warns and fits no board). The
+GPU device is created lazily on the first render, so a default build that
+fits no C3D board costs nothing at startup. It
 prefers a hardware adapter and falls back to a software one; if neither is
 available the board still autoconfigs and answers registers, but every
 doorbell's rendering work is silently dropped (a warning is logged once).
