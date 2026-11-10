@@ -13596,6 +13596,9 @@ mod wave;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "c3d"))]
+mod c3d_dma_tests;
+
 /// Borrowed in-progress frame capture; see [`Bus::in_progress_render_parts`].
 pub(crate) struct InProgressRenderParts<'a> {
     pub geometry: FrameGeometry,
