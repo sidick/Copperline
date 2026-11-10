@@ -343,9 +343,10 @@ pub const OP_QUERY: u16 = 0x0800;
 pub const OP_READ_PIXELS: u16 = 0x0801;
 
 // Shaders and programs (0x09xx) -- `c3d-cmd-shaders-and-programs`,
-// `CAP_PROGRAMMABLE`. `UNIFORM`/`UNIFORM_SAMPLER` (`0x090C`/`0x090D`) are
-// not implemented yet -- they need `PROGRAM_INTERFACE` (`0x0D02`, also not
-// yet implemented) to hand out the locations they take as input.
+// `CAP_PROGRAMMABLE`. `UNIFORM`/`UNIFORM_SAMPLER` (`0x090C`/`0x090D`) take
+// locations handed out by `PROGRAM_INTERFACE` (`0x0D02`); all three are
+// implemented (`ring.rs`'s `OP_UNIFORM`, `OP_UNIFORM_SAMPLER` and
+// `OP_PROGRAM_INTERFACE` arms).
 pub const OP_SHADER_CREATE: u16 = 0x0900;
 pub const OP_SHADER_DESTROY: u16 = 0x0901;
 pub const OP_SHADER_SOURCE: u16 = 0x0902;
