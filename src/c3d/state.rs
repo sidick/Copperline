@@ -1758,10 +1758,17 @@ pub struct Renderbuffer {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FramebufferAttachment {
     Renderbuffer(u32),
-    Texture { id: u32, level: u32 },
+    Texture {
+        id: u32,
+        level: u32,
+    },
     /// `FRAMEBUFFER_ATTACH_TEXTURE_FACE`: one face of a cube-map texture
     /// (render-to-cube-face).
-    TextureFace { id: u32, face: u32, level: u32 },
+    TextureFace {
+        id: u32,
+        face: u32,
+        level: u32,
+    },
 }
 
 /// One framebuffer object's attachment points and `DRAW_BUFFERS`/
@@ -1976,7 +1983,9 @@ impl State {
             programs: Rc::new(RefCell::new(BTreeMap::new())),
             current_program: 0,
             buffers: Rc::new(RefCell::new(BTreeSet::new())),
-            vertex_attribs: (0..limits.max_vertex_attribs).map(|_| VertexAttrib::default()).collect(),
+            vertex_attribs: (0..limits.max_vertex_attribs)
+                .map(|_| VertexAttrib::default())
+                .collect(),
             framebuffers: BTreeMap::new(),
             renderbuffers: Rc::new(RefCell::new(BTreeMap::new())),
             draw_framebuffer: 0,
@@ -2573,7 +2582,9 @@ impl State {
     /// resets an existing one to defaults (per the spec, "Creating an
     /// existing ID resets it") without touching who has it bound.
     pub fn tex_create(&mut self, id: u32) {
-        self.textures.borrow_mut().insert(id, TextureObject::default());
+        self.textures
+            .borrow_mut()
+            .insert(id, TextureObject::default());
     }
 
     /// `TEX_CREATE_CUBE`: as `TEX_CREATE`, but `id` becomes a cube-map
@@ -2672,7 +2683,9 @@ impl State {
             return Err(GlError::InvalidOperation);
         }
         let mut textures = self.textures.borrow_mut();
-        let tex = textures.get_mut(&id).expect("just checked contains_key above");
+        let tex = textures
+            .get_mut(&id)
+            .expect("just checked contains_key above");
         match param {
             TexParam::MinFilter(f) => tex.min_filter = f,
             TexParam::MagFilter(f) => tex.mag_filter = f,
@@ -2716,7 +2729,9 @@ impl State {
             return Err(GlError::InvalidOperation);
         }
         let mut textures = self.textures.borrow_mut();
-        let tex = textures.get_mut(&id).expect("just checked contains_key above");
+        let tex = textures
+            .get_mut(&id)
+            .expect("just checked contains_key above");
         tex.levels.insert(
             (face, level),
             TexLevel {
@@ -2735,7 +2750,9 @@ impl State {
             return Err(GlError::InvalidOperation);
         }
         let mut textures = self.textures.borrow_mut();
-        let tex = textures.get_mut(&id).expect("just checked contains_key above");
+        let tex = textures
+            .get_mut(&id)
+            .expect("just checked contains_key above");
         tex.palette_entries = if entries == 0 { None } else { Some(entries) };
         Ok(())
     }
@@ -2860,7 +2877,9 @@ impl State {
     /// attachments (and, in `render.rs`, its previous link result),
     /// exactly as `SHADER_CREATE` does for a shader.
     pub fn program_create(&mut self, id: u32) {
-        self.programs.borrow_mut().insert(id, ProgramObject::default());
+        self.programs
+            .borrow_mut()
+            .insert(id, ProgramObject::default());
     }
 
     /// `PROGRAM_DESTROY`: releases the object. If it was the current
@@ -2965,7 +2984,9 @@ impl State {
     /// Scoped to `self.namespace()`, exactly like the five shareable
     /// object kinds.
     pub fn fence_sync_create(&mut self, id: u32) {
-        self.sync_objects.borrow_mut().insert(id, SyncObject { signalled: true });
+        self.sync_objects
+            .borrow_mut()
+            .insert(id, SyncObject { signalled: true });
     }
 
     /// `FENCE_SYNC_DESTROY`: releases the guest's claim on `id`. Real
@@ -3092,7 +3113,8 @@ impl State {
     /// resets an existing one to that state, mirroring `tex_create`'s
     /// "creating an existing ID discards" behaviour.
     pub fn framebuffer_create(&mut self, id: u32) {
-        self.framebuffers.insert(id, Framebuffer::new(self.limits.max_color_attachments));
+        self.framebuffers
+            .insert(id, Framebuffer::new(self.limits.max_color_attachments));
     }
 
     /// `FRAMEBUFFER_DESTROY`: if it is the bound draw/read framebuffer,
@@ -3127,7 +3149,9 @@ impl State {
     }
 
     pub fn renderbuffer_create(&mut self, id: u32) {
-        self.renderbuffers.borrow_mut().insert(id, Renderbuffer::default());
+        self.renderbuffers
+            .borrow_mut()
+            .insert(id, Renderbuffer::default());
     }
 
     /// `RENDERBUFFER_DESTROY`: detaches it from every framebuffer
@@ -3147,15 +3171,30 @@ impl State {
         }
     }
 
-    pub fn renderbuffer_storage_color(&mut self, id: u32, width: u32, height: u32, format: SurfaceFormat) {
+    pub fn renderbuffer_storage_color(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        format: SurfaceFormat,
+    ) {
         if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples: 0 });
+            rb.storage = Some(RenderbufferStorage::Color {
+                width,
+                height,
+                format,
+                samples: 0,
+            });
         }
     }
 
     pub fn renderbuffer_storage_depth_stencil(&mut self, id: u32, width: u32, height: u32) {
         if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples: 0 });
+            rb.storage = Some(RenderbufferStorage::DepthStencil {
+                width,
+                height,
+                samples: 0,
+            });
         }
     }
 
@@ -3178,7 +3217,12 @@ impl State {
             return Err(ErrorCode::Limit);
         }
         if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::Color { width, height, format, samples });
+            rb.storage = Some(RenderbufferStorage::Color {
+                width,
+                height,
+                format,
+                samples,
+            });
         }
         Ok(())
     }
@@ -3196,7 +3240,11 @@ impl State {
             return Err(ErrorCode::Limit);
         }
         if let Some(rb) = self.renderbuffers.borrow_mut().get_mut(&id) {
-            rb.storage = Some(RenderbufferStorage::DepthStencil { width, height, samples });
+            rb.storage = Some(RenderbufferStorage::DepthStencil {
+                width,
+                height,
+                samples,
+            });
         }
         Ok(())
     }
@@ -3216,11 +3264,20 @@ impl State {
             return Err(ErrorCode::BadId);
         }
         if renderbuffer != 0 {
-            let storage = self.renderbuffers.borrow().get(&renderbuffer).and_then(|rb| rb.storage);
+            let storage = self
+                .renderbuffers
+                .borrow()
+                .get(&renderbuffer)
+                .and_then(|rb| rb.storage);
             let matches = matches!(
                 (attachment, storage),
-                (FramebufferAttachmentPoint::Color(_), Some(RenderbufferStorage::Color { .. }))
-                    | (FramebufferAttachmentPoint::DepthStencil, Some(RenderbufferStorage::DepthStencil { .. }))
+                (
+                    FramebufferAttachmentPoint::Color(_),
+                    Some(RenderbufferStorage::Color { .. })
+                ) | (
+                    FramebufferAttachmentPoint::DepthStencil,
+                    Some(RenderbufferStorage::DepthStencil { .. })
+                )
             );
             if !matches {
                 return Err(ErrorCode::BadArg);
@@ -3229,7 +3286,8 @@ impl State {
         let Some(fb) = self.framebuffers.get_mut(&fb_id) else {
             return Ok(());
         };
-        let value = (renderbuffer != 0).then_some(FramebufferAttachment::Renderbuffer(renderbuffer));
+        let value =
+            (renderbuffer != 0).then_some(FramebufferAttachment::Renderbuffer(renderbuffer));
         match attachment {
             FramebufferAttachmentPoint::Color(i) => {
                 if let Some(slot) = fb.colors.get_mut(i) {
@@ -3298,7 +3356,11 @@ impl State {
             return Ok(());
         };
         if let Some(slot) = fb.colors.get_mut(i) {
-            *slot = (texture != 0).then_some(FramebufferAttachment::TextureFace { id: texture, face, level });
+            *slot = (texture != 0).then_some(FramebufferAttachment::TextureFace {
+                id: texture,
+                face,
+                level,
+            });
         }
         Ok(())
     }
@@ -3381,9 +3443,16 @@ impl State {
     /// to be its only callers before `BLIT_FRAMEBUFFER`).
     fn attachment_size(&self, attachment: FramebufferAttachment) -> Option<(u32, u32)> {
         match attachment {
-            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
+            FramebufferAttachment::Renderbuffer(id) => match self
+                .renderbuffers
+                .borrow()
+                .get(&id)
+                .and_then(|rb| rb.storage)
+            {
                 Some(RenderbufferStorage::Color { width, height, .. }) => Some((width, height)),
-                Some(RenderbufferStorage::DepthStencil { width, height, .. }) => Some((width, height)),
+                Some(RenderbufferStorage::DepthStencil { width, height, .. }) => {
+                    Some((width, height))
+                }
                 None => None,
             },
             FramebufferAttachment::Texture { id, level } => self
@@ -3408,7 +3477,12 @@ impl State {
     /// INCOMPLETE_MULTISAMPLE` check.
     fn attachment_samples(&self, attachment: FramebufferAttachment) -> u32 {
         match attachment {
-            FramebufferAttachment::Renderbuffer(id) => match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
+            FramebufferAttachment::Renderbuffer(id) => match self
+                .renderbuffers
+                .borrow()
+                .get(&id)
+                .and_then(|rb| rb.storage)
+            {
                 Some(RenderbufferStorage::Color { samples, .. }) => samples,
                 Some(RenderbufferStorage::DepthStencil { samples, .. }) => samples,
                 None => 0,
@@ -3450,7 +3524,12 @@ impl State {
             return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
         };
         if let Some(FramebufferAttachment::Renderbuffer(id)) = fb.depth_stencil {
-            match self.renderbuffers.borrow().get(&id).and_then(|rb| rb.storage) {
+            match self
+                .renderbuffers
+                .borrow()
+                .get(&id)
+                .and_then(|rb| rb.storage)
+            {
                 Some(RenderbufferStorage::DepthStencil {
                     width: dw,
                     height: dh,
@@ -3517,7 +3596,9 @@ impl State {
         let mut out = Vec::new();
         for slot in &fb.draw_buffers {
             let Some(idx) = slot else { continue };
-            let Some(Some(attachment)) = fb.colors.get(*idx) else { continue };
+            let Some(Some(attachment)) = fb.colors.get(*idx) else {
+                continue;
+            };
             if let Some((w, h)) = self.attachment_size(*attachment) {
                 out.push((w, h, self.attachment_samples(*attachment)));
             }
@@ -5119,7 +5200,10 @@ mod tests {
     #[test]
     fn the_default_framebuffer_is_always_complete() {
         let s = state();
-        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_COMPLETE
+        );
     }
 
     #[test]
@@ -5129,9 +5213,16 @@ mod tests {
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.renderbuffer_create(1);
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
-        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_COMPLETE
+        );
     }
 
     #[test]
@@ -5161,10 +5252,18 @@ mod tests {
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
         s.renderbuffer_create(2);
         s.renderbuffer_storage_depth_stencil(2, 32, 32);
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 2)
-            .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::DepthStencil,
+            2,
+        )
+        .unwrap();
         assert_eq!(
             s.framebuffer_status(FramebufferTarget::Draw),
             GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS
@@ -5177,7 +5276,11 @@ mod tests {
         s.renderbuffer_create(1);
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
         assert_eq!(
-            s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1),
+            s.framebuffer_attach_renderbuffer(
+                FramebufferTarget::Draw,
+                FramebufferAttachmentPoint::Color(0),
+                1
+            ),
             Err(ErrorCode::BadId)
         );
     }
@@ -5190,7 +5293,11 @@ mod tests {
         s.renderbuffer_create(1);
         s.renderbuffer_storage_depth_stencil(1, 64, 64);
         assert_eq!(
-            s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1),
+            s.framebuffer_attach_renderbuffer(
+                FramebufferTarget::Draw,
+                FramebufferAttachmentPoint::Color(0),
+                1
+            ),
             Err(ErrorCode::BadArg)
         );
     }
@@ -5202,7 +5309,12 @@ mod tests {
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.tex_create(1);
         assert_eq!(
-            s.framebuffer_attach_texture(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 1, 0),
+            s.framebuffer_attach_texture(
+                FramebufferTarget::Draw,
+                FramebufferAttachmentPoint::DepthStencil,
+                1,
+                0
+            ),
             Err(ErrorCode::BadArg)
         );
     }
@@ -5214,8 +5326,12 @@ mod tests {
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.renderbuffer_create(1);
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
         s.renderbuffer_destroy(1);
         assert_eq!(s.framebuffer(1).unwrap().colors[0], None);
     }
@@ -5226,8 +5342,13 @@ mod tests {
         s.framebuffer_create(1);
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.tex_create(1);
-        s.framebuffer_attach_texture(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1, 0)
-            .unwrap();
+        s.framebuffer_attach_texture(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+            0,
+        )
+        .unwrap();
         s.tex_destroy(1);
         assert_eq!(s.framebuffer(1).unwrap().colors[0], None);
         // Not GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT (a dangling
@@ -5251,7 +5372,10 @@ mod tests {
     #[test]
     fn draw_buffers_against_the_default_framebuffer_is_bad_id() {
         let mut s = state();
-        assert_eq!(s.draw_buffers(&[GL_COLOR_ATTACHMENT0]), Err(ErrorCode::BadId));
+        assert_eq!(
+            s.draw_buffers(&[GL_COLOR_ATTACHMENT0]),
+            Err(ErrorCode::BadId)
+        );
     }
 
     #[test]
@@ -5344,14 +5468,28 @@ mod tests {
         s.framebuffer_create(1);
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.renderbuffer_create(1);
-        s.renderbuffer_storage_color_multisample(1, 64, 64, SurfaceFormat::A8r8g8b8, s.limits.max_samples as u32)
-            .unwrap();
+        s.renderbuffer_storage_color_multisample(
+            1,
+            64,
+            64,
+            SurfaceFormat::A8r8g8b8,
+            s.limits.max_samples as u32,
+        )
+        .unwrap();
         s.renderbuffer_create(2);
         s.renderbuffer_storage_depth_stencil(2, 64, 64); // samples: 0
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::DepthStencil, 2)
-            .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::DepthStencil,
+            2,
+        )
+        .unwrap();
         assert_eq!(
             s.framebuffer_status(FramebufferTarget::Draw),
             GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
@@ -5374,11 +5512,22 @@ mod tests {
         s.renderbuffer_create(2);
         s.renderbuffer_storage_color_multisample(2, 64, 64, SurfaceFormat::A8r8g8b8, samples)
             .unwrap();
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(1), 2)
-            .unwrap();
-        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(1),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_COMPLETE
+        );
     }
 
     #[test]
@@ -5396,7 +5545,8 @@ mod tests {
     }
 
     #[test]
-    fn draw_buffers_naming_the_same_attachment_twice_is_invalid_operation_and_keeps_the_old_mapping() {
+    fn draw_buffers_naming_the_same_attachment_twice_is_invalid_operation_and_keeps_the_old_mapping(
+    ) {
         let mut s = state();
         s.framebuffer_create(1);
         s.bind_framebuffer(FramebufferTarget::Both, 1);
@@ -5426,9 +5576,16 @@ mod tests {
         s.bind_framebuffer(FramebufferTarget::Both, 1);
         s.renderbuffer_create(1);
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(2), 1)
-            .unwrap();
-        assert_eq!(s.framebuffer_status(FramebufferTarget::Draw), GL_FRAMEBUFFER_COMPLETE);
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(2),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            s.framebuffer_status(FramebufferTarget::Draw),
+            GL_FRAMEBUFFER_COMPLETE
+        );
     }
 
     #[test]
@@ -5440,10 +5597,18 @@ mod tests {
         s.renderbuffer_storage_color(1, 64, 64, SurfaceFormat::A8r8g8b8);
         s.renderbuffer_create(2);
         s.renderbuffer_storage_color(2, 32, 32, SurfaceFormat::A8r8g8b8);
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(0), 1)
-            .unwrap();
-        s.framebuffer_attach_renderbuffer(FramebufferTarget::Draw, FramebufferAttachmentPoint::Color(1), 2)
-            .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(0),
+            1,
+        )
+        .unwrap();
+        s.framebuffer_attach_renderbuffer(
+            FramebufferTarget::Draw,
+            FramebufferAttachmentPoint::Color(1),
+            2,
+        )
+        .unwrap();
         assert_eq!(
             s.framebuffer_status(FramebufferTarget::Draw),
             GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS

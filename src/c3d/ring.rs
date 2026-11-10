@@ -630,7 +630,8 @@ impl<'a> RingCursor<'a> {
         // TEX_GENERATE_MIPS is spec-optional the same way, gated by
         // TEXFMT_SUPPORTED bit 10 (MipgenSupported) rather than by tier.
         if opcode == proto::OP_TEX_GENERATE_MIPS
-            && (self.config.texfmt_supported >> proto::TextureFormat::MipgenSupported as u32) & 1 == 0
+            && (self.config.texfmt_supported >> proto::TextureFormat::MipgenSupported as u32) & 1
+                == 0
         {
             return self.raise(ErrorCode::BadOpcode, start);
         }
@@ -976,7 +977,9 @@ impl<'a> RingCursor<'a> {
             }
             OP_CLEAR_STENCIL => {
                 fixed!(1);
-                Command::ClearStencil { value: w32(body, 0) }
+                Command::ClearStencil {
+                    value: w32(body, 0),
+                }
             }
 
             OP_MATRIX_MODE => {
@@ -2306,7 +2309,12 @@ impl<'a> RingCursor<'a> {
 
     /// `RENDERBUFFER_STORAGE_COLOR`/`RENDERBUFFER_STORAGE_DEPTH_STENCIL`'s
     /// `width`/`height` against `MAX_RENDERBUFFER_SIZE`.
-    fn check_renderbuffer_size(&mut self, width: u32, height: u32, start: u32) -> Result<(), Step<'a>> {
+    fn check_renderbuffer_size(
+        &mut self,
+        width: u32,
+        height: u32,
+        start: u32,
+    ) -> Result<(), Step<'a>> {
         if width > self.config.max_renderbuffer_size || height > self.config.max_renderbuffer_size {
             return Err(self.raise(ErrorCode::Limit, start));
         }
@@ -4582,7 +4590,10 @@ mod tests {
         let step = decode_one(&ring, 0, 12);
         assert_eq!(
             step,
-            Step::Command(Command::BindFramebuffer { target: 0x8D40, id: 0 })
+            Step::Command(Command::BindFramebuffer {
+                target: 0x8D40,
+                id: 0
+            })
         );
     }
 
@@ -4624,7 +4635,12 @@ mod tests {
 
     #[test]
     fn decodes_framebuffer_attach_renderbuffer_with_renderbuffer_zero_to_detach() {
-        let words = [header(OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, 4), 0x8D40, 0x8CE0, 0];
+        let words = [
+            header(OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, 4),
+            0x8D40,
+            0x8CE0,
+            0,
+        ];
         let ring = ring_with(4096, 0, &words);
         let step = decode_one(&ring, 0, 16);
         assert_eq!(
@@ -4658,13 +4674,13 @@ mod tests {
         let c = config(true);
         let words = [
             header(OP_VERTEX_ATTRIB_POINTER, 8),
-            0, // index
-            4, // size
+            0,      // index
+            4,      // size
             0x1406, // GL_FLOAT
-            0, // normalized
-            0, // stride_bytes
-            0, // offset
-            0, // buffer == 0
+            0,      // normalized
+            0,      // stride_bytes
+            0,      // offset
+            0,      // buffer == 0
         ];
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 32, c);
@@ -4729,10 +4745,10 @@ mod tests {
         let f = |v: f32| v.to_bits();
         let words = [
             header(OP_UNIFORM, 9),
-            1,          // program
-            0,          // location
-            0x8B52,     // GL_FLOAT_VEC4
-            1,          // count
+            1,      // program
+            0,      // location
+            0x8B52, // GL_FLOAT_VEC4
+            1,      // count
             f(1.0),
             f(2.0),
             f(3.0),
@@ -4740,7 +4756,14 @@ mod tests {
         ];
         let ring = ring_with(4096, 0, &words);
         let step = decode_one_with(&ring, 0, 36, c);
-        let Step::Command(Command::Uniform { program, location, type_, count, values }) = step else {
+        let Step::Command(Command::Uniform {
+            program,
+            location,
+            type_,
+            count,
+            values,
+        }) = step
+        else {
             panic!("expected Command::Uniform, got {step:?}");
         };
         assert_eq!((program, location, type_, count), (1, 0, 0x8B52, 1));

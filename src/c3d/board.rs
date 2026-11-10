@@ -130,7 +130,7 @@
 
 use super::dispatch::{Context, RenderOp};
 use super::proto;
-use super::render::{MemLoc, Memory, Renderer, RenderError};
+use super::render::{MemLoc, Memory, RenderError, Renderer};
 use super::ring::DeviceConfig;
 use super::state;
 use super::trace::TraceWriter;
@@ -311,12 +311,17 @@ struct ContextSlot {
 /// "no live member yet" starting point in [`Self::resolve`].
 #[derive(Default)]
 struct ShareGroupStores {
-    textures: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::TextureObject>>>,
-    shaders: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ShaderObject>>>,
-    programs: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ProgramObject>>>,
+    textures:
+        std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::TextureObject>>>,
+    shaders:
+        std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ShaderObject>>>,
+    programs:
+        std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::ProgramObject>>>,
     buffers: std::rc::Weak<std::cell::RefCell<std::collections::BTreeSet<u32>>>,
-    renderbuffers: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::Renderbuffer>>>,
-    sync_objects: std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::SyncObject>>>,
+    renderbuffers:
+        std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::Renderbuffer>>>,
+    sync_objects:
+        std::rc::Weak<std::cell::RefCell<std::collections::BTreeMap<u32, state::SyncObject>>>,
 }
 
 type SharedMap<T> = std::rc::Rc<std::cell::RefCell<T>>;
@@ -340,36 +345,49 @@ impl ShareGroupStores {
         SharedMap<std::collections::BTreeMap<u32, state::SyncObject>>,
     ) {
         let textures = self.textures.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             self.textures = std::rc::Rc::downgrade(&fresh);
             fresh
         });
         let shaders = self.shaders.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             self.shaders = std::rc::Rc::downgrade(&fresh);
             fresh
         });
         let programs = self.programs.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             self.programs = std::rc::Rc::downgrade(&fresh);
             fresh
         });
         let buffers = self.buffers.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
             self.buffers = std::rc::Rc::downgrade(&fresh);
             fresh
         });
         let renderbuffers = self.renderbuffers.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             self.renderbuffers = std::rc::Rc::downgrade(&fresh);
             fresh
         });
         let sync_objects = self.sync_objects.upgrade().unwrap_or_else(|| {
-            let fresh = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+            let fresh =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
             self.sync_objects = std::rc::Rc::downgrade(&fresh);
             fresh
         });
-        (textures, shaders, programs, buffers, renderbuffers, sync_objects)
+        (
+            textures,
+            shaders,
+            programs,
+            buffers,
+            renderbuffers,
+            sync_objects,
+        )
     }
 }
 
@@ -1135,12 +1153,16 @@ impl C3dBoard {
             // (nothing consumed yet) rather than `!enable`. Falling through
             // to the `_` arm's no-op when the guard fails is exactly a
             // discarded write, the same as every other gated case here.
-            SHARE_GROUP if self.caps0 & proto::CAP_SHARED_CONTEXTS != 0 && self.contexts[n].ctx.ring_head == 0 => {
+            SHARE_GROUP
+                if self.caps0 & proto::CAP_SHARED_CONTEXTS != 0
+                    && self.contexts[n].ctx.ring_head == 0 =>
+            {
                 if value == 0 {
                     self.contexts[n].ctx.state.set_private();
                 } else {
                     let stores = self.share_groups.entry(value).or_default();
-                    let (textures, shaders, programs, buffers, renderbuffers, sync_objects) = stores.resolve();
+                    let (textures, shaders, programs, buffers, renderbuffers, sync_objects) =
+                        stores.resolve();
                     self.contexts[n].ctx.state.set_share_group(
                         value,
                         textures,
@@ -1353,7 +1375,10 @@ impl C3dBoard {
         for _ in 0..=self.contexts.len() {
             let mut made_progress = false;
             for m in 0..self.contexts.len() {
-                if self.contexts[m].alloc && self.contexts[m].enable && self.contexts[m].ctx.awaiting_sync {
+                if self.contexts[m].alloc
+                    && self.contexts[m].enable
+                    && self.contexts[m].ctx.awaiting_sync
+                {
                     let retry_tail = self.contexts[m].ctx.ring_tail;
                     self.doorbell(m, retry_tail, host);
                     if !self.contexts[m].ctx.awaiting_sync {
@@ -3806,10 +3831,20 @@ mod tests {
         bytes.resize(bytes.len() + 4, 0); // RingCursor reserves one spare word
         let config = crate::c3d::ring::DeviceConfig::default();
         let mut out = Vec::new();
-        waiter.submit_with(&bytes, tail, &config, &mut out, &mut Vec::new(), &mut |_| None);
+        waiter.submit_with(
+            &bytes,
+            tail,
+            &config,
+            &mut out,
+            &mut Vec::new(),
+            &mut |_| None,
+        );
 
         assert_eq!(waiter.error_code, 0, "not an error, a stall");
-        assert!(waiter.awaiting_sync, "AWAITING_SYNC must be set while stalled");
+        assert!(
+            waiter.awaiting_sync,
+            "AWAITING_SYNC must be set while stalled"
+        );
         assert_eq!(
             waiter.ring_head, 0,
             "ring_head must sit at WAIT_SYNC itself, not past it"
@@ -3826,9 +3861,19 @@ mod tests {
         // Retrying is exactly `board.rs`'s `retry_awaiting_sync_contexts`:
         // call `submit_with` again from the same `ring_tail`.
         out.clear();
-        waiter.submit_with(&bytes, tail, &config, &mut out, &mut Vec::new(), &mut |_| None);
+        waiter.submit_with(
+            &bytes,
+            tail,
+            &config,
+            &mut out,
+            &mut Vec::new(),
+            &mut |_| None,
+        );
 
-        assert!(!waiter.awaiting_sync, "AWAITING_SYNC must clear once signalled");
+        assert!(
+            !waiter.awaiting_sync,
+            "AWAITING_SYNC must clear once signalled"
+        );
         assert_eq!(
             waiter.ring_head, tail,
             "the follow-up command must now have been decoded too"
@@ -3855,7 +3900,10 @@ mod tests {
         cmds.extend(wait_sync_cmd(1));
         submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &cmds);
         assert_eq!(error_code(&mut b, &mut h, 0), 0);
-        assert_eq!(ring_head(&mut b, &mut h, 0), ring_tail_reg(&mut b, &mut h, 0));
+        assert_eq!(
+            ring_head(&mut b, &mut h, 0),
+            ring_tail_reg(&mut b, &mut h, 0)
+        );
         assert_eq!(ctx_status(&mut b, &mut h, 0) & CTX_STATUS_AWAITING_SYNC, 0);
     }
 
@@ -3875,7 +3923,10 @@ mod tests {
         assert_eq!(error_code(&mut b, &mut h, 0), 0);
 
         submit_doorbell_n(&mut b, &mut h, 0, 0, &mut tail, &wait_sync_cmd(1));
-        assert_eq!(error_code(&mut b, &mut h, 0), proto::ErrorCode::BadId as u32);
+        assert_eq!(
+            error_code(&mut b, &mut h, 0),
+            proto::ErrorCode::BadId as u32
+        );
     }
 
     /// `WAIT_SYNC` decoded from inside a `CALL`'d buffer is `E_BAD_OPCODE`
@@ -4008,7 +4059,14 @@ mod tests {
         // the fragment colour is exactly the sampled texel) covering the
         // whole surface, then reads it back into the aperture.
         let tri_vertex = |x: f32, y: f32| -> [u32; 6] {
-            [x.to_bits(), y.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 0, 0]
+            [
+                x.to_bits(),
+                y.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0,
+                0,
+            ]
         };
         let mut ctx1_cmds = vec![
             opcode_len(proto::OP_TEX_BIND, 3),

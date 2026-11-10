@@ -136,10 +136,10 @@ use super::dispatch::{DrawVertices, QueryResult, RenderOp};
 use super::glsl;
 use super::proto::{self, Ref, RefSpace, VertexFormat};
 use super::state::{
-    self, BlendEquation, BlendFactor, ColorMaterialMode, CompareFunc, Face, FogMode, FrontFace, Mat4,
-    MatrixMode, Namespace, PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State, Surface,
-    SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode, TexWrap,
-    VertexAttribType,
+    self, BlendEquation, BlendFactor, ColorMaterialMode, CompareFunc, Face, FogMode, FrontFace,
+    Mat4, MatrixMode, Namespace, PolygonMode, PrimitiveType, ShadeModel, ShaderKind, State,
+    Surface, SurfaceFormat as WireSurfaceFormat, TexEnvMode, TexFilter, TexFormat, TexGenMode,
+    TexWrap, VertexAttribType,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -379,7 +379,12 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 /// material is used with the normal negated. `COLOR_MATERIAL`
 /// substitutes `vertex_color` for the tracked component(s) of whichever
 /// material (front/back) that resolves to, before any of the above.
-fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex_color: [f32; 4]) -> [f32; 4] {
+fn apply_lighting(
+    state: &State,
+    eye_pos: [f32; 3],
+    eye_normal: [f32; 3],
+    vertex_color: [f32; 4],
+) -> [f32; 4] {
     if !state.is_enabled(state::Capability::Lighting) {
         return vertex_color;
     }
@@ -433,7 +438,12 @@ fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex
         };
         (a, d, s, e)
     } else {
-        (material.ambient, material.diffuse, material.specular, material.emission)
+        (
+            material.ambient,
+            material.diffuse,
+            material.specular,
+            material.emission,
+        )
     };
 
     let mut rgb = [
@@ -448,7 +458,10 @@ fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex
         }
         let directional = light.position[3] == 0.0;
         let (l, attenuation) = if directional {
-            (normalize3([light.position[0], light.position[1], light.position[2]]), 1.0)
+            (
+                normalize3([light.position[0], light.position[1], light.position[2]]),
+                1.0,
+            )
         } else {
             let d = [
                 light.position[0] - eye_pos[0],
@@ -457,7 +470,9 @@ fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex
             ];
             let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             let atten = 1.0
-                / (light.constant_attenuation + light.linear_attenuation * dist + light.quadratic_attenuation * dist * dist)
+                / (light.constant_attenuation
+                    + light.linear_attenuation * dist
+                    + light.quadratic_attenuation * dist * dist)
                     .max(1e-8);
             (normalize3(d), atten)
         };
@@ -486,7 +501,11 @@ fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex
         let n_dot_h = (n[0] * half[0] + n[1] * half[1] + n[2] * half[2]).max(0.0);
         // `0.0.powf(0.0) == 1.0` in IEEE 754 (and GL's own convention),
         // so a zero `SHININESS` still lights correctly at `n_dot_h == 0`.
-        let spec_factor = if n_dot_l > 0.0 { n_dot_h.powf(material.shininess) } else { 0.0 };
+        let spec_factor = if n_dot_l > 0.0 {
+            n_dot_h.powf(material.shininess)
+        } else {
+            0.0
+        };
 
         for c in 0..3 {
             let ambient_term = ambient[c] * light.ambient[c];
@@ -496,7 +515,12 @@ fn apply_lighting(state: &State, eye_pos: [f32; 3], eye_normal: [f32; 3], vertex
         }
     }
 
-    [rgb[0].clamp(0.0, 1.0), rgb[1].clamp(0.0, 1.0), rgb[2].clamp(0.0, 1.0), diffuse[3]]
+    [
+        rgb[0].clamp(0.0, 1.0),
+        rgb[1].clamp(0.0, 1.0),
+        rgb[2].clamp(0.0, 1.0),
+        diffuse[3],
+    ]
 }
 
 /// `OBJECT_LINEAR`/`EYE_LINEAR` texgen (GL 1.1 section 2.10.4): the
@@ -656,7 +680,10 @@ fn texcoord_texel_scale(state: &State, unit: usize) -> [f32; 2] {
     if tu.coord_space != state::TexCoordSpace::Texel {
         return [1.0, 1.0];
     }
-    match state.texture(tu.bound_texture).and_then(|t| t.levels.get(&(0, 0)).copied()) {
+    match state
+        .texture(tu.bound_texture)
+        .and_then(|t| t.levels.get(&(0, 0)).copied())
+    {
         Some(level) if level.width > 0 && level.height > 0 => {
             [1.0 / level.width as f32, 1.0 / level.height as f32]
         }
@@ -732,7 +759,8 @@ pub const INTERNAL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dept
 /// `Depth24PlusStencil8`, whose depth aspect layout is backend-defined
 /// and not safely readable), so `READ_PIXELS(DEPTH)` needs no format-
 /// dependent decoding beyond picking the right copy aspect.
-pub const INTERNAL_DEPTH_STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
+pub const INTERNAL_DEPTH_STENCIL_FORMAT: wgpu::TextureFormat =
+    wgpu::TextureFormat::Depth32FloatStencil8;
 
 /// Converts one RGBA8 (straight, `0..255` per channel) pixel to the bytes
 /// of `fmt`, for [`RenderOp::SurfaceReadback`]. `Depth` is not a colour
@@ -2962,7 +2990,11 @@ fn write_level_rect_face(
         wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: level,
-            origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: face,
+            },
             aspect: wgpu::TextureAspect::All,
         },
         &packed,
@@ -3226,14 +3258,12 @@ struct ProgramBinaryBlob {
     uniform_bindings: Vec<UniformBinding>,
 }
 
-
 fn shader_stage(kind: ShaderKind) -> naga::ShaderStage {
     match kind {
         ShaderKind::Vertex => naga::ShaderStage::Vertex,
         ShaderKind::Fragment => naga::ShaderStage::Fragment,
     }
 }
-
 
 // GL enumerants PROGRAM_INTERFACE/UNIFORM's `type` field can report, for
 // the set `naga_type_to_gl_enum` recognises. Mirrors ring.rs's
@@ -3297,15 +3327,15 @@ fn naga_type_to_gl_enum(module: &naga::Module, ty: naga::Handle<naga::Type>) -> 
                 VectorSize::Quad => GL_INT_VEC4,
             })
         }
-        naga::TypeInner::Matrix { columns, rows, scalar }
-            if scalar.kind == ScalarKind::Float && columns == rows =>
-        {
-            Some(match columns {
-                VectorSize::Bi => GL_FLOAT_MAT2,
-                VectorSize::Tri => GL_FLOAT_MAT3,
-                VectorSize::Quad => GL_FLOAT_MAT4,
-            })
-        }
+        naga::TypeInner::Matrix {
+            columns,
+            rows,
+            scalar,
+        } if scalar.kind == ScalarKind::Float && columns == rows => Some(match columns {
+            VectorSize::Bi => GL_FLOAT_MAT2,
+            VectorSize::Tri => GL_FLOAT_MAT3,
+            VectorSize::Quad => GL_FLOAT_MAT4,
+        }),
         _ => None,
     }
 }
@@ -3428,15 +3458,26 @@ fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32, u32)> {
             // an array-of-samplers is still reflected as one uniform,
             // and read its length off the same `Array` type.
             let (image_ty, array_len) = match module.types[gv.ty].inner {
-                naga::TypeInner::Array { base, size: naga::ArraySize::Constant(n), .. }
-                | naga::TypeInner::BindingArray { base, size: naga::ArraySize::Constant(n) } => {
-                    (&module.types[base].inner, n.get())
+                naga::TypeInner::Array {
+                    base,
+                    size: naga::ArraySize::Constant(n),
+                    ..
                 }
+                | naga::TypeInner::BindingArray {
+                    base,
+                    size: naga::ArraySize::Constant(n),
+                } => (&module.types[base].inner, n.get()),
                 ref inner => (inner, 1),
             };
             let gl_type = match *image_ty {
-                naga::TypeInner::Image { dim: naga::ImageDimension::D2, .. } => GL_SAMPLER_2D,
-                naga::TypeInner::Image { dim: naga::ImageDimension::Cube, .. } => GL_SAMPLER_CUBE,
+                naga::TypeInner::Image {
+                    dim: naga::ImageDimension::D2,
+                    ..
+                } => GL_SAMPLER_2D,
+                naga::TypeInner::Image {
+                    dim: naga::ImageDimension::Cube,
+                    ..
+                } => GL_SAMPLER_CUBE,
                 _ => return None,
             };
             let samp_name = format!("{base}_samp");
@@ -3448,7 +3489,13 @@ fn module_samplers(module: &naga::Module) -> Vec<(String, u32, u32, u32, u32)> {
                 .binding
                 .as_ref()?
                 .binding;
-            Some((base.to_string(), tex_binding, samp_binding, gl_type, array_len))
+            Some((
+                base.to_string(),
+                tex_binding,
+                samp_binding,
+                gl_type,
+                array_len,
+            ))
         })
         .collect()
 }
@@ -3786,7 +3833,10 @@ impl Renderer {
         let polygon_mode_point_supported = device
             .features()
             .contains(wgpu::Features::POLYGON_MODE_POINT);
-        let depth_format = if device.features().contains(wgpu::Features::DEPTH32FLOAT_STENCIL8) {
+        let depth_format = if device
+            .features()
+            .contains(wgpu::Features::DEPTH32FLOAT_STENCIL8)
+        {
             INTERNAL_DEPTH_STENCIL_FORMAT
         } else {
             INTERNAL_DEPTH_FORMAT
@@ -3800,64 +3850,72 @@ impl Renderer {
         // fragment-shader builtin to write a stencil value, so a
         // multisample *stencil* source is rejected at dispatch time
         // instead (see `dispatch.rs`'s `Command::BlitFramebuffer` arm).
-        let bind_group_layout_depth_resolve = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("c3d depth-resolve bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: true,
-                },
-                count: None,
-            }],
-        });
-        let depth_resolve_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("c3d depth-resolve pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout_depth_resolve)],
-            immediate_size: 0,
-        });
+        let bind_group_layout_depth_resolve =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("c3d depth-resolve bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                }],
+            });
+        let depth_resolve_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("c3d depth-resolve pipeline layout"),
+                bind_group_layouts: &[Some(&bind_group_layout_depth_resolve)],
+                immediate_size: 0,
+            });
         let depth_resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("c3d depth-resolve shader"),
             source: wgpu::ShaderSource::Wgsl(DEPTH_RESOLVE_WGSL.into()),
         });
-        let depth_resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("c3d depth-resolve pipeline"),
-            layout: Some(&depth_resolve_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &depth_resolve_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &depth_resolve_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let depth_resolve_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("c3d depth-resolve pipeline"),
+                layout: Some(&depth_resolve_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &depth_resolve_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &depth_resolve_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
         // A `uniform sampler2D tex[N]` uniform (`glsl.rs`'s array-sampler
         // rewrite) compiles to a `wgpu` texture/sampler *binding array*,
         // an optional feature not every backend advertises. Same
         // request-only-if-available, degrade-at-use-time pattern as
         // `POLYGON_MODE_LINE`/`DEPTH32FLOAT_STENCIL8` above -- see
         // `draw_prog`'s sampler-array handling for the fallback.
-        let texture_binding_array_supported = device.features().contains(wgpu::Features::TEXTURE_BINDING_ARRAY)
+        let texture_binding_array_supported = device
+            .features()
+            .contains(wgpu::Features::TEXTURE_BINDING_ARRAY)
             && device.limits().max_binding_array_elements_per_shader_stage > 0
-            && device.limits().max_binding_array_sampler_elements_per_shader_stage > 0;
+            && device
+                .limits()
+                .max_binding_array_sampler_elements_per_shader_stage
+                > 0;
 
         let bind_group_layout_textured =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -4058,7 +4116,12 @@ impl Renderer {
     /// than a `&State` keeps this (and the two `ensure_renderbuffer_*`
     /// functions below, which *are* genuinely shareable) to one
     /// consistent shape.
-    fn ensure_surface(&mut self, part: Namespace, id: u32, def: &Surface) -> Result<&mut GpuSurface, RenderError> {
+    fn ensure_surface(
+        &mut self,
+        part: Namespace,
+        id: u32,
+        def: &Surface,
+    ) -> Result<&mut GpuSurface, RenderError> {
         let key = (part, id);
         let needs_create = match self.surfaces.get(&key) {
             Some(existing) => existing.def.width != def.width || existing.def.height != def.height,
@@ -4132,8 +4195,7 @@ impl Renderer {
         samples: u32,
     ) -> wgpu::TextureView {
         let key = (part, id);
-        let needs_create =
-            !matches!(self.renderbuffers.get(&key), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
+        let needs_create = !matches!(self.renderbuffers.get(&key), Some((_, _, w, h, s)) if *w == width && *h == height && *s == samples);
         if needs_create {
             let size = wgpu::Extent3d {
                 width: width.max(1),
@@ -4161,9 +4223,14 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffers.insert(key, (texture, view, width, height, samples));
+            self.renderbuffers
+                .insert(key, (texture, view, width, height, samples));
         }
-        self.renderbuffers.get(&key).expect("just inserted or present").1.clone()
+        self.renderbuffers
+            .get(&key)
+            .expect("just inserted or present")
+            .1
+            .clone()
     }
 
     /// A depth/stencil renderbuffer's GPU storage. See
@@ -4197,11 +4264,13 @@ impl Renderer {
                 sample_count: samples.max(1),
                 dimension: wgpu::TextureDimension::D2,
                 format: self.depth_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.renderbuffer_depth.insert(key, (texture, view, width, height, samples));
+            self.renderbuffer_depth
+                .insert(key, (texture, view, width, height, samples));
         }
         self.renderbuffer_depth
             .get(&key)
@@ -4236,14 +4305,25 @@ impl Renderer {
     fn resolve_draw_target(
         &mut self,
         state: &State,
-    ) -> Result<Option<(u32, u32, Vec<Option<wgpu::TextureView>>, wgpu::TextureView, bool, u32)>, RenderError> {
+    ) -> Result<
+        Option<(
+            u32,
+            u32,
+            Vec<Option<wgpu::TextureView>>,
+            wgpu::TextureView,
+            bool,
+            u32,
+        )>,
+        RenderError,
+    > {
         let fb_id = state.draw_framebuffer();
         if fb_id == 0 {
             let surf_id = state.draw_surface();
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
+            let gpu =
+                self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((
                 def.width,
                 def.height,
@@ -4253,7 +4333,9 @@ impl Renderer {
                 0,
             )));
         }
-        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
+        if state.framebuffer_status(state::FramebufferTarget::Draw)
+            != state::GL_FRAMEBUFFER_COMPLETE
+        {
             return Ok(None);
         }
         let fb = state
@@ -4268,14 +4350,16 @@ impl Renderer {
         // depth-only draw with every slot `NONE`). `FRAMEBUFFER_COMPLETE`
         // already guarantees every attached colour (and depth/stencil,
         // if attached) agrees in size.
-        let mut resolved: Vec<Option<(u32, u32, wgpu::TextureView, u32)>> = Vec::with_capacity(fb.colors.len());
+        let mut resolved: Vec<Option<(u32, u32, wgpu::TextureView, u32)>> =
+            Vec::with_capacity(fb.colors.len());
         let mut width = 0;
         let mut height = 0;
         let mut color_samples = 0;
         for color in &fb.colors {
             resolved.push(match color {
                 Some(attachment) => {
-                    let (w, h, view, samples) = self.resolve_color_attachment(state, *attachment)?;
+                    let (w, h, view, samples) =
+                        self.resolve_color_attachment(state, *attachment)?;
                     width = w;
                     height = h;
                     color_samples = samples;
@@ -4300,7 +4384,16 @@ impl Renderer {
                     Some(state::RenderbufferStorage::DepthStencil { samples, .. }) => samples,
                     _ => 0,
                 };
-                (self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples), true)
+                (
+                    self.ensure_renderbuffer_depth(
+                        state.namespace(),
+                        rb_id,
+                        width,
+                        height,
+                        samples,
+                    ),
+                    true,
+                )
             }
             _ => {
                 // Must match every colour attachment's sample count --
@@ -4324,10 +4417,20 @@ impl Renderer {
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
-                (depth.create_view(&wgpu::TextureViewDescriptor::default()), false)
+                (
+                    depth.create_view(&wgpu::TextureViewDescriptor::default()),
+                    false,
+                )
             }
         };
-        Ok(Some((width, height, color_views, depth_view, persistent_depth, color_samples)))
+        Ok(Some((
+            width,
+            height,
+            color_views,
+            depth_view,
+            persistent_depth,
+            color_samples,
+        )))
     }
 
     /// One colour attachment's resolved GPU view and declared size,
@@ -4366,12 +4469,27 @@ impl Renderer {
     ) -> Result<(u32, u32, wgpu::TextureView, u32), RenderError> {
         match attachment {
             state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
-                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                let Some(state::RenderbufferStorage::Color {
+                    width,
+                    height,
+                    samples,
+                    ..
+                }) = state.renderbuffer(rb_id).and_then(|r| r.storage)
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                Ok((width, height, self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples), samples))
+                Ok((
+                    width,
+                    height,
+                    self.ensure_renderbuffer_color(
+                        state.namespace(),
+                        rb_id,
+                        width,
+                        height,
+                        samples,
+                    ),
+                    samples,
+                ))
             }
             state::FramebufferAttachment::Texture { id, level } => {
                 let tex = self
@@ -4436,15 +4554,22 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let color = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?.color.clone();
+            let color = self
+                .ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?
+                .color
+                .clone();
             return Ok(Some((def.width, def.height, color, 0)));
         }
-        if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
+        if state.framebuffer_status(state::FramebufferTarget::Read)
+            != state::GL_FRAMEBUFFER_COMPLETE
+        {
             // Required detection (c3d.md's GL errors section), distinct
             // from the READ_BUFFER == NONE / empty-slot cases just below,
             // which are GL_INVALID_OPERATION, not this -- see "Reading
             // from an incomplete or buffer-less framebuffer".
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -4457,17 +4582,29 @@ impl Renderer {
         };
         match *attachment {
             state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
-                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                let Some(state::RenderbufferStorage::Color {
+                    width,
+                    height,
+                    samples,
+                    ..
+                }) = state.renderbuffer(rb_id).and_then(|r| r.storage)
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
                 self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples);
-                let texture = self.renderbuffers.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
+                let texture = self
+                    .renderbuffers
+                    .get(&(state.namespace(), rb_id))
+                    .expect("just ensured")
+                    .0
+                    .clone();
                 Ok(Some((width, height, texture, 0)))
             }
             state::FramebufferAttachment::Texture { id, level } => {
-                let tex = self.textures.get(&(state.namespace(), id)).ok_or(RenderError::UnknownObject("texture", id))?;
+                let tex = self
+                    .textures
+                    .get(&(state.namespace(), id))
+                    .ok_or(RenderError::UnknownObject("texture", id))?;
                 let width = mip_extent(tex.width, level);
                 let height = mip_extent(tex.height, level);
                 Ok(Some((width, height, tex.texture.clone(), level)))
@@ -5145,7 +5282,8 @@ impl Renderer {
                 data,
                 namespace,
             } => self.op_tex_subimage_face(
-                *id, *face, *level, *x, *y, *width, *height, *format, *row_bytes, *data, *namespace, mem,
+                *id, *face, *level, *x, *y, *width, *height, *format, *row_bytes, *data,
+                *namespace, mem,
             ),
             RenderOp::TexCopyImageFace {
                 id,
@@ -5187,12 +5325,16 @@ impl Renderer {
             ),
             RenderOp::Query { dest, result } => self.op_query(*dest, *result, mem),
 
-            RenderOp::ShaderSource { id, source, namespace } => {
-                self.op_shader_source(*id, *source, *namespace, mem)
-            }
-            RenderOp::ShaderCompile { id, kind, namespace } => {
-                self.op_shader_compile(*id, *kind, *namespace)
-            }
+            RenderOp::ShaderSource {
+                id,
+                source,
+                namespace,
+            } => self.op_shader_source(*id, *source, *namespace, mem),
+            RenderOp::ShaderCompile {
+                id,
+                kind,
+                namespace,
+            } => self.op_shader_compile(*id, *kind, *namespace),
             RenderOp::ProgramBindAttribLocation {
                 program,
                 index,
@@ -5208,21 +5350,27 @@ impl Renderer {
             RenderOp::ProgramValidate { program, namespace } => {
                 self.op_program_validate(*program, *namespace)
             }
-            RenderOp::ShaderStatus { shader, dest, namespace } => {
-                self.op_shader_status(*shader, *dest, *namespace, mem)
-            }
-            RenderOp::ProgramStatus { program, dest, namespace } => {
-                self.op_program_status(*program, *dest, *namespace, mem)
-            }
+            RenderOp::ShaderStatus {
+                shader,
+                dest,
+                namespace,
+            } => self.op_shader_status(*shader, *dest, *namespace, mem),
+            RenderOp::ProgramStatus {
+                program,
+                dest,
+                namespace,
+            } => self.op_program_status(*program, *dest, *namespace, mem),
             RenderOp::ProgramBinary {
                 program,
                 format,
                 data,
                 namespace,
             } => self.op_program_binary(*program, *format, *data, *namespace, mem),
-            RenderOp::ProgramGetBinary { program, dest, namespace } => {
-                self.op_program_get_binary(*program, *dest, *namespace, mem)
-            }
+            RenderOp::ProgramGetBinary {
+                program,
+                dest,
+                namespace,
+            } => self.op_program_get_binary(*program, *dest, *namespace, mem),
             RenderOp::BufferData {
                 id,
                 size,
@@ -5258,16 +5406,25 @@ impl Renderer {
                 values,
                 namespace,
             } => self.op_uniform(*program, *location, *type_, *count, values, *namespace),
-            RenderOp::UniformSampler { program, location, unit, namespace } => {
-                self.op_uniform_sampler(*program, *location, *unit, *namespace)
-            }
-            RenderOp::ProgramInterface { program, dest, namespace } => {
-                self.op_program_interface(*program, *dest, *namespace, mem)
-            }
+            RenderOp::UniformSampler {
+                program,
+                location,
+                unit,
+                namespace,
+            } => self.op_uniform_sampler(*program, *location, *unit, *namespace),
+            RenderOp::ProgramInterface {
+                program,
+                dest,
+                namespace,
+            } => self.op_program_interface(*program, *dest, *namespace, mem),
             RenderOp::FramebufferStatus { dest, status } => {
                 self.op_framebuffer_status(*dest, *status, mem)
             }
-            RenderOp::SyncStatus { id: _, dest, status } => self.op_sync_status(*dest, *status, mem),
+            RenderOp::SyncStatus {
+                id: _,
+                dest,
+                status,
+            } => self.op_sync_status(*dest, *status, mem),
             RenderOp::BlitFramebuffer {
                 src_x0,
                 src_y0,
@@ -5281,7 +5438,8 @@ impl Renderer {
                 filter,
                 state,
             } => self.op_blit_framebuffer(
-                *src_x0, *src_y0, *src_x1, *src_y1, *dst_x0, *dst_y0, *dst_x1, *dst_y1, *mask, *filter, state,
+                *src_x0, *src_y0, *src_x1, *src_y1, *dst_x0, *dst_y0, *dst_x1, *dst_y1, *mask,
+                *filter, state,
             ),
         }
     }
@@ -5294,7 +5452,11 @@ impl Renderer {
         // `mask`, means every downstream branch (load-op selection, the
         // scissored-draw fallback) naturally treats a disabled depth
         // clear as "not requested" with no separate check needed.
-        let mask = if state.raster.depth_mask { mask } else { mask & !proto::CLEAR_MASK_DEPTH };
+        let mask = if state.raster.depth_mask {
+            mask
+        } else {
+            mask & !proto::CLEAR_MASK_DEPTH
+        };
         let Some((width, height, color_views, depth_view, _persistent_depth, _color_samples)) =
             self.resolve_draw_target(state)?
         else {
@@ -5303,7 +5465,9 @@ impl Renderer {
             // GL_INVALID_FRAMEBUFFER_OPERATION -- required detection, per
             // c3d.md's GL errors section, the same rule
             // DRAW_ARRAYS_PROG/DRAW_ELEMENTS_PROG already follow.
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         };
 
         let mask_full = state.raster.color_mask.r
@@ -5333,8 +5497,8 @@ impl Renderer {
         let color_needs_draw =
             mask & proto::CLEAR_MASK_COLOR != 0 && (scissor_rect.is_some() || !mask_full);
         let depth_needs_draw = mask & proto::CLEAR_MASK_DEPTH != 0 && scissor_rect.is_some();
-        let stencil_needs_draw = mask & proto::CLEAR_MASK_STENCIL != 0
-            && (scissor_rect.is_some() || !stencil_mask_full);
+        let stencil_needs_draw =
+            mask & proto::CLEAR_MASK_STENCIL != 0 && (scissor_rect.is_some() || !stencil_mask_full);
 
         let [r, g, b, a] = state.raster.clear_color;
         let load_color = if mask & proto::CLEAR_MASK_COLOR != 0 && !color_needs_draw {
@@ -5488,7 +5652,9 @@ impl Renderer {
             // all (every `DRAW_BUFFERS` slot `NONE`, or none selected),
             // a scratch colour view stands in just to satisfy the
             // pipeline's structural shape; nothing reads it back.
-            let scratch_color = active_colors.is_empty().then(|| self.scratch_color_view(width, height));
+            let scratch_color = active_colors
+                .is_empty()
+                .then(|| self.scratch_color_view(width, height));
             let views_to_draw: Vec<&wgpu::TextureView> = match &scratch_color {
                 Some(view) => vec![view],
                 None => active_colors.clone(),
@@ -5569,10 +5735,14 @@ impl Renderer {
         state: &State,
     ) -> Result<(), RenderError> {
         if mask & proto::CLEAR_MASK_COLOR != 0 {
-            self.blit_color(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, filter, state)?;
+            self.blit_color(
+                src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, filter, state,
+            )?;
         }
         if mask & (proto::CLEAR_MASK_DEPTH | proto::CLEAR_MASK_STENCIL) != 0 {
-            self.blit_depth_stencil(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, state)?;
+            self.blit_depth_stencil(
+                src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, state,
+            )?;
         }
         Ok(())
     }
@@ -5625,7 +5795,9 @@ impl Renderer {
             return Ok(());
         };
         let Some((_, _, dests)) = self.resolve_blit_color_destinations(state)? else {
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         };
         if dests.is_empty() {
             return Ok(());
@@ -5651,7 +5823,9 @@ impl Renderer {
             }
             if src_samples > 1 {
                 if dst_tex.sample_count() == src_samples {
-                    self.copy_texture_region(&src_tex, src_level, sx, sy, dst_tex, 0, dx, dy, sw, sh);
+                    self.copy_texture_region(
+                        &src_tex, src_level, sx, sy, dst_tex, 0, dx, dy, sw, sh,
+                    );
                 } else {
                     // Dispatch-time validation already guarantees this is
                     // the exact same-size, unflipped case a hardware
@@ -5659,7 +5833,10 @@ impl Renderer {
                     self.resolve_multisample_color(&src_tex, dst_view);
                 }
             } else {
-                self.cpu_blit_color(&src_tex, src_level, sx, sy, sw, sh, dst_tex, dx, dy, dst_w, dst_h, flip_x, flip_y, filter)?;
+                self.cpu_blit_color(
+                    &src_tex, src_level, sx, sy, sw, sh, dst_tex, dx, dy, dst_w, dst_h, flip_x,
+                    flip_y, filter,
+                )?;
             }
         }
         Ok(())
@@ -5675,21 +5852,27 @@ impl Renderer {
     /// cube-face *source*. `Ok(None)` for an incomplete bound draw
     /// framebuffer; an empty `Vec` (not `None`) when there is simply
     /// nowhere to write (every `DRAW_BUFFERS` slot `NONE`).
-    fn resolve_blit_color_destinations(&mut self, state: &State) -> Result<BlitColorDestinations, RenderError> {
+    fn resolve_blit_color_destinations(
+        &mut self,
+        state: &State,
+    ) -> Result<BlitColorDestinations, RenderError> {
         let fb_id = state.draw_framebuffer();
         if fb_id == 0 {
             let surf_id = state.draw_surface();
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
+            let gpu =
+                self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((
                 def.width,
                 def.height,
                 vec![(gpu.color.clone(), gpu.color_view.clone())],
             )));
         }
-        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
+        if state.framebuffer_status(state::FramebufferTarget::Draw)
+            != state::GL_FRAMEBUFFER_COMPLETE
+        {
             return Ok(None);
         }
         let fb = state
@@ -5703,7 +5886,8 @@ impl Renderer {
         for color in &fb.colors {
             resolved.push(match color {
                 Some(attachment) => {
-                    let (w, h, tex, view) = self.resolve_color_attachment_texture(state, *attachment)?;
+                    let (w, h, tex, view) =
+                        self.resolve_color_attachment_texture(state, *attachment)?;
                     width = w;
                     height = h;
                     Some((w, h, tex, view))
@@ -5733,13 +5917,28 @@ impl Renderer {
     ) -> Result<(u32, u32, wgpu::Texture, wgpu::TextureView), RenderError> {
         match attachment {
             state::FramebufferAttachment::Renderbuffer(rb_id) => {
-                let Some(state::RenderbufferStorage::Color { width, height, samples, .. }) =
-                    state.renderbuffer(rb_id).and_then(|r| r.storage)
+                let Some(state::RenderbufferStorage::Color {
+                    width,
+                    height,
+                    samples,
+                    ..
+                }) = state.renderbuffer(rb_id).and_then(|r| r.storage)
                 else {
                     unreachable!("FRAMEBUFFER_COMPLETE already checked the colour storage kind");
                 };
-                let view = self.ensure_renderbuffer_color(state.namespace(), rb_id, width, height, samples);
-                let tex = self.renderbuffers.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
+                let view = self.ensure_renderbuffer_color(
+                    state.namespace(),
+                    rb_id,
+                    width,
+                    height,
+                    samples,
+                );
+                let tex = self
+                    .renderbuffers
+                    .get(&(state.namespace(), rb_id))
+                    .expect("just ensured")
+                    .0
+                    .clone();
                 Ok((width, height, tex, view))
             }
             // Mirrors `resolve_color_attachment`'s identical arms below
@@ -5939,12 +6138,15 @@ impl Renderer {
                     let tx = fx - x0 as f32;
                     let ty = fy - y0 as f32;
                     let texel = |x: u32, y: u32, c: usize| -> f32 {
-                        src_rgba[((y.min(sh.saturating_sub(1)) * sw + x.min(sw.saturating_sub(1))) * 4) as usize + c] as f32
+                        src_rgba[((y.min(sh.saturating_sub(1)) * sw + x.min(sw.saturating_sub(1)))
+                            * 4) as usize
+                            + c] as f32
                     };
                     for c in 0..4 {
                         let top = texel(x0, y0, c) * (1.0 - tx) + texel(x1, y0, c) * tx;
                         let bot = texel(x0, y1, c) * (1.0 - tx) + texel(x1, y1, c) * tx;
-                        out[out_idx + c] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+                        out[out_idx + c] =
+                            (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
                     }
                 } else {
                     let sx_px = ((u * sw as f32) as u32).min(sw.saturating_sub(1));
@@ -6015,13 +6217,18 @@ impl Renderer {
         // framebuffer is complete but simply has no depth/stencil to
         // copy" case -- real GL silently drops the mask bit for a
         // buffer that doesn't exist, rather than erroring).
-        let Some((src_w, src_h, src_tex, src_samples)) = self.resolve_depth_stencil_source(state)? else {
+        let Some((src_w, src_h, src_tex, src_samples)) =
+            self.resolve_depth_stencil_source(state)?
+        else {
             return Ok(());
         };
-        let Some((dst_w, dst_h, dst_tex, dst_samples)) = self.resolve_depth_stencil_destination(state)? else {
+        let Some((dst_w, dst_h, dst_tex, dst_samples)) =
+            self.resolve_depth_stencil_destination(state)?
+        else {
             return Ok(());
         };
-        let same_rect = (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+        let same_rect =
+            (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
         if !same_rect {
             // A scaled/flipped depth/stencil blit is not implemented in
             // this draft; dispatch-time validation already requires
@@ -6065,7 +6272,11 @@ impl Renderer {
     /// comment for why), forwarding sample index `0` of `src`'s depth
     /// aspect via [`DEPTH_RESOLVE_WGSL`]. `stencil_ops: None` leaves
     /// `dst`'s stencil content exactly as it was.
-    fn resolve_multisample_depth(&mut self, src: &wgpu::Texture, dst: &wgpu::Texture) -> Result<(), RenderError> {
+    fn resolve_multisample_depth(
+        &mut self,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+    ) -> Result<(), RenderError> {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor {
             aspect: wgpu::TextureAspect::DepthOnly,
             ..Default::default()
@@ -6130,11 +6341,16 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
+            let gpu =
+                self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
-        if state.framebuffer_status(state::FramebufferTarget::Read) != state::GL_FRAMEBUFFER_COMPLETE {
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+        if state.framebuffer_status(state::FramebufferTarget::Read)
+            != state::GL_FRAMEBUFFER_COMPLETE
+        {
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -6142,13 +6358,21 @@ impl Renderer {
         let Some(state::FramebufferAttachment::Renderbuffer(rb_id)) = fb.depth_stencil else {
             return Ok(None);
         };
-        let Some(state::RenderbufferStorage::DepthStencil { width, height, samples }) =
-            state.renderbuffer(rb_id).and_then(|r| r.storage)
+        let Some(state::RenderbufferStorage::DepthStencil {
+            width,
+            height,
+            samples,
+        }) = state.renderbuffer(rb_id).and_then(|r| r.storage)
         else {
             return Ok(None);
         };
         self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples);
-        let tex = self.renderbuffer_depth.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
+        let tex = self
+            .renderbuffer_depth
+            .get(&(state.namespace(), rb_id))
+            .expect("just ensured")
+            .0
+            .clone();
         Ok(Some((width, height, tex, samples)))
     }
 
@@ -6164,11 +6388,16 @@ impl Renderer {
             let def = *state
                 .surface(surf_id)
                 .ok_or(RenderError::UnknownObject("surface", surf_id))?;
-            let gpu = self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
+            let gpu =
+                self.ensure_surface(Namespace::Private(state.context_index()), surf_id, &def)?;
             return Ok(Some((def.width, def.height, gpu.depth.clone(), 0)));
         }
-        if state.framebuffer_status(state::FramebufferTarget::Draw) != state::GL_FRAMEBUFFER_COMPLETE {
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+        if state.framebuffer_status(state::FramebufferTarget::Draw)
+            != state::GL_FRAMEBUFFER_COMPLETE
+        {
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         }
         let fb = state
             .framebuffer(fb_id)
@@ -6176,13 +6405,21 @@ impl Renderer {
         let Some(state::FramebufferAttachment::Renderbuffer(rb_id)) = fb.depth_stencil else {
             return Ok(None);
         };
-        let Some(state::RenderbufferStorage::DepthStencil { width, height, samples }) =
-            state.renderbuffer(rb_id).and_then(|r| r.storage)
+        let Some(state::RenderbufferStorage::DepthStencil {
+            width,
+            height,
+            samples,
+        }) = state.renderbuffer(rb_id).and_then(|r| r.storage)
         else {
             return Ok(None);
         };
         self.ensure_renderbuffer_depth(state.namespace(), rb_id, width, height, samples);
-        let tex = self.renderbuffer_depth.get(&(state.namespace(), rb_id)).expect("just ensured").0.clone();
+        let tex = self
+            .renderbuffer_depth
+            .get(&(state.namespace(), rb_id))
+            .expect("just ensured")
+            .0
+            .clone();
         Ok(Some((width, height, tex, samples)))
     }
 
@@ -6960,7 +7197,9 @@ impl Renderer {
     /// data uploaded is simply not bound, for pipeline purposes" rule)
     /// for an id with no GPU texture at all.
     fn is_flat_texture(&self, state: &State, id: u32) -> bool {
-        self.textures.get(&(state.namespace(), id)).is_some_and(|t| t.kind == TexKind::Flat)
+        self.textures
+            .get(&(state.namespace(), id))
+            .is_some_and(|t| t.kind == TexKind::Flat)
     }
 
     fn op_tex_image(
@@ -6975,7 +7214,10 @@ impl Renderer {
         namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let palette = self.palettes.get(&(namespace, id)).map_or(&[][..], Vec::as_slice);
+        let palette = self
+            .palettes
+            .get(&(namespace, id))
+            .map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -7066,7 +7308,10 @@ impl Renderer {
         namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let palette = self.palettes.get(&(namespace, id)).map_or(&[][..], Vec::as_slice);
+        let palette = self
+            .palettes
+            .get(&(namespace, id))
+            .map_or(&[][..], Vec::as_slice);
         let rgba = decode_wire_rgba8(
             format,
             width,
@@ -7166,7 +7411,10 @@ impl Renderer {
         let def = *state
             .surface(surface_id)
             .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?.color.clone();
+        let color = self
+            .ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?
+            .color
+            .clone();
         let rgba = self.copy_texture_rect_to_cpu(&color, 0, x, y, width, height)?;
         self.define_texture_level_face(state.namespace(), id, face, level, width, height, &rgba)
     }
@@ -7196,14 +7444,19 @@ impl Renderer {
         let level_w = mip_extent(existing.width, level);
         let level_h = mip_extent(existing.height, level);
         if xoff + width > level_w || yoff + height > level_h {
-            return Err(RenderError::ShortPayload("TEX_COPY_SUBIMAGE_FACE rectangle"));
+            return Err(RenderError::ShortPayload(
+                "TEX_COPY_SUBIMAGE_FACE rectangle",
+            ));
         }
 
         let surface_id = state.draw_surface();
         let def = *state
             .surface(surface_id)
             .ok_or(RenderError::UnknownObject("surface", surface_id))?;
-        let color = self.ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?.color.clone();
+        let color = self
+            .ensure_surface(Namespace::Private(state.context_index()), surface_id, &def)?
+            .color
+            .clone();
         let dest = &self.textures[&(state.namespace(), id)].texture;
 
         let mut encoder = self
@@ -7358,7 +7611,9 @@ impl Renderer {
                     }
                 }
             }
-            self.define_texture_level_generic(namespace, id, kind, face, level, next_w, next_h, &next)?;
+            self.define_texture_level_generic(
+                namespace, id, kind, face, level, next_w, next_h, &next,
+            )?;
             prev = next;
             w = next_w;
             h = next_h;
@@ -7389,7 +7644,16 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
-        self.define_texture_level_generic(namespace, id, TexKind::Flat, 0, level, width, height, rgba)
+        self.define_texture_level_generic(
+            namespace,
+            id,
+            TexKind::Flat,
+            0,
+            level,
+            width,
+            height,
+            rgba,
+        )
     }
 
     /// `TEX_IMAGE_FACE`/`TEX_COPY_IMAGE_FACE`: as [`Self::define_texture_level`],
@@ -7407,7 +7671,16 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), RenderError> {
-        self.define_texture_level_generic(namespace, id, TexKind::Cube, face, level, width, height, rgba)
+        self.define_texture_level_generic(
+            namespace,
+            id,
+            TexKind::Cube,
+            face,
+            level,
+            width,
+            height,
+            rgba,
+        )
     }
 
     /// Common tail of [`Self::define_texture_level`] and
@@ -7490,7 +7763,8 @@ impl Renderer {
                     // wgpu to read past the old texture's actual bounds.
                     let w = mip_extent(tex.width, lvl);
                     let h = mip_extent(tex.height, lvl);
-                    let data = self.copy_texture_rect_to_cpu_face(&tex.texture, f, lvl, 0, 0, w, h)?;
+                    let data =
+                        self.copy_texture_rect_to_cpu_face(&tex.texture, f, lvl, 0, 0, w, h)?;
                     carried.push((f, lvl, w, h, data));
                 }
             }
@@ -7521,7 +7795,15 @@ impl Renderer {
         for (f, lvl, w, h, data) in &carried {
             write_level_rect_face(&self.queue, &texture, *f, *lvl, *w, *h, data);
         }
-        write_level_rect_face(&self.queue, &texture, face, write_level, width, height, rgba);
+        write_level_rect_face(
+            &self.queue,
+            &texture,
+            face,
+            write_level,
+            width,
+            height,
+            rgba,
+        );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
@@ -7742,7 +8024,10 @@ impl Renderer {
         let def = *state
             .surface(id)
             .ok_or(RenderError::UnknownObject("surface", id))?;
-        let color = self.ensure_surface(Namespace::Private(state.context_index()), id, &def)?.color.clone();
+        let color = self
+            .ensure_surface(Namespace::Private(state.context_index()), id, &def)?
+            .color
+            .clone();
 
         let bpp = surface_format_bytes_per_pixel(def.format);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -7838,16 +8123,22 @@ impl Renderer {
         // read-framebuffer attachment.
         let bpp = surface_format_bytes_per_pixel(format);
         let raw_bpp = bpp; // the *source* copy's own per-texel size, below
-        // Writes one encoded pixel into the front of `out` and reports its
-        // length, rather than returning a fresh `Vec` per pixel -- see
-        // `encode_pixel_into`. `row_width` is the raw buffer's own row
-        // stride in texels (not `w`/the destination rectangle's width).
-        let encode_at = |raw: &[u8], row_width: u32, sx: u32, sy: u32, out: &mut [u8]| -> Result<usize, RenderError> {
+                           // Writes one encoded pixel into the front of `out` and reports its
+                           // length, rather than returning a fresh `Vec` per pixel -- see
+                           // `encode_pixel_into`. `row_width` is the raw buffer's own row
+                           // stride in texels (not `w`/the destination rectangle's width).
+        let encode_at = |raw: &[u8],
+                         row_width: u32,
+                         sx: u32,
+                         sy: u32,
+                         out: &mut [u8]|
+         -> Result<usize, RenderError> {
             match format {
                 WireSurfaceFormat::Depth => {
                     let at = ((sy * row_width + sx) * 4) as usize;
-                    let depth =
-                        f32::from_le_bytes(*<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"));
+                    let depth = f32::from_le_bytes(
+                        *<&[u8; 4]>::try_from(&raw[at..at + 4]).expect("4-byte slice"),
+                    );
                     let scaled = (depth.clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
                     out.get_mut(..4)
                         .ok_or(RenderError::ShortPayload("READ_PIXELS destination"))?
@@ -7929,7 +8220,8 @@ impl Renderer {
                 // selected colour attachment instead of the draw
                 // surface -- the same source `TEX_COPY_IMAGE` resolves
                 // to, by the same rule.
-                let Some((src_width, src_height, color, level)) = self.resolve_read_source(state)?
+                let Some((src_width, src_height, color, level)) =
+                    self.resolve_read_source(state)?
                 else {
                     // `READ_BUFFER` == `NONE` (or an empty slot): not a
                     // protocol error, no effect (`dest` left unmodified).
@@ -7938,7 +8230,8 @@ impl Renderer {
                     // propagated by `?` above.
                     return Ok(());
                 };
-                let bytes = self.copy_texture_rect_to_cpu(&color, level, 0, 0, src_width, src_height)?;
+                let bytes =
+                    self.copy_texture_rect_to_cpu(&color, level, 0, 0, src_width, src_height)?;
                 (bytes, src_width, src_height)
             }
         };
@@ -8083,7 +8376,12 @@ impl Renderer {
     /// none was ever set via `SHADER_SOURCE`, which naga reports as a
     /// real parse failure -- "no main function" -- rather than this
     /// module inventing a special case for it).
-    fn op_shader_compile(&mut self, id: u32, kind: ShaderKind, namespace: Namespace) -> Result<(), RenderError> {
+    fn op_shader_compile(
+        &mut self,
+        id: u32,
+        kind: ShaderKind,
+        namespace: Namespace,
+    ) -> Result<(), RenderError> {
         let key = (namespace, id);
         let source = self
             .shaders
@@ -8141,12 +8439,19 @@ impl Renderer {
                 glsl::CompileResult::Err(_) => Some(false),
             }
         };
-        let (link_status, info_log) = match (vertex, compiled(vertex), fragment, compiled(fragment)) {
+        let (link_status, info_log) = match (vertex, compiled(vertex), fragment, compiled(fragment))
+        {
             (Some(_), Some(true), Some(_), Some(true)) => (true, String::new()),
             (None, _, _, _) => (false, "no vertex shader attached".to_string()),
             (_, _, None, _) => (false, "no fragment shader attached".to_string()),
-            (_, Some(false), _, _) => (false, "vertex shader did not compile successfully".to_string()),
-            (_, _, _, Some(false)) => (false, "fragment shader did not compile successfully".to_string()),
+            (_, Some(false), _, _) => (
+                false,
+                "vertex shader did not compile successfully".to_string(),
+            ),
+            (_, _, _, Some(false)) => (
+                false,
+                "fragment shader did not compile successfully".to_string(),
+            ),
             _ => (false, "attached shader has not been compiled".to_string()),
         };
         // Computed defensively (no unwrap/panic on an internal invariant
@@ -8159,9 +8464,10 @@ impl Renderer {
         let mut linked_modules: Option<(naga::Module, naga::Module)> = None;
         if link_status {
             if let (Some(vid), Some(fid)) = (vertex, fragment) {
-                if let (Some(vs_slot), Some(fs_slot)) =
-                    (self.shaders.get(&(namespace, vid)), self.shaders.get(&(namespace, fid)))
-                {
+                if let (Some(vs_slot), Some(fs_slot)) = (
+                    self.shaders.get(&(namespace, vid)),
+                    self.shaders.get(&(namespace, fid)),
+                ) {
                     if let (Some(glsl::CompileResult::Ok(vs)), Some(glsl::CompileResult::Ok(fs))) =
                         (&vs_slot.compiled, &fs_slot.compiled)
                     {
@@ -8229,7 +8535,12 @@ impl Renderer {
         // actually declares, with no "what if it was never set" case to
         // handle separately at draw time.
         slot.uniform_values.clear();
-        for (i, entry) in slot.interface.iter().skip(slot.attrib_count as usize).enumerate() {
+        for (i, entry) in slot
+            .interface
+            .iter()
+            .skip(slot.attrib_count as usize)
+            .enumerate()
+        {
             let size = gl_type_byte_size(entry.gl_type).unwrap_or(0);
             slot.uniform_values.insert(i as u32, vec![0u8; size]);
         }
@@ -8287,7 +8598,10 @@ impl Renderer {
         let blob: ProgramBinaryBlob = match bincode::deserialize(bytes) {
             Ok(blob) => blob,
             Err(err) => {
-                fail(slot, format!("PROGRAM_BINARY blob failed to deserialize: {err}"));
+                fail(
+                    slot,
+                    format!("PROGRAM_BINARY blob failed to deserialize: {err}"),
+                );
                 return Ok(());
             }
         };
@@ -8303,7 +8617,12 @@ impl Renderer {
         slot.uniform_bindings = blob.uniform_bindings;
         slot.cached_binary = Some(bytes.to_vec());
         slot.uniform_values.clear();
-        for (i, entry) in slot.interface.iter().skip(slot.attrib_count as usize).enumerate() {
+        for (i, entry) in slot
+            .interface
+            .iter()
+            .skip(slot.attrib_count as usize)
+            .enumerate()
+        {
             let size = gl_type_byte_size(entry.gl_type).unwrap_or(0);
             slot.uniform_values.insert(i as u32, vec![0u8; size]);
         }
@@ -8336,7 +8655,9 @@ impl Renderer {
         }
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
-            return Err(RenderError::BadMemory(format!("PROGRAM_GET_BINARY write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "PROGRAM_GET_BINARY write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8346,7 +8667,11 @@ impl Renderer {
     /// so validation succeeds exactly when the program is linked --
     /// matching GLES2's own "undefined... if not successfully linked"
     /// language, made concrete as "false".
-    fn op_program_validate(&mut self, program: u32, namespace: Namespace) -> Result<(), RenderError> {
+    fn op_program_validate(
+        &mut self,
+        program: u32,
+        namespace: Namespace,
+    ) -> Result<(), RenderError> {
         let slot = self.programs.entry((namespace, program)).or_default();
         slot.validate_status = slot.link_status;
         Ok(())
@@ -8367,10 +8692,12 @@ impl Renderer {
         let Some(slot) = self.programs.get(&(namespace, program)) else {
             return false;
         };
-        slot.interface[slot.attrib_count as usize..].iter().any(|e| {
-            let span = e.array_size.max(1);
-            location >= e.location && location < e.location + span
-        })
+        slot.interface[slot.attrib_count as usize..]
+            .iter()
+            .any(|e| {
+                let span = e.array_size.max(1);
+                location >= e.location && location < e.location + span
+            })
     }
 
     /// `UNIFORM`. A `location` that doesn't belong to `program`'s current
@@ -8390,8 +8717,14 @@ impl Renderer {
         if !self.uniform_location_is_valid(program, location, namespace) {
             return Err(RenderError::GlError(state::GlError::InvalidOperation));
         }
-        let slot = self.programs.get_mut(&(namespace, program)).expect("checked above");
-        let native: Vec<u8> = values.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect();
+        let slot = self
+            .programs
+            .get_mut(&(namespace, program))
+            .expect("checked above");
+        let native: Vec<u8> = values
+            .chunks_exact(4)
+            .flat_map(|w| w.iter().rev().copied())
+            .collect();
         slot.uniform_values.insert(location, native);
         Ok(())
     }
@@ -8410,7 +8743,10 @@ impl Renderer {
         if !self.uniform_location_is_valid(program, location, namespace) {
             return Err(RenderError::GlError(state::GlError::InvalidOperation));
         }
-        let slot = self.programs.get_mut(&(namespace, program)).expect("checked above");
+        let slot = self
+            .programs
+            .get_mut(&(namespace, program))
+            .expect("checked above");
         slot.sampler_bindings.insert(location, unit);
         Ok(())
     }
@@ -8437,7 +8773,9 @@ impl Renderer {
         }
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
-            return Err(RenderError::BadMemory(format!("PROGRAM_INTERFACE write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "PROGRAM_INTERFACE write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8449,7 +8787,11 @@ impl Renderer {
         namespace: Namespace,
         mem: &mut dyn Memory,
     ) -> Result<(), RenderError> {
-        let (compile_status, log) = match self.shaders.get(&(namespace, shader)).and_then(|s| s.compiled.as_ref()) {
+        let (compile_status, log) = match self
+            .shaders
+            .get(&(namespace, shader))
+            .and_then(|s| s.compiled.as_ref())
+        {
             Some(glsl::CompileResult::Ok(_)) => (1u32, String::new()),
             Some(glsl::CompileResult::Err(log)) => (0u32, log.clone()),
             None => (0u32, "not compiled".to_string()),
@@ -8460,7 +8802,9 @@ impl Renderer {
         bytes.extend_from_slice(log.as_bytes());
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
-            return Err(RenderError::BadMemory(format!("SHADER_STATUS write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "SHADER_STATUS write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8469,10 +8813,17 @@ impl Renderer {
     /// state at dispatch time by [`dispatch::Context::apply`] -- see
     /// [`RenderOp::FramebufferStatus`]'s doc comment -- no GPU resource
     /// involved) to `dest` as one `u32`.
-    fn op_framebuffer_status(&mut self, dest: Ref, status: u32, mem: &mut dyn Memory) -> Result<(), RenderError> {
+    fn op_framebuffer_status(
+        &mut self,
+        dest: Ref,
+        status: u32,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &status.to_be_bytes()) {
-            return Err(RenderError::BadMemory(format!("FRAMEBUFFER_STATUS write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "FRAMEBUFFER_STATUS write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8480,10 +8831,17 @@ impl Renderer {
     /// `SYNC_STATUS`: `status` was already resolved at dispatch time
     /// (`RenderOp::SyncStatus`'s doc comment) -- this just writes it, the
     /// same shape as [`Self::op_framebuffer_status`].
-    fn op_sync_status(&mut self, dest: Ref, status: u32, mem: &mut dyn Memory) -> Result<(), RenderError> {
+    fn op_sync_status(
+        &mut self,
+        dest: Ref,
+        status: u32,
+        mem: &mut dyn Memory,
+    ) -> Result<(), RenderError> {
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &status.to_be_bytes()) {
-            return Err(RenderError::BadMemory(format!("SYNC_STATUS write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "SYNC_STATUS write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8505,7 +8863,9 @@ impl Renderer {
         bytes.extend_from_slice(slot.info_log.as_bytes());
         let loc = MemLoc::from_ref(dest);
         if !mem.write(loc, &bytes) {
-            return Err(RenderError::BadMemory(format!("PROGRAM_STATUS write to {loc:?}")));
+            return Err(RenderError::BadMemory(format!(
+                "PROGRAM_STATUS write to {loc:?}"
+            )));
         }
         Ok(())
     }
@@ -8601,9 +8961,9 @@ impl Renderer {
             }
         };
         let needed = count as usize * bytes_per_index;
-        let bytes = mem
-            .read(loc, needed)
-            .ok_or_else(|| RenderError::BadMemory(format!("DRAW_ELEMENTS_PROG read from {loc:?}")))?;
+        let bytes = mem.read(loc, needed).ok_or_else(|| {
+            RenderError::BadMemory(format!("DRAW_ELEMENTS_PROG read from {loc:?}"))
+        })?;
         let base_indices: Vec<u32> = (0..count as usize)
             .map(|i| read_index(bytes, i * bytes_per_index, index_type).unwrap_or(0))
             .collect();
@@ -8656,11 +9016,19 @@ impl Renderer {
             let (Some(vs_id), Some(fs_id)) = (prog.linked_vertex, prog.linked_fragment) else {
                 return Ok(());
             };
-            let vs_module = match self.shaders.get(&(state.namespace(), vs_id)).and_then(|s| s.compiled.as_ref()) {
+            let vs_module = match self
+                .shaders
+                .get(&(state.namespace(), vs_id))
+                .and_then(|s| s.compiled.as_ref())
+            {
                 Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
                 _ => return Ok(()), // shader destroyed or re-sourced since link
             };
-            let fs_module = match self.shaders.get(&(state.namespace(), fs_id)).and_then(|s| s.compiled.as_ref()) {
+            let fs_module = match self
+                .shaders
+                .get(&(state.namespace(), fs_id))
+                .and_then(|s| s.compiled.as_ref())
+            {
                 Some(glsl::CompileResult::Ok(m)) => (**m).clone(),
                 _ => return Ok(()),
             };
@@ -8690,14 +9058,22 @@ impl Renderer {
             })
             .collect::<Result<_, _>>()?;
 
-        let Some((target_width, target_height, color_views, depth_view, persistent_depth, target_samples)) =
-            self.resolve_draw_target(state)?
+        let Some((
+            target_width,
+            target_height,
+            color_views,
+            depth_view,
+            persistent_depth,
+            target_samples,
+        )) = self.resolve_draw_target(state)?
         else {
             // A programmable draw against an incomplete bound framebuffer
             // is not a protocol error, but it has no effect AND sets
             // GL_INVALID_FRAMEBUFFER_OPERATION -- required detection, per
             // c3d.md's GL errors section and `DRAW_ARRAYS_PROG`'s own row.
-            return Err(RenderError::GlError(state::GlError::InvalidFramebufferOperation));
+            return Err(RenderError::GlError(
+                state::GlError::InvalidFramebufferOperation,
+            ));
         };
 
         // One `wgpu::VertexBufferLayout`/bound buffer per shader input,
@@ -8708,17 +9084,27 @@ impl Renderer {
         // Every referenced vertex, 0..=the highest index the (expanded)
         // draw touches: simplest correct bound for the fresh per-draw
         // buffer built below, not necessarily the tightest one.
-        let vertex_count = final_indices.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let vertex_count = final_indices
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
 
         let inputs = vertex_shader_inputs_typed(&vs_module);
         let mut layouts = Vec::with_capacity(inputs.len());
         let mut gpu_buffers = Vec::with_capacity(inputs.len());
         for (shader_location, (name, naga_location, gl_type)) in inputs.iter().enumerate() {
-            let attrib_index = bound_attrib_locations.get(name).copied().unwrap_or(*naga_location);
+            let attrib_index = bound_attrib_locations
+                .get(name)
+                .copied()
+                .unwrap_or(*naga_location);
             let attrib = state.vertex_attrib(attrib_index);
-            let pointer = attrib.filter(|a| a.enabled).and_then(|a| a.pointer.as_ref());
+            let pointer = attrib
+                .filter(|a| a.enabled)
+                .and_then(|a| a.pointer.as_ref());
             let (stride, format, gpu_buffer) = if let Some(pointer) = pointer {
-                let Some(format) = vertex_attrib_wgpu_format(pointer.type_, pointer.size, pointer.normalized)
+                let Some(format) =
+                    vertex_attrib_wgpu_format(pointer.type_, pointer.size, pointer.normalized)
                 else {
                     return Err(RenderError::Unimplemented(
                         "VERTEX_ATTRIB_POINTER type/size/normalized combination with no direct wgpu vertex format",
@@ -8743,23 +9129,32 @@ impl Renderer {
                 // one point `VERTEX_ATTRIB_POINTER`'s type is actually
                 // known (`Renderer::buffers`'s doc comment explains why it
                 // can't happen earlier, at upload time).
-                let mut gpu_bytes = Vec::with_capacity(vertex_count * pointer.size as usize * component_bytes);
+                let mut gpu_bytes =
+                    Vec::with_capacity(vertex_count * pointer.size as usize * component_bytes);
                 for v in 0..vertex_count {
                     let base = pointer.offset as usize + v * read_stride;
                     for c in 0..pointer.size as usize {
                         let at = base + c * component_bytes;
                         let Some(src) = raw.get(at..at + component_bytes) else {
-                            return Err(RenderError::ShortPayload("programmable draw vertex attribute data"));
+                            return Err(RenderError::ShortPayload(
+                                "programmable draw vertex attribute data",
+                            ));
                         };
                         gpu_bytes.extend(src.iter().rev());
                     }
                 }
-                let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("c3d programmable vertex attribute buffer"),
-                    contents: &gpu_bytes,
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                ((pointer.size as usize * component_bytes) as u64, format, gpu_buffer)
+                let gpu_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("c3d programmable vertex attribute buffer"),
+                            contents: &gpu_bytes,
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                (
+                    (pointer.size as usize * component_bytes) as u64,
+                    format,
+                    gpu_buffer,
+                )
             } else {
                 // Disabled (or enabled with no buffer pointer ever set,
                 // which the spec leaves undefined for a real guest but
@@ -8785,25 +9180,31 @@ impl Renderer {
                         gpu_bytes.extend_from_slice(&c.to_le_bytes());
                     }
                 }
-                let gpu_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("c3d programmable constant vertex attribute buffer"),
-                    contents: &gpu_bytes,
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+                let gpu_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("c3d programmable constant vertex attribute buffer"),
+                            contents: &gpu_bytes,
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
                 ((components * 4) as u64, format, gpu_buffer)
             };
             gpu_buffers.push(gpu_buffer);
             layouts.push((stride, format, shader_location as u32));
         }
 
-        let vs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("c3d programmable vertex shader"),
-            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(vs_module)),
-        });
-        let fs_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("c3d programmable fragment shader"),
-            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(fs_module)),
-        });
+        let vs_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("c3d programmable vertex shader"),
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(vs_module)),
+            });
+        let fs_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("c3d programmable fragment shader"),
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(fs_module)),
+            });
 
         let vertex_attrs: Vec<[wgpu::VertexAttribute; 1]> = layouts
             .iter()
@@ -8859,7 +9260,10 @@ impl Renderer {
             }
             let mut texture_ids = Vec::with_capacity(array_len as usize);
             for elem in 0..array_len {
-                let unit = sampler_bindings.get(&(i as u32 + elem)).copied().unwrap_or(0);
+                let unit = sampler_bindings
+                    .get(&(i as u32 + elem))
+                    .copied()
+                    .unwrap_or(0);
                 let texture_id = state
                     .texture_units
                     .get(unit as usize)
@@ -8928,11 +9332,13 @@ impl Renderer {
                 continue;
             }
             let buf_index = uniform_gpu_buffers.len();
-            uniform_gpu_buffers.push(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("c3d programmable uniform buffer"),
-                contents: value,
-                usage: wgpu::BufferUsages::UNIFORM,
-            }));
+            uniform_gpu_buffers.push(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("c3d programmable uniform buffer"),
+                    contents: value,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                },
+            ));
             for (slot, visibility) in [
                 (binding.vertex_binding, wgpu::ShaderStages::VERTEX),
                 (binding.fragment_binding, wgpu::ShaderStages::FRAGMENT),
@@ -8960,8 +9366,10 @@ impl Renderer {
         // above).
         let mut bind_group_slot_textures: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut bind_group_slot_samplers: Vec<(u32, Vec<SamplerKey>)> = Vec::new();
-        for ((binding, want_kind, texture_ids), keys) in sampler_textures.iter().zip(&sampler_keys) {
-            let array_count = std::num::NonZeroU32::new(texture_ids.len() as u32).filter(|n| n.get() > 1);
+        for ((binding, want_kind, texture_ids), keys) in sampler_textures.iter().zip(&sampler_keys)
+        {
+            let array_count =
+                std::num::NonZeroU32::new(texture_ids.len() as u32).filter(|n| n.get() > 1);
             let view_dimension = match want_kind {
                 TexKind::Flat => wgpu::TextureViewDimension::D2,
                 TexKind::Cube => wgpu::TextureViewDimension::Cube,
@@ -8985,7 +9393,10 @@ impl Renderer {
             }
             for (slot, visibility) in [
                 (binding.vertex_sampler_binding, wgpu::ShaderStages::VERTEX),
-                (binding.fragment_sampler_binding, wgpu::ShaderStages::FRAGMENT),
+                (
+                    binding.fragment_sampler_binding,
+                    wgpu::ShaderStages::FRAGMENT,
+                ),
             ] {
                 let Some(slot) = slot else { continue };
                 bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
@@ -9000,10 +9411,12 @@ impl Renderer {
         let uniform_bind_group = if bind_group_layout_entries.is_empty() {
             None
         } else {
-            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("c3d programmable uniform bind group layout"),
-                entries: &bind_group_layout_entries,
-            });
+            let layout = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("c3d programmable uniform bind group layout"),
+                    entries: &bind_group_layout_entries,
+                });
             let mut entries: Vec<wgpu::BindGroupEntry> = bind_group_slot_buffers
                 .iter()
                 .map(|&(binding, idx)| wgpu::BindGroupEntry {
@@ -9018,7 +9431,11 @@ impl Renderer {
             // that references them.
             let texture_views: Vec<Vec<&wgpu::TextureView>> = bind_group_slot_textures
                 .iter()
-                .map(|(_, ids)| ids.iter().map(|id| &self.textures[&(state.namespace(), *id)].view).collect())
+                .map(|(_, ids)| {
+                    ids.iter()
+                        .map(|id| &self.textures[&(state.namespace(), *id)].view)
+                        .collect()
+                })
                 .collect();
             entries.extend(bind_group_slot_textures.iter().zip(&texture_views).map(
                 |(&(binding, _), views)| wgpu::BindGroupEntry {
@@ -9060,11 +9477,13 @@ impl Renderer {
             Some((layout, _)) => &[Some(layout)],
             None => &[],
         };
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("c3d programmable pipeline layout"),
-            bind_group_layouts,
-            immediate_size: 0,
-        });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("c3d programmable pipeline layout"),
+                bind_group_layouts,
+                immediate_size: 0,
+            });
 
         let blend = if state.enables.blend {
             Some(wgpu::BlendState {
@@ -9095,7 +9514,11 @@ impl Renderer {
         // represented by `Self::scratch_color_view`'s throwaway texture,
         // not by `None`, since `None` here would mean "this location
         // isn't a pipeline output at all".
-        let target_count = frag_locations.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let target_count = frag_locations
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
         let mut targets: Vec<Option<wgpu::ColorTargetState>> = vec![None; target_count];
         for &loc in &frag_locations {
             targets[loc as usize] = Some(wgpu::ColorTargetState {
@@ -9132,71 +9555,76 @@ impl Renderer {
             })
             .collect();
 
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("c3d programmable pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vs_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                buffers: &vertex_buffers,
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: topology.to_wgpu(),
-                strip_index_format: None,
-                front_face: front_face_to_wgpu(state.raster.front_face),
-                cull_mode: if state.enables.cull_face && topology == PrimTopologyKey::Triangles {
-                    cull_to_wgpu(Some(FaceKey::from(state.raster.cull_face_mode)))
-                } else {
-                    None
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("c3d programmable pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &vs_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    buffers: &vertex_buffers,
                 },
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: self.depth_format,
-                depth_write_enabled: Some(state.raster.depth_mask),
-                depth_compare: Some(if state.enables.depth_test {
-                    CompareFuncKey::from(state.raster.depth_func).to_wgpu()
-                } else {
-                    wgpu::CompareFunction::Always
+                primitive: wgpu::PrimitiveState {
+                    topology: topology.to_wgpu(),
+                    strip_index_format: None,
+                    front_face: front_face_to_wgpu(state.raster.front_face),
+                    cull_mode: if state.enables.cull_face && topology == PrimTopologyKey::Triangles
+                    {
+                        cull_to_wgpu(Some(FaceKey::from(state.raster.cull_face_mode)))
+                    } else {
+                        None
+                    },
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: self.depth_format,
+                    depth_write_enabled: Some(state.raster.depth_mask),
+                    depth_compare: Some(if state.enables.depth_test {
+                        CompareFuncKey::from(state.raster.depth_func).to_wgpu()
+                    } else {
+                        wgpu::CompareFunction::Always
+                    }),
+                    stencil: if state.enables.stencil_test {
+                        StencilKey {
+                            func: state.raster.stencil_func.into(),
+                            fail: state.raster.stencil_fail_op.into(),
+                            zfail: state.raster.stencil_zfail_op.into(),
+                            zpass: state.raster.stencil_zpass_op.into(),
+                            read_mask: (state.raster.stencil_read_mask & 0xFF) as u8,
+                            write_mask: (state.raster.stencil_write_mask & 0xFF) as u8,
+                        }
+                        .to_wgpu()
+                    } else {
+                        wgpu::StencilState::default()
+                    },
+                    bias: wgpu::DepthBiasState::default(),
                 }),
-                stencil: if state.enables.stencil_test {
-                    StencilKey {
-                        func: state.raster.stencil_func.into(),
-                        fail: state.raster.stencil_fail_op.into(),
-                        zfail: state.raster.stencil_zfail_op.into(),
-                        zpass: state.raster.stencil_zpass_op.into(),
-                        read_mask: (state.raster.stencil_read_mask & 0xFF) as u8,
-                        write_mask: (state.raster.stencil_write_mask & 0xFF) as u8,
-                    }
-                    .to_wgpu()
-                } else {
-                    wgpu::StencilState::default()
+                multisample: wgpu::MultisampleState {
+                    count: target_samples.max(1),
+                    ..Default::default()
                 },
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: target_samples.max(1),
-                ..Default::default()
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &fs_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &targets,
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+                fragment: Some(wgpu::FragmentState {
+                    module: &fs_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    targets: &targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let index_bytes: Vec<u8> = final_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c3d programmable index buffer"),
-            contents: &index_bytes,
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("c3d programmable index buffer"),
+                contents: &index_bytes,
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         let mut encoder = self
             .device
@@ -9235,7 +9663,9 @@ impl Renderer {
             if let Some((_, bind_group)) = &uniform_bind_group {
                 pass.set_bind_group(0, bind_group, &[]);
             }
-            if let Some((x, y, sw, sh)) = Self::clamped_scissor_rect(state, target_width, target_height) {
+            if let Some((x, y, sw, sh)) =
+                Self::clamped_scissor_rect(state, target_width, target_height)
+            {
                 pass.set_scissor_rect(x, y, sw, sh);
             }
             if let Some((x, y, w, h, near, far)) =
@@ -9283,7 +9713,16 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RenderError> {
-        self.copy_texture_rect_to_cpu_aspect(texture, mip_level, x, y, width, height, wgpu::TextureAspect::All, 4)
+        self.copy_texture_rect_to_cpu_aspect(
+            texture,
+            mip_level,
+            x,
+            y,
+            width,
+            height,
+            wgpu::TextureAspect::All,
+            4,
+        )
     }
 
     /// [`Self::copy_texture_rect_to_cpu`], plus an explicit copy aspect
@@ -9370,7 +9809,8 @@ impl Renderer {
         for row in 0..height as usize {
             let src_start = row * padded_bytes_per_row as usize;
             let dst_start = row * row_bytes;
-            out[dst_start..dst_start + row_bytes].copy_from_slice(&data[src_start..src_start + row_bytes]);
+            out[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&data[src_start..src_start + row_bytes]);
         }
         drop(data);
         buffer.unmap();
@@ -9454,7 +9894,8 @@ impl Renderer {
         for row in 0..height as usize {
             let src_start = row * padded_bytes_per_row as usize;
             let dst_start = row * row_bytes;
-            out[dst_start..dst_start + row_bytes].copy_from_slice(&data[src_start..src_start + row_bytes]);
+            out[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&data[src_start..src_start + row_bytes]);
         }
         drop(data);
         buffer.unmap();
@@ -10331,7 +10772,10 @@ mod tests {
     /// [`cmd`], for an opcode whose payload words are `f32`s (e.g.
     /// `CLEAR_COLOR`) rather than `u32`s.
     fn cmd_f32(opcode: u16, payload: &[f32]) -> Vec<u8> {
-        cmd(opcode, &payload.iter().map(|f| f.to_bits()).collect::<Vec<_>>())
+        cmd(
+            opcode,
+            &payload.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+        )
     }
 
     /// Submits every byte of `commands` concatenated as one ring, in one
@@ -10347,9 +10791,18 @@ mod tests {
         ring.resize(ring.len() + 4, 0); // spare word: see RingCursor::new's own doc comment
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let mut mem = TestMemory::new(4096);
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -10378,9 +10831,18 @@ mod tests {
         // command in this entirely different buffer.
         ctx.ring_head = 0;
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -10452,7 +10914,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -10501,7 +10963,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -10515,7 +10977,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -10591,9 +11053,17 @@ mod tests {
                 let at = ((y * 8 + x) * 4) as usize;
                 let px = &pixels[at..at + 4];
                 if x < 4 {
-                    assert_eq!(px, [255, 0, 0, 255], "({x}, {y}) should be red (left scissor)");
+                    assert_eq!(
+                        px,
+                        [255, 0, 0, 255],
+                        "({x}, {y}) should be red (left scissor)"
+                    );
                 } else {
-                    assert_eq!(px, [0, 255, 0, 255], "({x}, {y}) should be green (right scissor)");
+                    assert_eq!(
+                        px,
+                        [0, 255, 0, 255],
+                        "({x}, {y}) should be green (right scissor)"
+                    );
                 }
             }
         }
@@ -10635,7 +11105,9 @@ mod tests {
         // Solid green initially -- overwritten by the off-screen CLEAR if
         // (and only if) the fix under test actually works.
         let tex_init = [0u8, 255, 0, 255].repeat(4 * 4);
-        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts: Vec<f32> = vec![
+            0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0,
+        ];
         let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
 
         let a_vs = 0x1000u32;
@@ -10665,7 +11137,10 @@ mod tests {
             },
             cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 1]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_TEXTURE, &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 1, 0]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_TEXTURE,
+                &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 1, 0],
+            ),
             cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]), // red -- must land in the texture
             cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]), // back to the default framebuffer
@@ -10690,9 +11165,15 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[0, 4, GL_FLOAT, 0, 0, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
             cmd(proto::OP_UNIFORM_SAMPLER, &[1, 0, 0]),
             cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
@@ -10703,16 +11184,26 @@ mod tests {
 
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
         let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
         let inside = &pixels[(32 * 64 + 32) * 4..][..4];
         assert_eq!(
-            inside, [255, 0, 0, 255],
+            inside,
+            [255, 0, 0, 255],
             "triangle centre should sample the off-screen-cleared (red) texture: {inside:?}"
         );
         let outside = &pixels[(2 * 64 + 2) * 4..][..4];
@@ -10750,9 +11241,12 @@ mod tests {
         const GL_FLOAT: u32 = 0x1406;
 
         let vs_src = b"attribute vec4 position;\nvoid main() { gl_Position = position; }\n";
-        let fs_src = b"precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        let fs_src =
+            b"precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
         // Comfortably covers the whole [-1, 1] NDC square.
-        let verts: Vec<f32> = vec![-3.0, -3.0, 0.0, 1.0, 3.0, -3.0, 0.0, 1.0, 0.0, 3.0, 0.0, 1.0];
+        let verts: Vec<f32> = vec![
+            -3.0, -3.0, 0.0, 1.0, 3.0, -3.0, 0.0, 1.0, 0.0, 3.0, 0.0, 1.0,
+        ];
         let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
 
         let a_vs = 0x1000u32;
@@ -10793,9 +11287,15 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[0, 4, GL_FLOAT, 0, 0, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
             // Confine rendering to a 32x32 sub-rectangle of the 64x64
             // surface, origin top-left.
@@ -10817,7 +11317,11 @@ mod tests {
         let mut out = Vec::new();
         ctx.submit(&ring, total, &config, &mut out);
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
@@ -10825,17 +11329,41 @@ mod tests {
         let px = |x: usize, y: usize| -> &[u8] { &pixels[(y * 64 + x) * 4..][..4] };
 
         // Inside the 32x32 viewport sub-rect (16..48, 16..48): red.
-        assert_eq!(px(32, 32), [255, 0, 0, 255], "centre of the viewport sub-rect should be red");
-        assert_eq!(px(17, 17), [255, 0, 0, 255], "just inside the viewport sub-rect should be red");
-        assert_eq!(px(46, 46), [255, 0, 0, 255], "just inside the far corner of the viewport sub-rect should be red");
+        assert_eq!(
+            px(32, 32),
+            [255, 0, 0, 255],
+            "centre of the viewport sub-rect should be red"
+        );
+        assert_eq!(
+            px(17, 17),
+            [255, 0, 0, 255],
+            "just inside the viewport sub-rect should be red"
+        );
+        assert_eq!(
+            px(46, 46),
+            [255, 0, 0, 255],
+            "just inside the far corner of the viewport sub-rect should be red"
+        );
 
         // Outside it: still the blue background, even though the
         // triangle itself covers the whole surface in clip space --
         // proving VIEWPORT, not scissor or luck, is what's constraining
         // the output.
-        assert_eq!(px(2, 2), [0, 0, 255, 255], "top-left corner, outside the viewport, should stay blue");
-        assert_eq!(px(60, 60), [0, 0, 255, 255], "bottom-right corner, outside the viewport, should stay blue");
-        assert_eq!(px(32, 2), [0, 0, 255, 255], "above the viewport sub-rect should stay blue");
+        assert_eq!(
+            px(2, 2),
+            [0, 0, 255, 255],
+            "top-left corner, outside the viewport, should stay blue"
+        );
+        assert_eq!(
+            px(60, 60),
+            [0, 0, 255, 255],
+            "bottom-right corner, outside the viewport, should stay blue"
+        );
+        assert_eq!(
+            px(32, 2),
+            [0, 0, 255, 255],
+            "above the viewport sub-rect should stay blue"
+        );
     }
 
     /// A disabled programmable-draw vertex attribute must actually reach
@@ -10863,7 +11391,9 @@ mod tests {
 
         let vs_src = b"attribute vec4 position;\nattribute vec4 color;\nvarying vec4 v_color;\nvoid main() { gl_Position = position; v_color = color; }\n";
         let fs_src = b"precision mediump float;\nvarying vec4 v_color;\nvoid main() { gl_FragColor = v_color; }\n";
-        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts: Vec<f32> = vec![
+            0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0,
+        ];
         let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
 
         let a_vs = 0x1000u32;
@@ -10904,15 +11434,27 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[0, 4, GL_FLOAT, 0, 0, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
             // `color` (location 1) is left disabled -- never enabled,
             // never pointed at a buffer -- with a known constant set.
             cmd(
                 proto::OP_VERTEX_ATTRIB_CONSTANT,
-                &[1, 1.0f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits()],
+                &[
+                    1,
+                    1.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                ],
             ),
             cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 3]), // GL_TRIANGLES
         ];
@@ -10922,21 +11464,32 @@ mod tests {
 
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
         let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
         let inside = &pixels[(32 * 64 + 32) * 4..][..4];
         assert_eq!(
-            inside, [255, 255, 0, 255],
+            inside,
+            [255, 255, 0, 255],
             "triangle centre should be the disabled attribute's constant (yellow): {inside:?}"
         );
         let outside = &pixels[(2 * 64 + 2) * 4..][..4];
         assert_eq!(
-            outside, [0, 0, 255, 255],
+            outside,
+            [0, 0, 255, 255],
             "outside the triangle should still be the background: {outside:?}"
         );
     }
@@ -10965,7 +11518,9 @@ mod tests {
 
         let vs_src = b"attribute vec4 position;\nattribute vec4 color;\nvarying vec4 v_color;\nvoid main() { gl_Position = position; v_color = color; }\n";
         let fs_src = b"precision mediump float;\nvarying vec4 v_color;\nvoid main() { gl_FragColor = v_color; }\n";
-        let verts: Vec<f32> = vec![0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0];
+        let verts: Vec<f32> = vec![
+            0.0, 0.8, 0.0, 1.0, -0.8, -0.8, 0.0, 1.0, 0.8, -0.8, 0.0, 1.0,
+        ];
         let verts_bytes: Vec<u8> = verts.iter().flat_map(|f| f.to_be_bytes()).collect();
 
         let a_vs = 0x1000u32;
@@ -11006,9 +11561,15 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[0, 4, GL_FLOAT, 0, 0, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
             // `color` (location 1): never enabled, never pointed, never
             // given an explicit constant -- the GLES2 default applies.
@@ -11020,16 +11581,26 @@ mod tests {
 
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
         let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
         let inside = &pixels[(32 * 64 + 32) * 4..][..4];
         assert_eq!(
-            inside, [0, 0, 0, 255],
+            inside,
+            [0, 0, 0, 255],
             "triangle centre should be the GLES2 default constant (opaque black): {inside:?}"
         );
     }
@@ -11095,17 +11666,24 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_STENCIL,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
-        assert!(errs.is_empty(), "unexpected errors (background clear): {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "unexpected errors (background clear): {errs:?}"
+        );
 
         // Pass 1: scissored to the left half, writes stencil 1 there.
         state.set_scissor(0, 0, 4, 8);
         state.enable(state::Capability::ScissorTest);
         state.set_stencil_func(state::StencilCompareFunc::Always, 1, 0xFF);
-        state.set_stencil_op(state::StencilOp::Keep, state::StencilOp::Keep, state::StencilOp::Replace);
+        state.set_stencil_op(
+            state::StencilOp::Keep,
+            state::StencilOp::Keep,
+            state::StencilOp::Replace,
+        );
         state.set_stencil_mask(0xFF);
         state.set_current_color(1.0, 0.0, 0.0, 1.0); // irrelevant -- overwritten (or not) by pass 2
         let errs = renderer.execute(
@@ -11115,7 +11693,7 @@ mod tests {
                 count: 3,
                 window_space: true,
                 vertices: DrawVertices::Inline(&verts),
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11125,7 +11703,11 @@ mod tests {
         // stencil test instead.
         state.disable(state::Capability::ScissorTest);
         state.set_stencil_func(state::StencilCompareFunc::Equal, 1, 0xFF);
-        state.set_stencil_op(state::StencilOp::Keep, state::StencilOp::Keep, state::StencilOp::Keep);
+        state.set_stencil_op(
+            state::StencilOp::Keep,
+            state::StencilOp::Keep,
+            state::StencilOp::Keep,
+        );
         state.set_current_color(0.0, 1.0, 0.0, 1.0);
         let errs = renderer.execute(
             &[RenderOp::Draw {
@@ -11134,7 +11716,7 @@ mod tests {
                 count: 3,
                 window_space: true,
                 vertices: DrawVertices::Inline(&verts),
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11198,7 +11780,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11210,7 +11792,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11281,14 +11863,14 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::SurfaceReadback {
                     x: 3,
                     y: 2,
                     w: 2,
                     h: 2,
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -11375,14 +11957,14 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::SurfaceUpload {
                     x: 3,
                     y: 2,
                     w: 2,
                     h: 2,
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -11448,7 +12030,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11458,7 +12040,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_COLOR,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11479,7 +12061,7 @@ mod tests {
                 row_bytes: 8,
                 flags: proto::READ_PIXELS_FLAG_ROWS_BOTTOM_UP,
                 dest,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11535,7 +12117,7 @@ mod tests {
         let errs = renderer.execute(
             &[RenderOp::Clear {
                 mask: proto::CLEAR_MASK_DEPTH,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11556,7 +12138,7 @@ mod tests {
                 row_bytes: 8,
                 flags: 0,
                 dest,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11607,7 +12189,10 @@ mod tests {
         // Seed a known depth with DEPTH_MASK still true (the default).
         state.set_clear_depth(0.5);
         let errs = renderer.execute(
-            &[RenderOp::Clear { mask: proto::CLEAR_MASK_DEPTH, state: state.clone() }],
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
+            }],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
@@ -11617,12 +12202,19 @@ mod tests {
         state.set_depth_mask(false);
         state.set_clear_depth(0.9);
         let errs = renderer.execute(
-            &[RenderOp::Clear { mask: proto::CLEAR_MASK_DEPTH, state: state.clone() }],
+            &[RenderOp::Clear {
+                mask: proto::CLEAR_MASK_DEPTH,
+                state: state.clone(),
+            }],
             &mut mem,
         );
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
-        let dest = Ref { address: 0, space: RefSpace::Aperture, length: 16 };
+        let dest = Ref {
+            address: 0,
+            space: RefSpace::Aperture,
+            length: 16,
+        };
         let errs = renderer.execute(
             &[RenderOp::ReadPixels {
                 x: 0,
@@ -11773,7 +12365,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_DEPTH,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -11781,7 +12373,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -11803,7 +12395,7 @@ mod tests {
                 row_bytes: 4,
                 flags: 0,
                 dest,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11919,7 +12511,7 @@ mod tests {
                 y: 8,
                 width: 16,
                 height: 8,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11974,7 +12566,7 @@ mod tests {
                 y: 0,
                 width: 16,
                 height: 8,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -11999,7 +12591,7 @@ mod tests {
                 y: 8,
                 width: 16,
                 height: 8,
-            state: state.clone(),
+                state: state.clone(),
             }],
             &mut mem,
         );
@@ -12069,9 +12661,12 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                namespace: Namespace::Private(0),
-            },
-                RenderOp::TexGenerateMips { id: 1, namespace: Namespace::Private(0) },
+                    namespace: Namespace::Private(0),
+                },
+                RenderOp::TexGenerateMips {
+                    id: 1,
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12083,10 +12678,26 @@ mod tests {
         let lvl1 = renderer
             .copy_texture_rect_to_cpu(&tex.texture, 1, 0, 0, 2, 2)
             .unwrap();
-        assert_eq!(&lvl1[0..4], &RED, "level 1 (0,0) should be the red quadrant's exact colour");
-        assert_eq!(&lvl1[4..8], &GREEN, "level 1 (1,0) should be the green quadrant's exact colour");
-        assert_eq!(&lvl1[8..12], &BLUE, "level 1 (0,1) should be the blue quadrant's exact colour");
-        assert_eq!(&lvl1[12..16], &WHITE, "level 1 (1,1) should be the white quadrant's exact colour");
+        assert_eq!(
+            &lvl1[0..4],
+            &RED,
+            "level 1 (0,0) should be the red quadrant's exact colour"
+        );
+        assert_eq!(
+            &lvl1[4..8],
+            &GREEN,
+            "level 1 (1,0) should be the green quadrant's exact colour"
+        );
+        assert_eq!(
+            &lvl1[8..12],
+            &BLUE,
+            "level 1 (0,1) should be the blue quadrant's exact colour"
+        );
+        assert_eq!(
+            &lvl1[12..16],
+            &WHITE,
+            "level 1 (1,1) should be the white quadrant's exact colour"
+        );
 
         // Level 2 (1x1): the average of (red, green, blue, white).
         // R: (255+0+0+255)/4 = 127.5 -> 128; same for G, B; A is 255
@@ -12136,9 +12747,12 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 12,
                     },
-                namespace: Namespace::Private(0),
-            },
-                RenderOp::TexGenerateMips { id: 1, namespace: Namespace::Private(0) },
+                    namespace: Namespace::Private(0),
+                },
+                RenderOp::TexGenerateMips {
+                    id: 1,
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12192,8 +12806,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -12206,8 +12820,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12307,8 +12921,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -12321,8 +12935,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 // Redefine level 0 bigger than before -- old level 1
                 // (sized from the old 4x4 base) must be read back
                 // against its own real size, not the new 8x8 base's.
@@ -12338,8 +12952,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 256,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12388,8 +13002,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 64,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::TexImage {
                     id: 1,
                     level: 1,
@@ -12402,8 +13016,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12508,7 +13122,7 @@ mod tests {
                     y: 0,
                     width: 16,
                     height: 8,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 // Level 1 of a 16x8 base texture is 8x4 (`mip_extent`) --
                 // copy from the blue bottom half at that size, a
@@ -12522,7 +13136,7 @@ mod tests {
                     y: 8,
                     width: 8,
                     height: 4,
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -12595,8 +13209,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 2,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12671,8 +13285,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 1,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
             ],
             &mut mem,
         );
@@ -12740,7 +13354,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR,
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -12748,7 +13362,7 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                 ],
                 &mut mem,
@@ -12827,7 +13441,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -12835,7 +13449,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -12934,7 +13548,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -12942,7 +13556,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -12999,7 +13613,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -13007,7 +13621,7 @@ mod tests {
                     count: 3,
                     window_space: false,
                     vertices: DrawVertices::Inline(verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -13031,7 +13645,12 @@ mod tests {
     /// `normal` here. Caller must pass a `format` that sets both bits,
     /// with `POS_COUNT` left `0` (4 words) to match `pos`'s unconditional
     /// 4-word encoding, e.g. `VertexFormat::COLOR | VertexFormat::NORMAL`.
-    fn encode_gl_vertex_with_normal(pos: [f32; 4], color: [f32; 4], normal: [f32; 3], out: &mut Vec<u8>) {
+    fn encode_gl_vertex_with_normal(
+        pos: [f32; 4],
+        color: [f32; 4],
+        normal: [f32; 3],
+        out: &mut Vec<u8>,
+    ) {
         encode_gl_vertex(pos, color, out);
         for n in normal {
             out.extend_from_slice(&n.to_bits().to_be_bytes());
@@ -13192,7 +13811,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_DEPTH,
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -13200,7 +13819,7 @@ mod tests {
                         count: 3,
                         window_space: false,
                         vertices: DrawVertices::Inline(&verts),
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                 ],
                 &mut mem,
@@ -13222,7 +13841,7 @@ mod tests {
                     row_bytes: 4,
                     flags: 0,
                     dest,
-                state: state.clone(),
+                    state: state.clone(),
                 }],
                 &mut mem,
             );
@@ -13288,7 +13907,9 @@ mod tests {
         // triangle's corner, but with an explicit w = 0.0.
         encode_gl_vertex([48.0, -16.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], &mut verts);
 
-        let Some(pixels) = draw_gl_space_triangle(VertexFormat(VertexFormat::COLOR), |_| {}, &verts) else {
+        let Some(pixels) =
+            draw_gl_space_triangle(VertexFormat(VertexFormat::COLOR), |_| {}, &verts)
+        else {
             return; // no adapter
         };
 
@@ -13352,7 +13973,10 @@ mod tests {
                 "channel {i} should be close to the predicted lit value {expected}: {center:?}"
             );
         }
-        assert_eq!(center[3], 255, "alpha should be the material's own diffuse alpha: {center:?}");
+        assert_eq!(
+            center[3], 255,
+            "alpha should be the material's own diffuse alpha: {center:?}"
+        );
     }
 
     /// `LIGHT_MODEL_TWO_SIDE` is GL 1.1's own *per-vertex* rule (section
@@ -13369,7 +13993,12 @@ mod tests {
         let tri = [(-16.0f32, -16.0), (-16.0, 48.0), (48.0, -16.0)];
         let mut verts = Vec::new();
         for (x, y) in tri {
-            encode_gl_vertex_with_normal([x, y, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, -1.0], &mut verts);
+            encode_gl_vertex_with_normal(
+                [x, y, 0.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, -1.0],
+                &mut verts,
+            );
         }
         let format = VertexFormat(VertexFormat::COLOR | VertexFormat::NORMAL);
 
@@ -13408,7 +14037,12 @@ mod tests {
             // Not material_front's default grey ambient/diffuse, and not
             // white/black either -- a value only COLOR_MATERIAL actually
             // reaching the lit colour could produce.
-            encode_gl_vertex_with_normal([x, y, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0], &mut verts);
+            encode_gl_vertex_with_normal(
+                [x, y, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0],
+                &mut verts,
+            );
         }
         let format = VertexFormat(VertexFormat::COLOR | VertexFormat::NORMAL);
 
@@ -13475,9 +14109,17 @@ mod tests {
             for x in 0..16u32 {
                 let px = &pixels[((y * 16 + x) * 4) as usize..][..4];
                 if x < 8 {
-                    assert_eq!(px, [0, 0, 0, 255], "({x}, {y}) is x<0: should be clipped to the background: {px:?}");
+                    assert_eq!(
+                        px,
+                        [0, 0, 0, 255],
+                        "({x}, {y}) is x<0: should be clipped to the background: {px:?}"
+                    );
                 } else {
-                    assert_eq!(px, [255, 255, 255, 255], "({x}, {y}) is x>=0: should pass the clip plane: {px:?}");
+                    assert_eq!(
+                        px,
+                        [255, 255, 255, 255],
+                        "({x}, {y}) is x>=0: should pass the clip plane: {px:?}"
+                    );
                 }
             }
         }
@@ -13753,11 +14395,11 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -13765,7 +14407,7 @@ mod tests {
                     count: 3,
                     window_space: false,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -13904,7 +14546,10 @@ mod tests {
 
         let Some(px) = draw_gl_space_texgen_triangle(
             |s| {
-                s.set_tex_env(0, state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel));
+                s.set_tex_env(
+                    0,
+                    state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel),
+                );
             },
             [(0.6, -0.3), (0.6, 0.3), (0.9, 0.0)],
             (1.5, 1.5),
@@ -13989,7 +14634,10 @@ mod tests {
         state.tex_create(1);
         state.tex_bind(0, 1);
         state.set_tex_env(0, state::TexEnvParam::Mode(TexEnvMode::Replace));
-        state.set_tex_env(0, state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel));
+        state.set_tex_env(
+            0,
+            state::TexEnvParam::CoordSpace(state::TexCoordSpace::Texel),
+        );
         state.enable(state::Capability::Texture2D);
 
         let mut mem = TestMemory::new(65536);
@@ -14028,8 +14676,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 16,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
                     state: state.clone(),
@@ -14273,7 +14921,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -14281,7 +14929,7 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                 ],
                 &mut mem,
@@ -14360,7 +15008,7 @@ mod tests {
                 &[
                     RenderOp::Clear {
                         mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                     RenderOp::Draw {
                         prim: PrimitiveType::Triangles,
@@ -14368,7 +15016,7 @@ mod tests {
                         count: 3,
                         window_space: true,
                         vertices: DrawVertices::Inline(&verts),
-                    state: state.clone(),
+                        state: state.clone(),
                     },
                 ],
                 &mut mem,
@@ -14463,7 +15111,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Lines,
@@ -14471,7 +15119,7 @@ mod tests {
                     count: 2,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -14537,7 +15185,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -14545,7 +15193,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -14678,7 +15326,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: true,
@@ -14686,7 +15334,7 @@ mod tests {
                     format,
                     count: 3,
                     vertices: DrawVertices::Arrays(&descriptors),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -14773,7 +15421,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: true,
@@ -14791,7 +15439,7 @@ mod tests {
                         index_ref,
                         descriptors: &descriptors,
                     },
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -14875,7 +15523,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: false,
@@ -14883,7 +15531,7 @@ mod tests {
                     format,
                     count: 3,
                     vertices: DrawVertices::Arrays(&descriptors),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -14971,7 +15619,7 @@ mod tests {
             &[
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     window_space: false,
@@ -14989,7 +15637,7 @@ mod tests {
                         index_ref,
                         descriptors: &descriptors,
                     },
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -15109,8 +15757,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::TexImage {
                     id: 2,
                     level: 0,
@@ -15123,11 +15771,11 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: tw * th * 4,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -15135,7 +15783,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -15285,8 +15933,8 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::TexImage {
                     id: 2,
                     level: 0,
@@ -15299,11 +15947,11 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 4,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -15311,7 +15959,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -15410,11 +16058,11 @@ mod tests {
                         space: RefSpace::Aperture,
                         length: 8,
                     },
-                namespace: Namespace::Private(0),
-            },
+                    namespace: Namespace::Private(0),
+                },
                 RenderOp::Clear {
                     mask: proto::CLEAR_MASK_COLOR,
-                state: state.clone(),
+                    state: state.clone(),
                 },
                 RenderOp::Draw {
                     prim: PrimitiveType::Triangles,
@@ -15422,7 +16070,7 @@ mod tests {
                     count: 3,
                     window_space: true,
                     vertices: DrawVertices::Inline(&verts),
-                state: state.clone(),
+                    state: state.clone(),
                 },
             ],
             &mut mem,
@@ -15690,9 +16338,15 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, GL_FLOAT, 0, 0, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[0, 4, GL_FLOAT, 0, 0, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
             // tex[0] -> texture unit 0 (the red texture); tex[1] -> unit 1 (green).
             cmd(proto::OP_UNIFORM_SAMPLER, &[1, 0, 0]),
@@ -15705,17 +16359,34 @@ mod tests {
 
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
-        assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR, "unexpected GL error");
+        assert_eq!(
+            ctx.state.gl_error(),
+            state::GL_NO_ERROR,
+            "unexpected GL error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
 
         let (_, _, pixels) = renderer.read_surface_rgba8(1).unwrap();
         let left = &pixels[(32 * 64 + 8) * 4..][..4];
-        assert_eq!(left, [255, 0, 0, 255], "left half should sample tex[0] (red): {left:?}");
+        assert_eq!(
+            left,
+            [255, 0, 0, 255],
+            "left half should sample tex[0] (red): {left:?}"
+        );
         let right = &pixels[(32 * 64 + 56) * 4..][..4];
-        assert_eq!(right, [0, 255, 0, 255], "right half should sample tex[1] (green): {right:?}");
+        assert_eq!(
+            right,
+            [0, 255, 0, 255],
+            "right half should sample tex[1] (green): {right:?}"
+        );
     }
 
     /// Reads back a `PROGRAM_INTERFACE` result written at `addr` and
@@ -15739,7 +16410,8 @@ mod tests {
         for _ in 0..total_entries {
             let location = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as u32;
             let name_len = u32::from_be_bytes(buf[off + 12..off + 16].try_into().unwrap());
-            let name = String::from_utf8_lossy(&buf[off + 16..off + 16 + name_len as usize]).to_string();
+            let name =
+                String::from_utf8_lossy(&buf[off + 16..off + 16 + name_len as usize]).to_string();
             for (i, want) in names.iter().enumerate() {
                 if name == *want {
                     found[i] = Some(location);
@@ -15757,7 +16429,12 @@ mod tests {
     /// solid 2x2 colour, `LINEAR`-filtered (no mipmap min filter, so each
     /// 1-level face samples flatly). Shared by every cube-map GPU test
     /// below.
-    fn cube_commands(mem: &mut TestMemory, id: u32, base_addr: u32, colors: [[u8; 4]; 6]) -> Vec<Vec<u8>> {
+    fn cube_commands(
+        mem: &mut TestMemory,
+        id: u32,
+        base_addr: u32,
+        colors: [[u8; 4]; 6],
+    ) -> Vec<Vec<u8>> {
         const RGBA8: u32 = 0;
         const GL_LINEAR: u32 = 0x2601;
         const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
@@ -15774,7 +16451,17 @@ mod tests {
             mem.write(MemLoc::Aperture(addr), &pixels);
             commands.push(cmd(
                 proto::OP_TEX_IMAGE_FACE,
-                &[id, face as u32, 0, RGBA8, 2, 2, 8, addr, pixels.len() as u32],
+                &[
+                    id,
+                    face as u32,
+                    0,
+                    RGBA8,
+                    2,
+                    2,
+                    8,
+                    addr,
+                    pixels.len() as u32,
+                ],
             ));
         }
         commands
@@ -15868,13 +16555,17 @@ mod tests {
         // this test -- look them up by name via `PROGRAM_INTERFACE`
         // rather than assuming a declaration-order numbering that isn't
         // part of the spec's contract.
-        let [cube_loc, dir_loc] = program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
+        let [cube_loc, dir_loc] =
+            program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
 
         let mut commands = vec![
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -15895,7 +16586,10 @@ mod tests {
             (16, [1.0, 1.0, 0.0]),  // seam: +X/+Y edge
         ];
         for (surf_id, dir) in directions {
-            commands.push(cmd(proto::OP_SURFACE_DEFINE, &[surf_id, 2, 2, 8, A8R8G8B8, 0, 0]));
+            commands.push(cmd(
+                proto::OP_SURFACE_DEFINE,
+                &[surf_id, 2, 2, 8, A8R8G8B8, 0, 0],
+            ));
             commands.push(cmd(proto::OP_SET_DRAW_SURFACE, &[surf_id]));
             commands.push(cmd(
                 proto::OP_UNIFORM,
@@ -15926,8 +16620,16 @@ mod tests {
 
         let (_, _, seam_pixels) = renderer.read_surface_rgba8(16).unwrap();
         let seam = &seam_pixels[0..4];
-        assert_ne!(seam, &red[..], "seam direction must not be the pure +X colour: {seam:?}");
-        assert_ne!(seam, &green[..], "seam direction must not be the pure +Y colour: {seam:?}");
+        assert_ne!(
+            seam,
+            &red[..],
+            "seam direction must not be the pure +X colour: {seam:?}"
+        );
+        assert_ne!(
+            seam,
+            &green[..],
+            "seam direction must not be the pure +Y colour: {seam:?}"
+        );
         assert!(
             seam[0] > 20 && seam[1] > 20,
             "seam direction should blend red and green across the +X/+Y edge, got {seam:?}"
@@ -15964,7 +16666,10 @@ mod tests {
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
         let tex = &renderer.textures[&(Namespace::Private(0), 1)];
-        assert_eq!(tex.mip_level_count, 2, "a 2x2 base should generate exactly one more level (1x1)");
+        assert_eq!(
+            tex.mip_level_count, 2,
+            "a 2x2 base should generate exactly one more level (1x1)"
+        );
         for (face, &expected) in colors.iter().enumerate() {
             let pixel = renderer
                 .copy_texture_rect_to_cpu_face(&tex.texture, face as u32, 1, 0, 0, 1, 1)
@@ -16024,10 +16729,22 @@ mod tests {
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
         let tex = &renderer.textures[&(Namespace::Private(0), 1)];
-        let face2 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 2, 0, 0, 0, 2, 2).unwrap();
-        assert_eq!(&face2[0..4], &[0, 0, 0, 255], "face 2 should now be cleared to black: {face2:?}");
-        let face0 = renderer.copy_texture_rect_to_cpu_face(&tex.texture, 0, 0, 0, 0, 2, 2).unwrap();
-        assert_eq!(&face0[0..4], &red[..], "face 0 must be untouched by a face-2 render target: {face0:?}");
+        let face2 = renderer
+            .copy_texture_rect_to_cpu_face(&tex.texture, 2, 0, 0, 0, 2, 2)
+            .unwrap();
+        assert_eq!(
+            &face2[0..4],
+            &[0, 0, 0, 255],
+            "face 2 should now be cleared to black: {face2:?}"
+        );
+        let face0 = renderer
+            .copy_texture_rect_to_cpu_face(&tex.texture, 0, 0, 0, 0, 2, 2)
+            .unwrap();
+        assert_eq!(
+            &face0[0..4],
+            &red[..],
+            "face 0 must be untouched by a face-2 render target: {face0:?}"
+        );
     }
 
     /// A `samplerCube` uniform reading a unit bound to a *2D* texture is
@@ -16100,7 +16817,8 @@ mod tests {
         ];
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
-        let [cube_loc, dir_loc] = program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
+        let [cube_loc, dir_loc] =
+            program_interface_locations(&mut mem, iface_addr, &["cube", "dir"]);
 
         let commands = [
             cmd(proto::OP_SURFACE_DEFINE, &[1, 2, 2, 8, A8R8G8B8, 0, 0]),
@@ -16116,7 +16834,10 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             {
                 let r = reference(a_verts, verts_bytes.len() as u32);
-                cmd(proto::OP_BUFFER_DATA, &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]])
+                cmd(
+                    proto::OP_BUFFER_DATA,
+                    &[1, verts_bytes.len() as u32, 0x88E4, r[0], r[1]],
+                )
             },
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -16196,11 +16917,22 @@ mod tests {
         ring.resize(ring.len() + 4, 0);
         ctx.ring_head = 0;
         let mut out = Vec::new();
-        ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
-        assert_eq!(ctx.error_code, 0, "a bad location is a GL error, not a protocol error");
+        ctx.submit(
+            &ring,
+            total,
+            &super::super::ring::DeviceConfig::default(),
+            &mut out,
+        );
+        assert_eq!(
+            ctx.error_code, 0,
+            "a bad location is a GL error, not a protocol error"
+        );
         let errs = renderer.execute(&out, &mut mem);
         assert!(
-            matches!(errs.as_slice(), [RenderError::GlError(state::GlError::InvalidOperation)]),
+            matches!(
+                errs.as_slice(),
+                [RenderError::GlError(state::GlError::InvalidOperation)]
+            ),
             "expected exactly one GL_INVALID_OPERATION, got: {errs:?}"
         );
 
@@ -16211,7 +16943,10 @@ mod tests {
             &mut ctx,
             &mut renderer,
             &mut mem,
-            &[cmd(proto::OP_UNIFORM, &[1, x_loc, GL_FLOAT, 1, 1.0f32.to_bits()])],
+            &[cmd(
+                proto::OP_UNIFORM,
+                &[1, x_loc, GL_FLOAT, 1, 1.0f32.to_bits()],
+            )],
         );
     }
 
@@ -16292,11 +17027,20 @@ mod tests {
                 proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
                 &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT1, 2],
             ),
-            cmd(proto::OP_DRAW_BUFFERS, &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1]),
+            cmd(
+                proto::OP_DRAW_BUFFERS,
+                &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1],
+            ),
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -16309,9 +17053,15 @@ mod tests {
         let dest1 = 0x4100u32;
         let readback = vec![
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 32]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 32],
+            ),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT1]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 32]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 32],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
@@ -16384,7 +17134,13 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -16394,7 +17150,10 @@ mod tests {
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
         let dest = 0x4000u32;
-        let readback = vec![cmd(proto::OP_READ_PIXELS, &[0, 0, 5, 5, A8R8G8B8, 20, 0, dest, 100])];
+        let readback = vec![cmd(
+            proto::OP_READ_PIXELS,
+            &[0, 0, 5, 5, A8R8G8B8, 20, 0, dest, 100],
+        )];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
         let pixels = mem.read(MemLoc::Aperture(dest), 100).unwrap().to_vec();
@@ -16464,7 +17223,13 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -16474,7 +17239,10 @@ mod tests {
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
         let dest = 0x4000u32;
-        let readback = vec![cmd(proto::OP_READ_PIXELS, &[2, 2, 1, 1, A8R8G8B8, 4, 0, dest, 4])];
+        let readback = vec![cmd(
+            proto::OP_READ_PIXELS,
+            &[2, 2, 1, 1, A8R8G8B8, 4, 0, dest, 4],
+        )];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
         let pixel = mem.read(MemLoc::Aperture(dest), 4).unwrap().to_vec();
@@ -16547,7 +17315,13 @@ mod tests {
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -16563,7 +17337,10 @@ mod tests {
             &mut mem,
             &[cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 512])],
         );
-        let status_head = mem.read(MemLoc::Aperture(status_dest), 12).unwrap().to_vec();
+        let status_head = mem
+            .read(MemLoc::Aperture(status_dest), 12)
+            .unwrap()
+            .to_vec();
         assert_eq!(
             u32::from_be_bytes(status_head[0..4].try_into().unwrap()),
             1,
@@ -16588,7 +17365,10 @@ mod tests {
                 &[1, get_binary_dest, binary_length + 16],
             )],
         );
-        let gb_head = mem.read(MemLoc::Aperture(get_binary_dest), 8).unwrap().to_vec();
+        let gb_head = mem
+            .read(MemLoc::Aperture(get_binary_dest), 8)
+            .unwrap()
+            .to_vec();
         let format = u32::from_be_bytes(gb_head[0..4].try_into().unwrap());
         let length = u32::from_be_bytes(gb_head[4..8].try_into().unwrap());
         assert_eq!(
@@ -16617,7 +17397,10 @@ mod tests {
             &mut ctx,
             &mut renderer,
             &mut mem,
-            &[cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 32])],
+            &[cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 32],
+            )],
         );
         let pixel = mem.read(MemLoc::Aperture(dest), 4).unwrap().to_vec();
         assert_eq!(
@@ -16654,14 +17437,20 @@ mod tests {
                 cmd(proto::OP_PROGRAM_STATUS, &[1, status_dest, 256]),
             ],
         );
-        let status = mem.read(MemLoc::Aperture(status_dest), 16).unwrap().to_vec();
+        let status = mem
+            .read(MemLoc::Aperture(status_dest), 16)
+            .unwrap()
+            .to_vec();
         assert_eq!(
             u32::from_be_bytes(status[0..4].try_into().unwrap()),
             0,
             "a format mismatch should fail like a bad link, not succeed"
         );
         let log_length = u32::from_be_bytes(status[12..16].try_into().unwrap());
-        assert!(log_length > 0, "a format mismatch should leave an explanatory info log");
+        assert!(
+            log_length > 0,
+            "a format mismatch should leave an explanatory info log"
+        );
     }
 
     /// A blob whose `format` matches but whose content doesn't deserialize
@@ -16780,7 +17569,10 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 4, 4, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd_f32(proto::OP_CLEAR_COLOR, &[0.0, 0.0, 0.0, 1.0]),
             cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
             // A scissor covering only the top-left pixel, enabled.
@@ -16788,7 +17580,10 @@ mod tests {
             cmd(proto::OP_ENABLE, &[GL_SCISSOR_TEST]),
             // Read side: the red surface (default framebuffer).
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 0]),
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 4, 4, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
@@ -16796,7 +17591,10 @@ mod tests {
         let readback = vec![
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[3, 3, 1, 1, A8R8G8B8, 4, 0, dest, 4]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[3, 3, 1, 1, A8R8G8B8, 4, 0, dest, 4],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
@@ -16884,7 +17682,8 @@ mod tests {
         ];
         let mut ctx = super::super::dispatch::Context::new(state::Limits::default());
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &link_commands);
-        let [pos_loc, color_loc] = program_interface_locations(&mut mem, iface_addr, &["position", "color"]);
+        let [pos_loc, color_loc] =
+            program_interface_locations(&mut mem, iface_addr, &["position", "color"]);
 
         let samples = ctx.state.limits().max_samples as u32;
         let commands = vec![
@@ -16893,16 +17692,34 @@ mod tests {
             cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, A8R8G8B8, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE,
+                &[1, 4, 4, A8R8G8B8, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[pos_loc, 4, GL_FLOAT, 0, 32, 0, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[pos_loc, 4, GL_FLOAT, 0, 32, 0, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[pos_loc, 1]),
-            cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[color_loc, 4, GL_FLOAT, 0, 32, 16, 1]),
+            cmd(
+                proto::OP_VERTEX_ATTRIB_POINTER,
+                &[color_loc, 4, GL_FLOAT, 0, 32, 16, 1],
+            ),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[color_loc, 1]),
             cmd(proto::OP_DRAW_ARRAYS_PROG, &[4, 0, 12]), // GL_TRIANGLES
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
@@ -16918,8 +17735,18 @@ mod tests {
         assert_eq!((w, h), (4, 4));
         let row = 1usize; // any row; the split is uniform along y
         let px = |col: usize| &pixels[(row * 4 + col) * 4..(row * 4 + col) * 4 + 4];
-        assert_eq!(px(0), [255, 0, 0, 255], "column 0 (well left of the edge) must be pure red: {:?}", px(0));
-        assert_eq!(px(3), [0, 0, 255, 255], "column 3 (well right of the edge) must be pure blue: {:?}", px(3));
+        assert_eq!(
+            px(0),
+            [255, 0, 0, 255],
+            "column 0 (well left of the edge) must be pure red: {:?}",
+            px(0)
+        );
+        assert_eq!(
+            px(3),
+            [0, 0, 255, 255],
+            "column 3 (well right of the edge) must be pure blue: {:?}",
+            px(3)
+        );
         let edge = px(2);
         assert!(
             edge != [255u8, 0, 0, 255] && edge != [0u8, 0, 255, 255],
@@ -16960,7 +17787,10 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
         // Four 1x1 SURFACE_UPLOAD-shaped TEX_SUBIMAGE-equivalent writes
@@ -16990,9 +17820,15 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 2]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[2, 4, 4, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 2]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 2],
+            ),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 2, 2, 0, 0, 4, 4, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &dest_commands);
 
@@ -17000,15 +17836,31 @@ mod tests {
         let readback = vec![
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 2]),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 4, 4, A8R8G8B8, 16, 0, dest, 64]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 4, 4, A8R8G8B8, 16, 0, dest, 64],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
         let scaled = mem.read(MemLoc::Aperture(dest), 64).unwrap().to_vec();
-        let pixel_at = |x: usize, y: usize| -> &[u8] { &scaled[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4] };
-        assert_eq!(pixel_at(0, 0), encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap());
-        assert_eq!(pixel_at(3, 0), encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 255, 0, 255]).unwrap());
-        assert_eq!(pixel_at(0, 3), encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap());
-        assert_eq!(pixel_at(3, 3), encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 255, 255, 255]).unwrap());
+        let pixel_at =
+            |x: usize, y: usize| -> &[u8] { &scaled[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4] };
+        assert_eq!(
+            pixel_at(0, 0),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 0, 255]).unwrap()
+        );
+        assert_eq!(
+            pixel_at(3, 0),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 255, 0, 255]).unwrap()
+        );
+        assert_eq!(
+            pixel_at(0, 3),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [0, 0, 255, 255]).unwrap()
+        );
+        assert_eq!(
+            pixel_at(3, 3),
+            encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 255, 255, 255]).unwrap()
+        );
 
         // The flipped copy: a reversed source y-range (0,2 -> 0,0, i.e.
         // src y0=2,y1=0) must swap the top/bottom halves relative to the
@@ -17019,21 +17871,31 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 3]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[3]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[3, 2, 2, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 3]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 3],
+            ),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
             // src y0=2 (bottom), y1=0 (top): reversed -- flips the y axis.
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 2, 2, 0, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 2, 2, 0, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &flip_commands);
         let dest2 = 0x3100u32;
         let readback2 = vec![
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 3]),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest2, 16]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest2, 16],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback2);
         let flipped = mem.read(MemLoc::Aperture(dest2), 16).unwrap().to_vec();
-        let flipped_at = |x: usize, y: usize| -> &[u8] { &flipped[(y * 2 + x) * 4..(y * 2 + x) * 4 + 4] };
+        let flipped_at =
+            |x: usize, y: usize| -> &[u8] { &flipped[(y * 2 + x) * 4..(y * 2 + x) * 4 + 4] };
         // Source (0,0)=red is on top; after a y-flip it must land at the
         // bottom (0,1) of the destination, and source (0,1)=blue must
         // land at the top (0,0).
@@ -17099,7 +17961,10 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd_f32(proto::OP_CLEAR_COLOR, &[1.0, 0.0, 0.0, 1.0]),
             cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR]),
         ];
@@ -17116,12 +17981,21 @@ mod tests {
         mem.write(MemLoc::Aperture(a_tex_init), &tex_init);
         let dest_commands = vec![
             cmd(proto::OP_TEX_CREATE, &[1]),
-            cmd(proto::OP_TEX_IMAGE, &[1, 0, RGBA8, 2, 2, 8, a_tex_init, tex_init.len() as u32]),
+            cmd(
+                proto::OP_TEX_IMAGE,
+                &[1, 0, RGBA8, 2, 2, 8, a_tex_init, tex_init.len() as u32],
+            ),
             cmd(proto::OP_FRAMEBUFFER_CREATE, &[2]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 2]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_TEXTURE, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1, 0]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_TEXTURE,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1, 0],
+            ),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &dest_commands);
 
@@ -17129,7 +18003,10 @@ mod tests {
         let readback = vec![
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 2]),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 16]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest, 16],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
         let pixels = mem.read(MemLoc::Aperture(dest), 16).unwrap().to_vec();
@@ -17186,14 +18063,26 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 2, 2, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[2, 2, 2, A8R8G8B8]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT1, 2]),
-            cmd(proto::OP_DRAW_BUFFERS, &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT1, 2],
+            ),
+            cmd(
+                proto::OP_DRAW_BUFFERS,
+                &[2, COLOR_ATTACHMENT0, COLOR_ATTACHMENT1],
+            ),
             // Read side: the orange surface (default framebuffer).
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 0]),
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
@@ -17206,17 +18095,29 @@ mod tests {
             // E_BAD_ID.
             cmd(proto::OP_BIND_FRAMEBUFFER, &[READ_FRAMEBUFFER, 1]),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT0]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 16]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest0, 16],
+            ),
             cmd(proto::OP_READ_BUFFER, &[COLOR_ATTACHMENT1]),
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 16]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, dest1, 16],
+            ),
         ];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
         let magenta = encode_pixel(WireSurfaceFormat::A8r8g8b8, [255, 0, 255, 255]).unwrap();
         let got0 = mem.read(MemLoc::Aperture(dest0), 4).unwrap().to_vec();
         let got1 = mem.read(MemLoc::Aperture(dest1), 4).unwrap().to_vec();
-        assert_eq!(got0, magenta, "COLOR_ATTACHMENT0 should receive the blitted source: {got0:?}");
-        assert_eq!(got1, magenta, "COLOR_ATTACHMENT1 should also receive the blitted source: {got1:?}");
+        assert_eq!(
+            got0, magenta,
+            "COLOR_ATTACHMENT0 should receive the blitted source: {got0:?}"
+        );
+        assert_eq!(
+            got1, magenta,
+            "COLOR_ATTACHMENT1 should also receive the blitted source: {got1:?}"
+        );
     }
 
     /// `CLEAR`, `READ_PIXELS`, `TEX_COPY_IMAGE`, and `BLIT_FRAMEBUFFER`
@@ -17229,7 +18130,8 @@ mod tests {
     /// (not via `submit_commands_ctx`, which asserts no errors) so its
     /// own single `RenderError::GlError` can be checked in isolation.
     #[test]
-    fn clear_read_pixels_copy_and_blit_against_an_incomplete_framebuffer_are_all_invalid_framebuffer_operation() {
+    fn clear_read_pixels_copy_and_blit_against_an_incomplete_framebuffer_are_all_invalid_framebuffer_operation(
+    ) {
         let mut renderer = match Renderer::new() {
             Ok(r) => r,
             Err(RenderError::NoAdapter) => {
@@ -17273,11 +18175,24 @@ mod tests {
             ring.resize(ring.len() + 4, 0);
             ctx.ring_head = 0;
             let mut out = Vec::new();
-            ctx.submit(&ring, total, &super::super::ring::DeviceConfig::default(), &mut out);
-            assert_eq!(ctx.error_code, 0, "{what}: an incomplete framebuffer is a GL error, not a protocol error");
+            ctx.submit(
+                &ring,
+                total,
+                &super::super::ring::DeviceConfig::default(),
+                &mut out,
+            );
+            assert_eq!(
+                ctx.error_code, 0,
+                "{what}: an incomplete framebuffer is a GL error, not a protocol error"
+            );
             let errs = renderer.execute(&out, mem);
             assert!(
-                matches!(errs.as_slice(), [RenderError::GlError(state::GlError::InvalidFramebufferOperation)]),
+                matches!(
+                    errs.as_slice(),
+                    [RenderError::GlError(
+                        state::GlError::InvalidFramebufferOperation
+                    )]
+                ),
                 "{what}: expected exactly one GL_INVALID_FRAMEBUFFER_OPERATION, got: {errs:?}"
             );
         }
@@ -17293,7 +18208,10 @@ mod tests {
             &mut ctx,
             &mut renderer,
             &mut mem,
-            cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, A8R8G8B8, 8, 0, 0x5000, 16]),
+            cmd(
+                proto::OP_READ_PIXELS,
+                &[0, 0, 2, 2, A8R8G8B8, 8, 0, 0x5000, 16],
+            ),
             "READ_PIXELS",
         );
         submit_and_expect_invalid_framebuffer_operation(
@@ -17307,7 +18225,10 @@ mod tests {
             &mut ctx,
             &mut renderer,
             &mut mem,
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 2, 2, 0, 0, 2, 2, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
             "BLIT_FRAMEBUFFER",
         );
     }
@@ -17394,16 +18315,37 @@ mod tests {
             cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[DRAW_FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 2, 2, A8R8G8B8, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE,
+                &[1, 2, 2, A8R8G8B8, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE, &[2, 2, 2, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[DRAW_FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2]),
-            cmd(proto::OP_CLEAR, &[proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE,
+                &[2, 2, 2, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[DRAW_FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2],
+            ),
+            cmd(
+                proto::OP_CLEAR,
+                &[proto::CLEAR_MASK_COLOR | proto::CLEAR_MASK_DEPTH],
+            ),
             cmd(proto::OP_BUFFER_CREATE, &[1]),
             cmd(
                 proto::OP_BUFFER_DATA,
-                &[1, verts_bytes.len() as u32, 0x88E4, a_verts, verts_bytes.len() as u32],
+                &[
+                    1,
+                    verts_bytes.len() as u32,
+                    0x88E4,
+                    a_verts,
+                    verts_bytes.len() as u32,
+                ],
             ),
             cmd(proto::OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0x1406, 0, 0, 0, 1]),
             cmd(proto::OP_VERTEX_ATTRIB_ENABLE, &[0, 1]),
@@ -17421,7 +18363,10 @@ mod tests {
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &commands);
 
         let dest = 0x4000u32;
-        let readback = vec![cmd(proto::OP_READ_PIXELS, &[0, 0, 2, 2, DEPTH, 8, 0, dest, 16])];
+        let readback = vec![cmd(
+            proto::OP_READ_PIXELS,
+            &[0, 0, 2, 2, DEPTH, 8, 0, dest, 16],
+        )];
         submit_commands_ctx(&mut ctx, &mut renderer, &mut mem, &readback);
 
         let raw = mem.read(MemLoc::Aperture(dest), 4).unwrap();

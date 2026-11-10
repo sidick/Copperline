@@ -172,7 +172,9 @@ pub fn rewrite_to_core_profile(source: &str, stage: ShaderStage) -> String {
         indices.sort_unstable();
         let mut decls = String::new();
         for n in indices {
-            decls.push_str(&format!("layout(location = {n}) out vec4 c3d_frag_data_{n};\n"));
+            decls.push_str(&format!(
+                "layout(location = {n}) out vec4 c3d_frag_data_{n};\n"
+            ));
         }
         out = format!("{decls}{rewritten}");
     }
@@ -569,7 +571,10 @@ fn fix_sampler_binding_array_types(module: &mut naga::Module) {
         let name = module.types[handle].name.clone();
         module.types.replace(
             handle,
-            naga::Type { name, inner: naga::TypeInner::BindingArray { base, size } },
+            naga::Type {
+                name,
+                inner: naga::TypeInner::BindingArray { base, size },
+            },
         );
     }
     // An opaque (image/sampler) global normally lives in naga's `Handle`
@@ -625,7 +630,11 @@ fn drop_redundant_binding_array_loads(
         .iter()
         .filter_map(|(handle, expr)| match *expr {
             naga::Expression::Load { pointer }
-                if expression_indexes_into_binding_array(expressions, pointer, rewritten_globals) =>
+                if expression_indexes_into_binding_array(
+                    expressions,
+                    pointer,
+                    rewritten_globals,
+                ) =>
             {
                 Some((handle, pointer))
             }
@@ -730,7 +739,9 @@ fn drop_emits_for(block: &mut naga::Block, replaced: &[naga::Handle<naga::Expres
                     drop_emits_for(&mut case.body, replaced);
                 }
             }
-            naga::Statement::Loop { body, continuing, .. } => {
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
                 drop_emits_for(body, replaced);
                 drop_emits_for(continuing, replaced);
             }
@@ -781,7 +792,8 @@ pub fn compile(source: &str, stage: ShaderStage) -> CompileResult {
 mod tests {
     use super::*;
 
-    const VERTEX_SRC: &str = "attribute vec4 position;\nvoid main() {\n    gl_Position = position;\n}\n";
+    const VERTEX_SRC: &str =
+        "attribute vec4 position;\nvoid main() {\n    gl_Position = position;\n}\n";
     const FRAGMENT_SRC_OK: &str = "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n}\n";
     const FRAGMENT_SRC_BAD: &str =
         "precision mediump float;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0\n}\n";
@@ -834,7 +846,11 @@ mod tests {
             .filter_map(|(_, gv)| gv.binding.map(|b| b.binding))
             .collect();
         let unique: std::collections::BTreeSet<_> = bindings.iter().copied().collect();
-        assert_eq!(bindings.len(), unique.len(), "binding collision: {bindings:?}");
+        assert_eq!(
+            bindings.len(),
+            unique.len(),
+            "binding collision: {bindings:?}"
+        );
     }
 
     #[test]
@@ -961,11 +977,17 @@ mod tests {
             vec![
                 (
                     Some("scale".to_string()),
-                    Some(naga::ResourceBinding { group: 0, binding: 0 })
+                    Some(naga::ResourceBinding {
+                        group: 0,
+                        binding: 0
+                    })
                 ),
                 (
                     Some("tint".to_string()),
-                    Some(naga::ResourceBinding { group: 0, binding: 1 })
+                    Some(naga::ResourceBinding {
+                        group: 0,
+                        binding: 1
+                    })
                 ),
             ]
         );
@@ -985,7 +1007,10 @@ mod tests {
 
     #[test]
     fn rewrites_gl_frag_color_to_a_synthesised_out_var() {
-        let f = rewrite_to_core_profile("void main() { gl_FragColor = vec4(0); }", ShaderStage::Fragment);
+        let f = rewrite_to_core_profile(
+            "void main() { gl_FragColor = vec4(0); }",
+            ShaderStage::Fragment,
+        );
         assert!(f.starts_with("layout(location = 0) out vec4 c3d_frag_color;\n"));
         assert!(f.contains("c3d_frag_color = vec4(0);"));
         assert!(!f.contains("gl_FragColor"));

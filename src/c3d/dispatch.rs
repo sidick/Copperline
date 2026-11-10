@@ -156,7 +156,10 @@ pub enum RenderOp<'a> {
     /// -- a full [`state::State`] snapshot taken *at the moment this
     /// command was applied* (see this type's doc comment on why every
     /// op below that depends on time-varying state carries one).
-    Clear { mask: u32, state: State },
+    Clear {
+        mask: u32,
+        state: State,
+    },
     /// `DRAW_INLINE(_WIN)`/`DRAW_ARRAYS(_WIN)`/`DRAW_ELEMENTS(_WIN)`.
     /// `window_space` distinguishes the `_WIN` opcodes (already-transformed
     /// vertices) from the GL-space ones, which is the one piece of
@@ -172,11 +175,23 @@ pub enum RenderOp<'a> {
     },
     /// `SURFACE_UPLOAD`. Rectangle in surface pixels, already validated
     /// against the draw surface's bounds.
-    SurfaceUpload { x: u32, y: u32, w: u32, h: u32, state: State },
+    SurfaceUpload {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        state: State,
+    },
     /// `SURFACE_READBACK`. See the [readback contract](
     /// https://docs.internals/c3d.md#c3d-readback) for when its effects
     /// must be visible.
-    SurfaceReadback { x: u32, y: u32, w: u32, h: u32, state: State },
+    SurfaceReadback {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        state: State,
+    },
     /// `TEX_IMAGE`. Emitted only once [`state::State::define_tex_level`]
     /// has recorded the level's shape against an existing texture object.
     TexImage {
@@ -296,7 +311,10 @@ pub enum RenderOp<'a> {
     /// which GPU-side mip levels get regenerated -- depends on the
     /// dispatching context's `CAP_SHARED_CONTEXTS` namespace, even
     /// though nothing else about this op depends on broader GL state.
-    TexGenerateMips { id: u32, namespace: state::Namespace },
+    TexGenerateMips {
+        id: u32,
+        namespace: state::Namespace,
+    },
     /// `READ_PIXELS`. Rectangle already validated against the draw
     /// surface's bounds.
     ReadPixels {
@@ -317,12 +335,17 @@ pub enum RenderOp<'a> {
     /// later submission must not retroactively change an earlier query's
     /// answer. All that is left for a renderer to do is write `result` to
     /// `dest`.
-    Query { dest: Ref, result: QueryResult },
+    Query {
+        dest: Ref,
+        result: QueryResult,
+    },
     /// `FENCE`. The renderer calls [`Context::complete_fence`] once every
     /// preceding op (including a readback's or query's memory effects)
     /// has actually taken effect; `submit` never advances
     /// `FENCE_COMPLETED` itself.
-    Fence { id: u32 },
+    Fence {
+        id: u32,
+    },
 
     // -- CAP_PROGRAMMABLE: shaders and programs. See this module's doc
     // comment above `RenderOp` -- these carry refs (source text, an
@@ -332,7 +355,11 @@ pub enum RenderOp<'a> {
     /// `SHADER_SOURCE`. Replaces the shader's source text; the renderer
     /// also clears any previous compile result, matching the spec's
     /// "replacing any previous source".
-    ShaderSource { id: u32, source: Ref, namespace: state::Namespace },
+    ShaderSource {
+        id: u32,
+        source: Ref,
+        namespace: state::Namespace,
+    },
     /// `SHADER_COMPILE`. `kind` is read from `state` at dispatch time (see
     /// [`Context::apply`]) so the renderer doesn't need a `state`
     /// parameter for this op.
@@ -361,7 +388,10 @@ pub enum RenderOp<'a> {
         namespace: state::Namespace,
     },
     /// `PROGRAM_VALIDATE`.
-    ProgramValidate { program: u32, namespace: state::Namespace },
+    ProgramValidate {
+        program: u32,
+        namespace: state::Namespace,
+    },
     /// `SHADER_STATUS`/`PROGRAM_STATUS` (`0x0D00`/`0x0D01`). Both write a
     /// fixed-shape status record (and the two leave their own variant
     /// rather than sharing `Query`'s `QueryResult`, which is a fixed `f32`
@@ -397,7 +427,11 @@ pub enum RenderOp<'a> {
     /// `SYNC_STATUS`. Resolved eagerly at dispatch time, like
     /// `FramebufferStatus`/`Query` -- `status` is a snapshot of
     /// "signalled right now", not re-read at execute time.
-    SyncStatus { id: u32, dest: Ref, status: u32 },
+    SyncStatus {
+        id: u32,
+        dest: Ref,
+        status: u32,
+    },
 
     // -- CAP_PROGRAMMABLE: buffers. `BUFFER_CREATE`/`_DESTROY` and every
     // `VERTEX_ATTRIB_*` opcode carry no ref and are pure `state.rs`
@@ -483,7 +517,10 @@ pub enum RenderOp<'a> {
     // resolved from `state` immediately, exactly like `Query`'s `result`
     // -- completeness is pure state, so there is nothing a renderer needs
     // to re-derive later.
-    FramebufferStatus { dest: Ref, status: u32 },
+    FramebufferStatus {
+        dest: Ref,
+        status: u32,
+    },
     /// `BLIT_FRAMEBUFFER`. Corner coordinates, not `x, y, w, h`, so a
     /// reversed pair (`x0 > x1`/`y0 > y1`) can flip that axis, exactly as
     /// `glBlitFramebuffer` allows -- cast to `i32` at dispatch time since
@@ -819,15 +856,17 @@ impl Context {
                 // inside a `CALL`'d buffer falls through to `apply`'s
                 // generic (non-stalling) arm instead -- see that arm's
                 // doc comment for why.
-                Some(ring::Step::Command(Command::WaitSync { id })) => match self.state.sync_signalled(id) {
-                    None => self.latch_protocol_error(ErrorCode::BadId, start),
-                    Some(true) => {}
-                    Some(false) => {
-                        self.awaiting_sync = true;
-                        self.ring_head = start;
-                        return;
+                Some(ring::Step::Command(Command::WaitSync { id })) => {
+                    match self.state.sync_signalled(id) {
+                        None => self.latch_protocol_error(ErrorCode::BadId, start),
+                        Some(true) => {}
+                        Some(false) => {
+                            self.awaiting_sync = true;
+                            self.ring_head = start;
+                            return;
+                        }
                     }
-                },
+                }
                 Some(ring::Step::Command(Command::Call { data })) => {
                     match fetch_call_buffer(data) {
                         Some(bytes) => {
@@ -947,7 +986,13 @@ impl Context {
     /// none). `start` is the command's ring offset, needed only for a
     /// [`state::State`]-detected protocol error (`ring.rs`'s own errors
     /// already carry their offset in [`ring::ProtoError`]).
-    fn apply<'a>(&mut self, cmd: Command<'a>, start: u32, config: &DeviceConfig, out: &mut Vec<RenderOp<'a>>) {
+    fn apply<'a>(
+        &mut self,
+        cmd: Command<'a>,
+        start: u32,
+        config: &DeviceConfig,
+        out: &mut Vec<RenderOp<'a>>,
+    ) {
         match cmd {
             Command::Nop | Command::Flush | Command::Finish => {}
             Command::Fence { id } => out.push(RenderOp::Fence { id }),
@@ -1975,10 +2020,12 @@ impl Context {
                 let Some(format) = self.decode_gl(state::SurfaceFormat::from_wire(format)) else {
                     return;
                 };
-                self.state.renderbuffer_storage_color(id, width, height, format);
+                self.state
+                    .renderbuffer_storage_color(id, width, height, format);
             }
             Command::RenderbufferStorageDepthStencil { id, width, height } => {
-                self.state.renderbuffer_storage_depth_stencil(id, width, height);
+                self.state
+                    .renderbuffer_storage_depth_stencil(id, width, height);
             }
             Command::FramebufferAttachRenderbuffer {
                 target,
@@ -1988,13 +2035,15 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
-                else {
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(
+                    attachment,
+                    self.state.limits().max_color_attachments,
+                )) else {
                     return;
                 };
-                if let Err(code) = self
-                    .state
-                    .framebuffer_attach_renderbuffer(target, attachment, renderbuffer)
+                if let Err(code) =
+                    self.state
+                        .framebuffer_attach_renderbuffer(target, attachment, renderbuffer)
                 {
                     self.latch_protocol_error(code, start);
                 }
@@ -2008,8 +2057,10 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
-                else {
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(
+                    attachment,
+                    self.state.limits().max_color_attachments,
+                )) else {
                     return;
                 };
                 if let Err(code) = self
@@ -2041,8 +2092,10 @@ impl Context {
                 let Some(target) = self.decode_gl(state::FramebufferTarget::from_gl(target)) else {
                     return;
                 };
-                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(attachment, self.state.limits().max_color_attachments))
-                else {
+                let Some(attachment) = self.decode_gl(state::FramebufferAttachmentPoint::from_gl(
+                    attachment,
+                    self.state.limits().max_color_attachments,
+                )) else {
                     return;
                 };
                 if let Err(code) = self
@@ -2141,18 +2194,22 @@ impl Context {
                 // resolve. Only checked when `mask` includes colour: this
                 // is specifically the colour plane's own rule.
                 if mask & proto::CLEAR_MASK_COLOR != 0 {
-                    if let (Some((_, _, src_samples)), Some(dests)) =
-                        (self.state.blit_color_source_info(), self.state.blit_color_dest_info())
-                    {
-                        let same_size_and_orientation =
-                            (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+                    if let (Some((_, _, src_samples)), Some(dests)) = (
+                        self.state.blit_color_source_info(),
+                        self.state.blit_color_dest_info(),
+                    ) {
+                        let same_size_and_orientation = (src_x1 - src_x0) == (dst_x1 - dst_x0)
+                            && (src_y1 - src_y0) == (dst_y1 - dst_y0);
                         let mismatched = dests.iter().any(|&(_, _, dst_samples)| {
                             if dst_samples > 0 && src_samples == 0 {
                                 // "Un-resolving" into a multisample
                                 // destination from a non-multisample
                                 // source is never valid.
                                 true
-                            } else if dst_samples > 0 && src_samples > 0 && src_samples != dst_samples {
+                            } else if dst_samples > 0
+                                && src_samples > 0
+                                && src_samples != dst_samples
+                            {
                                 true
                             } else {
                                 (src_samples > 0 || dst_samples > 0) && !same_size_and_orientation
@@ -2175,15 +2232,16 @@ impl Context {
                 // doc comment) -- a real correctness gap otherwise,
                 // not something to silently no-op.
                 if mask & (proto::CLEAR_MASK_DEPTH | proto::CLEAR_MASK_STENCIL) != 0 {
-                    if let (Some((_, _, src_samples)), Some((_, _, dst_samples))) =
-                        (self.state.blit_depth_stencil_source_info(), self.state.blit_depth_stencil_dest_info())
-                    {
+                    if let (Some((_, _, src_samples)), Some((_, _, dst_samples))) = (
+                        self.state.blit_depth_stencil_source_info(),
+                        self.state.blit_depth_stencil_dest_info(),
+                    ) {
                         if mask & proto::CLEAR_MASK_STENCIL != 0 && src_samples > 0 {
                             self.state.raise_gl_error(GlError::InvalidOperation);
                             return;
                         }
-                        let same_size_and_orientation =
-                            (src_x1 - src_x0) == (dst_x1 - dst_x0) && (src_y1 - src_y0) == (dst_y1 - dst_y0);
+                        let same_size_and_orientation = (src_x1 - src_x0) == (dst_x1 - dst_x0)
+                            && (src_y1 - src_y0) == (dst_y1 - dst_y0);
                         let mismatched = (dst_samples > 0 && src_samples != dst_samples)
                             || ((src_samples > 0 || dst_samples > 0) && !same_size_and_orientation);
                         if mismatched {
@@ -2575,7 +2633,8 @@ mod tests {
     /// rect that fits the (larger) draw surface but not the (smaller)
     /// attachment must still be rejected.
     #[test]
-    fn tex_copy_image_against_a_read_framebuffer_checks_the_attachments_own_size_not_the_draw_surfaces() {
+    fn tex_copy_image_against_a_read_framebuffer_checks_the_attachments_own_size_not_the_draw_surfaces(
+    ) {
         let mut ctx = context();
         const FRAMEBUFFER: u32 = 0x8D40; // GL_FRAMEBUFFER
         const COLOR_ATTACHMENT0: u32 = 0x8CE0;
@@ -2587,7 +2646,10 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 4, 4, 5]), // 4x4, A8R8G8B8
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             // (0,0,8,8) fits the 8x8 draw surface but not the 4x4
             // attachment the bound read framebuffer actually sources
             // from -- must be E_BAD_RECT.
@@ -2619,7 +2681,10 @@ mod tests {
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
             cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR, &[1, 8, 8, 5]), // 8x8, A8R8G8B8
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd(proto::OP_TEX_CREATE, &[1]),
             // (0,0,8,8) overflows the 2x2 draw surface but fits the 8x8
             // attachment the bound read framebuffer actually sources
@@ -2633,7 +2698,13 @@ mod tests {
         assert_eq!(ctx.error_code, 0, "unexpected protocol error");
         assert_eq!(out.len(), 1, "expected exactly one RenderOp, got {out:?}");
         match &out[0] {
-            RenderOp::TexCopyImage { x, y, width, height, .. } => {
+            RenderOp::TexCopyImage {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
                 assert_eq!((*x, *y, *width, *height), (0, 0, 8, 8));
             }
             other => panic!("expected a TexCopyImage op, got {other:?}"),
@@ -2673,7 +2744,8 @@ mod tests {
         assert_eq!(ctx.error_code, 0, "not a protocol error");
         assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
         assert!(
-            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            out.iter()
+                .all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
             "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
         );
     }
@@ -2691,14 +2763,23 @@ mod tests {
             cmd(proto::OP_FRAMEBUFFER_CREATE, &[1]),
             cmd(proto::OP_BIND_FRAMEBUFFER, &[FRAMEBUFFER, 1]),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, 5, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE,
+                &[1, 4, 4, 5, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             // Read side names the multisample renderbuffer (default
             // READ_BUFFER is COLOR_ATTACHMENT0); the draw side is the
             // 8x8 non-multisample default surface -- a scaled 4x4 -> 8x8
             // colour copy with a multisample source must be rejected,
             // not silently scaled.
-            cmd(proto::OP_BLIT_FRAMEBUFFER, &[0, 0, 4, 4, 0, 0, 8, 8, proto::CLEAR_MASK_COLOR, NEAREST]),
+            cmd(
+                proto::OP_BLIT_FRAMEBUFFER,
+                &[0, 0, 4, 4, 0, 0, 8, 8, proto::CLEAR_MASK_COLOR, NEAREST],
+            ),
         ];
         let ring = ring_of(&commands);
         let total = commands.iter().map(Vec::len).sum::<usize>() as u32;
@@ -2707,7 +2788,8 @@ mod tests {
         assert_eq!(ctx.error_code, 0, "not a protocol error");
         assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
         assert!(
-            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            out.iter()
+                .all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
             "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
         );
     }
@@ -2740,11 +2822,23 @@ mod tests {
             // see an incomplete read framebuffer and treat this as a
             // no-op before ever reaching the stencil-specific check.
             cmd(proto::OP_RENDERBUFFER_CREATE, &[1]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE, &[1, 4, 4, 5, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_COLOR_MULTISAMPLE,
+                &[1, 4, 4, 5, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[FRAMEBUFFER, COLOR_ATTACHMENT0, 1],
+            ),
             cmd(proto::OP_RENDERBUFFER_CREATE, &[2]),
-            cmd(proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE, &[2, 4, 4, samples]),
-            cmd(proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER, &[FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2]),
+            cmd(
+                proto::OP_RENDERBUFFER_STORAGE_DEPTH_STENCIL_MULTISAMPLE,
+                &[2, 4, 4, samples],
+            ),
+            cmd(
+                proto::OP_FRAMEBUFFER_ATTACH_RENDERBUFFER,
+                &[FRAMEBUFFER, DEPTH_STENCIL_ATTACHMENT, 2],
+            ),
             // Read side names the multisample renderbuffer (fb 1, bound
             // to both sides above); point the draw side back at the
             // default framebuffer (the surface's own non-multisample
@@ -2764,7 +2858,8 @@ mod tests {
         assert_eq!(ctx.error_code, 0, "not a protocol error");
         assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
         assert!(
-            out.iter().all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
+            out.iter()
+                .all(|op| !matches!(op, RenderOp::BlitFramebuffer { .. })),
             "an invalid BLIT_FRAMEBUFFER must push no RenderOp: {out:?}"
         );
     }
@@ -2818,7 +2913,10 @@ mod tests {
         let ring = ring_of(&commands);
         let mut out = Vec::new();
         ctx.submit(&ring, total, &config(), &mut out);
-        assert!(out.is_empty(), "program lifecycle ops carry no refs and push no RenderOp");
+        assert!(
+            out.is_empty(),
+            "program lifecycle ops carry no refs and push no RenderOp"
+        );
         assert_eq!(ctx.state.gl_error(), GlError::InvalidOperation.to_gl());
         assert_eq!(ctx.state.program(1).unwrap().attached_vertex, Some(1));
     }
@@ -2870,17 +2968,18 @@ mod tests {
         ctx.submit(&ring, total, &config(), &mut out);
         assert!(matches!(
             out.as_slice(),
-            [RenderOp::BufferData { id: 1, size: 256, .. }]
+            [RenderOp::BufferData {
+                id: 1,
+                size: 256,
+                ..
+            }]
         ));
     }
 
     #[test]
     fn vertex_attrib_pointer_with_a_bad_type_raises_gl_invalid_enum_and_records_nothing() {
         let mut ctx = context();
-        let ring = ring_of(&[cmd(
-            OP_VERTEX_ATTRIB_POINTER,
-            &[0, 4, 0xDEAD, 0, 0, 0, 1],
-        )]);
+        let ring = ring_of(&[cmd(OP_VERTEX_ATTRIB_POINTER, &[0, 4, 0xDEAD, 0, 0, 0, 1])]);
         let mut out = Vec::new();
         ctx.submit(&ring, 32, &config(), &mut out);
         assert!(out.is_empty());
@@ -2914,7 +3013,7 @@ mod tests {
     fn stencil_func_op_mask_and_clear_stencil_mutate_raster_state() {
         let mut ctx = context();
         let commands = [
-            cmd(OP_STENCIL_FUNC, &[0x0207, 2, 0xAA]), // GL_ALWAYS
+            cmd(OP_STENCIL_FUNC, &[0x0207, 2, 0xAA]),      // GL_ALWAYS
             cmd(OP_STENCIL_OP, &[0x1E01, 0x1E01, 0x1E02]), // REPLACE, REPLACE, INCR
             cmd(OP_STENCIL_MASK, &[0x0F]),
             cmd(OP_CLEAR_STENCIL, &[7]),
@@ -2924,7 +3023,10 @@ mod tests {
         let mut out = Vec::new();
         ctx.submit(&ring, total, &config(), &mut out);
         assert_eq!(ctx.state.gl_error(), state::GL_NO_ERROR);
-        assert_eq!(ctx.state.raster.stencil_func, state::StencilCompareFunc::Always);
+        assert_eq!(
+            ctx.state.raster.stencil_func,
+            state::StencilCompareFunc::Always
+        );
         assert_eq!(ctx.state.raster.stencil_ref, 2);
         assert_eq!(ctx.state.raster.stencil_read_mask, 0xAA);
         assert_eq!(ctx.state.raster.stencil_fail_op, state::StencilOp::Replace);
@@ -3023,7 +3125,11 @@ mod tests {
         ctx.submit(&ring, total, &config(), &mut out);
         assert!(matches!(
             out.as_slice(),
-            [RenderOp::DrawArraysProg { first: 0, count: 3, .. }]
+            [RenderOp::DrawArraysProg {
+                first: 0,
+                count: 3,
+                ..
+            }]
         ));
     }
 
@@ -3040,10 +3146,22 @@ mod tests {
         let ring = ring_of(&commands);
         let mut out = Vec::new();
         ctx.submit(&ring, total, &config(), &mut out);
-        assert!(matches!(out[0], RenderOp::Uniform { program: 1, location: 0, .. }));
+        assert!(matches!(
+            out[0],
+            RenderOp::Uniform {
+                program: 1,
+                location: 0,
+                ..
+            }
+        ));
         assert!(matches!(
             out[1],
-            RenderOp::UniformSampler { program: 1, location: 0, unit: 2, .. }
+            RenderOp::UniformSampler {
+                program: 1,
+                location: 0,
+                unit: 2,
+                ..
+            }
         ));
     }
 
@@ -3064,7 +3182,10 @@ mod tests {
         let ring = ring_of(&commands);
         let mut out = Vec::new();
         ctx.submit(&ring, total, &config(), &mut out);
-        assert!(matches!(out.as_slice(), [RenderOp::ProgramInterface { program: 1, .. }]));
+        assert!(matches!(
+            out.as_slice(),
+            [RenderOp::ProgramInterface { program: 1, .. }]
+        ));
     }
 
     #[test]
@@ -3397,7 +3518,8 @@ mod tests {
         let before_bad_enable = (define.len() + set.len() + clear.len()) as u32;
         ctx.submit(&ring, before_bad_enable, &config(), &mut out);
         let clear1_state = ctx.state.clone();
-        let total = before_bad_enable + (bad_enable.len() + bad_readback.len() + clear2.len()) as u32;
+        let total =
+            before_bad_enable + (bad_enable.len() + bad_readback.len() + clear2.len()) as u32;
         ctx.submit(&ring, total, &config(), &mut out);
         let clear2_state = ctx.state.clone();
 

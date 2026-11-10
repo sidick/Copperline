@@ -474,7 +474,11 @@ fn encode_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), S
 /// fixed-shape status records, not image data, so a hex string is the
 /// useful form to print, not a pixel-diff summary.
 fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
@@ -584,9 +588,13 @@ fn cmd_compare(path: &Path) -> Result<i32, String> {
     for section in TraceReader::new(&bytes) {
         match section.map_err(|e| e.to_string())? {
             Section::Gold(g) => golds.push((g.context, g.fence_id, g.surface_id, g.png.to_vec())),
-            Section::Result(r) => {
-                rslts.push((r.context, r.fence_id, r.space, r.address, r.expected.to_vec()))
-            }
+            Section::Result(r) => rslts.push((
+                r.context,
+                r.fence_id,
+                r.space,
+                r.address,
+                r.expected.to_vec(),
+            )),
             _ => {}
         }
     }
@@ -609,7 +617,10 @@ fn cmd_compare(path: &Path) -> Result<i32, String> {
         };
         match mem.read(loc, expected.len()) {
             Some(actual) if actual == expected.as_slice() => {
-                println!("PASS ctx{context} fence{fence_id} {loc:?}: {} byte(s) match", expected.len());
+                println!(
+                    "PASS ctx{context} fence{fence_id} {loc:?}: {} byte(s) match",
+                    expected.len()
+                );
             }
             Some(actual) => {
                 println!(
@@ -620,7 +631,10 @@ fn cmd_compare(path: &Path) -> Result<i32, String> {
                 all_passed = false;
             }
             None => {
-                println!("FAIL ctx{context} fence{fence_id} {loc:?}: could not read {} byte(s)", expected.len());
+                println!(
+                    "FAIL ctx{context} fence{fence_id} {loc:?}: could not read {} byte(s)",
+                    expected.len()
+                );
                 all_passed = false;
             }
         }
