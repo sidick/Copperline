@@ -778,6 +778,53 @@ fn appended_ring_bytes(ring: &[u8], old_head: u32, new_tail: u32) -> Vec<u8> {
     }
 }
 
+/// Fits a C3D board on the Zorro chain and applies `[c3d]`'s boot-time
+/// trace-capture settings, for `crate::emulator`'s machine construction.
+/// Kept here, rather than inline at that call site, so the board owns its
+/// own wiring and `build_machine_inner` carries one call.
+///
+/// The caller has already decided the board is wanted ([`C3dConfig::enabled`]);
+/// this does not re-check it.
+///
+/// Returns the Zorro slot the board took, which the caller logs: the
+/// "board on the Zorro chain" line belongs to the `copperline::emulator`
+/// log target like every other board's, and `RUST_LOG` filters built
+/// around that target (`tests/c3d.rs`'s own included) would not see it
+/// from here.
+pub(crate) fn attach(
+    zorro: &mut crate::zorro::ZorroChain,
+    devices: &mut Vec<crate::zorro_device::BoardDevice>,
+    cfg: &crate::config::C3dConfig,
+) -> anyhow::Result<usize> {
+    // The whole Zorro III window; not yet a `[c3d]` config knob (see this
+    // module's doc comment). A legal Zorro III size -- BoardSpec::validate
+    // checks this the same as any other board.
+    const WINDOW_BYTES: u32 = 0x0200_0000; // 32 MiB
+    let slot = devices.len();
+    zorro.add_board(crate::zorro::BoardSpec::c3d(slot, WINDOW_BYTES as usize))?;
+    let mut board = C3dBoard::with_masked_caps(WINDOW_BYTES, cfg.mask_caps);
+    // `[c3d] trace`/`trace_enabled`/`trace_rolling_bytes`/
+    // `trace_trigger_texture`: see `docs/internals/c3d.md`'s "Trace
+    // capture" and `C3dBoard::trace_start`'s doc comment for the full
+    // fallback chain `trace` alone (no `trace_enabled`) participates in
+    // without auto-starting anything itself. `trace_trigger_texture` set
+    // means "wait", so it takes precedence over starting immediately --
+    // the two are the same "now vs. deferred" choice `c3d.trace_start`'s
+    // own `trigger_texture` parameter makes at the control layer.
+    if let Some(path) = &cfg.trace {
+        board.set_configured_trace_path(path.clone());
+    }
+    if cfg.trace_enabled {
+        if let Some(texture_id) = cfg.trace_trigger_texture {
+            board.trace_arm_on_texture_bind(texture_id, None, cfg.trace_rolling_bytes);
+        } else if let Err(e) = board.trace_start(None, cfg.trace_rolling_bytes) {
+            log::warn!("c3d: [c3d] trace_enabled capture failed to start: {e}");
+        }
+    }
+    devices.push(crate::zorro_device::BoardDevice::C3d(Box::new(board)));
+    Ok(slot)
+}
+
 impl C3dBoard {
     /// `window_bytes` is the whole autoconfig window
     /// ([`crate::zorro::BoardSpec::c3d`] takes the same value); the data

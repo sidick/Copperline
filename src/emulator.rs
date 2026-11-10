@@ -4428,35 +4428,8 @@ fn build_machine_inner(
     // crate::c3d::board and docs/internals/c3d.md.
     #[cfg(feature = "c3d")]
     if cfg.c3d.enabled {
-        // The whole Zorro III window; not yet a `[c3d]` config knob (see
-        // crate::c3d::board's module doc comment). A legal Zorro III size
-        // -- BoardSpec::validate checks this the same as any other board.
-        const WINDOW_BYTES: u32 = 0x0200_0000; // 32 MiB
-        let slot = devices.len();
-        zorro.add_board(crate::zorro::BoardSpec::c3d(slot, WINDOW_BYTES as usize))?;
+        let slot = crate::c3d::board::attach(&mut zorro, &mut devices, &cfg.c3d)?;
         info!("c3d: 3D accelerator board on the Zorro chain (slot {slot})");
-        let mut c3d_board =
-            crate::c3d::board::C3dBoard::with_masked_caps(WINDOW_BYTES, cfg.c3d.mask_caps);
-        // `[c3d] trace`/`trace_enabled`/`trace_rolling_bytes`/
-        // `trace_trigger_texture`: see `docs/internals/c3d.md`'s "Trace
-        // capture" and `C3dBoard::trace_start`'s doc comment for the
-        // full fallback chain `trace` alone (no `trace_enabled`)
-        // participates in without auto-starting anything itself.
-        // `trace_trigger_texture` set means "wait", so it takes
-        // precedence over starting immediately -- the two are the same
-        // "now vs. deferred" choice `c3d.trace_start`'s own
-        // `trigger_texture` parameter makes at the control layer.
-        if let Some(path) = &cfg.c3d.trace {
-            c3d_board.set_configured_trace_path(path.clone());
-        }
-        if cfg.c3d.trace_enabled {
-            if let Some(texture_id) = cfg.c3d.trace_trigger_texture {
-                c3d_board.trace_arm_on_texture_bind(texture_id, None, cfg.c3d.trace_rolling_bytes);
-            } else if let Err(e) = c3d_board.trace_start(None, cfg.c3d.trace_rolling_bytes) {
-                log::warn!("c3d: [c3d] trace_enabled capture failed to start: {e}");
-            }
-        }
-        devices.push(crate::zorro_device::BoardDevice::C3d(Box::new(c3d_board)));
     }
     #[cfg(not(feature = "c3d"))]
     if cfg.c3d.enabled {
